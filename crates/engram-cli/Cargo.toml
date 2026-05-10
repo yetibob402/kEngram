@@ -1,0 +1,26 @@
+[package]
+name = "engram-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "engram"
+path = "src/main.rs"
+
+[dependencies]
+engram-core.workspace = true
+engram-storage.workspace = true
+engram-embed.workspace = true
+engram-mcp.workspace = true
+
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+figment.workspace = true
+rmcp.workspace = true
+sqlx.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true

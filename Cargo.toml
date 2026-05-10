@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/engram-core",
+  "crates/engram-storage",
+  "crates/engram-embed",
+  "crates/engram-mcp",
+  "crates/engram-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+authors = ["Ron Forrester <ron.forrester@me.com>"]
+
+[workspace.dependencies]
+# Internal crates
+engram-core    = { path = "crates/engram-core" }
+engram-storage = { path = "crates/engram-storage" }
+engram-embed   = { path = "crates/engram-embed" }
+engram-mcp     = { path = "crates/engram-mcp" }
+
+# Async runtime + traits
+tokio       = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
+async-trait = "0.1"
+
+# Errors
+thiserror = "2"
+anyhow    = "1"
+
+# Serde
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# IDs and timestamps
+uuid = { version = "1", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["serde", "macros"] }
+
+# Tracing
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "json", "env-filter"] }
+
+# Database
+sqlx     = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "time", "json", "macros", "migrate"] }
+pgvector = { version = "0.4", features = ["sqlx"] }
+
+# HTTP clients / servers
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+axum    = "0.8"
+
+# Config
+figment = { version = "0.10", features = ["toml", "env"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# MCP
+rmcp = "0.1"

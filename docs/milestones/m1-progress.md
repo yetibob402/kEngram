@@ -2,18 +2,18 @@
 
 Living checklist tracking M1 implementation. Each phase ends in a runnable, reviewable checkpoint. Items are checked off as they land; the **History** section at the bottom captures dated notes — decisions made in passing, surprises, things deferred. The companion design doc is `m1-capture-and-search.md` in this directory.
 
-## Phase A — Foundation
+## Phase A — Foundation ✅
 
 End state: workspace compiles clean; database schema is loaded.
 
-- [ ] Root `Cargo.toml`: `[workspace]` members + `[workspace.dependencies]` block listing every crate from the CLAUDE.md Stack table, pinned to current stable versions
-- [ ] Library crates: `engram-core`, `engram-storage`, `engram-embed`, `engram-mcp` (all empty, all compile)
-- [ ] Binary crate: `engram-cli` declaring `[[bin]] name = "engram"`
-- [ ] `.gitignore` (Rust `target/`, IDE files, `.env`, `.DS_Store`)
-- [ ] `migrations/0001_initial.sql` matching design doc §5
-- [ ] `sqlx migrate run` succeeds against the M0 Docker Postgres
-- [ ] `cargo build --workspace` clean
-- [ ] `cargo clippy --all-targets -- -D warnings` clean
+- [x] Root `Cargo.toml`: `[workspace]` members + `[workspace.dependencies]` block listing every crate from the CLAUDE.md Stack table, pinned to current stable versions
+- [x] Library crates: `engram-core`, `engram-storage`, `engram-embed`, `engram-mcp` (all empty, all compile)
+- [x] Binary crate: `engram-cli` declaring `[[bin]] name = "engram"`
+- [x] `.gitignore` (Rust `target/`, IDE files, `.env`, `.DS_Store`)
+- [x] `migrations/0001_initial.sql` matching design doc §5
+- [x] `sqlx migrate run` succeeds against the M0 Docker Postgres
+- [x] `cargo build --workspace` clean
+- [x] `cargo clippy --all-targets -- -D warnings` clean
 
 ## Phase B — Capture vertical slice
 
@@ -64,4 +64,4 @@ Dated notes appended as items land. Format: `YYYY-MM-DD — <one-line summary>`.
 
 <!-- Most recent entry first. -->
 
-- (no entries yet)
+- **2026-05-09** — Phase A complete. Workspace skeleton (`Cargo.toml` + 5 crates) compiles cleanly with edition 2024 on rustc 1.95. Resolved versions: `tokio 1`, `axum 0.8.9`, `sqlx 0.8.6`, `pgvector 0.4.1`, `reqwest 0.12.28`, `figment 0.10.19`, `clap 4.6.1`, `rmcp 0.1.5`, `tracing-subscriber 0.3.23`. Migration `0001_initial.sql` applied in 39 ms; all five tables, three required extensions (`pgcrypto`, `vector 0.8.2`, `pg_trgm 1.6`), and the four named indexes (including `embeddings_bge_m3_hnsw` HNSW partial) confirmed via `\dt`/`\dx`/`\di`. Note: `chrono` resolved transitively (figment → uncased → chrono); we use `time` directly per workspace deps, so this is a transitive duplicate, not a workspace-level inconsistency.

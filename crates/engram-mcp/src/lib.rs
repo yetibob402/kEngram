@@ -3,9 +3,12 @@
 //!
 //! The orchestration functions (`capture`, plus `search_thoughts`,
 //! `recent_thoughts`, `get_thought` in Phase C) are testable Rust functions
-//! that take `&PgPool` + `&dyn Embedder` + a request struct. The rmcp tool
-//! wiring (Phase B.2) is a thin layer over them.
+//! that take `&PgPool` + `&dyn Embedder` + a request struct. The
+//! [`EngramServer`] type wires them into rmcp's `ServerHandler` trait so
+//! they're invokable over an MCP transport.
 
 pub mod capture;
+pub mod server;
 
 pub use capture::{capture, CaptureError, CaptureRequest, CaptureResponse, MAX_CONTENT_LEN};
+pub use server::{CaptureArgs, EngramServer};

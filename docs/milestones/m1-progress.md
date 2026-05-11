@@ -15,7 +15,7 @@ End state: workspace compiles clean; database schema is loaded.
 - [x] `cargo build --workspace` clean
 - [x] `cargo clippy --all-targets -- -D warnings` clean
 
-## Phase B — Capture vertical slice
+## Phase B — Capture vertical slice ✅
 
 End state: an agent can call `capture` over MCP; thought row + embedding row land in the database; soft-fail returns `embedding_status: "pending"` cleanly.
 
@@ -25,10 +25,11 @@ End state: an agent can call `capture` over MCP; thought row + embedding row lan
 - [x] `engram-embed` `FakeEmbedder` (deterministic; for sqlx-tests with no Ollama dependency)
 - [x] `engram-storage` repository functions: insert thought, insert embedding, fetch thought by id
 - [x] `engram-mcp` capture orchestration function (`capture(pool, embedder, request) -> CaptureResponse`)
-- [ ] `engram-mcp` rmcp tool descriptor wiring the orchestration function as the MCP `capture` tool
-- [ ] `engram-cli` `serve` subcommand: axum + rmcp transport on `127.0.0.1:<port>`
-- [ ] `figment` config loader: `~/.config/engram/engram.toml` + `ENGRAM_*` env overrides + `--config <path>` override
-- [ ] `tracing` initialization: structured output to stderr
+- [x] `engram-mcp` rmcp tool descriptor wiring the orchestration function as the MCP `capture` tool
+- [x] `engram-cli` `serve` subcommand: axum + rmcp transport on `127.0.0.1:<port>`
+- [x] `engram-cli` `migrate` subcommand (bonus; runs sqlx::migrate! against the configured DB)
+- [x] `figment` config loader: `~/.config/engram/engram.toml` + `ENGRAM_*` env overrides + `--config <path>` override
+- [x] `tracing` initialization: structured output to stderr
 - [x] `sqlx::test`: `capture` with `FakeEmbedder` writes both rows, returns `embedding_status: "indexed"`
 - [x] `sqlx::test`: `capture` with a failing `FakeEmbedder` returns `embedding_status: "pending"`; thought row exists; embedding row absent; WARN logged
 
@@ -65,5 +66,6 @@ Dated notes appended as items land. Format: `YYYY-MM-DD — <one-line summary>`.
 
 <!-- Most recent entry first. -->
 
+- **2026-05-10** — Phase B complete. rmcp `ServerHandler` impl in `engram-mcp::server` exposes `capture` as an MCP tool over SSE transport. `engram-cli` provides `serve` and `migrate` subcommands with `figment`-layered TOML + env config (default `~/.config/engram/engram.toml`, override via `--config`, env-overrides via `ENGRAM_DATABASE__URL` etc.). `tracing-subscriber` initialised at startup with `RUST_LOG`/`ENGRAM_LOG` filter. Smoke-tested: `cargo run -- migrate` re-applies idempotently; `cargo run -- serve` binds 127.0.0.1:8080, `curl /sse` returns 200 `text/event-stream`. Two pieces of rmcp friction worth noting: (1) the `#[tool]` macro doesn't accept `Result<String, rmcp::Error>` because `rmcp::Error` doesn't impl `IntoContents`; we use `Result<String, String>` so failures land as tool-level errors (`isError: true` content) rather than JSON-RPC protocol errors — this is the more idiomatic shape for validation failures anyway; (2) the macro requires `#[tool(tool_box)]` on both the `impl Server { ... }` and the `impl ServerHandler for Server { ... }` blocks. Total 64 tests passing (30 + 16 + 9 + 6 + 3 cli config), clippy clean. Full MCP-protocol round-trip (Claude Code or `mcp-inspector` invoking `capture` end-to-end) deferred to Phase D smoke-test alongside the other three tools.
 - **2026-05-10** — Phase B orchestration checkpoint. All testable logic landed: `engram-core` domain types (`Thought`, `ThoughtId`, `Scope`, `Source`, `Embedding`, `EmbeddingModel`, `EmbeddingStatus`, `Metadata`) + `Embedder` trait with transient-vs-fatal classification; `engram-embed::FakeEmbedder` (deterministic, configurable failure modes) and `engram-embed::OpenAICompatibleEmbedder` (one struct covers Ollama / TEI / OpenAI / Voyage; configurable endpoint, model, api_key, timeout); `engram-storage` repository functions (`insert_thought`, `insert_embedding`, `insert_thought_embedding`, `fetch_thought`, `thought_has_embedding`); `engram-mcp::capture` orchestration that writes the thought, attempts to embed, and soft-fails to `EmbeddingStatus::Pending` on any embedder/embedding/storage failure (logging warn for transient, error for fatal). 61 tests pass (30 engram-core + 16 engram-embed + 6 engram-storage + 9 engram-mcp). Workspace clippy clean. Note: sqlx::query! requires `DATABASE_URL` at *build* time in every crate that uses it — `.env` at workspace root is not sufficient; pass via shell env or per-crate `.env`. Documented in next History pass.
 - **2026-05-09** — Phase A complete. Workspace skeleton (`Cargo.toml` + 5 crates) compiles cleanly with edition 2024 on rustc 1.95. Resolved versions: `tokio 1`, `axum 0.8.9`, `sqlx 0.8.6`, `pgvector 0.4.1`, `reqwest 0.12.28`, `figment 0.10.19`, `clap 4.6.1`, `rmcp 0.1.5`, `tracing-subscriber 0.3.23`. Migration `0001_initial.sql` applied in 39 ms; all five tables, three required extensions (`pgcrypto`, `vector 0.8.2`, `pg_trgm 1.6`), and the four named indexes (including `embeddings_bge_m3_hnsw` HNSW partial) confirmed via `\dt`/`\dx`/`\di`. Note: `chrono` resolved transitively (figment → uncased → chrono); we use `time` directly per workspace deps, so this is a transitive duplicate, not a workspace-level inconsistency.

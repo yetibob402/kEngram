@@ -56,7 +56,7 @@ figment = { version = "0.10", features = ["toml", "env"] }
 clap = { version = "4", features = ["derive"] }
 
 # MCP
-rmcp = "0.1"
+rmcp = { version = "0.1", features = ["transport-sse-server"] }
 
 # Test utilities (dev-deps)
 wiremock = "0.6"

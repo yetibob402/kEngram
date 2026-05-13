@@ -4,7 +4,9 @@ Self-hosted, MCP-native memory service for AI agents. Single Rust binary; Postgr
 
 ## Why Engram
 
-Engram gives any MCP-capable agent (Claude Code, Claude Desktop, opencode, Cline, …) a **shared, persistent memory** backed by your own Postgres. A thought captured from one client is searchable from any other — across sessions, models, and machines. M2 layers structured facts on top: a local LLM (via vLLM or OpenRouter) extracts `(subject, predicate, object)` triples from your captures on a schedule, and the same agents can query both the natural-language thoughts and the derived facts.
+Engram gives any MCP-capable agent (Claude Code, Claude Desktop, opencode, Cline, …) a **shared, persistent memory** backed by your own Postgres. A thought captured from one client is searchable from any other — across sessions, models, and machines.
+
+What sets Engram apart from "an MCP server that talks to a database" is the **facts pipeline**. On a schedule you control, a local LLM (vLLM, or OpenRouter for cloud fallback) reads each new thought and extracts structured `(subject, predicate, object, confidence)` triples. So a casual capture like *"Talked to Sarah — she wants migration #0042 fast-tracked, mobile freeze starts Thursday"* becomes two queryable rows: *Sarah → wants fast-tracked → migration #0042* and *mobile freeze → starts → Thursday*. Agents can search both the raw thoughts (natural language) and the derived facts (structured statements with source-thought provenance), correct extractions that got it wrong (with the audit trail preserved), and re-run extraction when you upgrade the model. The raw thought stays immutable underneath; facts are derived data that can be re-derived.
 
 The deployment is the `engram` binary plus Postgres plus any OpenAI-compatible embedding endpoint (Ollama is the zero-config dev path). No SaaS, no per-seat fees, no vendor lock-in — change LLM provider whenever you like; your memory comes with you.
 
@@ -24,6 +26,43 @@ For design rationale see [`docs/engram-design-v0.md`](docs/engram-design-v0.md);
 | `correct_fact` | Operator-driven correction. With a replacement, inserts a manual-author fact (`extractor_model="manual"`, `extractor_version=0`, `confidence=1.0`) and supersedes the old row, preserving the audit trail. Without a replacement, retracts via supersede. |
 
 CLI subcommands: `engram serve`, `engram worker`, `engram migrate`, `engram embed-backfill`, `engram reflect [--rerun --since <RFC3339>]`. Operational details in [`DEVELOPMENT.md`](DEVELOPMENT.md).
+
+## How fact extraction works
+
+Thoughts are raw, immutable, free-form text — what an agent or operator typed. Facts are structured rows derived from thoughts on a schedule: each one is a self-contained natural-language statement, optionally decomposed into an (S, P, O) triple, with a confidence score and a pointer back to the source thought. Facts are queryable independently of thoughts; you can ask `search_facts("migration #0042")` and get back the fact rows with their source-thought context attached.
+
+The lifecycle, end to end:
+
+**1. Capture.** A client (Claude Code, Claude Desktop, opencode, …) calls `capture(content, scope?, source?, metadata?)`. Engram writes the thought row and returns the `thought_id` immediately. Embedding is async — the `engram worker` drainer task vectorizes the thought within a few seconds so vector search picks it up. Trigram search works against the raw content immediately.
+
+**2. Reflect.** On a cron you control (default `0 0 3 * * *` — 03:00 daily; or run `engram reflect --limit 50` on demand), the same worker process wakes up its reflector task. It walks **unfacted thoughts** — `LEFT JOIN facts WHERE facts.id IS NULL`, oldest first — and asks your configured extractor LLM to extract structured facts.
+
+**3. Extract.** The extractor speaks OpenAI's `/v1/chat/completions` with `response_format: { type: "json_schema", ... }`. The model gets the thought content plus a system prompt that defines the output schema: an array of `{ statement, subject?, predicate?, object?, confidence }`. JSON Schema-guided decoding (vLLM's `xgrammar`/`outlines` backends, OpenRouter's structured-outputs) makes the response guaranteed-parseable. So given:
+
+> *"Talked to Sarah today about the PR backlog. She wants migration #0042 fast-tracked because the mobile freeze starts Thursday."*
+
+…a reasonable extractor returns:
+
+```json
+{ "facts": [
+    { "statement": "Sarah wants migration #0042 fast-tracked",
+      "subject": "Sarah", "predicate": "wants fast-tracked", "object": "migration #0042",
+      "confidence": 0.9 },
+    { "statement": "Mobile freeze starts Thursday",
+      "subject": "mobile freeze", "predicate": "starts", "object": "Thursday",
+      "confidence": 0.85 }
+] }
+```
+
+**4. Route.** Facts with `confidence ≥ review_queue_below` (default 0.7) land in `facts` and become immediately searchable. Lower-confidence rows go to `facts_review_queue` for operator decision. Either path records `extractor_model`, `extractor_version`, and `source_run_id` — so a whole bad run can be jointly retracted later (`UPDATE facts SET superseded_at = NOW() WHERE source_run_id = ...`) and re-evaluating after a model upgrade is `WHERE extractor_version < N`.
+
+**5. Search.** `search_facts(query, scope?)` does trigram retrieval over `facts.statement`, filtered to active (non-superseded) rows, joined to the source thought. Each result is self-contained: the fact, the (S, P, O) triple, the confidence, *and* the source thought's content/scope/created_at. No follow-up `get_thought` call needed. `get_thought(id)` carries `linked_facts` for the reverse direction.
+
+**6. Correct.** When the extractor gets it wrong, `correct_fact(fact_id, replacement?)` supersedes the row. With a replacement, a new fact is inserted with sentinel provenance (`extractor_model="manual"`, `extractor_version=0`, `confidence=1.0`) — the operator is the authority. Without a replacement, the row is retracted. The old row stays in the database with `superseded_at` set; the audit trail is complete.
+
+**7. Rerun.** `engram reflect --rerun [--since <RFC3339>]` re-extracts already-facted thoughts. Exact `(S, P, O, statement)` matches are no-ops (idempotency keystone); same triple with a different statement supersedes the old row (preserving the audit trail); new triples insert as additional facts. It's additive only — existing facts the new extractor *doesn't* reproduce stay active, because rerun reflects model drift in how facts are stated, not in what the thought says.
+
+**What this gives you.** Raw thoughts you can search lexically and semantically *and* structured facts you can query as data — without the database becoming the source of truth for either. The raw capture is immutable; the facts are reproducible from it; bad extractions are correctable in place; model upgrades are routine re-runs rather than migrations. Every fact carries enough provenance (`extractor_model`, `extractor_version`, `source_run_id`, `superseded_by`) that "where did this come from and is it still current?" is always a single `SELECT`.
 
 ## Quick start
 

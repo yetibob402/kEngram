@@ -62,10 +62,131 @@ The existing `facts` table is now populated by code. No structural change to `fa
 
 ## Open questions
 
-- **Async embedding mechanism.** A dedicated `pending_embeddings` queue table polled by the worker, vs. PostgreSQL `LISTEN/NOTIFY` from the capture side, vs. an external queue (`apalis`, `pgmq`)? Each has different failure-mode and back-pressure characteristics.
-- **Reflector batching strategy.** Per-scope round-robin, strict by `created_at`, or per-thought as soon as it's "old enough"? What does "recent thoughts" mean — within the last cron interval, or "all thoughts that don't yet have any facts"?
-- **Extractor prompt design.** JSON Schema response format vs. grammar-constrained vs. free-text + parse. Vendor-coupling considerations.
-- **Facts table — should it grow a `source_run_id`?** So all facts produced in one reflection run can be jointly retracted if the run is later judged bad. Possibly, possibly later.
-- **Dual-extractor disagreement handling.** Store both with a flag, store neither, or store the higher-confidence one and queue the disagreement for review?
-- **Search strategy for facts.** Same RRF hybrid as thoughts? Or weighted toward exact-statement match because facts are shorter and more structured?
-- **Trait location for `Extractor`.** In `engram-core` (alongside `Embedder`) or in `engram-extract` (where it lives)? Hinges on whether `engram-core` should ever depend on `engram-extract`.
+Each item is the engineer's lean + reasoning, followed by an `RJF:` placeholder for the operator's answer. Once all are filled in, this milestone gets a Phase-A planning conversation that produces a plan file.
+
+### 1. Async embedding mechanism
+
+Capture must return immediately with a thought ID; the actual `Embedder::embed` call moves to the worker. How does the capture side hand the work off?
+
+- **(a)** A dedicated `pending_embeddings` queue table. Capture inserts a row; worker drains with `SELECT FOR UPDATE SKIP LOCKED`. Durable, observable (`SELECT COUNT(*) FROM pending_embeddings` = backlog), no new ops dependency.
+- **(b)** Postgres `LISTEN/NOTIFY` from capture. Worker holds a long-lived subscription. Racy: notifications can be dropped on connection death — you'd want (a) as a backstop anyway.
+- **(c)** External queue (`pgmq` extension, `apalis` Redis-backed, etc.). New service to operate.
+
+**Lean: (a).** Well-trodden pattern, observable, zero new dependencies. If we ever want push-style wakeup we can layer NOTIFY on top of (a) later.
+
+**RJF:** (a)
+
+### 2. Reflector batching strategy
+
+What does "recent thoughts" mean when the reflector wakes up?
+
+- **(a)** Strict cron-window — thoughts created since last tick. Fragile: worker downtime = lost extractions.
+- **(b)** "All thoughts that don't yet have any facts" — LEFT JOIN on `facts`, IS NULL. Same shape as M1's embed-backfill. Survives downtime cleanly.
+- **(c)** Per-thought as soon as it's "old enough" (e.g. 5 minutes). Real-time-ish; competes with active vLLM use.
+
+Within whichever set, ordering matters: ASC by `created_at` so oldest unfacted thoughts get processed first. Per-scope round-robin is over-engineered for single-user (one scope will dominate).
+
+**Lean: (b)** with ASC ordering. No per-scope round-robin.
+
+**RJF:** (b)
+
+### 3. Extractor prompt design
+
+How do we get structured output from vLLM?
+
+- **(a)** `response_format = {"type": "json_schema", "json_schema": {...}}`. Supported by vLLM and OpenRouter. One JSON Schema defines the output shape; the model is constrained to it.
+- **(b)** Grammar-constrained (gbnf-style). More powerful, more backend-specific.
+- **(c)** Free-text response + parse / fix-it loop. Fragile.
+
+**Lean: (a).**
+
+**RJF:** (a)
+
+### 4. Facts `source_run_id`
+
+A nullable `UUID` column populated per reflection run. Lets a bad run's facts be jointly retracted later.
+
+- **For:** cheap to add now; the consumer UX (`engram audit`) lands in M5 but the data is there waiting.
+- **Against:** M2 has no consumer for it; we usually push back on "add column for hypothetical future."
+
+**Lean: genuinely undecided. Operator call.** (My instinct says yes — small cost, real provenance value — but it's exactly the kind of speculative addition the project pattern rejects.)
+
+**RJF:** For
+
+### 5. Dual-extractor disagreement handling
+
+`extractor.dual_run = true`: run two distinct extractors, do what when they disagree?
+
+- **(a)** Ship the mechanism in M2. Disagreements go to the review queue; agreements get committed.
+- **(b)** Defer dual-run entirely to M5. M2 ships single-extractor + confidence gating only.
+
+**Lean: (b), defer to M5.** Dual-run is a quality-evaluation mechanism, and M5 ships the eval suite. M2's confidence gating is already a complete useful slice.
+
+**RJF:** (b)
+
+### 6. Facts search strategy
+
+- **(a)** Same RRF hybrid (vector kNN ∪ trigram, fused) as `search_thoughts`. Code reuse; trigram works fine on short text.
+- **(b)** Weighted toward exact-statement match, since facts are short and more structured than thoughts.
+
+**Lean: (a).** Revise after dogfood if retrieval quality disappoints.
+
+**RJF:** (a)
+
+### 7. Trait location for `Extractor`
+
+- **(a)** In `engram-core`, alongside `Embedder`. Trait lives at the abstraction boundary; impls live in `engram-extract`. Symmetry with M1.
+- **(b)** In `engram-extract` (where it lives). Smaller `engram-core`.
+
+**Lean: (a).** Avoids any circular-dep concern; lets `engram-mcp` depend only on `engram-core` for the trait.
+
+**RJF:** (a)
+
+### 8. Worker process structure
+
+- **(a)** One `engram worker` process running two Tokio tasks: embed-queue drainer (every few seconds) + reflector cron (daily by default). One systemd unit.
+- **(b)** Two subcommands (`engram worker --drain`, `engram worker --reflect`). Two systemd units.
+
+**Lean: (a).** Reflector idle 23h/day is fine. Simpler to operate.
+
+**RJF:** definitely (a)
+
+### 9. Reflector behavior when vLLM is unreachable
+
+- **(a)** Per-thought soft-fail: log error, mark the thought as "extractor-attempted but failed" somehow, continue with next. Mirrors M1's embedder soft-fail. Next tick retries.
+- **(b)** Bail the whole run on first failure.
+
+**Lean: (a).** Soft-fail per thought; no special "attempted but failed" mark needed if we just retry from the LEFT-JOIN-IS-NULL set next tick.
+
+**RJF:** (a)
+
+### 10. `correct_fact` provenance
+
+When the operator manually corrects a fact, what goes in `extractor_model` / `extractor_version` on the new row?
+
+- **(a)** Special sentinel: `extractor_model = "manual"`, `extractor_version = 0`. Provenance stays uniform; queries like "facts not produced by the current extractor" work cleanly across machine- and human-authored facts.
+- **(b)** Some other column (`source = "manual"`) instead of squashing them through `extractor_model`.
+
+**Lean: (a).**
+
+**RJF:** (a)
+
+### 11. Cron scheduler crate
+
+- **(a)** `tokio-cron-scheduler` — mature, in-process, supports standard cron syntax.
+- **(b)** `cron` crate + a small Tokio loop. More DIY but fewer dependencies.
+
+**Lean: (a).** Flag for revision in Phase-A planning if a closer look turns up issues.
+
+**RJF:** (a)
+
+### 12. `search_facts` response shape
+
+Does the response include a snippet of the source thought, or just the fact + `source_thought_id`?
+
+- **(a)** Include `source_thought_content` (and `source_thought_scope`, `source_thought_created_at`) in each result. One extra JOIN. Agent UX: no follow-up `get_thought` call needed to make sense of the fact.
+- **(b)** Just the fact rows + `source_thought_id`. Agent calls `get_thought` if it wants context.
+
+**Lean: (a).**
+
+**RJF:** (a)

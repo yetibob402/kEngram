@@ -58,13 +58,16 @@ The migration creates the three required extensions in the `engram` database and
 
 ```bash
 cargo build --workspace
-cargo test --workspace                       # 106 tests (unit + sqlx::test)
+cargo test --workspace                       # unit + sqlx::test (~140 from M2 Phase B)
 cargo test --workspace --features integration   # adds a live-Ollama round-trip test
 
 cargo run --bin engram -- serve              # starts the MCP server on 127.0.0.1:8080
+cargo run --bin engram -- worker             # in a second shell — drains pending_embeddings
 ```
 
 Point an MCP-capable client (Claude Code, Claude Desktop, `mcp-inspector`) at `http://127.0.0.1:8080/mcp` (streamable-HTTP transport, per the current MCP spec).
+
+`engram serve` and `engram worker` are paired: `serve` writes thoughts and enqueues embedding jobs; `worker` drains the queue and writes the embedding rows. Running `serve` without `worker` is fine — thoughts are still durable and trigram-searchable — but vector kNN won't surface them until `worker` runs.
 
 `sqlx::query!` macros and the `sqlx::test` attribute both require `DATABASE_URL` to be set at *build time*, not just at runtime. The `.env` file at the workspace root is read by `sqlx-cli` but NOT by `cargo build` — set `DATABASE_URL` in your shell or pass it inline: `DATABASE_URL=... cargo build`.
 
@@ -83,8 +86,10 @@ docker exec -it engram-postgres psql -U engram -d engram
 # Tail Postgres logs
 docker compose logs -f postgres
 
-# Find captures that landed as `embedding_status: "pending"` (e.g. because
-# Ollama was down at capture time) and re-embed them inline:
+# Heal-then-drain backfill: enqueue any unembedded thoughts that lack a
+# queue row (pre-M2 captures, or captures whose enqueue lost a crash race),
+# then drain the queue inline. Use this if you've been running `serve`
+# without `worker` and want to catch up without spinning up the worker.
 cargo run --bin engram -- embed-backfill --limit 1000
 # or restricted to one scope:
 cargo run --bin engram -- embed-backfill --scope work --limit 100
@@ -111,7 +116,13 @@ model = "bge-m3"
 model_id = "bge-m3:1024"                 # must match an HNSW partial index
 dimensions = 1024
 timeout_seconds = 5
+
+[worker]
+tick_interval_seconds = 5                # how often `engram worker` drains the queue
+batch_size = 16                          # max jobs per tick
 ```
+
+Env override examples: `ENGRAM_WORKER__TICK_INTERVAL_SECONDS=2 cargo run --bin engram -- worker` (snappier ticks for development), `ENGRAM_WORKER__BATCH_SIZE=64` (kinder to the embedder on a backlog).
 
 ## Port conflicts
 

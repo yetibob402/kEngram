@@ -190,12 +190,16 @@ pub async fn get_thought(
 mod tests {
     use super::*;
     use crate::capture::{CaptureRequest, capture};
+    use crate::drain::drain_pending_embeddings;
     use engram_embed::{FakeBehavior, FakeEmbedder};
 
-    async fn cap(pool: &PgPool, embedder: &dyn Embedder, content: &str, scope: &str) -> ThoughtId {
-        let resp = capture(
+    const TEST_MODEL_ID: &str = "bge-m3:1024";
+
+    /// Capture a thought — Phase B leaves it queued, not embedded.
+    async fn cap(pool: &PgPool, content: &str, scope: &str) -> ThoughtId {
+        capture(
             pool,
-            embedder,
+            TEST_MODEL_ID,
             CaptureRequest {
                 content: content.to_string(),
                 source: Source::new("test").unwrap(),
@@ -204,17 +208,29 @@ mod tests {
             },
         )
         .await
-        .unwrap();
-        resp.thought_id
+        .unwrap()
+        .thought_id
+    }
+
+    /// Capture and immediately drain — for tests that need vector search to
+    /// work. Mirrors what `engram serve` + `engram worker` does in production.
+    async fn cap_and_drain(
+        pool: &PgPool,
+        embedder: &dyn Embedder,
+        content: &str,
+        scope: &str,
+    ) -> ThoughtId {
+        let id = cap(pool, content, scope).await;
+        drain_pending_embeddings(pool, embedder, 16).await.unwrap();
+        id
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_thoughts_round_trip_with_fake_embedder(pool: PgPool) {
         let embedder = FakeEmbedder::new();
-        // Capture two thoughts. The fake embedder is deterministic so vector
-        // similarity for an exact query matches the exact thought.
-        let id_a = cap(&pool, &embedder, "alpha", "global").await;
-        let _id_b = cap(&pool, &embedder, "beta", "global").await;
+        // Drain so the thoughts have embedding rows for vector kNN to find.
+        let id_a = cap_and_drain(&pool, &embedder, "alpha", "global").await;
+        let _id_b = cap_and_drain(&pool, &embedder, "beta", "global").await;
 
         let resp = search_thoughts(
             &pool,
@@ -236,11 +252,10 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_thoughts_degrades_when_embedder_fails(pool: PgPool) {
-        let good = FakeEmbedder::new();
-        // Capture a thought normally so trigram can match it.
-        let id = cap(&pool, &good, "the tcgplayer integration was painful", "work").await;
+        // Capture (no drain) → only trigram leg can find the thought.
+        let id = cap(&pool, "the tcgplayer integration was painful", "work").await;
 
-        // Now search with a failing embedder.
+        // Search with a failing embedder.
         let bad = FakeEmbedder::always_failing(EmbeddingModel::bge_m3(), FakeBehavior::Unreachable);
         let resp = search_thoughts(
             &pool,
@@ -299,8 +314,8 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_thoughts_respects_scope(pool: PgPool) {
         let embedder = FakeEmbedder::new();
-        let _w = cap(&pool, &embedder, "tcgplayer work", "work").await;
-        let _p = cap(&pool, &embedder, "tcgplayer personal", "personal").await;
+        cap(&pool, "tcgplayer work", "work").await;
+        cap(&pool, "tcgplayer personal", "personal").await;
 
         let resp = search_thoughts(
             &pool,
@@ -320,10 +335,9 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn recent_thoughts_returns_newest_first(pool: PgPool) {
-        let embedder = FakeEmbedder::new();
-        let _a = cap(&pool, &embedder, "first", "global").await;
+        cap(&pool, "first", "global").await;
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let _b = cap(&pool, &embedder, "second", "global").await;
+        cap(&pool, "second", "global").await;
 
         let resp = recent_thoughts(
             &pool,
@@ -339,9 +353,9 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn get_thought_indexed_when_embedded(pool: PgPool) {
+    async fn get_thought_indexed_after_drain(pool: PgPool) {
         let embedder = FakeEmbedder::new();
-        let id = cap(&pool, &embedder, "hello", "global").await;
+        let id = cap_and_drain(&pool, &embedder, "hello", "global").await;
         let resp = get_thought(&pool, embedder.model(), id).await.unwrap();
         assert_eq!(resp.embedding_status, EmbeddingStatus::Indexed);
         assert!(resp.embedded_at.is_some());
@@ -350,9 +364,12 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn get_thought_pending_when_unembedded(pool: PgPool) {
-        let bad = FakeEmbedder::always_failing(EmbeddingModel::bge_m3(), FakeBehavior::Unreachable);
-        let id = cap(&pool, &bad, "hello", "global").await;
-        let resp = get_thought(&pool, bad.model(), id).await.unwrap();
+        // Capture-without-drain leaves the thought pending. The Phase B
+        // success criterion is exactly that: capture returns immediately;
+        // vector readiness waits for the worker tick.
+        let embedder = FakeEmbedder::new();
+        let id = cap(&pool, "hello", "global").await;
+        let resp = get_thought(&pool, embedder.model(), id).await.unwrap();
         assert_eq!(resp.embedding_status, EmbeddingStatus::Pending);
         assert!(resp.embedded_at.is_none());
     }

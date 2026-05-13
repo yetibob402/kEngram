@@ -9,11 +9,13 @@
 
 pub mod backfill;
 pub mod capture;
+pub mod drain;
 pub mod search;
 pub mod server;
 
 pub use backfill::{BackfillError, BackfillReport, embed_backfill};
 pub use capture::{capture, CaptureError, CaptureRequest, CaptureResponse, MAX_CONTENT_LEN};
+pub use drain::{drain_pending_embeddings, DrainError, DrainReport};
 pub use search::{
     get_thought, recent_thoughts, search_thoughts, GetThoughtResponse, ReadError, RecentRequest,
     RecentResponse, SearchHit, SearchRequest, SearchResponse, DEFAULT_SEARCH_LIMIT,

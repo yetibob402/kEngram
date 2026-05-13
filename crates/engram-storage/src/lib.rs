@@ -88,10 +88,15 @@ pub async fn insert_embedding(
     vector: Vec<f32>,
 ) -> Result<(), StorageError> {
     let pgv = pgvector::Vector::from(vector);
+    // ON CONFLICT DO NOTHING: makes the insert idempotent under M2-style worker
+    // replay (worker crashes after this insert but before `mark_embedded` →
+    // next tick re-claims, re-embeds, and re-inserts; the UNIQUE constraint
+    // would otherwise reject the duplicate).
     sqlx::query(
         r#"
         INSERT INTO embeddings (target_kind, target_id, model_id, model_version, vector)
         VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (target_kind, target_id, model_id, model_version) DO NOTHING
         "#,
     )
     .bind(target_kind)
@@ -351,6 +356,164 @@ pub async fn find_unembedded_thoughts(
             })
         })
         .collect()
+}
+
+/// A row pulled off the `pending_embeddings` queue by `claim_pending`.
+/// `attempts` is the *new* attempt count (post-bump): a job freshly claimed
+/// for its first attempt returns `attempts = 1`.
+#[derive(Debug, Clone)]
+pub struct PendingJob {
+    pub id: Uuid,
+    pub target_kind: String,
+    pub target_id: Uuid,
+    pub model_id: String,
+    pub attempts: i32,
+}
+
+/// Enqueue a target for embedding by the worker.
+///
+/// Idempotent: the UNIQUE `(target_kind, target_id, model_id)` constraint on
+/// `pending_embeddings` (migration 0002) means a duplicate enqueue is a no-op.
+/// Returns `true` if a new row was inserted, `false` if the row already existed.
+pub async fn enqueue_embedding(
+    pool: &PgPool,
+    target_kind: &str,
+    target_id: Uuid,
+    model_id: &str,
+) -> Result<bool, StorageError> {
+    let result = sqlx::query!(
+        r#"
+        INSERT INTO pending_embeddings (target_kind, target_id, model_id)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (target_kind, target_id, model_id) DO NOTHING
+        "#,
+        target_kind,
+        target_id,
+        model_id,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Atomically claim up to `batch_size` pending jobs, oldest first, bumping
+/// `attempts` and `last_attempt_at` on each.
+///
+/// The inner `SELECT ... FOR UPDATE SKIP LOCKED` is the canonical Postgres
+/// pattern for a competing-consumers queue: rows already locked by another
+/// transaction are skipped, so concurrent workers see disjoint claims. Locks
+/// release at statement commit; no long-held transaction is required.
+pub async fn claim_pending(
+    pool: &PgPool,
+    batch_size: i64,
+) -> Result<Vec<PendingJob>, StorageError> {
+    let rows = sqlx::query!(
+        r#"
+        UPDATE pending_embeddings p
+        SET attempts = p.attempts + 1, last_attempt_at = NOW()
+        FROM (
+            SELECT id FROM pending_embeddings
+            ORDER BY enqueued_at ASC
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+        ) AS sub
+        WHERE p.id = sub.id
+        RETURNING p.id, p.target_kind, p.target_id, p.model_id, p.attempts
+        "#,
+        batch_size,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| PendingJob {
+            id: r.id,
+            target_kind: r.target_kind,
+            target_id: r.target_id,
+            model_id: r.model_id,
+            attempts: r.attempts,
+        })
+        .collect())
+}
+
+/// Mark a claimed job as successfully embedded — removes it from the queue.
+pub async fn mark_embedded(pool: &PgPool, pending_id: Uuid) -> Result<(), StorageError> {
+    sqlx::query!(
+        r#"DELETE FROM pending_embeddings WHERE id = $1"#,
+        pending_id
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Record a failure for a claimed job. The row stays in the queue (so the
+/// next tick re-claims it); `last_error` captures why this attempt failed.
+/// `attempts` is *not* bumped here — `claim_pending` already bumped it.
+pub async fn mark_failed(
+    pool: &PgPool,
+    pending_id: Uuid,
+    error_msg: &str,
+) -> Result<(), StorageError> {
+    sqlx::query!(
+        r#"UPDATE pending_embeddings SET last_error = $2 WHERE id = $1"#,
+        pending_id,
+        error_msg,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Heal-step companion to the worker: enqueue every unembedded thought (for
+/// the given model and optional scope) that doesn't already have a queue row.
+/// Used by `engram embed-backfill` to catch pre-M2 thoughts (captured before
+/// the queue existed) and any thought that slipped through a server crash
+/// between `insert_thought` and `enqueue_embedding`.
+///
+/// `ON CONFLICT DO NOTHING` keeps it idempotent even when the queue already
+/// has entries for some of the thoughts in the LEFT-JOIN set.
+pub async fn enqueue_unembedded_thoughts(
+    pool: &PgPool,
+    model_id: &str,
+    scope: Option<&str>,
+    limit: i64,
+) -> Result<usize, StorageError> {
+    let result = sqlx::query!(
+        r#"
+        INSERT INTO pending_embeddings (target_kind, target_id, model_id)
+        SELECT 'thought', t.id, $1
+        FROM thoughts t
+        LEFT JOIN embeddings e
+            ON e.target_kind = 'thought'
+           AND e.target_id = t.id
+           AND e.model_id = $1
+        WHERE e.id IS NULL
+          AND ($2::text IS NULL OR t.scope = $2)
+        ORDER BY t.created_at ASC
+        LIMIT $3
+        ON CONFLICT (target_kind, target_id, model_id) DO NOTHING
+        "#,
+        model_id,
+        scope,
+        limit,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() as usize)
+}
+
+/// Total rows currently in `pending_embeddings`. Cheap (no index scan
+/// required for the small queue sizes this is meant for); intended for
+/// tests and operator-driven observability.
+pub async fn count_pending(pool: &PgPool) -> Result<i64, StorageError> {
+    let row = sqlx::query!(
+        r#"SELECT COUNT(*) AS "count!" FROM pending_embeddings"#
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.count)
 }
 
 /// Vector-similarity kNN over `embeddings` for the given model. Hits are
@@ -768,5 +931,191 @@ mod tests {
         let pending_b = find_unembedded_thoughts(&pool, &model_b, None, 10).await.unwrap();
         assert!(pending_a.iter().all(|x| x.id != t));
         assert!(pending_b.iter().any(|x| x.id == t));
+    }
+
+    // -- M2 Phase B: pending_embeddings queue --------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn enqueue_embedding_inserts_row(pool: PgPool) {
+        let id = insert_test_thought(&pool, "queue me", "global").await;
+        let inserted = enqueue_embedding(&pool, target::THOUGHT, id.into_uuid(), "bge-m3:1024")
+            .await
+            .unwrap();
+        assert!(inserted);
+        assert_eq!(count_pending(&pool).await.unwrap(), 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn enqueue_embedding_is_idempotent(pool: PgPool) {
+        let id = insert_test_thought(&pool, "queue me", "global").await;
+        let first = enqueue_embedding(&pool, target::THOUGHT, id.into_uuid(), "bge-m3:1024")
+            .await
+            .unwrap();
+        let second = enqueue_embedding(&pool, target::THOUGHT, id.into_uuid(), "bge-m3:1024")
+            .await
+            .unwrap();
+        assert!(first);
+        assert!(!second, "second enqueue must be a no-op");
+        assert_eq!(count_pending(&pool).await.unwrap(), 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn claim_pending_returns_oldest_first_and_bumps_attempts(pool: PgPool) {
+        let id_a = insert_test_thought(&pool, "a", "global").await;
+        enqueue_embedding(&pool, target::THOUGHT, id_a.into_uuid(), "bge-m3:1024")
+            .await
+            .unwrap();
+        // Sleep so `enqueued_at` is comfortably different across the two
+        // auto-commit transactions; 50ms is well above any timer-resolution
+        // surprises on the dev machine.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let id_b = insert_test_thought(&pool, "b", "global").await;
+        enqueue_embedding(&pool, target::THOUGHT, id_b.into_uuid(), "bge-m3:1024")
+            .await
+            .unwrap();
+
+        let first_batch = claim_pending(&pool, 1).await.unwrap();
+        assert_eq!(first_batch.len(), 1);
+        assert_eq!(first_batch[0].target_id, id_a.into_uuid());
+        assert_eq!(first_batch[0].attempts, 1, "first claim bumps attempts 0→1");
+
+        // Worker finishes the first job before claiming the next batch.
+        // Otherwise the still-present row a (oldest) would be re-claimed.
+        mark_embedded(&pool, first_batch[0].id).await.unwrap();
+
+        let second_batch = claim_pending(&pool, 1).await.unwrap();
+        assert_eq!(second_batch.len(), 1);
+        assert_eq!(second_batch[0].target_id, id_b.into_uuid());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn claim_pending_skips_locked_rows(pool: PgPool) {
+        let id_a = insert_test_thought(&pool, "a", "global").await;
+        enqueue_embedding(&pool, target::THOUGHT, id_a.into_uuid(), "bge-m3:1024")
+            .await
+            .unwrap();
+        let id_b = insert_test_thought(&pool, "b", "global").await;
+        enqueue_embedding(&pool, target::THOUGHT, id_b.into_uuid(), "bge-m3:1024")
+            .await
+            .unwrap();
+
+        // Hold a row-level lock on whichever row enqueued first (a) from a
+        // separate transaction. From another connection, claim_pending must
+        // skip past it and return b.
+        let mut tx = pool.begin().await.unwrap();
+        let _ = sqlx::query!(
+            r#"
+            SELECT id FROM pending_embeddings
+            WHERE target_id = $1
+            FOR UPDATE
+            "#,
+            id_a.into_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+
+        let claimed = claim_pending(&pool, 10).await.unwrap();
+        assert_eq!(claimed.len(), 1, "must skip the locked row");
+        assert_eq!(claimed[0].target_id, id_b.into_uuid());
+
+        // Releasing the tx lets future claims see row a again.
+        drop(tx);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn mark_embedded_removes_row(pool: PgPool) {
+        let id = insert_test_thought(&pool, "x", "global").await;
+        enqueue_embedding(&pool, target::THOUGHT, id.into_uuid(), "bge-m3:1024")
+            .await
+            .unwrap();
+        let job = claim_pending(&pool, 10).await.unwrap().pop().unwrap();
+        mark_embedded(&pool, job.id).await.unwrap();
+        assert_eq!(count_pending(&pool).await.unwrap(), 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn mark_failed_records_error_but_keeps_row(pool: PgPool) {
+        let id = insert_test_thought(&pool, "x", "global").await;
+        enqueue_embedding(&pool, target::THOUGHT, id.into_uuid(), "bge-m3:1024")
+            .await
+            .unwrap();
+        let job = claim_pending(&pool, 10).await.unwrap().pop().unwrap();
+        mark_failed(&pool, job.id, "embedder unreachable").await.unwrap();
+
+        assert_eq!(count_pending(&pool).await.unwrap(), 1);
+        let row = sqlx::query!(
+            r#"SELECT attempts, last_error FROM pending_embeddings WHERE id = $1"#,
+            job.id,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.attempts, 1, "claim already bumped to 1; mark_failed does not bump");
+        assert_eq!(row.last_error.as_deref(), Some("embedder unreachable"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn count_pending_returns_queue_depth(pool: PgPool) {
+        assert_eq!(count_pending(&pool).await.unwrap(), 0);
+        for i in 0..3 {
+            let id = insert_test_thought(&pool, &format!("t{i}"), "global").await;
+            enqueue_embedding(&pool, target::THOUGHT, id.into_uuid(), "bge-m3:1024")
+                .await
+                .unwrap();
+        }
+        assert_eq!(count_pending(&pool).await.unwrap(), 3);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn enqueue_unembedded_thoughts_heals_gaps_and_skips_duplicates(pool: PgPool) {
+        let model = EmbeddingModel::bge_m3();
+        let already_embedded = insert_test_thought(&pool, "done", "global").await;
+        insert_thought_embedding(
+            &pool,
+            already_embedded,
+            &Embedding::new(model.clone(), vec![0.0_f32; 1024]).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let already_queued = insert_test_thought(&pool, "queued", "global").await;
+        enqueue_embedding(&pool, target::THOUGHT, already_queued.into_uuid(), &model.id)
+            .await
+            .unwrap();
+
+        let orphan = insert_test_thought(&pool, "orphan", "global").await;
+
+        // Heal: should enqueue only the orphan (skips embedded + already-queued).
+        let inserted = enqueue_unembedded_thoughts(&pool, &model.id, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(inserted, 1);
+        assert_eq!(count_pending(&pool).await.unwrap(), 2);
+
+        // Verify it's the orphan that landed in the queue alongside `already_queued`.
+        let claimed = claim_pending(&pool, 10).await.unwrap();
+        let target_ids: Vec<Uuid> = claimed.iter().map(|j| j.target_id).collect();
+        assert!(target_ids.contains(&orphan.into_uuid()));
+        assert!(target_ids.contains(&already_queued.into_uuid()));
+        assert!(!target_ids.contains(&already_embedded.into_uuid()));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn insert_thought_embedding_is_idempotent_under_replay(pool: PgPool) {
+        // Regression test: simulate the worker crashing between
+        // insert_thought_embedding and mark_embedded, then re-inserting on
+        // the next claim. The ON CONFLICT DO NOTHING means the duplicate is
+        // a no-op rather than a UNIQUE-violation error.
+        let id = insert_test_thought(&pool, "replay me", "global").await;
+        let model = EmbeddingModel::bge_m3();
+        let emb = Embedding::new(model.clone(), vec![0.5_f32; 1024]).unwrap();
+
+        insert_thought_embedding(&pool, id, &emb).await.unwrap();
+        insert_thought_embedding(&pool, id, &emb)
+            .await
+            .expect("second insert must be a no-op, not a UNIQUE violation");
+
+        assert!(thought_has_embedding(&pool, id, &model).await.unwrap());
     }
 }

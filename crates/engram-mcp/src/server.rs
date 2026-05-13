@@ -93,7 +93,7 @@ impl std::fmt::Debug for EngramServer {
 
 #[tool_router]
 impl EngramServer {
-    #[tool(description = "Capture a thought into engram's persistent memory. Returns the thought_id and an embedding_status indicating whether vector search will immediately surface it ('indexed') or whether the embedding is deferred to a backfill ('pending').")]
+    #[tool(description = "Capture a thought into engram's persistent memory. Returns the thought_id and embedding_status='pending'. The thought is durable and findable by trigram (lexical) search immediately; vector search picks it up on the next worker tick (default 5 seconds). To make vector-search-readiness fully synchronous, run `engram worker` alongside `engram serve`.")]
     async fn capture(
         &self,
         Parameters(args): Parameters<CaptureArgs>,
@@ -115,7 +115,7 @@ impl EngramServer {
             metadata,
         };
 
-        let resp = capture::capture(&self.pool, self.embedder.as_ref(), request)
+        let resp = capture::capture(&self.pool, &self.embedder.model().id, request)
             .await
             .map_err(map_capture_error)?;
 
@@ -301,7 +301,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn capture_tool_returns_thought_id_and_indexed_status(pool: PgPool) {
+    async fn capture_tool_returns_thought_id_and_pending_status(pool: PgPool) {
         let s = server(pool);
         let raw = s
             .capture(Parameters(CaptureArgs {
@@ -314,7 +314,8 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(json["thought_id"].is_string());
-        assert_eq!(json["embedding_status"], "indexed");
+        // M2 Phase B flip: pending is the normal return; worker drains on its tick.
+        assert_eq!(json["embedding_status"], "pending");
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -394,7 +395,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn get_thought_tool_returns_thought_and_provenance(pool: PgPool) {
+    async fn get_thought_tool_returns_thought_and_pending_provenance(pool: PgPool) {
         let s = server(pool);
         let cap_raw = s
             .capture(Parameters(CaptureArgs {
@@ -415,8 +416,9 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(json["thought"].is_object());
         assert_eq!(json["thought"]["content"], "hello");
-        assert_eq!(json["provenance"]["embedding_status"], "indexed");
-        assert!(json["provenance"]["embedded_at"].is_string());
+        // M2 Phase B: capture leaves the embedding pending; no worker has run.
+        assert_eq!(json["provenance"]["embedding_status"], "pending");
+        assert!(json["provenance"]["embedded_at"].is_null());
         assert_eq!(json["provenance"]["linked_facts"], serde_json::json!([]));
     }
 
@@ -430,5 +432,41 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("invalid thought_id"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_then_drain_makes_thought_indexed_via_get_thought(pool: PgPool) {
+        // M2 Phase B end-to-end (success criterion #4 in m2-facts-pipeline.md):
+        // capture → worker drains → get_thought reports embedding_status=indexed.
+        let s = server(pool.clone());
+
+        let cap_raw = s
+            .capture(Parameters(CaptureArgs {
+                content: "drain me end-to-end".into(),
+                source: "test".into(),
+                scope: None,
+                metadata: None,
+            }))
+            .await
+            .unwrap();
+        let cap_json: serde_json::Value = serde_json::from_str(&cap_raw).unwrap();
+        let thought_id = cap_json["thought_id"].as_str().unwrap().to_string();
+        assert_eq!(cap_json["embedding_status"], "pending");
+
+        // Worker tick: pull the queue, embed, mark.
+        let report = crate::drain::drain_pending_embeddings(&pool, s.embedder.as_ref(), 16)
+            .await
+            .unwrap();
+        assert_eq!(report.embedded, 1);
+        assert_eq!(report.failed, 0);
+
+        // After the drain, get_thought reports indexed.
+        let raw = s
+            .get_thought(Parameters(GetThoughtArgs { thought_id }))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(json["provenance"]["embedding_status"], "indexed");
+        assert!(json["provenance"]["embedded_at"].is_string());
     }
 }

@@ -17,6 +17,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub database: DatabaseConfig,
     pub embedder: EmbedderConfig,
+    pub worker: WorkerConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +85,29 @@ impl Default for EmbedderConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkerConfig {
+    /// How often the embed-drainer wakes up and claims a batch off the
+    /// `pending_embeddings` queue. 5s is fine for single-user dogfood; tune
+    /// lower for snappier vector-search readiness, higher to be gentler on
+    /// the embedder backend.
+    pub tick_interval_seconds: u64,
+    /// Max jobs claimed per tick. Bigger batches are kinder to the embedder
+    /// (one HTTP call per batch instead of per row); smaller batches mean
+    /// shorter critical sections and faster failover when a job hangs.
+    pub batch_size: i64,
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self {
+            tick_interval_seconds: 5,
+            batch_size: 16,
+        }
+    }
+}
+
 pub fn default_config_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/engram/engram.toml"))
 }
@@ -132,5 +156,12 @@ mod tests {
         assert_eq!(c.embedder.model_id, "bge-m3:1024");
         assert_eq!(c.embedder.dimensions, 1024);
         assert_eq!(c.embedder.timeout_seconds, 5);
+    }
+
+    #[test]
+    fn default_worker_uses_5s_tick_and_batch_16() {
+        let c = Config::default();
+        assert_eq!(c.worker.tick_interval_seconds, 5);
+        assert_eq!(c.worker.batch_size, 16);
     }
 }

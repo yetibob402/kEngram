@@ -51,23 +51,26 @@ End state: migration applied; new crate compiles; types and traits exist; nothin
 
 End state: capture handler no longer calls `Embedder::embed` inline; it enqueues. Worker process drains. New thought visible by trigram immediately; vector kNN within one worker tick.
 
-- [ ] `engram-storage` repository functions:
-  - [ ] `enqueue_embedding(pool, target_kind, target_id, model_id)`
-  - [ ] `claim_pending(pool, batch_size) -> Vec<PendingJob>` (SKIP LOCKED inside a tx)
-  - [ ] `mark_embedded(pool, pending_id)` (delete the row)
-  - [ ] `mark_failed(pool, pending_id, error_msg)` (bump attempts, leave row for next tick)
-  - [ ] `sqlx::test`: enqueue + claim + mark_embedded round trip; SKIP LOCKED across two simulated workers
-- [ ] `engram-mcp::capture` rewritten:
-  - [ ] No `Embedder` dependency in capture path
-  - [ ] Insert thought, enqueue, return `embedding_status: "pending"`
-  - [ ] `sqlx::test`: capture writes thought + pending_embeddings row; no embedding row yet
-- [ ] `engram-cli` `worker` subcommand:
-  - [ ] Embed-drainer task: loop, claim up to N, embed via `Embedder::embed`, persist, mark embedded; on transient failure log + mark_failed; on permanent failure log + leave (operator inspects)
-  - [ ] Configurable tick interval (default 5s) and batch size (default 16)
-  - [ ] Graceful shutdown on ctrl-c
-- [ ] `engram-mcp::backfill` (M1's `embed-backfill`) updated to also drain `pending_embeddings` in addition to LEFT-JOIN-IS-NULL set
-- [ ] End-to-end test: capture while no worker running → thought exists, no embedding → start worker → embedding row appears within one tick
-- [ ] DEVELOPMENT.md: section on running `engram worker` alongside `engram serve`
+- [x] `engram-storage` repository functions:
+  - [x] `enqueue_embedding(pool, target_kind, target_id, model_id)` (returns bool — newly enqueued vs idempotent no-op)
+  - [x] `claim_pending(pool, batch_size) -> Vec<PendingJob>` — single-statement atomic UPDATE … FROM (SELECT … FOR UPDATE SKIP LOCKED). No long-held tx required (the engineer's lean turned out to be cleaner than the "inside a tx" wording in the original checklist).
+  - [x] `mark_embedded(pool, pending_id)` (DELETE)
+  - [x] `mark_failed(pool, pending_id, error_msg)` (UPDATE last_error; attempts already bumped by claim)
+  - [x] `enqueue_unembedded_thoughts(pool, model_id, scope?, limit)` (heal pre-M2 thoughts)
+  - [x] `count_pending(pool)` (queue depth)
+  - [x] Idempotency fix: `insert_thought_embedding` now `ON CONFLICT DO NOTHING` so crash-replay (worker dies between insert and mark_embedded) is harmless.
+  - [x] `sqlx::test`: enqueue + claim + mark_embedded round trip; SKIP LOCKED smoke test via two-conn-with-tx pattern
+- [x] `engram-mcp::capture` rewritten:
+  - [x] No `Embedder` dependency in capture path — signature is `capture(pool, model_id, request)`
+  - [x] Insert thought, enqueue, return `embedding_status: "pending"`
+  - [x] `sqlx::test`: capture writes thought + pending_embeddings row; no embedding row yet
+- [x] `engram-cli` `worker` subcommand:
+  - [x] Embed-drainer task: loop, claim up to N, embed via `Embedder::embed`, persist, mark embedded; on transient failure log + mark_failed; on permanent failure log + leave (operator inspects)
+  - [x] Configurable tick interval (default 5s) and batch size (default 16)
+  - [x] Graceful shutdown on ctrl-c — `CancellationToken` + `tokio::task::JoinSet` + 30s deadline (so Phase C can `set.spawn(reflector_loop)` without refactor)
+- [x] `engram-mcp::backfill` (M1's `embed-backfill`) rewritten as heal-then-drain over `pending_embeddings`
+- [x] End-to-end test: capture-then-drain end-to-end via `EngramServer` tools (`capture_then_drain_makes_thought_indexed_via_get_thought`)
+- [x] DEVELOPMENT.md: section on running `engram worker` alongside `engram serve`
 
 ## Phase C — Extractor + reflector
 
@@ -118,6 +121,8 @@ End state: M2 success criteria from m2-facts-pipeline.md met. Operator-driven do
 Dated notes appended as items land. Format: `YYYY-MM-DD — <one-line summary>`. Multi-line entries fine for decisions that need explanation.
 
 <!-- Most recent entry first. -->
+
+- **2026-05-12** — M2 Phase B landed. Async embedding seam in place: `capture` no longer takes an `Embedder` arg — it inserts the thought, enqueues a `pending_embeddings` row keyed by the active model id, and always returns `embedding_status: "pending"`. New `engram worker` subcommand drains the queue every 5s in a `tokio::task::JoinSet` (designed for Phase C's reflector task to plug in alongside it). `embed-backfill` rewritten as heal-then-drain (enqueues any unembedded thoughts → drains the queue, bounded by `--limit`). Three engineering refinements during synthesis: (1) `claim_pending` is single-statement `UPDATE ... FROM (... FOR UPDATE SKIP LOCKED)` rather than the originally-prescribed long-held tx — same SKIP LOCKED safety, no held connection; (2) `insert_thought_embedding` now `ON CONFLICT DO NOTHING` so a worker that crashes between embed and `mark_embedded` is harmless on replay; (3) `ExtractionContext` only carries scope + max_facts since the `Thought` is passed separately. Test count 114 → 129 (storage 20→29, mcp 29→35, plus a `WorkerConfig` default test). Manual smoke: `engram worker` starts cleanly, drains the queue every 5s, exits within ~1s of SIGINT.
 
 - **2026-05-12** — M2 Phase A landed. Migration `0002_facts_pipeline.sql` applied cleanly (three new tables — `pending_embeddings`, `reflector_runs`, `facts_review_queue` — plus `facts.source_run_id` FK both ways). New `engram-extract` crate compiles empty; the `Extractor` trait + `ExtractedFact` + `ExtractionContext` + `ExtractorError` live in `engram-core`, mirroring `Embedder`/`EmbedderError` in shape and `is_transient()` discipline. One drift from the plan: dropped `source_thought_id` from `ExtractionContext` because the `Thought` is already passed as the first argument to `extract()` — carrying the id separately would be redundant. Workspace test count 106 → 114 (the 8 new `extractor` tests).
 

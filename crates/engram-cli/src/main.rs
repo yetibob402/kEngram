@@ -16,7 +16,7 @@ use rmcp::transport::streamable_http_server::{
 use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Config, EmbedderConfig};
+use crate::config::{Config, EmbedderConfig, WorkerConfig};
 
 #[derive(Parser, Debug)]
 #[command(name = "engram", version, about = "Self-hosted MCP-native memory service")]
@@ -35,6 +35,10 @@ enum Command {
     Serve,
     /// Apply pending database migrations.
     Migrate,
+    /// Long-running worker process: drains the `pending_embeddings` queue.
+    /// (M2 Phase C adds the reflector cron as a second task in the same
+    /// process.) Knobs live in `[worker]` config — no CLI flags needed.
+    Worker,
     /// Embed thoughts that don't yet have an embedding row for the active model.
     EmbedBackfill {
         /// Restrict to a single scope.
@@ -150,6 +154,93 @@ async fn run_migrate(config: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn run_worker(config: Config) -> anyhow::Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(config.database.max_connections)
+        .connect(&config.database.url)
+        .await
+        .with_context(|| format!("connecting to {}", config.database.url))?;
+    let embedder = build_embedder(&config.embedder)?;
+
+    let cancel = CancellationToken::new();
+    let mut set = tokio::task::JoinSet::new();
+
+    let drain_pool = pool.clone();
+    let drain_embedder = embedder.clone();
+    let drain_cancel = cancel.clone();
+    let WorkerConfig {
+        tick_interval_seconds,
+        batch_size,
+    } = config.worker;
+    let interval = Duration::from_secs(tick_interval_seconds);
+    set.spawn(async move {
+        embed_drainer_loop(drain_pool, drain_embedder, interval, batch_size, drain_cancel).await;
+    });
+
+    tracing::info!(
+        tick_interval_seconds,
+        batch_size,
+        embedder_endpoint = %config.embedder.endpoint,
+        model_id = %config.embedder.model_id,
+        "engram worker started"
+    );
+
+    // Wait for ctrl-c, then signal the loop(s) to wind down and join with a
+    // 30s ceiling so a hung embed call can't block shutdown forever.
+    tokio::signal::ctrl_c()
+        .await
+        .context("waiting for shutdown signal")?;
+    tracing::info!("shutdown signal received");
+    cancel.cancel();
+
+    let shutdown_deadline = tokio::time::sleep(Duration::from_secs(30));
+    tokio::select! {
+        _ = async { while set.join_next().await.is_some() {} } => {
+            tracing::info!("worker tasks exited cleanly");
+        }
+        _ = shutdown_deadline => {
+            tracing::warn!("worker tasks did not exit within 30s; forcing exit");
+            set.abort_all();
+        }
+    }
+    Ok(())
+}
+
+async fn embed_drainer_loop(
+    pool: sqlx::PgPool,
+    embedder: std::sync::Arc<dyn Embedder>,
+    interval: Duration,
+    batch_size: i64,
+    cancel: CancellationToken,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    // Skip the eager first tick that `interval` fires immediately so we wait
+    // a full interval before the first drain.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!("embed drainer shutting down");
+                return;
+            }
+            _ = ticker.tick() => {
+                match engram_mcp::drain_pending_embeddings(&pool, embedder.as_ref(), batch_size).await {
+                    Ok(report) if report.found > 0 => tracing::info!(
+                        found = report.found,
+                        embedded = report.embedded,
+                        failed = report.failed,
+                        "embed drain tick",
+                    ),
+                    Ok(_) => {} // idle tick; stay quiet
+                    Err(err) => tracing::error!(error = ?err, "embed drain tick failed"),
+                }
+            }
+        }
+    }
+}
+
 async fn run_embed_backfill(
     config: Config,
     scope: Option<String>,
@@ -167,7 +258,7 @@ async fn run_embed_backfill(
         engram_mcp::embed_backfill(&pool, embedder.as_ref(), scope.as_deref(), limit).await?;
 
     tracing::info!(
-        found = report.found,
+        healed = report.healed,
         embedded = report.embedded,
         failed = report.failed,
         "backfill complete"
@@ -176,9 +267,8 @@ async fn run_embed_backfill(
     if report.failed > 0 {
         // Non-zero exit so scripts/cron can detect partial failures.
         anyhow::bail!(
-            "{} of {} thoughts failed to embed (see logs); {} succeeded",
+            "{} thoughts failed to embed (see logs); {} succeeded",
             report.failed,
-            report.found,
             report.embedded
         );
     }
@@ -194,6 +284,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Serve => run_serve(config).await,
         Command::Migrate => run_migrate(config).await,
+        Command::Worker => run_worker(config).await,
         Command::EmbedBackfill { scope, limit } => run_embed_backfill(config, scope, limit).await,
     }
 }

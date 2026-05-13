@@ -2,22 +2,28 @@
 
 Self-hosted, MCP-native memory service for AI agents. Single Rust binary; Postgres + pgvector backing store; vendor-neutral via an OpenAI-compatible embedding endpoint.
 
-The full design lives in [`docs/engram-design-v0.md`](docs/engram-design-v0.md), with per-milestone scope in [`docs/milestones/`](docs/milestones/). For first-time setup see [`DEVELOPMENT.md`](DEVELOPMENT.md).
+## Why Engram
 
-## Status
+Engram gives any MCP-capable agent (Claude Code, Claude Desktop, opencode, Cline, …) a **shared, persistent memory** backed by your own Postgres. A thought captured from one client is searchable from any other — across sessions, models, and machines. M2 layers structured facts on top: a local LLM (via vLLM or OpenRouter) extracts `(subject, predicate, object)` triples from your captures on a schedule, and the same agents can query both the natural-language thoughts and the derived facts.
 
-Built in five capability milestones (M1 → M5), preceded by an environment milestone (M0). **M1 and M2 are implemented**: capture + hybrid search + facts pipeline + six MCP tools.
+The deployment is the `engram` binary plus Postgres plus any OpenAI-compatible embedding endpoint (Ollama is the zero-config dev path). No SaaS, no per-seat fees, no vendor lock-in — change LLM provider whenever you like; your memory comes with you.
 
-| Milestone | Status | What it adds |
-|---|---|---|
-| [M0 — dev environment](docs/milestones/m0-dev-environment.md) | ✅ | Docker Postgres + Ollama dev path |
-| [M1 — capture & search](docs/milestones/m1-capture-and-search.md) | ✅ | `capture`, `search_thoughts`, `recent_thoughts`, `get_thought` over MCP |
-| [M2 — facts pipeline](docs/milestones/m2-facts-pipeline.md) | ✅ | Async embedding seam, reflector cron, `search_facts`, `correct_fact`, `engram reflect` |
-| [M3 — search quality](docs/milestones/m3-search-quality.md) | ⏳ | Cross-encoder reranker; fact embeddings (vector leg in `search_facts`) |
-| [M4 — artifacts](docs/milestones/m4-artifacts.md) | ⏳ | Long-form document ingestion |
-| [M5 — operational maturity](docs/milestones/m5-operational-maturity.md) | ⏳ | Metrics, Tier 2 auth, eval suite, backups |
+For design rationale see [`docs/engram-design-v0.md`](docs/engram-design-v0.md); per-milestone scope and progress live in [`docs/milestones/`](docs/milestones/); first-time setup details are in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 
-Per-milestone progress is tracked in `docs/milestones/m{N}-progress.md`.
+## What you get (MCP surface)
+
+**Status:** M1 and M2 are shipped (capture, hybrid search, facts pipeline, six MCP tools). M3–M5 are planned — see the [Roadmap](#roadmap) at the end of this doc.
+
+| Tool | What it does |
+|---|---|
+| `capture` | Record a thought. Returns `thought_id` + `embedding_status: "pending"`; the `engram worker` drains the embed queue on its tick. |
+| `search_thoughts` | Hybrid retrieval (vector kNN ∪ trigram, fused by RRF, recency-boosted). Gracefully degrades to trigram-only when the embedder is unreachable; result includes `vector_search_available: bool`. |
+| `recent_thoughts` | Browse by recency in a (optional) scope. |
+| `get_thought` | Full thought + provenance (embedding status, embedded-at, and active `linked_facts`). |
+| `search_facts` | Trigram search over `facts.statement`, filtered to active (non-superseded) rows. Each result includes the fact's S/P/O triple plus the source thought's content/scope/created_at (no follow-up `get_thought` needed). M3 adds the vector leg. |
+| `correct_fact` | Operator-driven correction. With a replacement, inserts a manual-author fact (`extractor_model="manual"`, `extractor_version=0`, `confidence=1.0`) and supersedes the old row, preserving the audit trail. Without a replacement, retracts via supersede. |
+
+CLI subcommands: `engram serve`, `engram worker`, `engram migrate`, `engram embed-backfill`, `engram reflect [--rerun --since <RFC3339>]`. Operational details in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 
 ## Quick start
 
@@ -38,7 +44,87 @@ DATABASE_URL='postgres://engram:engram@localhost:5432/engram' \
   cargo run --bin engram -- worker
 ```
 
-The server binds `127.0.0.1:8080` by default and exposes a streamable-HTTP MCP endpoint at `/mcp` (per the current MCP spec, via rmcp's `StreamableHttpService`).
+The server binds `127.0.0.1:8080` by default and exposes a streamable-HTTP MCP endpoint at `/mcp` (per the current MCP spec, via rmcp's `StreamableHttpService`). With it running, point a chat client at the endpoint — see [Connecting MCP clients](#connecting-mcp-clients) below.
+
+## Connecting MCP clients
+
+### Claude Code
+
+The official Claude Code CLI speaks streamable-HTTP natively, so no bridge is needed.
+
+```bash
+# Project-scoped (writes to a checked-in .mcp.json):
+claude mcp add --transport http engram --scope project http://127.0.0.1:8080/mcp
+
+# User-scoped (writes to ~/.claude.json for the current project):
+claude mcp add --transport http engram http://127.0.0.1:8080/mcp
+```
+
+Equivalent JSON for `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "type": "http",
+      "url": "http://127.0.0.1:8080/mcp"
+    }
+  }
+}
+```
+
+### Claude Desktop
+
+Claude Desktop's MCP support is stdio-only, so a bridge process is required. The community-standard `mcp-remote` (Node, runs via `npx`) relays stdio ↔ HTTP:
+
+```jsonc
+// ~/Library/Application Support/Claude/claude_desktop_config.json (macOS)
+{
+  "mcpServers": {
+    "engram": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "http://127.0.0.1:8080/mcp"]
+    }
+  }
+}
+```
+
+Restart Claude Desktop after editing the config. Equivalent paths on Windows: `%APPDATA%\Claude\claude_desktop_config.json`.
+
+### opencode (Ollama-backed)
+
+Engram doesn't host the chat — it just publishes the tool surface. To drive Engram from a *local Ollama model* you need an MCP-capable agent that supports both. [opencode](https://opencode.ai) is the most direct fit: a TUI coding agent with native streamable-HTTP MCP support and a built-in Ollama provider.
+
+Config lives at `opencode.json` (project root) or `~/.config/opencode/opencode.json` (user). One file, two blocks — the `mcp` entry points at Engram; the `provider` entry wires a tool-capable Ollama model:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "engram": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8080/mcp",
+      "enabled": true
+    }
+  },
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama (local)",
+      "options": { "baseURL": "http://localhost:11434/v1" },
+      "models": {
+        "qwen3:14b": { "name": "Qwen3 14B" }
+      }
+    }
+  }
+}
+```
+
+In opencode, pick the model via `/models` (it appears as `ollama/qwen3:14b`); Engram's six tools become available alongside opencode's built-ins. **The model must be tool-capable** — `qwen3` family, `llama3.1+`, `gpt-oss` work; many smaller Llama variants silently no-op on tool calls. No `opencode auth` step is needed (Ollama has no API key; Engram has no auth in M1).
+
+### Other MCP clients
+
+Any client that speaks streamable-HTTP (per the current MCP spec) can point at `http://127.0.0.1:8080/mcp` directly. Known-good options for Ollama-driven chat include [Cline](https://github.com/cline/cline) and [Roo Code](https://github.com/RooCodeInc/Roo-Code) (VS Code extensions) and [OpenWebUI](https://openwebui.com) via the [MCPO](https://github.com/open-webui/mcpo) bridge. For a quick smoke test without a chat UI, `npx @modelcontextprotocol/inspector` opens an interactive tool browser.
 
 ## Configuring the embedding backend
 
@@ -176,99 +262,6 @@ The reflector uses structured outputs, so the model + serving stack must:
 - **Support `response_format: { type: "json_schema" }`** — vLLM's `xgrammar` and `outlines` guided-decoding backends do; most OpenRouter chat models do.
 - **Be instruction-following enough to populate the (S, P, O) triple cleanly** — Qwen 2.5 7B/14B Instruct, Llama 3.1 8B+, Claude Haiku / Sonnet via OpenRouter all work well. Smaller / non-instruct models often return malformed payloads (logged as `ExtractorError::MalformedResponse` and soft-failed per Q9).
 
-## Connecting MCP clients
-
-### Claude Code
-
-The official Claude Code CLI speaks streamable-HTTP natively, so no bridge is needed.
-
-```bash
-# Project-scoped (writes to a checked-in .mcp.json):
-claude mcp add --transport http engram --scope project http://127.0.0.1:8080/mcp
-
-# User-scoped (writes to ~/.claude.json for the current project):
-claude mcp add --transport http engram http://127.0.0.1:8080/mcp
-```
-
-Equivalent JSON for `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "engram": {
-      "type": "http",
-      "url": "http://127.0.0.1:8080/mcp"
-    }
-  }
-}
-```
-
-### Claude Desktop
-
-Claude Desktop's MCP support is stdio-only, so a bridge process is required. The community-standard `mcp-remote` (Node, runs via `npx`) relays stdio ↔ HTTP:
-
-```jsonc
-// ~/Library/Application Support/Claude/claude_desktop_config.json (macOS)
-{
-  "mcpServers": {
-    "engram": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote", "http://127.0.0.1:8080/mcp"]
-    }
-  }
-}
-```
-
-Restart Claude Desktop after editing the config. Equivalent paths on Windows: `%APPDATA%\Claude\claude_desktop_config.json`.
-
-### opencode (Ollama-backed)
-
-Engram doesn't host the chat — it just publishes the tool surface. To drive Engram from a *local Ollama model* you need an MCP-capable agent that supports both. [opencode](https://opencode.ai) is the most direct fit: a TUI coding agent with native streamable-HTTP MCP support and a built-in Ollama provider.
-
-Config lives at `opencode.json` (project root) or `~/.config/opencode/opencode.json` (user). One file, two blocks — the `mcp` entry points at Engram; the `provider` entry wires a tool-capable Ollama model:
-
-```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "mcp": {
-    "engram": {
-      "type": "remote",
-      "url": "http://127.0.0.1:8080/mcp",
-      "enabled": true
-    }
-  },
-  "provider": {
-    "ollama": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "Ollama (local)",
-      "options": { "baseURL": "http://localhost:11434/v1" },
-      "models": {
-        "qwen3:14b": { "name": "Qwen3 14B" }
-      }
-    }
-  }
-}
-```
-
-In opencode, pick the model via `/models` (it appears as `ollama/qwen3:14b`); Engram's six tools become available alongside opencode's built-ins. **The model must be tool-capable** — `qwen3` family, `llama3.1+`, `gpt-oss` work; many smaller Llama variants silently no-op on tool calls. No `opencode auth` step is needed (Ollama has no API key; Engram has no auth in M1).
-
-### Other MCP clients
-
-Any client that speaks streamable-HTTP (per the current MCP spec) can point at `http://127.0.0.1:8080/mcp` directly. Known-good options for Ollama-driven chat include [Cline](https://github.com/cline/cline) and [Roo Code](https://github.com/RooCodeInc/Roo-Code) (VS Code extensions) and [OpenWebUI](https://openwebui.com) via the [MCPO](https://github.com/open-webui/mcpo) bridge. For a quick smoke test without a chat UI, `npx @modelcontextprotocol/inspector` opens an interactive tool browser.
-
-## MCP surface (M1 + M2)
-
-| Tool | What it does |
-|---|---|
-| `capture` | Record a thought. Returns `thought_id` + `embedding_status: "pending"`; the `engram worker` drains the embed queue on its tick (M2). |
-| `search_thoughts` | Hybrid retrieval (vector kNN ∪ trigram, fused by RRF, recency-boosted). Gracefully degrades to trigram-only when the embedder is unreachable; result includes `vector_search_available: bool`. |
-| `recent_thoughts` | Browse by recency in a (optional) scope. |
-| `get_thought` | Full thought + provenance (embedding status, embedded-at, and active `linked_facts`). |
-| `search_facts` | Trigram search over `facts.statement`, filtered to active (non-superseded) rows. Each result includes the fact's S/P/O triple plus the source thought's content/scope/created_at (no follow-up `get_thought` needed). M3 adds the vector leg. |
-| `correct_fact` | Operator-driven correction. With a replacement, inserts a manual-author fact (`extractor_model="manual"`, `extractor_version=0`, `confidence=1.0`) and supersedes the old row, preserving the audit trail. Without a replacement, retracts via supersede. |
-
-CLI subcommands: `engram serve`, `engram worker`, `engram migrate`, `engram embed-backfill`, `engram reflect [--rerun --since <RFC3339>]`. See the [M2 milestone doc](docs/milestones/m2-facts-pipeline.md) and `DEVELOPMENT.md` for operational details.
-
 ## Repo layout
 
 ```
@@ -281,7 +274,23 @@ crates/
 └── engram-cli/       # binary; serve/migrate/worker/embed-backfill/reflect subcommands
 migrations/           # sqlx migrations (numbered)
 docs/                 # design doc + per-milestone scope/progress
+scripts/              # operator-driven runbooks (smoke.md)
 ```
+
+## Roadmap
+
+Built in five capability milestones (M1 → M5), preceded by an environment milestone (M0):
+
+| Milestone | Status | What it adds |
+|---|---|---|
+| [M0 — dev environment](docs/milestones/m0-dev-environment.md) | ✅ | Docker Postgres + Ollama dev path |
+| [M1 — capture & search](docs/milestones/m1-capture-and-search.md) | ✅ | `capture`, `search_thoughts`, `recent_thoughts`, `get_thought` over MCP |
+| [M2 — facts pipeline](docs/milestones/m2-facts-pipeline.md) | ✅ | Async embedding seam, reflector cron, `search_facts`, `correct_fact`, `engram reflect` |
+| [M3 — search quality](docs/milestones/m3-search-quality.md) | ⏳ | Cross-encoder reranker; fact embeddings (vector leg in `search_facts`) |
+| [M4 — artifacts](docs/milestones/m4-artifacts.md) | ⏳ | Long-form document ingestion |
+| [M5 — operational maturity](docs/milestones/m5-operational-maturity.md) | ⏳ | Metrics, Tier 2 auth, eval suite, backups |
+
+Per-milestone progress is tracked in `docs/milestones/m{N}-progress.md`.
 
 ## License
 

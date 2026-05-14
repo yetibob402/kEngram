@@ -149,10 +149,15 @@ provider = "openai-compatible"           # also "openrouter"
 endpoint = "http://localhost:8000/v1"    # vLLM default; OpenRouter is https://openrouter.ai/api/v1
 model_name = "qwen2.5-7b-instruct"       # the model the backend serves
 model_id = "vllm/qwen2.5-7b-instruct"    # provenance written into facts.extractor_model
-model_version = 1                        # bump when prompt/schema changes
+model_version = 2                        # bump when prompt/schema changes; v2 = rubric-anchored prompt (2026-05-13)
 timeout_seconds = 60                     # vLLM JSON-Schema responses can run long
 temperature = 0.2
 max_facts_per_thought = 8
+# system_prompt_file = "~/.config/engram/extractor-prompt.txt"
+# When set, the file's contents replace the bundled prompt. Must contain
+# the {MAX_FACTS} placeholder. Operator is responsible for bumping
+# model_version when the prompt changes. The extractor emits a WARN at
+# startup when a custom prompt is in use.
 
 [reflector]
 enabled = false                          # opt-in: flip to true when vLLM is running

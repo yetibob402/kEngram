@@ -11,6 +11,8 @@ use figment::{
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+// PathBuf is referenced from ExtractorConfig::system_prompt_file below.
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -132,6 +134,14 @@ pub struct ExtractorConfig {
     pub timeout_seconds: u64,
     pub temperature: f32,
     pub max_facts_per_thought: usize,
+    /// Path to a file containing the extractor system prompt. `None` means
+    /// use `engram_extract::openai_compatible::BUNDLED_SYSTEM_PROMPT`
+    /// (recommended). Operators who supply a custom prompt are responsible
+    /// for also bumping `model_version` so `facts.extractor_version`
+    /// remains meaningful provenance. The file's contents must contain the
+    /// `{MAX_FACTS}` placeholder; the extractor refuses to construct
+    /// otherwise.
+    pub system_prompt_file: Option<PathBuf>,
 }
 
 impl Default for ExtractorConfig {
@@ -149,6 +159,7 @@ impl Default for ExtractorConfig {
             timeout_seconds: 60,
             temperature: 0.2,
             max_facts_per_thought: 8,
+            system_prompt_file: None,
         }
     }
 }
@@ -222,6 +233,8 @@ mod tests {
         assert_eq!(c.extractor.model_version, 2);
         assert!(c.extractor.api_key.is_none());
         assert_eq!(c.extractor.max_facts_per_thought, 8);
+        // Default is the bundled prompt — no file override.
+        assert!(c.extractor.system_prompt_file.is_none());
     }
 
     #[test]

@@ -102,6 +102,23 @@ fn build_embedder(c: &EmbedderConfig) -> anyhow::Result<Arc<dyn Embedder>> {
 }
 
 fn build_extractor(c: &ExtractorConfig) -> anyhow::Result<Arc<dyn Extractor>> {
+    // Resolve the system prompt: bundled by default; load from a file when
+    // `system_prompt_file` is set. The path is anyhow-context'd so errors
+    // surface with the path the operator typed.
+    let system_prompt = match c.system_prompt_file.as_ref() {
+        Some(path) => Some(std::fs::read_to_string(path).with_context(|| {
+            format!("reading extractor system_prompt_file at {}", path.display())
+        })?),
+        None => None,
+    };
+    tracing::info!(
+        system_prompt = %match c.system_prompt_file.as_ref() {
+            Some(p) => format!("file:{}", p.display()),
+            None => "bundled".to_string(),
+        },
+        "extractor: resolved system prompt",
+    );
+
     match c.provider.as_str() {
         "openai-compatible" | "openrouter" => {
             let extractor = OpenAICompatibleExtractor::new(ExtractorConfigBuilder {
@@ -113,6 +130,7 @@ fn build_extractor(c: &ExtractorConfig) -> anyhow::Result<Arc<dyn Extractor>> {
                 timeout: Duration::from_secs(c.timeout_seconds),
                 temperature: c.temperature,
                 max_facts_per_thought: c.max_facts_per_thought,
+                system_prompt,
             })
             .with_context(|| format!("constructing extractor for endpoint {}", c.endpoint))?;
             Ok(Arc::new(extractor))

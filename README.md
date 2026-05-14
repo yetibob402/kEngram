@@ -277,6 +277,29 @@ temperature           = 0.2
 max_facts_per_thought = 8
 ```
 
+### Inspecting or overriding the system prompt
+
+The extractor's system prompt is bundled in the binary as
+`engram_extract::openai_compatible::BUNDLED_SYSTEM_PROMPT`. To inspect it
+without reading source, point `[extractor].system_prompt_file` at a copy
+on disk — the file's contents replace the bundled prompt for that run.
+The file must contain the `{MAX_FACTS}` placeholder (the extractor
+substitutes it per request); the extractor refuses to construct
+otherwise.
+
+```toml
+[extractor]
+# … other extractor fields …
+system_prompt_file = "/Users/you/.config/engram/extractor-prompt.txt"
+```
+
+**The prompt and `model_version` are paired.** If you override the
+prompt, you are responsible for also bumping `model_version` so the
+provenance partition on `facts.extractor_version` stays meaningful —
+otherwise rows tagged v2 may have been produced under two different
+prompts. The extractor emits a `WARN`-level log line at startup whenever
+a custom prompt is in use, naming the active `model_version`.
+
 ### Turning the reflector on
 
 ```toml

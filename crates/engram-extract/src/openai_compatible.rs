@@ -37,6 +37,13 @@ pub struct OpenAICompatibleConfig {
     /// Soft cap on facts per thought. The reflector context's `max_facts`
     /// wins if it's smaller (so per-run policy can throttle independently).
     pub max_facts_per_thought: usize,
+    /// Override the bundled system prompt (`BUNDLED_SYSTEM_PROMPT`). `None`
+    /// means use the bundled default. `Some(_)` means the operator supplied
+    /// a custom prompt — must contain the `{MAX_FACTS}` placeholder, and
+    /// the operator is responsible for also bumping `model_version` so
+    /// `facts.extractor_version` remains meaningful provenance. A WARN is
+    /// emitted at construction when this is `Some(_)`.
+    pub system_prompt: Option<String>,
 }
 
 impl OpenAICompatibleConfig {
@@ -56,6 +63,7 @@ impl OpenAICompatibleConfig {
             timeout: Duration::from_secs(60),
             temperature: 0.2,
             max_facts_per_thought: 8,
+            system_prompt: None,
         }
     }
 
@@ -73,6 +81,7 @@ impl OpenAICompatibleConfig {
             timeout: Duration::from_secs(60),
             temperature: 0.2,
             max_facts_per_thought: 8,
+            system_prompt: None,
         }
     }
 }
@@ -86,6 +95,11 @@ pub struct OpenAICompatibleExtractor {
     api_key: Option<String>,
     temperature: f32,
     max_facts_per_thought: usize,
+    /// Resolved system prompt — either the bundled default or the
+    /// operator's override. Stored at construction so `extract()` doesn't
+    /// re-resolve on every request. The `{MAX_FACTS}` placeholder inside
+    /// is substituted per-call.
+    system_prompt: String,
     client: Client,
 }
 
@@ -106,6 +120,32 @@ impl OpenAICompatibleExtractor {
                 "max_facts_per_thought must be > 0".into(),
             ));
         }
+
+        // Resolve the system prompt: operator override wins; otherwise the
+        // bundled default. Any override must keep the {MAX_FACTS} placeholder
+        // or per-call substitution silently no-ops, leaving the model with
+        // an unanchored prompt.
+        let (system_prompt, is_override) = match config.system_prompt {
+            Some(custom) => {
+                if !custom.contains("{MAX_FACTS}") {
+                    return Err(ExtractorError::Misconfigured(
+                        "custom system_prompt must contain the {MAX_FACTS} placeholder".into(),
+                    ));
+                }
+                (custom, true)
+            }
+            None => (BUNDLED_SYSTEM_PROMPT.to_string(), false),
+        };
+        if is_override {
+            tracing::warn!(
+                model_id = %config.model_id,
+                model_version = config.model_version,
+                "extractor: custom system_prompt in use; ensure model_version reflects this prompt's identity. \
+                 Past facts with the same extractor_version were produced under the bundled prompt; \
+                 facts produced under a custom prompt should bump model_version so provenance partitions cleanly."
+            );
+        }
+
         let client = Client::builder()
             .timeout(config.timeout)
             .build()
@@ -118,17 +158,30 @@ impl OpenAICompatibleExtractor {
             api_key: config.api_key,
             temperature: config.temperature,
             max_facts_per_thought: config.max_facts_per_thought,
+            system_prompt,
             client,
         })
     }
 }
 
-// Prompt version is paired with `OpenAICompatibleConfig::model_version`
-// (default 2). Bump the default version whenever this prompt or the
-// response schema changes such that prior facts shouldn't be considered
-// comparable; `engram reflect --rerun` then re-extracts under the new
-// version. See docs/engram-design-v0.md §6.5 and §10.
-const SYSTEM_PROMPT: &str = "\
+/// The bundled extractor system prompt. Exposed `pub const` so operators
+/// can inspect it (`engram-cli` can print it; configuration can compare
+/// against it) and so a custom prompt loaded from `system_prompt_file`
+/// can be diffed against the bundled one at startup.
+///
+/// The prompt is **paired** with `OpenAICompatibleConfig::model_version`
+/// (default 2 when the bundled prompt is in use). Bump the version
+/// whenever this prompt or the response schema changes such that prior
+/// facts shouldn't be considered comparable; `engram reflect --rerun`
+/// then re-extracts under the new version. If you override this via
+/// `OpenAICompatibleConfig::system_prompt`, you are responsible for
+/// also bumping the version — see `docs/engram-design-v0.md` §6.5 / §10.
+///
+/// The `{MAX_FACTS}` placeholder is required; the extractor substitutes
+/// it per request from `ctx.max_facts.min(config.max_facts_per_thought)`.
+/// Custom prompts that omit the placeholder are rejected at construction
+/// time with `ExtractorError::Misconfigured`.
+pub const BUNDLED_SYSTEM_PROMPT: &str = "\
 You are an information-extraction assistant. Given a single thought from a memory service, identify discrete factual claims and return them as structured JSON.
 
 Each fact has:
@@ -226,7 +279,7 @@ impl Extractor for OpenAICompatibleExtractor {
         let max_facts = ctx.max_facts.min(self.max_facts_per_thought).max(1);
         let url = format!("{}/chat/completions", self.endpoint.trim_end_matches('/'));
 
-        let system_prompt = SYSTEM_PROMPT.replace("{MAX_FACTS}", &max_facts.to_string());
+        let system_prompt = self.system_prompt.replace("{MAX_FACTS}", &max_facts.to_string());
         let body = ChatRequestBody {
             model: &self.model_name,
             temperature: self.temperature,
@@ -369,6 +422,7 @@ mod tests {
             timeout: Duration::from_secs(2),
             temperature: 0.0,
             max_facts_per_thought: 8,
+            system_prompt: None,
         }
     }
 
@@ -549,6 +603,57 @@ mod tests {
         cfg.endpoint = "".into();
         let err = OpenAICompatibleExtractor::new(cfg).unwrap_err();
         assert!(matches!(err, ExtractorError::Misconfigured(_)));
+    }
+
+    #[tokio::test]
+    async fn custom_system_prompt_flows_into_request_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_response_with_facts(json!([]))))
+            .mount(&server)
+            .await;
+
+        let mut cfg = config_for(format!("{}/v1", server.uri()), None);
+        cfg.system_prompt = Some(
+            "Custom prompt for the dogfood week. Return at most {MAX_FACTS} facts.".to_string(),
+        );
+        let e = OpenAICompatibleExtractor::new(cfg).unwrap();
+        let _ = e.extract(&make_thought("x"), &ctx(7)).await;
+
+        let received = server.received_requests().await.unwrap();
+        let last = received.last().expect("at least one request");
+        let body: serde_json::Value = serde_json::from_slice(&last.body).unwrap();
+        let sys = body["messages"][0]["content"].as_str().unwrap();
+        assert!(sys.contains("Custom prompt for the dogfood week"));
+        // Per-call substitution still works for custom prompts.
+        assert!(sys.contains("at most 7 facts"));
+        // Bundled-prompt language must NOT leak in.
+        assert!(!sys.contains("episodic"));
+    }
+
+    #[tokio::test]
+    async fn custom_system_prompt_missing_max_facts_placeholder_is_misconfigured() {
+        let mut cfg = config_for("http://127.0.0.1:1/v1".to_string(), None);
+        cfg.system_prompt = Some("a prompt that forgot to include the placeholder".to_string());
+        let err = OpenAICompatibleExtractor::new(cfg).unwrap_err();
+        match err {
+            ExtractorError::Misconfigured(msg) => {
+                assert!(msg.contains("MAX_FACTS"), "msg should name the placeholder: {msg}");
+            }
+            other => panic!("expected Misconfigured, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bundled_system_prompt_constant_contains_max_facts_placeholder() {
+        // Regression guard: if anyone ever edits the bundled prompt and
+        // drops the placeholder, this test will catch it before facts
+        // start landing under an unanchored prompt.
+        assert!(
+            BUNDLED_SYSTEM_PROMPT.contains("{MAX_FACTS}"),
+            "BUNDLED_SYSTEM_PROMPT must contain the {{MAX_FACTS}} placeholder",
+        );
     }
 
     #[tokio::test]

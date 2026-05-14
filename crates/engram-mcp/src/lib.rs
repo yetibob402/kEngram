@@ -12,6 +12,7 @@ pub mod capture;
 pub mod correct;
 pub mod drain;
 pub mod reflect;
+pub mod retract;
 pub mod search;
 pub mod server;
 
@@ -25,10 +26,16 @@ pub use drain::{drain_pending_embeddings, DrainError, DrainReport};
 pub use reflect::{
     run_reflector_once, run_reflector_rerun, ReflectorError, ReflectorOptions, ReflectorReport,
 };
+pub use retract::{
+    retract_thought, RetractError, RetractThoughtRequest, RetractThoughtResponse,
+};
 pub use search::{
     get_thought, recent_thoughts, search_facts, search_thoughts, GetThoughtResponse, ReadError,
     RecentRequest, RecentResponse, SearchFactHit, SearchFactsRequest, SearchFactsResponse,
     SearchHit, SearchRequest, SearchResponse, DEFAULT_SEARCH_LIMIT, DEFAULT_TOP_K_PER_LEG,
     MAX_SEARCH_LIMIT,
 };
-pub use server::{CaptureArgs, EngramServer, GetThoughtArgs, RecentThoughtsArgs, SearchThoughtsArgs};
+pub use server::{
+    CaptureArgs, CorrectFactArgs, CorrectFactReplacementArgs, EngramServer, GetThoughtArgs,
+    RecentThoughtsArgs, RetractThoughtArgs, SearchFactsArgs, SearchThoughtsArgs,
+};

@@ -59,6 +59,14 @@ pub struct GetThoughtResponse {
     pub embedding_status: EmbeddingStatus,
     pub embedded_at: Option<OffsetDateTime>,
     pub linked_facts: Vec<Fact>,
+    /// `Some(_)` when the operator has retracted this thought via
+    /// `retract_thought`. Retracted thoughts don't appear in
+    /// `search_thoughts` / `recent_thoughts` / `search_facts`, and their
+    /// `linked_facts` will always be empty (auto-superseded as part of
+    /// retraction). `get_thought` is the audit path: ID lookup always
+    /// returns the row regardless of retraction state.
+    pub retracted_at: Option<OffsetDateTime>,
+    pub retracted_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -215,6 +223,8 @@ pub async fn get_thought(
         embedding_status: prov.embedding_status,
         embedded_at: prov.embedded_at,
         linked_facts,
+        retracted_at: prov.retracted_at,
+        retracted_reason: prov.retracted_reason,
     })
 }
 

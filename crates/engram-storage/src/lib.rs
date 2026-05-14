@@ -184,6 +184,14 @@ pub struct ThoughtWithProvenance {
     pub thought: Thought,
     pub embedding_status: EmbeddingStatus,
     pub embedded_at: Option<OffsetDateTime>,
+    /// `Some(_)` when the operator has marked this thought as untrusted via
+    /// `retract_thought`. Retracted thoughts are excluded from retrieval
+    /// (`search_thoughts`, `recent_thoughts`, `search_facts`) and from the
+    /// reflector's extraction set (`find_unfacted_thoughts`,
+    /// `find_facted_thoughts`); their derived facts are auto-superseded as
+    /// part of the retraction tx.
+    pub retracted_at: Option<OffsetDateTime>,
+    pub retracted_reason: Option<String>,
 }
 
 /// Fetch a thought along with its embedding provenance for the given model.
@@ -195,6 +203,7 @@ pub async fn fetch_thought_with_provenance(
     let row = sqlx::query!(
         r#"
         SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
+               t.retracted_at, t.retracted_reason,
                e.created_at AS "embedded_at?"
         FROM thoughts t
         LEFT JOIN embeddings e
@@ -232,6 +241,8 @@ pub async fn fetch_thought_with_provenance(
         thought,
         embedding_status,
         embedded_at: r.embedded_at,
+        retracted_at: r.retracted_at,
+        retracted_reason: r.retracted_reason,
     }))
 }
 
@@ -246,6 +257,7 @@ pub async fn recent_thoughts(
         SELECT id, scope, content, source, created_at, metadata
         FROM thoughts
         WHERE ($1::text IS NULL OR scope = $1)
+          AND retracted_at IS NULL
         ORDER BY created_at DESC
         LIMIT $2
         "#,
@@ -289,6 +301,7 @@ pub async fn search_trigram(
         FROM thoughts
         WHERE similarity(content, $1) > 0.1
           AND ($2::text IS NULL OR scope = $2)
+          AND retracted_at IS NULL
         ORDER BY similarity(content, $1) DESC
         LIMIT $3
         "#,
@@ -334,6 +347,7 @@ pub async fn find_unembedded_thoughts(
            AND e.model_id = $1
         WHERE e.id IS NULL
           AND ($2::text IS NULL OR t.scope = $2)
+          AND t.retracted_at IS NULL
         ORDER BY t.created_at ASC
         LIMIT $3
         "#,
@@ -491,6 +505,7 @@ pub async fn enqueue_unembedded_thoughts(
            AND e.model_id = $1
         WHERE e.id IS NULL
           AND ($2::text IS NULL OR t.scope = $2)
+          AND t.retracted_at IS NULL
         ORDER BY t.created_at ASC
         LIMIT $3
         ON CONFLICT (target_kind, target_id, model_id) DO NOTHING
@@ -650,6 +665,7 @@ pub async fn find_unfacted_thoughts(
             ON f.source_thought_id = t.id
         WHERE f.id IS NULL
           AND ($1::text IS NULL OR t.scope = $1)
+          AND t.retracted_at IS NULL
         ORDER BY t.created_at ASC
         LIMIT $2
         "#,
@@ -806,6 +822,7 @@ pub async fn search_facts_trigram(
         JOIN thoughts t ON t.id = f.source_thought_id
         WHERE similarity(f.statement, $1) > 0.1
           AND f.superseded_at IS NULL
+          AND t.retracted_at IS NULL
           AND ($2::text IS NULL OR f.scope = $2)
         ORDER BY similarity(f.statement, $1) DESC
         LIMIT $3
@@ -959,6 +976,77 @@ pub async fn supersede_fact(
     Ok(result.rows_affected() == 1)
 }
 
+/// Result of `retract_thought`. Distinguishes "actually retracted this row"
+/// from "row didn't exist or was already retracted." The `facts_superseded`
+/// count is for operator-facing observability ("you retracted N facts as a
+/// side effect").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetractThoughtOutcome {
+    pub retracted: bool,
+    pub facts_superseded: i64,
+}
+
+/// Mark a thought as retracted and auto-supersede every active fact derived
+/// from it. Atomic: both operations run in a single transaction so a crash
+/// between the UPDATEs can't leave the thought retracted with facts still
+/// live (or vice versa).
+///
+/// Idempotent on a row that's already retracted (`retracted: false,
+/// facts_superseded: 0`); idempotent on a missing row (same shape). The
+/// caller maps that to an operator-facing error string if it wants — the
+/// storage layer just reports what it did.
+///
+/// The auto-supersede side-effect is the dogfood-driven decision: without
+/// it, the operator has to retract every derived fact one at a time, and a
+/// single missed fact keeps the source thought in the reflector's
+/// `find_facted_thoughts` set, which re-extracts under the next rerun.
+/// Tying the two together at the storage tx level closes that gap.
+pub async fn retract_thought(
+    pool: &PgPool,
+    thought_id: ThoughtId,
+    reason: Option<&str>,
+) -> Result<RetractThoughtOutcome, StorageError> {
+    let mut tx = pool.begin().await?;
+
+    let updated = sqlx::query!(
+        r#"
+        UPDATE thoughts
+        SET retracted_at = NOW(), retracted_reason = $2
+        WHERE id = $1 AND retracted_at IS NULL
+        "#,
+        thought_id.into_uuid(),
+        reason,
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    if updated.rows_affected() == 0 {
+        // Either missing or already retracted; either way nothing to do.
+        tx.rollback().await?;
+        return Ok(RetractThoughtOutcome {
+            retracted: false,
+            facts_superseded: 0,
+        });
+    }
+
+    let facts = sqlx::query!(
+        r#"
+        UPDATE facts
+        SET superseded_at = NOW(), superseded_by = NULL
+        WHERE source_thought_id = $1 AND superseded_at IS NULL
+        "#,
+        thought_id.into_uuid(),
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(RetractThoughtOutcome {
+        retracted: true,
+        facts_superseded: facts.rows_affected() as i64,
+    })
+}
+
 /// Thoughts that have at least one active (non-superseded) fact. Inverse of
 /// `find_unfacted_thoughts`. Used by `engram reflect --rerun` to re-evaluate
 /// already-facted thoughts. `since` filters by `thoughts.created_at` if
@@ -978,6 +1066,7 @@ pub async fn find_facted_thoughts(
            AND f.superseded_at IS NULL
         WHERE ($1::text IS NULL OR t.scope = $1)
           AND ($2::timestamptz IS NULL OR t.created_at >= $2)
+          AND t.retracted_at IS NULL
         ORDER BY t.created_at ASC
         LIMIT $3
         "#,
@@ -1079,6 +1168,7 @@ pub async fn search_vector_knn(
         JOIN embeddings e ON e.target_kind = 'thought' AND e.target_id = t.id
         WHERE e.model_id = $2
           AND ($3::text IS NULL OR t.scope = $3)
+          AND t.retracted_at IS NULL
         ORDER BY e.vector <=> $1
         LIMIT $4
         "#,
@@ -2194,5 +2284,164 @@ mod tests {
         assert!((row.confidence - 0.3).abs() < 1e-5);
         assert!(row.reviewed_at.is_none());
         assert_eq!(row.source_run_id, Some(run_id.0));
+    }
+
+    // -- M3 starter: thought retraction ----------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn retract_thought_sets_retracted_at_and_supersedes_facts(pool: PgPool) {
+        let scope = Scope::global();
+        let thought_id = insert_test_thought(&pool, "wrong claim", "global").await;
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        insert_active_fact(&pool, thought_id, &scope, "f1", (None, None, None), run_id, 0.9).await;
+        insert_active_fact(&pool, thought_id, &scope, "f2", (None, None, None), run_id, 0.9).await;
+        insert_active_fact(&pool, thought_id, &scope, "f3", (None, None, None), run_id, 0.9).await;
+
+        let outcome = retract_thought(&pool, thought_id, Some("operator error"))
+            .await
+            .unwrap();
+        assert!(outcome.retracted);
+        assert_eq!(outcome.facts_superseded, 3);
+
+        let row = sqlx::query!(
+            r#"SELECT retracted_at, retracted_reason FROM thoughts WHERE id = $1"#,
+            thought_id.into_uuid(),
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(row.retracted_at.is_some());
+        assert_eq!(row.retracted_reason.as_deref(), Some("operator error"));
+
+        let active_facts = sqlx::query!(
+            r#"SELECT COUNT(*) AS "n!" FROM facts
+               WHERE source_thought_id = $1 AND superseded_at IS NULL"#,
+            thought_id.into_uuid(),
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .n;
+        assert_eq!(active_facts, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn retract_thought_is_idempotent_on_already_retracted(pool: PgPool) {
+        let thought_id = insert_test_thought(&pool, "wrong", "global").await;
+        let first = retract_thought(&pool, thought_id, None).await.unwrap();
+        assert!(first.retracted);
+
+        let second = retract_thought(&pool, thought_id, Some("ignored")).await.unwrap();
+        assert!(!second.retracted);
+        assert_eq!(second.facts_superseded, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn retract_thought_on_missing_id_reports_no_op(pool: PgPool) {
+        let outcome = retract_thought(&pool, ThoughtId::new(), None).await.unwrap();
+        assert!(!outcome.retracted);
+        assert_eq!(outcome.facts_superseded, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn retracted_thought_excluded_from_recent_thoughts(pool: PgPool) {
+        let kept = insert_test_thought(&pool, "kept", "global").await;
+        let gone = insert_test_thought(&pool, "gone", "global").await;
+        retract_thought(&pool, gone, None).await.unwrap();
+
+        let results = recent_thoughts(&pool, None, 10).await.unwrap();
+        let ids: Vec<ThoughtId> = results.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&kept));
+        assert!(!ids.contains(&gone), "retracted thought must not appear");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn retracted_thought_excluded_from_search_trigram(pool: PgPool) {
+        let kept = insert_test_thought(&pool, "kept widget alpha", "global").await;
+        let gone = insert_test_thought(&pool, "gone widget alpha", "global").await;
+        retract_thought(&pool, gone, None).await.unwrap();
+
+        let hits = search_trigram(&pool, "widget", None, 10).await.unwrap();
+        let ids: Vec<ThoughtId> = hits.iter().map(|h| h.thought.id).collect();
+        assert!(ids.contains(&kept));
+        assert!(!ids.contains(&gone));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn retracted_thought_excluded_from_find_unfacted_thoughts(pool: PgPool) {
+        let kept = insert_test_thought(&pool, "kept", "global").await;
+        let gone = insert_test_thought(&pool, "gone", "global").await;
+        retract_thought(&pool, gone, None).await.unwrap();
+
+        let pending = find_unfacted_thoughts(&pool, None, 100).await.unwrap();
+        let ids: Vec<ThoughtId> = pending.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&kept));
+        assert!(!ids.contains(&gone), "reflector must not see retracted thoughts");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn retracted_thought_excluded_from_find_facted_thoughts(pool: PgPool) {
+        let scope = Scope::global();
+        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        insert_active_fact(&pool, thought_id, &scope, "f1", (None, None, None), run_id, 0.9).await;
+
+        // Before retraction: visible in find_facted_thoughts.
+        let before = find_facted_thoughts(&pool, None, None, 100).await.unwrap();
+        assert!(before.iter().any(|t| t.id == thought_id));
+
+        retract_thought(&pool, thought_id, None).await.unwrap();
+
+        // After retraction: gone — because the auto-supersede dropped its
+        // active facts, *and* the new retraction filter would have caught
+        // it anyway. Belt-and-braces.
+        let after = find_facted_thoughts(&pool, None, None, 100).await.unwrap();
+        assert!(after.iter().all(|t| t.id != thought_id));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn retracted_thought_excludes_its_facts_from_search_facts_trigram(pool: PgPool) {
+        let scope = Scope::global();
+        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        insert_active_fact(
+            &pool, thought_id, &scope, "search me later", (None, None, None), run_id, 0.9,
+        )
+        .await;
+
+        // Before retraction: fact is searchable.
+        let before = search_facts_trigram(&pool, "search me", None, 10).await.unwrap();
+        assert_eq!(before.len(), 1);
+
+        retract_thought(&pool, thought_id, None).await.unwrap();
+
+        // After: fact is gone from search_facts (because auto-superseded *and*
+        // the JOIN on thoughts now filters retracted).
+        let after = search_facts_trigram(&pool, "search me", None, 10).await.unwrap();
+        assert!(after.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetch_thought_with_provenance_surfaces_retracted_at(pool: PgPool) {
+        let model = EmbeddingModel::bge_m3();
+        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
+
+        let before = fetch_thought_with_provenance(&pool, thought_id, &model)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(before.retracted_at.is_none());
+        assert!(before.retracted_reason.is_none());
+
+        retract_thought(&pool, thought_id, Some("test reason"))
+            .await
+            .unwrap();
+
+        let after = fetch_thought_with_provenance(&pool, thought_id, &model)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(after.retracted_at.is_some());
+        assert_eq!(after.retracted_reason.as_deref(), Some("test reason"));
     }
 }

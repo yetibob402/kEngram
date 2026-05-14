@@ -14,16 +14,17 @@ For design rationale see [`docs/engram-design-v0.md`](docs/engram-design-v0.md);
 
 ## What you get (MCP surface)
 
-**Status:** M1 and M2 are shipped (capture, hybrid search, facts pipeline, six MCP tools). M3–M5 are planned — see the [Roadmap](#roadmap) at the end of this doc.
+**Status:** M1 and M2 are shipped (capture, hybrid search, facts pipeline, seven MCP tools — `retract_thought` was added in 2026-05-13 from dogfood feedback). M3–M5 are planned — see the [Roadmap](#roadmap) at the end of this doc.
 
 | Tool | What it does |
 |---|---|
 | `capture` | Record a thought. Returns `thought_id` + `embedding_status: "pending"`; the `engram worker` drains the embed queue on its tick. |
-| `search_thoughts` | Hybrid retrieval (vector kNN ∪ trigram, fused by RRF, recency-boosted). Gracefully degrades to trigram-only when the embedder is unreachable; result includes `vector_search_available: bool`. |
-| `recent_thoughts` | Browse by recency in a (optional) scope. |
-| `get_thought` | Full thought + provenance (embedding status, embedded-at, and active `linked_facts`). |
-| `search_facts` | Trigram search over `facts.statement`, filtered to active (non-superseded) rows. Each result includes the fact's S/P/O triple plus the source thought's content/scope/created_at (no follow-up `get_thought` needed). M3 adds the vector leg. |
-| `correct_fact` | Operator-driven correction. With a replacement, inserts a manual-author fact (`extractor_model="manual"`, `extractor_version=0`, `confidence=1.0`) and supersedes the old row, preserving the audit trail. Without a replacement, retracts via supersede. |
+| `search_thoughts` | Hybrid retrieval (vector kNN ∪ trigram, fused by RRF, recency-boosted). Gracefully degrades to trigram-only when the embedder is unreachable; result includes `vector_search_available: bool`. Excludes retracted thoughts. |
+| `recent_thoughts` | Browse by recency in a (optional) scope. Excludes retracted thoughts. |
+| `get_thought` | Full thought + provenance (embedding status, embedded-at, active `linked_facts`, retraction state). Direct lookup by ID returns the row even if retracted — this is the audit path. |
+| `search_facts` | Trigram search over `facts.statement`, filtered to active (non-superseded) rows whose source thought is also not retracted. Each result includes the fact's S/P/O triple plus the source thought's content/scope/created_at. M3 adds the vector leg. |
+| `correct_fact` | Operator-driven correction. With a replacement, inserts a manual-author fact (`extractor_model="manual"`, `extractor_version=0`, `confidence=1.0`) and supersedes the old row, preserving the audit trail. Without a replacement, retracts via supersede. Operates on a single fact. |
+| `retract_thought` | Mark a thought as untrusted (e.g. you captured a wrong claim). Atomically sets `thoughts.retracted_at` *and* auto-supersedes every active fact derived from it — so a subsequent reflector run can't re-extract from the untrusted source. The row stays in the DB; `get_thought` still returns it with retraction state. Use this rather than `correct_fact`-ing each derived fact one at a time. |
 
 CLI subcommands: `engram serve`, `engram worker`, `engram migrate`, `engram embed-backfill`, `engram reflect [--rerun --since <RFC3339>]`. Operational details in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 
@@ -59,6 +60,8 @@ The lifecycle, end to end:
 **5. Search.** `search_facts(query, scope?)` does trigram retrieval over `facts.statement`, filtered to active (non-superseded) rows, joined to the source thought. Each result is self-contained: the fact, the (S, P, O) triple, the confidence, *and* the source thought's content/scope/created_at. No follow-up `get_thought` call needed. `get_thought(id)` carries `linked_facts` for the reverse direction.
 
 **6. Correct.** When the extractor gets it wrong, `correct_fact(fact_id, replacement?)` supersedes the row. With a replacement, a new fact is inserted with sentinel provenance (`extractor_model="manual"`, `extractor_version=0`, `confidence=1.0`) — the operator is the authority. Without a replacement, the row is retracted. The old row stays in the database with `superseded_at` set; the audit trail is complete.
+
+**6a. Retract a whole thought.** When the *source thought* was wrong (not just one of its derived facts), `retract_thought(thought_id, reason?)` is the right tool. Atomic: sets `thoughts.retracted_at` *and* supersedes every active fact derived from the thought in one transaction. The thought is now invisible to retrieval and to the reflector — a subsequent `engram reflect --rerun` can't re-extract from the untrusted source, which is the failure mode that motivated this tool's existence. `get_thought` still returns the row with retraction state surfaced; the row never leaves the database.
 
 **7. Rerun.** `engram reflect --rerun [--since <RFC3339>]` re-extracts already-facted thoughts. Exact `(S, P, O, statement)` matches are no-ops (idempotency keystone); same triple with a different statement supersedes the old row (preserving the audit trail); new triples insert as additional facts. It's additive only — existing facts the new extractor *doesn't* reproduce stay active, because rerun reflects model drift in how facts are stated, not in what the thought says.
 

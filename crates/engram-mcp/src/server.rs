@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use crate::capture::{self, CaptureError, CaptureRequest, MAX_CONTENT_LEN};
 use crate::correct::{self, CorrectError, CorrectFactRequest, FactReplacement};
+use crate::retract::{self, RetractError, RetractThoughtRequest};
 use crate::search::{
     self, GetThoughtResponse, ReadError, RecentRequest, RecentResponse, SearchFactsRequest,
     SearchFactsResponse, SearchRequest, SearchResponse,
@@ -89,6 +90,15 @@ pub struct CorrectFactArgs {
 
     #[schemars(description = "Optional replacement. If present, a new fact is inserted with manual-author provenance (extractor_model='manual', extractor_version=0, confidence=1.0) and the old fact is superseded with `superseded_by` pointing at the new row. If omitted, the old fact is superseded with no replacement (delete-by-supersede).")]
     pub replacement: Option<CorrectFactReplacementArgs>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RetractThoughtArgs {
+    #[schemars(description = "Thought ID (UUID string) to retract.")]
+    pub thought_id: String,
+
+    #[schemars(description = "Optional free-text reason for the retraction (e.g. 'wrong claim — see thought <new id> for correction'). Stored on thoughts.retracted_reason for audit; max 1000 chars.")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -254,6 +264,29 @@ impl EngramServer {
             .map_err(|e| format!("response serialization error: {e}"))
     }
 
+    #[tool(description = "Retract a thought as untrusted (e.g. the operator captured a wrong claim). Atomically marks `thoughts.retracted_at = NOW()` and auto-supersedes every active fact derived from the thought, so a subsequent reflector run won't re-extract from the still-untrusted source. The thought row itself stays in the DB (`get_thought` still finds it; the response carries `retracted_at` and `retracted_reason`). Use this rather than retracting facts one at a time, which is fragile if the operator misses any.")]
+    async fn retract_thought(
+        &self,
+        Parameters(args): Parameters<RetractThoughtArgs>,
+    ) -> Result<String, String> {
+        let thought_id = ThoughtId::from_str(&args.thought_id)
+            .map_err(|e| format!("invalid thought_id: {e}"))?;
+
+        let resp = retract::retract_thought(
+            &self.pool,
+            RetractThoughtRequest { thought_id, reason: args.reason },
+        )
+        .await
+        .map_err(map_retract_error)?;
+
+        let body = serde_json::json!({
+            "retracted": resp.retracted,
+            "facts_superseded": resp.facts_superseded,
+        });
+        serde_json::to_string(&body)
+            .map_err(|e| format!("response serialization error: {e}"))
+    }
+
     #[tool(description = "Correct or retract a fact. With a replacement, inserts a new fact (manual provenance: extractor_model='manual', version=0, confidence=1.0) and supersedes the old one; the audit trail (superseded_by, superseded_at) is preserved. Without a replacement, the fact is superseded with no successor — the row stays in the DB but search_facts and get_thought will no longer surface it.")]
     async fn correct_fact(
         &self,
@@ -318,6 +351,18 @@ fn map_correct_error(err: CorrectError) -> String {
         }
         CorrectError::Storage(e) => {
             tracing::error!(error = %e, "correct_fact storage error");
+            "internal database error".to_string()
+        }
+    }
+}
+
+fn map_retract_error(err: RetractError) -> String {
+    match err {
+        RetractError::NotFoundOrAlreadyRetracted(id) => {
+            format!("thought not found or already retracted: {id}")
+        }
+        RetractError::Storage(e) => {
+            tracing::error!(error = %e, "retract_thought storage error");
             "internal database error".to_string()
         }
     }
@@ -394,6 +439,8 @@ fn get_thought_response_json(resp: &GetThoughtResponse) -> serde_json::Value {
             "embedding_status": resp.embedding_status,
             "embedded_at": resp.embedded_at.and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()),
             "linked_facts": linked_facts,
+            "retracted_at": resp.retracted_at.and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()),
+            "retracted_reason": resp.retracted_reason,
         },
     })
 }
@@ -732,6 +779,81 @@ mod tests {
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0]["statement"], "the fact");
         assert!(facts[0]["fact_id"].is_string());
+        // Fresh thought has no retraction state.
+        assert!(json["provenance"]["retracted_at"].is_null());
+        assert!(json["provenance"]["retracted_reason"].is_null());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn retract_thought_tool_marks_thought_and_supersedes_facts(pool: PgPool) {
+        let (thought_id, fact_id) =
+            seed_fact_for_tool_test(&pool, "wrong claim", "derived false fact").await;
+        let s = server(pool.clone());
+
+        let raw = s
+            .retract_thought(Parameters(RetractThoughtArgs {
+                thought_id: thought_id.clone(),
+                reason: Some("test reason".into()),
+            }))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(json["retracted"], true);
+        assert_eq!(json["facts_superseded"], 1);
+
+        // get_thought now surfaces retraction state + empty linked_facts.
+        let raw = s
+            .get_thought(Parameters(GetThoughtArgs { thought_id: thought_id.clone() }))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(json["provenance"]["retracted_at"].is_string());
+        assert_eq!(json["provenance"]["retracted_reason"], "test reason");
+        let linked = json["provenance"]["linked_facts"].as_array().unwrap();
+        assert!(linked.is_empty());
+
+        // The derived fact is now superseded in the DB.
+        let fact_uuid = uuid::Uuid::from_str(&fact_id).unwrap();
+        let row = sqlx::query!(
+            r#"SELECT superseded_at FROM facts WHERE id = $1"#,
+            fact_uuid,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(row.superseded_at.is_some());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn retract_thought_tool_errors_on_already_retracted(pool: PgPool) {
+        let (thought_id, _) = seed_fact_for_tool_test(&pool, "wrong claim", "f").await;
+        let s = server(pool);
+
+        s.retract_thought(Parameters(RetractThoughtArgs {
+            thought_id: thought_id.clone(),
+            reason: None,
+        }))
+        .await
+        .unwrap();
+
+        let err = s
+            .retract_thought(Parameters(RetractThoughtArgs { thought_id, reason: None }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("not found or already retracted"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn retract_thought_tool_errors_on_invalid_uuid(pool: PgPool) {
+        let s = server(pool);
+        let err = s
+            .retract_thought(Parameters(RetractThoughtArgs {
+                thought_id: "not-a-uuid".into(),
+                reason: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("invalid thought_id"));
     }
 
     #[sqlx::test(migrations = "../../migrations")]

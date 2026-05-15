@@ -126,6 +126,24 @@ pub async fn insert_thought_embedding(
     .await
 }
 
+/// Convenience: insert an embedding tied to a fact. Facts have no newtype
+/// id (unlike thoughts), so this takes a raw `Uuid`. Same ON CONFLICT DO
+/// NOTHING idempotency under M2-style worker replay.
+pub async fn insert_fact_embedding(
+    pool: &PgPool,
+    fact_id: Uuid,
+    embedding: &Embedding,
+) -> Result<(), StorageError> {
+    insert_embedding(
+        pool,
+        target::FACT,
+        fact_id,
+        &embedding.model,
+        embedding.vector.clone(),
+    )
+    .await
+}
+
 /// Look up a thought by id. Returns `None` if not found.
 pub async fn fetch_thought(
     pool: &PgPool,
@@ -507,6 +525,47 @@ pub async fn enqueue_unembedded_thoughts(
           AND ($2::text IS NULL OR t.scope = $2)
           AND t.retracted_at IS NULL
         ORDER BY t.created_at ASC
+        LIMIT $3
+        ON CONFLICT (target_kind, target_id, model_id) DO NOTHING
+        "#,
+        model_id,
+        scope,
+        limit,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() as usize)
+}
+
+/// Heal-side companion to `enqueue_unembedded_thoughts`: enqueues any
+/// `facts` row that lacks an `embeddings` entry for `model_id`. Skips
+/// superseded facts and facts whose source thought has been retracted —
+/// the same active-row invariants that govern retrieval.
+///
+/// Used by `engram embed-backfill --target facts` to catch pre-M3-Phase-B
+/// facts (committed before the fact-embedding seam existed) and any fact
+/// that slipped through a crash between `insert_fact` and `enqueue_embedding`.
+pub async fn enqueue_unembedded_facts(
+    pool: &PgPool,
+    model_id: &str,
+    scope: Option<&str>,
+    limit: i64,
+) -> Result<usize, StorageError> {
+    let result = sqlx::query!(
+        r#"
+        INSERT INTO pending_embeddings (target_kind, target_id, model_id)
+        SELECT 'fact', f.id, $1
+        FROM facts f
+        JOIN thoughts t ON t.id = f.source_thought_id
+        LEFT JOIN embeddings e
+            ON e.target_kind = 'fact'
+           AND e.target_id = f.id
+           AND e.model_id = $1
+        WHERE e.id IS NULL
+          AND f.superseded_at IS NULL
+          AND t.retracted_at IS NULL
+          AND ($2::text IS NULL OR f.scope = $2)
+        ORDER BY f.created_at ASC
         LIMIT $3
         ON CONFLICT (target_kind, target_id, model_id) DO NOTHING
         "#,
@@ -1249,6 +1308,106 @@ struct VectorSearchRow {
     source: String,
     created_at: OffsetDateTime,
     metadata: serde_json::Value,
+    distance: f64,
+}
+
+/// kNN over `embeddings` joined with `facts` (and `thoughts` for source-thought
+/// enrichment matching `search_facts_trigram`'s response shape). Mirrors
+/// `search_vector_knn` for thoughts: per-model HNSW partial index, cosine
+/// distance ordering, scope filter, active-only via `superseded_at IS NULL`
+/// and `retracted_at IS NULL`.
+pub async fn search_facts_vector_knn(
+    pool: &PgPool,
+    query_vector: Vec<f32>,
+    model: &EmbeddingModel,
+    scope: Option<&str>,
+    limit: i64,
+) -> Result<Vec<FactHit>, StorageError> {
+    let pgv = pgvector::Vector::from(query_vector);
+
+    let rows: Vec<FactVectorSearchRow> = sqlx::query_as(
+        r#"
+        SELECT f.id            AS fact_id,
+               f.scope         AS fact_scope,
+               f.statement,
+               f.subject,
+               f.predicate,
+               f.object,
+               f.source_thought_id,
+               f.extractor_model,
+               f.extractor_version,
+               f.source_run_id,
+               f.confidence,
+               f.created_at    AS fact_created_at,
+               t.content       AS source_thought_content,
+               t.scope         AS source_thought_scope,
+               t.created_at    AS source_thought_created_at,
+               (e.vector <=> $1) AS distance
+        FROM facts f
+        JOIN embeddings e ON e.target_kind = 'fact' AND e.target_id = f.id
+        JOIN thoughts t ON t.id = f.source_thought_id
+        WHERE e.model_id = $2
+          AND f.superseded_at IS NULL
+          AND t.retracted_at IS NULL
+          AND ($3::text IS NULL OR f.scope = $3)
+        ORDER BY e.vector <=> $1
+        LIMIT $4
+        "#,
+    )
+    .bind(pgv)
+    .bind(&model.id)
+    .bind(scope)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|r| {
+            // cosine distance ∈ [0, 2]; convert to similarity ∈ [-1, 1]
+            // (typically [0, 1]). Matches `search_vector_knn`'s convention.
+            let score = (1.0 - r.distance) as f32;
+            let fact = fact_from_columns(
+                r.fact_id,
+                r.fact_scope,
+                r.statement,
+                r.subject,
+                r.predicate,
+                r.object,
+                r.source_thought_id,
+                r.extractor_model,
+                r.extractor_version,
+                r.source_run_id,
+                r.confidence,
+                r.fact_created_at,
+            )?;
+            Ok(FactHit {
+                fact,
+                source_thought_content: r.source_thought_content,
+                source_thought_scope: Scope::new(r.source_thought_scope)?,
+                source_thought_created_at: r.source_thought_created_at,
+                score,
+            })
+        })
+        .collect()
+}
+
+#[derive(sqlx::FromRow)]
+struct FactVectorSearchRow {
+    fact_id: Uuid,
+    fact_scope: String,
+    statement: String,
+    subject: Option<String>,
+    predicate: Option<String>,
+    object: Option<String>,
+    source_thought_id: Uuid,
+    extractor_model: String,
+    extractor_version: i32,
+    source_run_id: Option<Uuid>,
+    confidence: f32,
+    fact_created_at: OffsetDateTime,
+    source_thought_content: String,
+    source_thought_scope: String,
+    source_thought_created_at: OffsetDateTime,
     distance: f64,
 }
 
@@ -2126,6 +2285,130 @@ mod tests {
             "expected Ron/Go fact to be the top hit, got: {}",
             hits[0].fact.statement
         );
+    }
+
+    // -- M3 Phase B step 1: fact embeddings -----------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn insert_fact_embedding_persists_vector_for_model(pool: PgPool) {
+        let model = EmbeddingModel::new("test:1024", 1024);
+        let scope = Scope::global();
+        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        let fact_id = insert_active_fact(
+            &pool,
+            thought_id,
+            &scope,
+            "fact statement",
+            (Some("S"), Some("P"), Some("O")),
+            run_id,
+            0.9,
+        )
+        .await;
+
+        let v = unit_vector_1024(7);
+        insert_fact_embedding(&pool, fact_id, &Embedding::new(model.clone(), v).unwrap())
+            .await
+            .unwrap();
+
+        // Verify the row landed under target_kind='fact'.
+        let n = sqlx::query!(
+            r#"SELECT COUNT(*) AS "n!" FROM embeddings
+               WHERE target_kind = 'fact' AND target_id = $1 AND model_id = $2"#,
+            fact_id,
+            model.id,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .n;
+        assert_eq!(n, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_facts_vector_knn_finds_inserted_vector(pool: PgPool) {
+        let model = EmbeddingModel::new("test:1024", 1024);
+        let scope = Scope::global();
+        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+
+        let fact_a = insert_active_fact(
+            &pool,
+            thought_id,
+            &scope,
+            "alpha fact",
+            (Some("A"), None, None),
+            run_id,
+            0.9,
+        )
+        .await;
+        let fact_b = insert_active_fact(
+            &pool,
+            thought_id,
+            &scope,
+            "beta fact",
+            (Some("B"), None, None),
+            run_id,
+            0.9,
+        )
+        .await;
+
+        let va = unit_vector_1024(0);
+        let vb = unit_vector_1024(1);
+        insert_fact_embedding(&pool, fact_a, &Embedding::new(model.clone(), va.clone()).unwrap())
+            .await
+            .unwrap();
+        insert_fact_embedding(&pool, fact_b, &Embedding::new(model.clone(), vb).unwrap())
+            .await
+            .unwrap();
+
+        // Query with the exact 'a' vector → fact_a ranks first with score ≈ 1.
+        let hits = search_facts_vector_knn(&pool, va, &model, None, 10).await.unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].fact.id, fact_a);
+        assert!((hits[0].score - 1.0).abs() < 1e-4);
+        // Source-thought enrichment fields populated.
+        assert_eq!(hits[0].source_thought_content, "anchor");
+        assert_eq!(hits[0].source_thought_scope.as_str(), "global");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn enqueue_unembedded_facts_skips_already_embedded(pool: PgPool) {
+        let model = EmbeddingModel::new("bge-m3:1024", 1024);
+        let scope = Scope::global();
+        let thought_id = insert_test_thought(&pool, "anchor", "global").await;
+        let run_id = start_run(&pool, "fake/extractor", 1, None).await.unwrap();
+        let fact_a = insert_active_fact(
+            &pool, thought_id, &scope, "fact-a", (None, None, None), run_id, 0.9,
+        )
+        .await;
+        let _fact_b = insert_active_fact(
+            &pool, thought_id, &scope, "fact-b", (None, None, None), run_id, 0.9,
+        )
+        .await;
+
+        // Pre-embed fact_a only; it should be skipped by the heal.
+        insert_fact_embedding(
+            &pool,
+            fact_a,
+            &Embedding::new(model.clone(), unit_vector_1024(0)).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let healed = enqueue_unembedded_facts(&pool, &model.id, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(healed, 1, "fact_a was already embedded; only fact_b enqueues");
+
+        let pending = sqlx::query!(
+            r#"SELECT COUNT(*) AS "n!" FROM pending_embeddings WHERE target_kind = 'fact'"#
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .n;
+        assert_eq!(pending, 1);
     }
 
     #[sqlx::test(migrations = "../../migrations")]

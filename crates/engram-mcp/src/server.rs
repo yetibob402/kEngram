@@ -256,7 +256,7 @@ impl EngramServer {
             recency_half_life_days: args.recency_half_life_days,
         };
 
-        let resp = search::search_facts(&self.pool, request)
+        let resp = search::search_facts(&self.pool, self.embedder.as_ref(), request)
             .await
             .map_err(map_read_error)?;
 
@@ -465,7 +465,10 @@ fn search_facts_response_json(resp: &SearchFactsResponse) -> serde_json::Value {
             })
         })
         .collect();
-    serde_json::json!({ "results": results })
+    serde_json::json!({
+        "results": results,
+        "vector_search_available": resp.vector_search_available,
+    })
 }
 
 #[tool_handler(router = self.tool_router)]

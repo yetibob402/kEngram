@@ -73,6 +73,7 @@ pub enum ReflectorError {
 pub async fn run_reflector_once(
     pool: &PgPool,
     extractor: &dyn Extractor,
+    embedder_model_id: &str,
     options: &ReflectorOptions,
 ) -> Result<ReflectorReport, ReflectorError> {
     let run_id = engram_storage::start_run(
@@ -127,7 +128,17 @@ pub async fn run_reflector_once(
         };
 
         for fact in facts {
-            match commit_or_supersede(pool, run_id, options, thought, &fact, extractor).await {
+            match commit_or_supersede(
+                pool,
+                run_id,
+                options,
+                thought,
+                &fact,
+                extractor,
+                embedder_model_id,
+            )
+            .await
+            {
                 Ok(CommitOutcome::Committed) => n_committed += 1,
                 Ok(CommitOutcome::Review) => n_review += 1,
                 Ok(CommitOutcome::Skipped) | Ok(CommitOutcome::NoOp) => {}
@@ -249,6 +260,7 @@ async fn commit_or_supersede(
     thought: &Thought,
     fact: &ExtractedFact,
     extractor: &dyn Extractor,
+    embedder_model_id: &str,
 ) -> Result<CommitOutcome, ReflectorError> {
     if fact.statement.trim().is_empty() {
         return Ok(CommitOutcome::Skipped);
@@ -290,7 +302,7 @@ async fn commit_or_supersede(
     .await?;
 
     if matches.is_empty() {
-        engram_storage::insert_fact(
+        let new_fact_id = engram_storage::insert_fact(
             pool,
             NewFact {
                 scope: &thought.scope,
@@ -304,6 +316,13 @@ async fn commit_or_supersede(
                 source_run_id: Some(run_id),
                 confidence: fact.confidence,
             },
+        )
+        .await?;
+        engram_storage::enqueue_embedding(
+            pool,
+            engram_storage::target::FACT,
+            new_fact_id,
+            embedder_model_id,
         )
         .await?;
         return Ok(CommitOutcome::Committed);
@@ -373,6 +392,17 @@ async fn commit_or_supersede(
     if canonical.is_some() {
         Ok(CommitOutcome::NoOp)
     } else {
+        // `target_id` is the row we just inserted; enqueue it for embedding.
+        // The no-op-floor path above (canonical = Some) skips this because
+        // the byte-identical existing row was already enqueued when it was
+        // first inserted.
+        engram_storage::enqueue_embedding(
+            pool,
+            engram_storage::target::FACT,
+            target_id,
+            embedder_model_id,
+        )
+        .await?;
         Ok(CommitOutcome::Committed)
     }
 }
@@ -410,6 +440,7 @@ async fn commit_or_supersede(
 pub async fn run_reflector_rerun(
     pool: &PgPool,
     extractor: &dyn Extractor,
+    embedder_model_id: &str,
     options: &ReflectorOptions,
     since: Option<OffsetDateTime>,
 ) -> Result<ReflectorReport, ReflectorError> {
@@ -461,7 +492,17 @@ pub async fn run_reflector_rerun(
         };
 
         for fact in facts {
-            match commit_or_supersede(pool, run_id, options, thought, &fact, extractor).await {
+            match commit_or_supersede(
+                pool,
+                run_id,
+                options,
+                thought,
+                &fact,
+                extractor,
+                embedder_model_id,
+            )
+            .await
+            {
                 Ok(CommitOutcome::Committed) => n_committed += 1,
                 Ok(CommitOutcome::Review) => n_review += 1,
                 Ok(CommitOutcome::Skipped) | Ok(CommitOutcome::NoOp) => {}
@@ -539,7 +580,7 @@ mod tests {
     async fn commits_high_confidence_facts(pool: PgPool) {
         let id = cap(&pool, "Engram uses pgvector", "global").await;
         let extractor = FakeExtractor::with_confidence(0.9);
-        let report = run_reflector_once(&pool, &extractor, &options(0.7))
+        let report = run_reflector_once(&pool, &extractor, TEST_MODEL_ID, &options(0.7))
             .await
             .unwrap();
         assert_eq!(report.n_thoughts_processed, 1);
@@ -562,7 +603,7 @@ mod tests {
     async fn routes_low_confidence_to_review_queue(pool: PgPool) {
         let id = cap(&pool, "vague claim", "global").await;
         let extractor = FakeExtractor::with_confidence(0.3);
-        let report = run_reflector_once(&pool, &extractor, &options(0.7))
+        let report = run_reflector_once(&pool, &extractor, TEST_MODEL_ID, &options(0.7))
             .await
             .unwrap();
         assert_eq!(report.n_facts_committed, 0);
@@ -592,7 +633,7 @@ mod tests {
     async fn writes_source_run_id_on_committed_facts(pool: PgPool) {
         cap(&pool, "stamp me", "global").await;
         let extractor = FakeExtractor::with_confidence(0.85);
-        let report = run_reflector_once(&pool, &extractor, &options(0.7))
+        let report = run_reflector_once(&pool, &extractor, TEST_MODEL_ID, &options(0.7))
             .await
             .unwrap();
 
@@ -609,7 +650,7 @@ mod tests {
     async fn skips_thought_when_extractor_fails(pool: PgPool) {
         cap(&pool, "unreachable extractor", "global").await;
         let extractor = FakeExtractor::always_failing(FakeBehavior::Unreachable);
-        let report = run_reflector_once(&pool, &extractor, &options(0.7))
+        let report = run_reflector_once(&pool, &extractor, TEST_MODEL_ID, &options(0.7))
             .await
             .unwrap();
         assert_eq!(report.n_thoughts_processed, 1);
@@ -630,14 +671,14 @@ mod tests {
         cap(&pool, "extract me once", "global").await;
         let extractor = FakeExtractor::with_confidence(0.9);
 
-        let first = run_reflector_once(&pool, &extractor, &options(0.7))
+        let first = run_reflector_once(&pool, &extractor, TEST_MODEL_ID, &options(0.7))
             .await
             .unwrap();
         assert_eq!(first.n_facts_committed, 1);
 
         // Second run: the thought now has a fact, so it's excluded from
         // find_unfacted_thoughts and produces no new rows.
-        let second = run_reflector_once(&pool, &extractor, &options(0.7))
+        let second = run_reflector_once(&pool, &extractor, TEST_MODEL_ID, &options(0.7))
             .await
             .unwrap();
         assert_eq!(second.n_thoughts_processed, 0);
@@ -657,7 +698,7 @@ mod tests {
             cap(&pool, &format!("t-{i}"), "global").await;
         }
         let extractor = FakeExtractor::with_confidence(0.9);
-        let report = run_reflector_once(&pool, &extractor, &options(0.7))
+        let report = run_reflector_once(&pool, &extractor, TEST_MODEL_ID, &options(0.7))
             .await
             .unwrap();
 
@@ -684,7 +725,7 @@ mod tests {
         let extractor = FakeExtractor::with_confidence(0.9);
         let mut opts = options(0.7);
         opts.scope_filter = Some("work".to_string());
-        let report = run_reflector_once(&pool, &extractor, &opts).await.unwrap();
+        let report = run_reflector_once(&pool, &extractor, TEST_MODEL_ID, &opts).await.unwrap();
         assert_eq!(report.n_thoughts_processed, 1);
         assert_eq!(report.n_facts_committed, 1);
 
@@ -705,7 +746,7 @@ mod tests {
             object: Some("pgvector".into()),
             confidence: 0.95,
         }]);
-        run_reflector_once(&pool, &extractor, &options(0.7))
+        run_reflector_once(&pool, &extractor, TEST_MODEL_ID, &options(0.7))
             .await
             .unwrap();
 
@@ -736,10 +777,10 @@ mod tests {
             object: Some("O".into()),
             confidence: 0.9,
         }]);
-        run_reflector_once(&pool, &extractor, &options(0.7)).await.unwrap();
+        run_reflector_once(&pool, &extractor, TEST_MODEL_ID, &options(0.7)).await.unwrap();
         let before = sqlx::query!(r#"SELECT COUNT(*) AS "n!" FROM facts"#).fetch_one(&pool).await.unwrap().n;
 
-        let report = run_reflector_rerun(&pool, &extractor, &options(0.7), None).await.unwrap();
+        let report = run_reflector_rerun(&pool, &extractor, TEST_MODEL_ID, &options(0.7), None).await.unwrap();
         let after = sqlx::query!(r#"SELECT COUNT(*) AS "n!" FROM facts"#).fetch_one(&pool).await.unwrap().n;
         assert_eq!(before, after, "byte-identical match must produce zero new rows");
         assert_eq!(report.n_facts_committed, 0);
@@ -766,7 +807,7 @@ mod tests {
             object: Some("O".into()),
             confidence: 0.9,
         }]);
-        run_reflector_once(&pool, &v1, &options(0.7)).await.unwrap();
+        run_reflector_once(&pool, &v1, TEST_MODEL_ID, &options(0.7)).await.unwrap();
 
         // Rerun with an extractor that gives the same (S,P,O) but new statement.
         let v2 = FakeExtractor::with_facts(vec![ExtractedFact {
@@ -776,7 +817,7 @@ mod tests {
             object: Some("O".into()),
             confidence: 0.9,
         }]);
-        run_reflector_rerun(&pool, &v2, &options(0.7), None).await.unwrap();
+        run_reflector_rerun(&pool, &v2, TEST_MODEL_ID, &options(0.7), None).await.unwrap();
 
         // Active facts now: only the new one.
         let active = sqlx::query!(
@@ -810,7 +851,7 @@ mod tests {
             object: Some("B".into()),
             confidence: 0.9,
         }]);
-        run_reflector_once(&pool, &v1, &options(0.7)).await.unwrap();
+        run_reflector_once(&pool, &v1, TEST_MODEL_ID, &options(0.7)).await.unwrap();
 
         // Rerun with an extractor that produces a *different* (S,P,O).
         let v2 = FakeExtractor::with_facts(vec![ExtractedFact {
@@ -820,7 +861,7 @@ mod tests {
             object: Some("Y".into()),
             confidence: 0.9,
         }]);
-        run_reflector_rerun(&pool, &v2, &options(0.7), None).await.unwrap();
+        run_reflector_rerun(&pool, &v2, TEST_MODEL_ID, &options(0.7), None).await.unwrap();
 
         // Both should be active — the old one is not subtracted.
         let active = sqlx::query!(
@@ -850,7 +891,7 @@ mod tests {
             object: Some("append-only".into()),
             confidence: 0.9,
         }]);
-        run_reflector_once(&pool, &v1, &options(0.7)).await.unwrap();
+        run_reflector_once(&pool, &v1, TEST_MODEL_ID, &options(0.7)).await.unwrap();
         let v1_id = sqlx::query!(
             r#"SELECT id FROM facts WHERE statement = 'current API surface is append-only'"#
         )
@@ -866,7 +907,7 @@ mod tests {
             object: Some("append-only".into()),
             confidence: 0.9,
         }]);
-        run_reflector_rerun(&pool, &v2, &options(0.7), None).await.unwrap();
+        run_reflector_rerun(&pool, &v2, TEST_MODEL_ID, &options(0.7), None).await.unwrap();
 
         // Exactly one active row remains.
         let active = sqlx::query!(
@@ -952,7 +993,7 @@ mod tests {
             object: Some("obj".into()),
             confidence: 0.9,
         }]);
-        run_reflector_rerun(&pool, &v3, &options(0.7), None).await.unwrap();
+        run_reflector_rerun(&pool, &v3, TEST_MODEL_ID, &options(0.7), None).await.unwrap();
 
         // Both drifts are superseded; new row is canonical.
         let active = sqlx::query!(
@@ -1043,7 +1084,7 @@ mod tests {
             object: Some("O".into()),
             confidence: 0.9,
         }]);
-        run_reflector_rerun(&pool, &v, &options(0.7), None).await.unwrap();
+        run_reflector_rerun(&pool, &v, TEST_MODEL_ID, &options(0.7), None).await.unwrap();
 
         // No new row was inserted — the exact match served as canonical.
         let after_total =
@@ -1081,10 +1122,10 @@ mod tests {
             object: Some("O".into()),
             confidence: 0.9,
         }]);
-        run_reflector_once(&pool, &extractor, &options(0.7)).await.unwrap();
+        run_reflector_once(&pool, &extractor, TEST_MODEL_ID, &options(0.7)).await.unwrap();
 
         // First rerun.
-        run_reflector_rerun(&pool, &extractor, &options(0.7), None).await.unwrap();
+        run_reflector_rerun(&pool, &extractor, TEST_MODEL_ID, &options(0.7), None).await.unwrap();
         let snap1 = sqlx::query!(
             r#"SELECT id, statement, superseded_at FROM facts ORDER BY id"#
         )
@@ -1093,7 +1134,7 @@ mod tests {
         .unwrap();
 
         // Second rerun.
-        run_reflector_rerun(&pool, &extractor, &options(0.7), None).await.unwrap();
+        run_reflector_rerun(&pool, &extractor, TEST_MODEL_ID, &options(0.7), None).await.unwrap();
         let snap2 = sqlx::query!(
             r#"SELECT id, statement, superseded_at FROM facts ORDER BY id"#
         )
@@ -1119,7 +1160,7 @@ mod tests {
         cap(&pool, "personal thought", "personal").await;
 
         let v1 = FakeExtractor::with_confidence(0.9);
-        run_reflector_once(&pool, &v1, &options(0.7)).await.unwrap();
+        run_reflector_once(&pool, &v1, TEST_MODEL_ID, &options(0.7)).await.unwrap();
 
         // Rerun scoped to "work" with a since cutoff in the past — should
         // process only the work thought.
@@ -1131,7 +1172,9 @@ mod tests {
         let mut opts = options(0.7);
         opts.scope_filter = Some("work".to_string());
         let since = OffsetDateTime::now_utc() - time::Duration::days(1);
-        let report = run_reflector_rerun(&pool, &v2, &opts, Some(since)).await.unwrap();
+        let report = run_reflector_rerun(&pool, &v2, TEST_MODEL_ID, &opts, Some(since))
+            .await
+            .unwrap();
         assert_eq!(report.n_thoughts_processed, 1);
     }
 
@@ -1161,7 +1204,7 @@ mod tests {
     async fn reflector_skips_thought_with_extract_none(pool: PgPool) {
         cap_with_extract(&pool, "skip-this thought", "global", "none").await;
         let e = FakeExtractor::with_confidence(0.9);
-        let report = run_reflector_once(&pool, &e, &options(0.7)).await.unwrap();
+        let report = run_reflector_once(&pool, &e, TEST_MODEL_ID, &options(0.7)).await.unwrap();
         assert_eq!(report.n_thoughts_processed, 1);
         assert_eq!(report.n_facts_committed, 0);
 
@@ -1183,7 +1226,7 @@ mod tests {
     async fn reflector_propagates_durable_only_via_context(pool: PgPool) {
         cap_with_extract(&pool, "mixed content thought", "global", "durable-only").await;
         let e = FakeExtractor::with_confidence(0.9);
-        run_reflector_once(&pool, &e, &options(0.7)).await.unwrap();
+        run_reflector_once(&pool, &e, TEST_MODEL_ID, &options(0.7)).await.unwrap();
 
         let ctx = e
             .last_ctx()
@@ -1198,7 +1241,7 @@ mod tests {
     async fn reflector_treats_absent_extract_as_all(pool: PgPool) {
         cap(&pool, "plain thought, no metadata flag", "global").await;
         let e = FakeExtractor::with_confidence(0.9);
-        run_reflector_once(&pool, &e, &options(0.7)).await.unwrap();
+        run_reflector_once(&pool, &e, TEST_MODEL_ID, &options(0.7)).await.unwrap();
 
         let ctx = e
             .last_ctx()
@@ -1238,7 +1281,7 @@ mod tests {
                 confidence: 0.9,
             },
         ]);
-        run_reflector_once(&pool, &e, &options(0.7)).await.unwrap();
+        run_reflector_once(&pool, &e, TEST_MODEL_ID, &options(0.7)).await.unwrap();
 
         // Exactly one active row remains; the other is superseded.
         let active = sqlx::query!(
@@ -1265,5 +1308,64 @@ mod tests {
             Some(active[0].id),
             "superseded row should link to the canonical (active) row"
         );
+    }
+
+    // -- M3 Phase B step 1: reflector enqueues fact embeddings ---------------
+
+    /// After every fact insert inside `commit_or_supersede`, the reflector
+    /// should enqueue a `pending_embeddings` row for the new fact under the
+    /// active embedder model_id. The no-op-floor branch (byte-identical
+    /// match exists) must NOT enqueue (no new fact written).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn reflector_enqueues_fact_embedding_after_commit_or_supersede(pool: PgPool) {
+        cap(&pool, "anchor thought", "global").await;
+        let e = FakeExtractor::with_facts(vec![
+            ExtractedFact {
+                statement: "first claim".into(),
+                subject: Some("a".into()),
+                predicate: Some("rel".into()),
+                object: Some("b".into()),
+                confidence: 0.9,
+            },
+            ExtractedFact {
+                statement: "second claim".into(),
+                subject: None,
+                predicate: None,
+                object: None,
+                confidence: 0.9,
+            },
+        ]);
+        run_reflector_once(&pool, &e, TEST_MODEL_ID, &options(0.7))
+            .await
+            .unwrap();
+
+        // Two fact rows committed → two pending_embeddings rows under
+        // target_kind='fact' with the right model_id.
+        let n_fact_pending = sqlx::query!(
+            r#"SELECT COUNT(*) AS "n!" FROM pending_embeddings
+               WHERE target_kind = 'fact' AND model_id = $1"#,
+            TEST_MODEL_ID,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .n;
+        assert_eq!(n_fact_pending, 2);
+
+        // Second rerun against the same extractor → byte-identical match,
+        // no-op floor fires, no new pending row.
+        run_reflector_rerun(&pool, &e, TEST_MODEL_ID, &options(0.7), None)
+            .await
+            .unwrap();
+        let after = sqlx::query!(
+            r#"SELECT COUNT(*) AS "n!" FROM pending_embeddings
+               WHERE target_kind = 'fact' AND model_id = $1"#,
+            TEST_MODEL_ID,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .n;
+        assert_eq!(after, n_fact_pending, "no-op floor must not enqueue");
     }
 }

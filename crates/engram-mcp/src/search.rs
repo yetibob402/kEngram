@@ -95,6 +95,11 @@ pub struct SearchFactHit {
 #[derive(Debug, Clone)]
 pub struct SearchFactsResponse {
     pub results: Vec<SearchFactHit>,
+    /// `false` when the embedder failed (couldn't embed the query, or the
+    /// vector kNN query errored) and the response is trigram-only. Mirrors
+    /// `SearchResponse.vector_search_available` so clients can warn about
+    /// degraded retrieval.
+    pub vector_search_available: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -236,6 +241,7 @@ pub async fn get_thought(
 /// when the reflector ran, not when the underlying thought was captured).
 pub async fn search_facts(
     pool: &PgPool,
+    embedder: &dyn Embedder,
     request: SearchFactsRequest,
 ) -> Result<SearchFactsResponse, ReadError> {
     if request.query.is_empty() {
@@ -250,7 +256,42 @@ pub async fn search_facts(
     }
     let scope_filter = request.scope.as_ref().map(Scope::as_str);
 
-    let mut hits = engram_storage::search_facts_trigram(
+    // Vector leg (soft-fail to empty + flag), mirroring `search_thoughts`.
+    let (vector_hits, vector_search_available) =
+        match embedder.embed(std::slice::from_ref(&request.query)).await {
+            Ok(mut vectors) => {
+                let v = vectors
+                    .pop()
+                    .expect("non-empty input must yield at least one vector");
+                match engram_storage::search_facts_vector_knn(
+                    pool,
+                    v,
+                    embedder.model(),
+                    scope_filter,
+                    DEFAULT_TOP_K_PER_LEG as i64,
+                )
+                .await
+                {
+                    Ok(hits) => (hits, true),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "fact vector kNN query failed; falling back to trigram only"
+                        );
+                        (vec![], false)
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "embedder failed to embed query for facts; falling back to trigram only"
+                );
+                (vec![], false)
+            }
+        };
+
+    let trigram_hits = engram_storage::search_facts_trigram(
         pool,
         &request.query,
         scope_filter,
@@ -258,30 +299,30 @@ pub async fn search_facts(
     )
     .await?;
 
-    // Recency boost keyed on the source thought's created_at. With only one
-    // ranking leg, RRF normalization is identity, so we skip rrf_fuse and
-    // apply the boost directly to the trigram score. When M3 adds the
-    // vector leg, this becomes a real fuse-then-boost pipeline; we'll need
-    // to refactor `rrf_fuse` to be generic (or fold FactHit through a
-    // ranking abstraction) at that point.
+    // RRF fuse → recency boost → truncate. `rrf_fuse` in engram-core is
+    // hardcoded for `Hit { thought, score }`; the fact-side fuse is the
+    // same algorithm keyed on `fact.id` instead. Inline here rather than
+    // generic-ifying engram-core's primitive — Phase B step 1 doesn't yet
+    // need fact-aware fusion anywhere else.
+    let mut fused = rrf_fuse_facts(vec![vector_hits, trigram_hits], DEFAULT_RRF_K);
     let half_life = request
         .recency_half_life_days
         .unwrap_or(DEFAULT_RECENCY_HALF_LIFE_DAYS);
     if half_life > 0.0 {
         let now = OffsetDateTime::now_utc();
-        for h in hits.iter_mut() {
+        for h in fused.iter_mut() {
             let age_secs = (now - h.source_thought_created_at).whole_seconds() as f32;
             let age_days = age_secs / 86_400.0;
             h.score *= 0.5_f32.powf(age_days / half_life);
         }
-        hits.sort_by(|a, b| {
+        fused.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
     }
 
-    let results: Vec<SearchFactHit> = hits
+    let results: Vec<SearchFactHit> = fused
         .into_iter()
         .take(limit)
         .map(|h| SearchFactHit {
@@ -299,7 +340,49 @@ pub async fn search_facts(
         })
         .collect();
 
-    Ok(SearchFactsResponse { results })
+    Ok(SearchFactsResponse {
+        results,
+        vector_search_available,
+    })
+}
+
+/// Fact-side analogue of `engram_core::search::rrf_fuse`, keyed on
+/// `fact.id` instead of `thought.id`. Same reciprocal-rank-fusion algorithm
+/// (`score = Σ 1 / (k + rank_i)`). Inline because `rrf_fuse` in engram-core
+/// is `Hit`-specific and Phase B step 1 is the only place that needs
+/// fact-aware fusion right now.
+fn rrf_fuse_facts(
+    rankings: Vec<Vec<engram_storage::FactHit>>,
+    k: f32,
+) -> Vec<engram_storage::FactHit> {
+    use std::collections::HashMap;
+    let mut acc: HashMap<uuid::Uuid, (engram_storage::FactHit, f32)> = HashMap::new();
+    for ranking in rankings {
+        for (i, hit) in ranking.into_iter().enumerate() {
+            let rank = (i + 1) as f32;
+            let contribution = 1.0 / (k + rank);
+            let id = hit.fact.id;
+            match acc.get_mut(&id) {
+                Some((_, s)) => *s += contribution,
+                None => {
+                    acc.insert(id, (hit, contribution));
+                }
+            }
+        }
+    }
+    let mut fused: Vec<engram_storage::FactHit> = acc
+        .into_values()
+        .map(|(mut hit, score)| {
+            hit.score = score;
+            hit
+        })
+        .collect();
+    fused.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    fused
 }
 
 #[cfg(test)]
@@ -543,6 +626,7 @@ mod tests {
 
         let resp = search_facts(
             &pool,
+            &FakeEmbedder::new(),
             SearchFactsRequest {
                 query: "pgvector".to_string(),
                 scope: None,
@@ -572,6 +656,7 @@ mod tests {
         // Visible before supersede.
         let before = search_facts(
             &pool,
+            &FakeEmbedder::new(),
             SearchFactsRequest {
                 query: "widgets".to_string(),
                 scope: None,
@@ -587,6 +672,7 @@ mod tests {
 
         let after = search_facts(
             &pool,
+            &FakeEmbedder::new(),
             SearchFactsRequest {
                 query: "widgets".to_string(),
                 scope: None,
@@ -603,6 +689,7 @@ mod tests {
     async fn search_facts_empty_query_errors(pool: PgPool) {
         let err = search_facts(
             &pool,
+            &FakeEmbedder::new(),
             SearchFactsRequest {
                 query: String::new(),
                 scope: None,
@@ -619,6 +706,7 @@ mod tests {
     async fn search_facts_limit_out_of_bounds_errors(pool: PgPool) {
         let err = search_facts(
             &pool,
+            &FakeEmbedder::new(),
             SearchFactsRequest {
                 query: "x".to_string(),
                 scope: None,
@@ -640,6 +728,7 @@ mod tests {
 
         let resp = search_facts(
             &pool,
+            &FakeEmbedder::new(),
             SearchFactsRequest {
                 query: "widget".to_string(),
                 scope: Some(Scope::new("work").unwrap()),
@@ -686,5 +775,107 @@ mod tests {
         let resp = get_thought(&pool, embedder.model(), id).await.unwrap();
         assert_eq!(resp.linked_facts.len(), 1);
         assert_eq!(resp.linked_facts[0].statement, "alive");
+    }
+
+    // -- M3 Phase B step 1: search_facts vector leg ---------------------------
+
+    /// Embed a fact via the embed pipeline: insert the fact, enqueue, drain.
+    /// Returns the new fact's id.
+    async fn insert_fact_and_embed(
+        pool: &PgPool,
+        embedder: &dyn Embedder,
+        thought_id: engram_core::ThoughtId,
+        scope: &str,
+        statement: &str,
+    ) -> uuid::Uuid {
+        let fact_id = insert_test_fact(
+            pool,
+            thought_id,
+            scope,
+            statement,
+            (None, None, None),
+            0.9,
+        )
+        .await;
+        engram_storage::enqueue_embedding(
+            pool,
+            engram_storage::target::FACT,
+            fact_id,
+            &embedder.model().id,
+        )
+        .await
+        .unwrap();
+        drain_pending_embeddings(pool, embedder, 16).await.unwrap();
+        fact_id
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_facts_returns_results_from_vector_leg(pool: PgPool) {
+        let embedder = FakeEmbedder::new();
+        let id = cap(&pool, "anchor thought", "global").await;
+        let fact_id = insert_fact_and_embed(
+            &pool,
+            &embedder,
+            id,
+            "global",
+            "semantic-only payload that wouldn't trigram-match the query terms",
+        )
+        .await;
+
+        // Query has zero token overlap with the statement, so trigram alone
+        // wouldn't surface this fact. FakeEmbedder produces a deterministic
+        // vector per query string; if both sides go through it, the query
+        // vector and fact vector live in the same space — the kNN finds it.
+        let resp = search_facts(
+            &pool,
+            &embedder,
+            SearchFactsRequest {
+                query: "completely unrelated lexically".to_string(),
+                scope: None,
+                limit: None,
+                recency_half_life_days: Some(0.0),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(resp.vector_search_available);
+        assert!(
+            resp.results.iter().any(|h| h.fact_id == fact_id),
+            "vector leg should surface the embedded fact even with no lexical overlap"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_facts_response_carries_vector_search_available_flag(pool: PgPool) {
+        let healthy = FakeEmbedder::new();
+        cap(&pool, "a thought", "global").await;
+        let ok_resp = search_facts(
+            &pool,
+            &healthy,
+            SearchFactsRequest {
+                query: "anything".to_string(),
+                scope: None,
+                limit: None,
+                recency_half_life_days: Some(0.0),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(ok_resp.vector_search_available);
+
+        let broken = FakeEmbedder::always_failing(EmbeddingModel::bge_m3(), FakeBehavior::Unreachable);
+        let degraded_resp = search_facts(
+            &pool,
+            &broken,
+            SearchFactsRequest {
+                query: "anything".to_string(),
+                scope: None,
+                limit: None,
+                recency_half_life_days: Some(0.0),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!degraded_resp.vector_search_available);
     }
 }

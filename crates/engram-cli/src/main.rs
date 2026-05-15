@@ -6,7 +6,7 @@ mod config;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use engram_core::{Embedder, EmbeddingModel, Extractor};
 use engram_embed::{OpenAICompatibleConfig, OpenAICompatibleEmbedder};
 use engram_extract::{
@@ -43,14 +43,20 @@ enum Command {
     /// (M2 Phase C adds the reflector cron as a second task in the same
     /// process.) Knobs live in `[worker]` config — no CLI flags needed.
     Worker,
-    /// Embed thoughts that don't yet have an embedding row for the active model.
+    /// Embed thoughts and/or facts that don't yet have an embedding row for the active model.
     EmbedBackfill {
         /// Restrict to a single scope.
         #[arg(long)]
         scope: Option<String>,
-        /// Maximum number of thoughts to embed in this run. Defaults to 1000.
+        /// Maximum number of items to embed in this run. Defaults to 1000.
+        /// With `--target all` the limit applies independently to each kind.
         #[arg(long, default_value_t = 1000)]
         limit: i64,
+        /// Which embedding targets to backfill. `thoughts` (pre-M3 default),
+        /// `facts` (Phase B addition for the fact-embedding seam), or `all`
+        /// (M3 default — covers both).
+        #[arg(long, value_enum, default_value_t = BackfillTarget::All)]
+        target: BackfillTarget,
     },
     /// One-shot reflector run. By default acts on unfacted thoughts (same as
     /// the worker's cron tick). With --rerun, re-evaluates already-facted
@@ -265,9 +271,16 @@ async fn run_worker(config: Config) -> anyhow::Result<()> {
         let reflector_options = config.reflector.clone();
         let schedule = reflector_options.schedule.clone();
         let model_id = extractor.model_id().to_string();
+        let embedder_model_id_for_reflector = config.embedder.model_id.clone();
         set.spawn(async move {
             if let Err(err) =
-                reflector_loop(reflector_pool, extractor, reflector_options, reflector_cancel)
+                reflector_loop(
+                reflector_pool,
+                extractor,
+                embedder_model_id_for_reflector,
+                reflector_options,
+                reflector_cancel,
+            )
                     .await
             {
                 tracing::error!(error = ?err, "reflector loop exited with error");
@@ -311,6 +324,7 @@ async fn run_worker(config: Config) -> anyhow::Result<()> {
 async fn reflector_loop(
     pool: sqlx::PgPool,
     extractor: Arc<dyn Extractor>,
+    embedder_model_id: String,
     options: ReflectorOptions,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
@@ -321,12 +335,21 @@ async fn reflector_loop(
     let pool_for_job = pool.clone();
     let extractor_for_job = extractor.clone();
     let options_for_job = options.clone();
+    let embedder_model_id_for_job = embedder_model_id.clone();
     let job = Job::new_async(options.schedule.as_str(), move |_uuid, _l| {
         let pool = pool_for_job.clone();
         let extractor = extractor_for_job.clone();
         let options = options_for_job.clone();
+        let embedder_model_id = embedder_model_id_for_job.clone();
         Box::pin(async move {
-            match engram_mcp::run_reflector_once(&pool, extractor.as_ref(), &options).await {
+            match engram_mcp::run_reflector_once(
+                &pool,
+                extractor.as_ref(),
+                &embedder_model_id,
+                &options,
+            )
+            .await
+            {
                 Ok(r) => tracing::info!(
                     run_id = %r.run_id,
                     processed = r.n_thoughts_processed,
@@ -386,10 +409,31 @@ async fn embed_drainer_loop(
     }
 }
 
+/// CLI-side mirror of `engram_mcp::BackfillTarget` with `clap::ValueEnum`
+/// derive so it can serve as a `--target` flag. Converted to the engram-mcp
+/// shape at the call site (one-line `From` impl below).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BackfillTarget {
+    Thoughts,
+    Facts,
+    All,
+}
+
+impl From<BackfillTarget> for engram_mcp::BackfillTarget {
+    fn from(t: BackfillTarget) -> Self {
+        match t {
+            BackfillTarget::Thoughts => engram_mcp::BackfillTarget::Thoughts,
+            BackfillTarget::Facts => engram_mcp::BackfillTarget::Facts,
+            BackfillTarget::All => engram_mcp::BackfillTarget::All,
+        }
+    }
+}
+
 async fn run_embed_backfill(
     config: Config,
     scope: Option<String>,
     limit: i64,
+    target: BackfillTarget,
 ) -> anyhow::Result<()> {
     let pool = PgPoolOptions::new()
         .max_connections(config.database.max_connections)
@@ -399,8 +443,14 @@ async fn run_embed_backfill(
 
     let embedder = build_embedder(&config.embedder)?;
 
-    let report =
-        engram_mcp::embed_backfill(&pool, embedder.as_ref(), scope.as_deref(), limit).await?;
+    let report = engram_mcp::embed_backfill(
+        &pool,
+        embedder.as_ref(),
+        scope.as_deref(),
+        limit,
+        target.into(),
+    )
+    .await?;
 
     tracing::info!(
         healed = report.healed,
@@ -445,6 +495,7 @@ async fn run_reflect(
         .await
         .with_context(|| format!("connecting to {}", config.database.url))?;
     let extractor = build_extractor(&config.extractor)?;
+    let embedder_model_id = config.embedder.model_id.clone();
 
     // CLI flags override config defaults.
     let mut options = config.reflector.clone();
@@ -462,14 +513,22 @@ async fn run_reflect(
             since = ?parsed_since,
             "engram reflect --rerun starting",
         );
-        engram_mcp::run_reflector_rerun(&pool, extractor.as_ref(), &options, parsed_since).await?
+        engram_mcp::run_reflector_rerun(
+            &pool,
+            extractor.as_ref(),
+            &embedder_model_id,
+            &options,
+            parsed_since,
+        )
+        .await?
     } else {
         tracing::info!(
             scope = ?options.scope_filter,
             limit = options.max_thoughts_per_run,
             "engram reflect starting",
         );
-        engram_mcp::run_reflector_once(&pool, extractor.as_ref(), &options).await?
+        engram_mcp::run_reflector_once(&pool, extractor.as_ref(), &embedder_model_id, &options)
+            .await?
     };
 
     tracing::info!(
@@ -502,7 +561,11 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve => run_serve(config).await,
         Command::Migrate => run_migrate(config).await,
         Command::Worker => run_worker(config).await,
-        Command::EmbedBackfill { scope, limit } => run_embed_backfill(config, scope, limit).await,
+        Command::EmbedBackfill {
+            scope,
+            limit,
+            target,
+        } => run_embed_backfill(config, scope, limit, target).await,
         Command::Reflect { scope, limit, rerun, since } => {
             run_reflect(config, scope, limit, rerun, since).await
         }

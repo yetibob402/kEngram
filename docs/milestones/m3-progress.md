@@ -51,13 +51,45 @@ End state: dogfood-driven SPO bugs corrected at the prompt level; within-call de
 
 ## Phase B — Retrieval quality
 
-Not yet planned. Items (per `m3-search-quality.md`):
+Three commits per Phase B plan (2026-05-14):
+
+### Step 1 — Fact embeddings
+
+End state: facts have embeddings flowing through the same async-embedding seam as thoughts; `search_facts` runs as real hybrid retrieval (vector + trigram fused via RRF).
+
+- [x] `engram-storage`: `insert_fact_embedding` convenience wrapper.
+- [x] `engram-storage`: `search_facts_vector_knn` mirroring `search_vector_knn` (joins facts + thoughts; cosine-distance ordered; filters active rows; per-model HNSW partial index already exists from migration 0001).
+- [x] `engram-storage`: `enqueue_unembedded_facts` heal-side companion to `enqueue_unembedded_thoughts`.
+- [x] `engram-mcp/drain`: `process_job` dispatches on `target_kind`: thoughts via the existing path, facts via `fetch_fact` + embed + `insert_fact_embedding`, anything else is `UnsupportedTargetKind` (preserves `artifact_chunk` future-proofing).
+- [x] `engram-mcp/reflect`: `run_reflector_once` and `run_reflector_rerun` gain an `embedder_model_id: &str` parameter; `commit_or_supersede` plumbs it through and enqueues a `target_kind='fact'` row in `pending_embeddings` after every fact insert. No-op-floor branch does NOT enqueue (no new fact written → the byte-identical existing row was already enqueued at its original insert).
+- [x] `engram-mcp/search`: `search_facts` gains `embedder: &dyn Embedder` parameter + a real vector leg + `vector_search_available: bool` on the response. Inline `rrf_fuse_facts` mirrors `engram-core::rrf_fuse` keyed on `fact.id`.
+- [x] `engram-mcp/server`: `search_facts` tool handler passes `self.embedder.as_ref()` through; `search_facts_response_json` carries `vector_search_available`.
+- [x] `engram-cli`: `embed-backfill` gains `--target {thoughts,facts,all}` flag, defaulting to `all`. `run_embed_backfill` plumbs through to `embed_backfill(target.into())`.
+- [x] `engram-mcp::BackfillTarget` enum (engram-mcp-side; engram-cli has a clap-derived mirror with one-line `From` impl).
+- [x] `cargo test --workspace`: 244 passing (235 today + 9 new).
+- [x] `cargo clippy --all-targets -- -D warnings`: clean.
+
+**Operator-driven (post-merge):**
+
+- [ ] `engram embed-backfill --target facts --limit 1000` once against the live DB to backfill pre-Phase-B facts.
+- [ ] Capture a thought; wait for reflector tick; verify via psql that `embeddings WHERE target_kind = 'fact'` grew by the right amount.
+- [ ] MCP `search_facts` with a query that has zero token overlap with any fact's statement but is semantically related — confirm hits come back from the vector leg.
+
+### Step 2 — Cross-encoder reranker + rerank stage
+
+Not yet planned.
 
 - [ ] Cross-encoder reranker + TEI rerank-task deployment (L)
 - [ ] Rerank stage in `search_thoughts` / `search_facts`
 - [ ] Per-call rerank parameters (`rerank?: bool`, `candidate_pool?: int`)
-- [ ] Fact embeddings (extend async-embedding seam; `target_kind = 'fact'`)
-- [ ] Eval-suite-style A/B comparison harness
+
+### Step 3 — A/B benchmarking harness
+
+Not yet planned.
+
+- [ ] `engram bench rerank` CLI subcommand reading fixture file
+- [ ] Curated fixture corpus at `tests/fixtures/rerank-bench.json` (~30-50 query/expected-hit pairs)
+- [ ] nDCG@10 comparison table output
 
 ## Phase C — Deeper pipeline quality
 
@@ -83,6 +115,8 @@ Not yet planned. Items:
 Dated notes appended as items land. Format: `YYYY-MM-DD — <one-line summary>`. Multi-line entries fine for decisions that need explanation.
 
 <!-- Most recent entry first. -->
+
+- **2026-05-14** — **M3 Phase B step 1 landed: fact embeddings.** Closes M2 Phase D's deferred simplification — `search_facts` now runs as real hybrid retrieval (vector + trigram fused via RRF) instead of trigram-only. Three new storage primitives (`insert_fact_embedding`, `search_facts_vector_knn`, `enqueue_unembedded_facts`), drain-side fact dispatch in `process_job` (clean match on `target_kind` between thoughts and facts; `artifact_chunk` future-proofing preserved), reflector enqueues fact embeddings via the same `enqueue_embedding(target::FACT, ...)` pattern that `capture` uses for thoughts, `search_facts` gains an `embedder` parameter + `vector_search_available` response field + an inline fact-aware RRF fuse (kept `engram-core::rrf_fuse` Hit-specific since Phase B step 1 is the only fact-fusion site so far), and `embed-backfill --target {thoughts,facts,all}` lets operators heal pre-Phase-B facts on-demand. Test count 235 → 244 (+9 new: storage +3, drain +2, reflect +1, search +2, backfill +1). Build, test, clippy all green. No migration. Next: Phase B step 2 (cross-encoder reranker + TEI Docker + rerank stage in both search tools) — its own planning conversation.
 
 - **2026-05-14** — **M3 Phase A closed out.** Validated Phase A via dogfood `engram reflect --rerun` against v3 prompt + `qwen3-coder:30b` (54 commits, 11 thoughts, 1 review-queue routing, 0 failures). Pipeline plumbing all works — v3 prompt content is being sent (logged `system_prompt=bundled`), `commit_or_supersede` is folding statement-matched drift into canonicals via supersession, the new review-queue routing fires when confidence drops below 0.7. Two operator-discovered bugs fixed in follow-up commit `1d627e4` (cosmetic hardcoded "60s" timeout display + missing config-resolution startup log). Detected limitations of v3 prompt under `qwen3-coder:30b`: SPO inversion / self-referential triples / compound-statement-multi-decomp not reliably suppressed. Documented in `## Pipeline quality` of m3-search-quality.md as a new "Quality-aware dedup for within-call duplicates" backlog item. v3-prompt-effectiveness across models is Phase B A/B-harness territory; Phase A's success criterion ("v3 prompt is in the binary, dedup pipeline works") is met. Brief detour to evaluate `qwen3.5:35b-a3b-coding-nvfp4` ran into 180s timeouts (nvfp4 isn't Metal-accelerated on Apple Silicon); reverted. Phase A is in the books.
 

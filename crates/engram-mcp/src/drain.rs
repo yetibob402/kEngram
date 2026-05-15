@@ -112,24 +112,51 @@ async fn process_job(
         });
     }
 
-    if job.target_kind != engram_storage::target::THOUGHT {
-        return Err(JobError::UnsupportedTargetKind(job.target_kind.clone()));
-    }
+    // Resolve the text to embed and the insert path by `target_kind`. Both
+    // branches share the embed → insert → mark_embedded shape; the only
+    // difference is which DB row provides the input text and which
+    // `insert_*_embedding` wrapper receives the vector.
+    let text = match job.target_kind.as_str() {
+        engram_storage::target::THOUGHT => {
+            let thought_id = ThoughtId::from(job.target_id);
+            let thought = engram_storage::fetch_thought(pool, thought_id)
+                .await
+                .map_err(JobError::Storage)?
+                .ok_or(JobError::SourceMissing)?;
+            thought.content
+        }
+        engram_storage::target::FACT => {
+            let fact = engram_storage::fetch_fact(pool, job.target_id)
+                .await
+                .map_err(JobError::Storage)?
+                .ok_or(JobError::SourceMissing)?;
+            fact.statement
+        }
+        _ => return Err(JobError::UnsupportedTargetKind(job.target_kind.clone())),
+    };
 
-    let thought_id = ThoughtId::from(job.target_id);
-    let thought = engram_storage::fetch_thought(pool, thought_id)
-        .await
-        .map_err(JobError::Storage)?
-        .ok_or(JobError::SourceMissing)?;
-
-    let texts = vec![thought.content.clone()];
+    let texts = vec![text];
     let mut vectors = embedder.embed(&texts).await.map_err(JobError::Embedder)?;
     let vector = vectors.pop().ok_or(JobError::EmptyEmbedderOutput)?;
     let embedding = Embedding::new(embedder.model().clone(), vector).map_err(JobError::Embedding)?;
 
-    engram_storage::insert_thought_embedding(pool, thought_id, &embedding)
-        .await
-        .map_err(JobError::Storage)?;
+    match job.target_kind.as_str() {
+        engram_storage::target::THOUGHT => {
+            engram_storage::insert_thought_embedding(
+                pool,
+                ThoughtId::from(job.target_id),
+                &embedding,
+            )
+            .await
+            .map_err(JobError::Storage)?;
+        }
+        engram_storage::target::FACT => {
+            engram_storage::insert_fact_embedding(pool, job.target_id, &embedding)
+                .await
+                .map_err(JobError::Storage)?;
+        }
+        _ => unreachable!("target_kind validated above"),
+    }
 
     engram_storage::mark_embedded(pool, job.id)
         .await
@@ -274,5 +301,117 @@ mod tests {
         assert_eq!(report.found, 0);
         assert_eq!(report.embedded, 0);
         assert_eq!(report.failed, 0);
+    }
+
+    // -- M3 Phase B step 1: fact dispatch in process_job ----------------------
+
+    /// Helper: insert a fact and enqueue an embedding for it, bypassing the
+    /// reflector. Returns the new fact's id.
+    async fn enqueue_fact(pool: &PgPool, statement: &str) -> uuid::Uuid {
+        let scope = Scope::new("global").unwrap();
+        let thought_id = capture_one(pool, "anchor thought").await;
+        let run_id = engram_storage::start_run(pool, "fake/extractor", 1, None)
+            .await
+            .unwrap();
+        let fact_id = engram_storage::insert_fact(
+            pool,
+            engram_storage::NewFact {
+                scope: &scope,
+                statement,
+                subject: None,
+                predicate: None,
+                object: None,
+                source_thought_id: thought_id,
+                extractor_model: "fake/extractor",
+                extractor_version: 1,
+                source_run_id: Some(run_id),
+                confidence: 0.9,
+            },
+        )
+        .await
+        .unwrap();
+        engram_storage::enqueue_embedding(
+            pool,
+            engram_storage::target::FACT,
+            fact_id,
+            TEST_MODEL_ID,
+        )
+        .await
+        .unwrap();
+        fact_id
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drain_processes_fact_pending_to_embedding(pool: PgPool) {
+        let fact_id = enqueue_fact(&pool, "Engram uses pgvector").await;
+
+        let good = FakeEmbedder::new();
+        let report = drain_pending_embeddings(&pool, &good, 10).await.unwrap();
+        // capture_one also enqueued the source thought → 2 jobs found, 2 embedded.
+        assert!(report.found >= 1);
+        assert!(report.embedded >= 1);
+        assert_eq!(report.failed, 0);
+
+        // Fact row landed under target_kind='fact'.
+        let n = sqlx::query!(
+            r#"SELECT COUNT(*) AS "n!" FROM embeddings
+               WHERE target_kind = 'fact' AND target_id = $1 AND model_id = $2"#,
+            fact_id,
+            TEST_MODEL_ID,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .n;
+        assert_eq!(n, 1, "fact embedding should be present after drain");
+
+        // pending row removed.
+        let pending = sqlx::query!(
+            r#"SELECT COUNT(*) AS "n!" FROM pending_embeddings
+               WHERE target_kind = 'fact' AND target_id = $1"#,
+            fact_id,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .n;
+        assert_eq!(pending, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drain_marks_failed_when_fact_target_missing(pool: PgPool) {
+        // Enqueue a pending row for a fact_id that doesn't exist.
+        let bogus = uuid::Uuid::new_v4();
+        engram_storage::enqueue_embedding(
+            &pool,
+            engram_storage::target::FACT,
+            bogus,
+            TEST_MODEL_ID,
+        )
+        .await
+        .unwrap();
+
+        let good = FakeEmbedder::new();
+        let report = drain_pending_embeddings(&pool, &good, 10).await.unwrap();
+        assert_eq!(report.found, 1);
+        assert_eq!(report.embedded, 0);
+        assert_eq!(report.failed, 1);
+
+        // Row stays in the queue with last_error set (SourceMissing).
+        let row = sqlx::query!(
+            r#"SELECT last_error FROM pending_embeddings
+               WHERE target_kind = 'fact' AND target_id = $1"#,
+            bogus,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            row.last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("source thought no longer exists")),
+            "expected SourceMissing-derived error, got {:?}",
+            row.last_error
+        );
     }
 }

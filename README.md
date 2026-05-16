@@ -304,12 +304,14 @@ a custom prompt is in use, naming the active `model_version`.
 
 ```toml
 [reflector]
-enabled               = true
-schedule              = "0 0 3 * * *"   # 6-field cron (sec min hour dom month dow). 03:00 daily.
-review_queue_below    = 0.7             # confidence < this → facts_review_queue; ≥ → facts
-scope_filter          = ""               # leave blank for all scopes
-max_thoughts_per_run  = 1000
-max_facts_per_thought = 8
+enabled                  = true
+schedule                 = "0 0 3 * * *"   # 6-field cron (sec min hour dom month dow). 03:00 daily.
+review_queue_below       = 0.7             # confidence < this → facts_review_queue; ≥ → facts
+min_confidence_to_store  = 0.85            # confidence in [review_queue_below, this) → facts with flagged=true; ≥ → flagged=false. Set equal to review_queue_below to collapse to two-band (M3 Phase C).
+subsumption_keep         = "specific"      # when (subject, predicate) matches and one object refines another, keep "specific" (default) or "general" (M3 Phase C).
+scope_filter             = ""              # leave blank for all scopes
+max_thoughts_per_run     = 1000
+max_facts_per_thought    = 8
 ```
 
 For development, tighten the schedule to something like `"*/30 * * * * *"` (every 30 seconds) and watch the worker logs. Alternatively, drive a one-shot pass without waiting for cron:
@@ -407,6 +409,120 @@ The response shape gains two additions (additive — existing consumers ignore u
 - **`rerank: false` per-request override** → skip rerank for that call only. `rerank_used: false`.
 
 This matches the embedder's degradation pattern: a missing or down sidecar narrows quality, never blocks search.
+
+## Configuration reference
+
+Engram's configuration lives in a single TOML file. Defaults are baked into the binary; the file overrides them; environment variables override the file. The task-oriented sections above ([embedder](#configuring-the-embedding-backend), [extractor](#configuring-the-extractor-backend-m2), [reranker](#reranking-search-results)) show minimal blocks for setting up each backend; this section is the canonical reference for every section and every field.
+
+### File location and overrides
+
+| Precedence | Source | Notes |
+|---|---|---|
+| 1 (highest) | `ENGRAM_*` environment variables | Nested via `__` (e.g. `ENGRAM_DATABASE__URL`, `ENGRAM_REFLECTOR__SCHEDULE`). One-off overrides without editing the file. |
+| 2 | `--config <path>` CLI argument | `engram --config ./my-engram.toml serve` |
+| 3 | `~/.config/engram/engram.toml` | Default lookup path on macOS / Linux. |
+| 4 (lowest) | Built-in defaults | Encoded in `crates/engram-cli/src/config.rs`. Everything is optional in the file. |
+
+### Annotated example (every field)
+
+This is the complete config surface as of M3 Phase C. Every field is optional — omit any line to take the built-in default. Sections themselves are optional too (an empty `engram.toml` boots a working dev server against local Postgres + Ollama).
+
+```toml
+[server]
+bind = "127.0.0.1:8080"                   # SocketAddr to bind. 0.0.0.0 to listen on all interfaces.
+
+[database]
+url             = "postgres://engram:engram@localhost:5432/engram"
+max_connections = 10                      # sqlx connection pool ceiling.
+
+[embedder]
+provider        = "openai-compatible"     # only valid value today; covers Ollama, TEI, OpenAI, Voyage, …
+endpoint        = "http://localhost:11434/v1"   # OpenAI-compatible /v1/embeddings root.
+model           = "bge-m3"                # The name the backend serves (passed in the request payload).
+model_id        = "bge-m3:1024"           # Engram's stable provenance label. Must match an HNSW partial index (the M1 migration ships one for `bge-m3:1024`).
+dimensions      = 1024                    # Output vector dimensionality. Must match the model.
+api_key         = ""                      # Optional bearer token for hosted endpoints. Leave blank for Ollama / TEI.
+timeout_seconds = 5
+
+[reranker]                                # M3 Phase B step 2; opt-in. Omit the entire section to disable.
+provider        = "tei"                   # "" = disabled (default if the section is present but provider is empty); "tei" = TEI sidecar.
+endpoint        = "http://localhost:8080" # No /v1 suffix; the impl appends /rerank.
+model_id        = "cross-encoder/ms-marco-MiniLM-L-6-v2"   # MiniLM for Mac dev (~22M params, ONNX-fast); BAAI/bge-reranker-v2-m3 for GPU prod.
+timeout_seconds = 30
+
+[worker]
+tick_interval_seconds = 5                 # How often `engram worker` drains the pending_embeddings queue.
+batch_size            = 16                # Max jobs per tick.
+
+[extractor]                               # M2+; only consulted when [reflector].enabled = true.
+provider              = "openai-compatible"   # also "openrouter" for the cloud preset.
+endpoint              = "http://localhost:8000/v1"   # vLLM default; "https://openrouter.ai/api/v1" for OpenRouter.
+model_name            = "qwen2.5-7b-instruct"   # The model the backend serves.
+model_id              = "vllm/qwen2.5-7b-instruct"   # Provenance label written into facts.extractor_model.
+model_version         = 4                 # v4 = M3 Phase C (relations rule + reinforced SPO few-shots + flagged-band framing). Bump whenever the prompt or schema changes such that prior facts shouldn't be considered comparable.
+api_key               = ""                # Bearer token for hosted endpoints (OpenRouter, etc.).
+timeout_seconds       = 60                # vLLM JSON-Schema responses can run long.
+temperature           = 0.2
+max_facts_per_thought = 8
+# system_prompt_file = "~/.config/engram/extractor-prompt.txt"
+# Optional: replace the bundled v4 prompt with the file's contents. Must
+# contain the {MAX_FACTS} placeholder. You are responsible for also bumping
+# model_version when overriding. The extractor logs a WARN at startup when
+# a custom prompt is in use.
+
+[reflector]                               # M2+; opt-in (defaults to disabled).
+enabled                  = false          # Flip to true when the extractor endpoint is reachable.
+schedule                 = "0 0 3 * * *"  # 6-field cron (sec min hour dom month dow). Default = 03:00 daily.
+review_queue_below       = 0.7            # Confidence < this routes to facts_review_queue.
+min_confidence_to_store  = 0.85           # Confidence in [review_queue_below, this) commits to facts with flagged=true (M3 Phase C three-band routing). Set equal to review_queue_below for two-band (kill-switch).
+subsumption_keep         = "specific"     # "specific" (default — drop the more general) or "general" (drop the more specific) when (subject, predicate) matches and one object refines another. M3 Phase C.
+scope_filter             = ""             # Restrict the reflector to a single scope. Blank = all scopes.
+max_thoughts_per_run     = 1000
+max_facts_per_thought    = 8
+```
+
+### Environment-variable overrides (worked examples)
+
+The `ENGRAM_` prefix + `__` nesting maps to the TOML hierarchy. Examples:
+
+```bash
+# Snappier worker ticks for development:
+ENGRAM_WORKER__TICK_INTERVAL_SECONDS=2 cargo run --bin engram -- worker
+
+# Reflect every 30 seconds (live dogfood) and turn the reflector on
+# without flipping the file:
+ENGRAM_REFLECTOR__ENABLED=true \
+ENGRAM_REFLECTOR__SCHEDULE="*/30 * * * * *" \
+  cargo run --bin engram -- worker
+
+# OpenRouter API key without checking it into config:
+ENGRAM_EXTRACTOR__API_KEY=sk-or-... \
+ENGRAM_EXTRACTOR__PROVIDER=openrouter \
+ENGRAM_EXTRACTOR__ENDPOINT='https://openrouter.ai/api/v1' \
+ENGRAM_EXTRACTOR__MODEL_NAME='anthropic/claude-haiku-4.5' \
+  cargo run --bin engram -- worker
+
+# Listen on all interfaces (LAN-accessible dev):
+ENGRAM_SERVER__BIND=0.0.0.0:8080 cargo run --bin engram -- serve
+
+# Different database (e.g. a second pool for testing):
+ENGRAM_DATABASE__URL='postgres://engram:engram@localhost:5432/engram_test' \
+  cargo run --bin engram -- migrate
+```
+
+### What's required vs optional
+
+Strictly required for `engram serve` to boot:
+
+- A reachable Postgres at `[database].url` with the migrations applied.
+
+Required when the corresponding feature is in use:
+
+- `[embedder]` reachable, for `search_thoughts` / `search_facts` to populate the vector leg (soft-fails to trigram-only if unreachable; `vector_search_available: false` on responses).
+- `[reranker]` configured + reachable, for the rerank stage to fire (soft-fails to RRF + recency if absent or down; `rerank_used: false` on responses).
+- `[extractor]` reachable + `[reflector] enabled = true`, for fact extraction to run.
+
+The defaults wire up a working dev environment against `localhost` Postgres + Ollama; you only need an `engram.toml` when you're overriding something.
 
 ## Repo layout
 

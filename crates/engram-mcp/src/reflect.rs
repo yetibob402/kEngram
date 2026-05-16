@@ -31,6 +31,14 @@ pub struct ReflectorOptions {
     /// Cron expression. `tokio-cron-scheduler` accepts 6-field cron
     /// (sec min hour dom month dow). Default is 03:00 every day.
     pub schedule: String,
+    /// When set, restricts the reflector to thoughts whose `scope` exactly
+    /// equals this string. When `None` (or `""` in the TOML / env var,
+    /// which the custom deserializer normalises to `None`), the reflector
+    /// processes every scope. Empty-string-as-no-filter matches the
+    /// `engram.toml` example's intent and avoids a foot-gun where a
+    /// literal empty `scope_filter` silently matched zero rows. Phase D
+    /// dogfood 2026-05-16.
+    #[serde(deserialize_with = "empty_string_as_none")]
     pub scope_filter: Option<String>,
     pub max_thoughts_per_run: i64,
     pub max_facts_per_thought: usize,
@@ -79,6 +87,20 @@ impl Default for ReflectorOptions {
             subsumption_keep: SubsumptionKeep::Specific,
         }
     }
+}
+
+/// Serde helper: deserialize an `Option<String>` such that the empty
+/// string normalises to `None`. The `scope_filter` SQL predicate is
+/// `($1::text IS NULL OR t.scope = $1)`, so a literal empty filter
+/// silently matched zero rows. This normalisation makes
+/// `scope_filter = ""` mean "no filter" (which is what the example
+/// TOML's comment always claimed). Phase D dogfood 2026-05-16.
+fn empty_string_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    Ok(opt.filter(|s| !s.is_empty()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

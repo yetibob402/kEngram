@@ -321,4 +321,45 @@ mod tests {
             engram_mcp::SubsumptionKeep::General,
         );
     }
+
+    /// Phase D dogfood 2026-05-16: `scope_filter = ""` in TOML used to
+    /// deserialize to `Some("")`, which the SQL predicate then matched
+    /// against zero rows (every scope is non-empty). The custom
+    /// deserializer normalizes `""` to `None` so the example TOML's
+    /// "leave blank for all scopes" comment is retroactively accurate.
+    #[test]
+    fn scope_filter_empty_string_normalizes_to_none() {
+        // Explicit empty string in TOML → None.
+        let toml = r#"
+            [reflector]
+            scope_filter = ""
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert!(c.reflector.scope_filter.is_none());
+
+        // A non-empty value still round-trips intact.
+        let toml = r#"
+            [reflector]
+            scope_filter = "work"
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert_eq!(c.reflector.scope_filter.as_deref(), Some("work"));
+
+        // Field omitted → default (None).
+        let toml = "[reflector]\nenabled = true\n";
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert!(c.reflector.scope_filter.is_none());
+    }
 }

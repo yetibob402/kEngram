@@ -505,10 +505,14 @@ async fn run_embed_backfill(
 
     let embedder = build_embedder(&config.embedder)?;
 
+    // Treat `--scope ""` as "no filter" (same empty-string normalisation
+    // applied on the reflector / config side).
+    let scope_filter = scope.filter(|s| !s.is_empty());
+
     let report = engram_mcp::embed_backfill(
         &pool,
         embedder.as_ref(),
-        scope.as_deref(),
+        scope_filter.as_deref(),
         limit,
         target.into(),
     )
@@ -559,10 +563,13 @@ async fn run_reflect(
     let extractor = build_extractor(&config.extractor)?;
     let embedder_model_id = config.embedder.model_id.clone();
 
-    // CLI flags override config defaults.
+    // CLI flags override config defaults. Treat `--scope ""` as "no
+    // filter" (matches the empty-string-as-None normalisation on the
+    // config side; without it, a literal `--scope ""` silently matched
+    // zero rows).
     let mut options = config.reflector.clone();
     if let Some(s) = scope {
-        options.scope_filter = Some(s);
+        options.scope_filter = if s.is_empty() { None } else { Some(s) };
     }
     if let Some(l) = limit {
         options.max_thoughts_per_run = l;

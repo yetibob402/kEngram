@@ -12,7 +12,8 @@
 use engram_core::{
     ExtractMode, ExtractedFact, ExtractionContext, Extractor, Fact, Metadata, Thought,
 };
-use engram_storage::{NewFact, NewReviewRow, RunId};
+use engram_storage::{NewReviewRow, RunId};
+use uuid::Uuid;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -35,9 +36,34 @@ pub struct ReflectorOptions {
     pub max_facts_per_thought: usize,
     /// Confidence below this threshold routes the fact to
     /// `facts_review_queue` for operator review. At-or-above commits to
-    /// `facts`. Single-band routing in Phase C; m2-facts-pipeline.md's
-    /// three-band design (with a `flagged` column on `facts`) is deferred.
+    /// `facts`. Lower bound of the three-band routing (M3 Phase C).
     pub review_queue_below: f32,
+    /// Confidence below this threshold (but ≥ `review_queue_below`) commits
+    /// the fact to `facts` with `flagged = true` — the "stored but
+    /// flagged" middle band. At-or-above commits with `flagged = false`.
+    /// Kill-switch: set this equal to `review_queue_below` to collapse
+    /// back to two-band routing (every committed row gets `flagged =
+    /// false`). M3 Phase C.
+    pub min_confidence_to_store: f32,
+    /// Policy for subsumption-aware dedup: when two facts on the same
+    /// thought share `(subject, predicate)` and one's `object` is a
+    /// substring of the other's, which do we keep? Default `Specific`
+    /// drops the more general; `General` does the inverse. M3 Phase C.
+    pub subsumption_keep: SubsumptionKeep,
+}
+
+/// Operator policy for [`commit_or_supersede`]'s subsumption-aware dedup
+/// pass. Configured via `[reflector] subsumption_keep` in `engram.toml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SubsumptionKeep {
+    /// Keep the more specific fact; supersede the more general. Default —
+    /// matches the dogfood expectation that the specific claim implies
+    /// the general one.
+    #[default]
+    Specific,
+    /// Keep the more general fact; supersede the more specific.
+    General,
 }
 
 impl Default for ReflectorOptions {
@@ -49,6 +75,8 @@ impl Default for ReflectorOptions {
             max_thoughts_per_run: 1000,
             max_facts_per_thought: 8,
             review_queue_below: 0.7,
+            min_confidence_to_store: 0.85,
+            subsumption_keep: SubsumptionKeep::Specific,
         }
     }
 }
@@ -141,7 +169,11 @@ pub async fn run_reflector_once(
             {
                 Ok(CommitOutcome::Committed) => n_committed += 1,
                 Ok(CommitOutcome::Review) => n_review += 1,
-                Ok(CommitOutcome::Skipped) | Ok(CommitOutcome::NoOp) => {}
+                Ok(CommitOutcome::Skipped)
+                | Ok(CommitOutcome::NoOp)
+                | Ok(CommitOutcome::Inherited)
+                | Ok(CommitOutcome::DriftFolded)
+                | Ok(CommitOutcome::SubsumedByActive) => {}
                 Err(err) => {
                     tracing::error!(
                         run_id = %run_id,
@@ -197,15 +229,38 @@ fn is_byte_identical(new: &ExtractedFact, new_version: i32, existing: &Fact) -> 
 enum CommitOutcome {
     /// Empty / whitespace-only statement; skipped without DB write.
     Skipped,
-    /// New row inserted into `facts` (with or without drift folding via
-    /// supersession). Includes the brand-new-claim and the new-canonical-with-fold cases.
+    /// New active row inserted into `facts` (with or without drift folding
+    /// via supersession). Includes the brand-new-claim and the
+    /// new-canonical-with-fold cases.
     Committed,
     /// Low-confidence; routed to `facts_review_queue` instead of `facts`.
     Review,
     /// Byte-identical match already active on the thought; no new row
     /// inserted (the no-op floor). Drift rows may still have been folded
-    /// into the existing canonical via supersession.
+    /// into the existing canonical via supersession. Counter-equivalent
+    /// to `Inherited` / `DriftFolded`.
     NoOp,
+    /// M3 Phase C: the same claim was previously retracted (matched in
+    /// `find_matching_superseded_facts`). The new emission is written for
+    /// audit and immediately superseded — `superseded_by` inherits the
+    /// existing canonical's pointer (or `NULL` for retraction-without-
+    /// replacement). No active state change; the active fact set is
+    /// unchanged. Treated like `NoOp` by counters; the distinct variant
+    /// exists for test introspection.
+    Inherited,
+    /// M3 Phase C: the quality-aware pick chose an existing active fact
+    /// over the new emission (statements matched but full rows weren't
+    /// byte-identical, and the existing row scored higher on the quality
+    /// tiebreakers). The new emission was written for audit and
+    /// immediately superseded into the chosen canonical. No active state
+    /// change. Treated like `NoOp` by counters.
+    DriftFolded,
+    /// M3 Phase C: subsumption-aware dedup decided the new emission was
+    /// less informative (more general / more specific per
+    /// `subsumption_keep`) than an already-active fact sharing
+    /// `(subject, predicate)`. The new emission was not inserted; the
+    /// existing fact stays canonical. Treated like `NoOp` by counters.
+    SubsumedByActive,
 }
 
 /// What `metadata.extract` directs the reflector to do for a given thought.
@@ -235,21 +290,44 @@ fn extract_directive(metadata: &Metadata) -> ExtractDirective {
 
 /// Per-fact decision logic shared by `run_reflector_once` (first-time
 /// extraction) and `run_reflector_rerun` (re-evaluating facted thoughts).
-/// Implements the four-case decision tree under the dedup-via-supersession
-/// design principle locked 2026-05-14: facts table is append-only audit;
+/// Under the dedup-via-supersession design principle locked 2026-05-14
+/// and the M3 Phase C extensions: facts table is append-only audit;
 /// `superseded_at` / `superseded_by` are the deprecation mechanism; claim
 /// transitions produce a new active row + supersession on the old one.
 ///
-/// Cases:
-/// - empty/whitespace `statement` → [`CommitOutcome::Skipped`].
-/// - `fact.confidence < options.review_queue_below` → row to
-///   `facts_review_queue`; existing active rows unchanged → [`CommitOutcome::Review`].
-/// - 0 matches via `find_matching_active_facts` → insert as brand-new claim
-///   → [`CommitOutcome::Committed`].
-/// - ≥1 match, byte-identical row already active → no-op floor; non-identical
-///   drift rows fold into the canonical via `superseded_by` → [`CommitOutcome::NoOp`].
-/// - ≥1 match, none byte-identical → insert new as canonical; fold all
-///   matches via `superseded_by` → [`CommitOutcome::Committed`].
+/// Decision tree (top to bottom, first match wins):
+/// 1. Empty/whitespace `statement` → [`CommitOutcome::Skipped`].
+/// 2. `confidence < options.review_queue_below` → row to
+///    `facts_review_queue`; existing active rows unchanged →
+///    [`CommitOutcome::Review`].
+/// 3. Compute `flagged = confidence < options.min_confidence_to_store`
+///    for the three-band routing (Phase C). Kill-switch:
+///    `min_confidence_to_store == review_queue_below` collapses to
+///    two-band (always `flagged = false`).
+/// 4. Find active matches (statement OR (S, P, O)). Branches:
+/// - **0 active matches**: run the subsumption pass (Phase C) — if an
+///   active fact on this thought shares `(subject, predicate)` with the
+///   new emission's `object` in a substring relation, apply
+///   `options.subsumption_keep` to either short-circuit to
+///   [`CommitOutcome::SubsumedByActive`] or mark existing rows for
+///   folding into the upcoming canonical. Then run the retraction
+///   durability check (Phase C): if the claim has a previously-superseded
+///   match, insert the new row and immediately supersede it inheriting
+///   `superseded_by` from the existing canonical (or `NULL` for
+///   retraction-without-replacement) → [`CommitOutcome::Inherited`].
+///   Otherwise, fresh insert (plus subsumption folds) →
+///   [`CommitOutcome::Committed`].
+/// - **≥1 active match, byte-identical**: no-op floor; drift rows fold
+///   into the byte-identical canonical → [`CommitOutcome::NoOp`].
+/// - **≥1 active match, none byte-identical**: quality-aware pick
+///   across `{new emission} ∪ active_matches` using a lex tuple
+///   (subject != object, both-tokens-in-statement, subject-before-
+///   object). If the new emission wins → insert as canonical, fold the
+///   rest → [`CommitOutcome::Committed`]. If an existing fact wins →
+///   insert new as already-superseded into the chosen canonical, fold
+///   non-canonical matches → [`CommitOutcome::DriftFolded`]. The
+///   triple-match rerun-reword partition (same SPO + different
+///   statement on any active match) short-circuits to "new wins".
 ///
 /// All writes for a single matched group happen in one transaction so a
 /// crash between writes cannot orphan rows.
@@ -288,10 +366,14 @@ async fn commit_or_supersede(
         return Ok(CommitOutcome::Review);
     }
 
+    // Three-band routing flag: facts in `[review_queue_below,
+    // min_confidence_to_store)` land in `facts` with `flagged = true`.
+    let flagged = fact.confidence < options.min_confidence_to_store;
+
     // Commit path: "same claim" predicate is `statement` match OR (S, P, O)
-    // match via `find_matching_active_facts`. Multiple drift rows can match
-    // (pre-existing audit-corrupt state); they all get folded.
-    let matches = engram_storage::find_matching_active_facts(
+    // match. Multiple drift rows can match (pre-existing audit-corrupt
+    // state); they all get folded.
+    let active_matches = engram_storage::find_matching_active_facts(
         pool,
         thought.id,
         &fact.statement,
@@ -301,54 +383,112 @@ async fn commit_or_supersede(
     )
     .await?;
 
-    if matches.is_empty() {
-        let new_fact_id = engram_storage::insert_fact(
+    if active_matches.is_empty() {
+        // Subsumption pre-pass (Phase C). Only fires for fully-populated
+        // (subject, predicate, object) — substring-relation isn't
+        // well-defined otherwise.
+        let mut subsumption_folds: Vec<Uuid> = Vec::new();
+        if let (Some(s), Some(p), Some(new_obj)) =
+            (fact.subject.as_deref(), fact.predicate.as_deref(), fact.object.as_deref())
+        {
+            let subsuming =
+                engram_storage::find_subsuming_active_facts(pool, thought.id, s, p).await?;
+            for existing in &subsuming {
+                let Some(existing_obj) = existing.object.as_deref() else {
+                    continue;
+                };
+                match subsumption_relation(existing_obj, new_obj) {
+                    SubsumptionRelation::Equal => {
+                        // Identical object; the main dedup pass would have
+                        // caught this on statement-or-triple match. Skip.
+                    }
+                    SubsumptionRelation::NewIsMoreSpecific => {
+                        // New emission refines existing.
+                        match options.subsumption_keep {
+                            SubsumptionKeep::Specific => subsumption_folds.push(existing.id),
+                            SubsumptionKeep::General => {
+                                return Ok(CommitOutcome::SubsumedByActive);
+                            }
+                        }
+                    }
+                    SubsumptionRelation::NewIsMoreGeneral => {
+                        // New emission is a generalisation of existing.
+                        match options.subsumption_keep {
+                            SubsumptionKeep::Specific => {
+                                return Ok(CommitOutcome::SubsumedByActive);
+                            }
+                            SubsumptionKeep::General => subsumption_folds.push(existing.id),
+                        }
+                    }
+                    SubsumptionRelation::Unrelated => {}
+                }
+            }
+        }
+
+        // Retraction durability (Phase C). If the same claim has been
+        // retracted before, inherit its supersession state on the new
+        // emission so retracted claims don't reappear on rerun.
+        let superseded_matches = engram_storage::find_matching_superseded_facts(
             pool,
-            NewFact {
-                scope: &thought.scope,
-                statement: &fact.statement,
-                subject: fact.subject.as_deref(),
-                predicate: fact.predicate.as_deref(),
-                object: fact.object.as_deref(),
-                source_thought_id: thought.id,
-                extractor_model: extractor.model_id(),
-                extractor_version: extractor.version(),
-                source_run_id: Some(run_id),
-                confidence: fact.confidence,
-            },
+            thought.id,
+            &fact.statement,
+            fact.subject.as_deref(),
+            fact.predicate.as_deref(),
+            fact.object.as_deref(),
         )
         .await?;
-        engram_storage::enqueue_embedding(
-            pool,
-            engram_storage::target::FACT,
-            new_fact_id,
-            embedder_model_id,
-        )
-        .await?;
-        return Ok(CommitOutcome::Committed);
-    }
+        if !superseded_matches.is_empty() {
+            // Most recent retraction shape wins (find_matching_superseded_facts
+            // orders DESC). Inherit its canonical pointer; this is `None` for
+            // retraction-without-replacement.
+            let inherited_canonical = superseded_matches[0].1;
 
-    let canonical = matches
-        .iter()
-        .find(|m| is_byte_identical(fact, extractor.version(), m))
-        .map(|m| m.id);
+            let mut tx = pool.begin().await.map_err(engram_storage::StorageError::from)?;
+            let new_id = sqlx::query_scalar!(
+                r#"
+                INSERT INTO facts (
+                    scope, statement, subject, predicate, object,
+                    source_thought_id, extractor_model, extractor_version,
+                    source_run_id, confidence, flagged,
+                    superseded_at, superseded_by
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), $12)
+                RETURNING id
+                "#,
+                thought.scope.as_str(),
+                fact.statement,
+                fact.subject,
+                fact.predicate,
+                fact.object,
+                thought.id.into_uuid(),
+                extractor.model_id(),
+                extractor.version(),
+                run_id.0,
+                fact.confidence,
+                flagged,
+                inherited_canonical,
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(engram_storage::StorageError::from)?;
+            tx.commit().await.map_err(engram_storage::StorageError::from)?;
 
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(engram_storage::StorageError::from)?;
+            // Skip embedding enqueue — the row is soft-deleted on insert,
+            // so vectorizing it is wasted work.
+            let _ = new_id;
+            return Ok(CommitOutcome::Inherited);
+        }
 
-    let target_id = if let Some(existing_id) = canonical {
-        existing_id
-    } else {
-        sqlx::query_scalar!(
+        // Fresh insert (plus folds for any subsumption-marked rows).
+        let mut tx = pool.begin().await.map_err(engram_storage::StorageError::from)?;
+        let new_fact_id = sqlx::query_scalar!(
             r#"
             INSERT INTO facts (
                 scope, statement, subject, predicate, object,
                 source_thought_id, extractor_model, extractor_version,
-                source_run_id, confidence
+                source_run_id, confidence, flagged
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING id
             "#,
             thought.scope.as_str(),
@@ -361,50 +501,320 @@ async fn commit_or_supersede(
             extractor.version(),
             run_id.0,
             fact.confidence,
+            flagged,
         )
         .fetch_one(&mut *tx)
         .await
-        .map_err(engram_storage::StorageError::from)?
-    };
+        .map_err(engram_storage::StorageError::from)?;
 
-    for m in &matches {
-        if m.id == target_id {
-            continue;
+        for old_id in &subsumption_folds {
+            sqlx::query!(
+                r#"
+                UPDATE facts
+                SET superseded_by = $2, superseded_at = NOW()
+                WHERE id = $1 AND superseded_at IS NULL
+                "#,
+                old_id,
+                new_fact_id,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(engram_storage::StorageError::from)?;
         }
-        sqlx::query!(
-            r#"
-            UPDATE facts
-            SET superseded_by = $2, superseded_at = NOW()
-            WHERE id = $1 AND superseded_at IS NULL
-            "#,
-            m.id,
-            target_id,
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(engram_storage::StorageError::from)?;
-    }
 
-    tx.commit()
-        .await
-        .map_err(engram_storage::StorageError::from)?;
+        tx.commit().await.map_err(engram_storage::StorageError::from)?;
 
-    if canonical.is_some() {
-        Ok(CommitOutcome::NoOp)
-    } else {
-        // `target_id` is the row we just inserted; enqueue it for embedding.
-        // The no-op-floor path above (canonical = Some) skips this because
-        // the byte-identical existing row was already enqueued when it was
-        // first inserted.
         engram_storage::enqueue_embedding(
             pool,
             engram_storage::target::FACT,
-            target_id,
+            new_fact_id,
             embedder_model_id,
         )
         .await?;
-        Ok(CommitOutcome::Committed)
+        return Ok(CommitOutcome::Committed);
     }
+
+    // ≥1 active match path.
+    let byte_identical = active_matches
+        .iter()
+        .find(|m| is_byte_identical(fact, extractor.version(), m))
+        .map(|m| m.id);
+
+    if let Some(canonical_id) = byte_identical {
+        // No-op floor: byte-identical canonical already active; fold any
+        // non-identical drift rows.
+        let mut tx = pool.begin().await.map_err(engram_storage::StorageError::from)?;
+        for m in &active_matches {
+            if m.id == canonical_id {
+                continue;
+            }
+            sqlx::query!(
+                r#"
+                UPDATE facts
+                SET superseded_by = $2, superseded_at = NOW()
+                WHERE id = $1 AND superseded_at IS NULL
+                "#,
+                m.id,
+                canonical_id,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(engram_storage::StorageError::from)?;
+        }
+        tx.commit().await.map_err(engram_storage::StorageError::from)?;
+        return Ok(CommitOutcome::NoOp);
+    }
+
+    // ≥1 active match, none byte-identical. Two sub-cases:
+    //   - Triple-match rerun-reword: any active match has the same
+    //     (S, P, O) as the new emission, but a different statement. The
+    //     extractor is re-stating the same claim with new wording; the
+    //     new statement is what the operator wants going forward, so the
+    //     new emission wins.
+    //   - SPO drift (statement match with different SPO): the extractor
+    //     produced a different (S, P, O) decomposition of the same
+    //     statement. This is the Phase A dogfood class — pick the best
+    //     decomposition via quality_aware_pick rather than letting
+    //     emission order decide.
+    let triple_match = active_matches.iter().any(|m| {
+        m.subject.as_deref() == fact.subject.as_deref()
+            && m.predicate.as_deref() == fact.predicate.as_deref()
+            && m.object.as_deref() == fact.object.as_deref()
+    });
+    let canonical = if triple_match {
+        QualityWinner::New
+    } else {
+        quality_aware_pick(fact, &active_matches)
+    };
+
+    let mut tx = pool.begin().await.map_err(engram_storage::StorageError::from)?;
+
+    match canonical {
+        QualityWinner::New => {
+            // New emission wins — insert as canonical, fold all existing
+            // matches.
+            let new_id = sqlx::query_scalar!(
+                r#"
+                INSERT INTO facts (
+                    scope, statement, subject, predicate, object,
+                    source_thought_id, extractor_model, extractor_version,
+                    source_run_id, confidence, flagged
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                RETURNING id
+                "#,
+                thought.scope.as_str(),
+                fact.statement,
+                fact.subject,
+                fact.predicate,
+                fact.object,
+                thought.id.into_uuid(),
+                extractor.model_id(),
+                extractor.version(),
+                run_id.0,
+                fact.confidence,
+                flagged,
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(engram_storage::StorageError::from)?;
+
+            for m in &active_matches {
+                sqlx::query!(
+                    r#"
+                    UPDATE facts
+                    SET superseded_by = $2, superseded_at = NOW()
+                    WHERE id = $1 AND superseded_at IS NULL
+                    "#,
+                    m.id,
+                    new_id,
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(engram_storage::StorageError::from)?;
+            }
+            tx.commit().await.map_err(engram_storage::StorageError::from)?;
+
+            engram_storage::enqueue_embedding(
+                pool,
+                engram_storage::target::FACT,
+                new_id,
+                embedder_model_id,
+            )
+            .await?;
+            Ok(CommitOutcome::Committed)
+        }
+        QualityWinner::Existing(canonical_id) => {
+            // An existing fact wins — insert new emission as already-
+            // superseded into the canonical (for audit); fold other
+            // non-canonical matches into the canonical too.
+            let _new_id = sqlx::query_scalar!(
+                r#"
+                INSERT INTO facts (
+                    scope, statement, subject, predicate, object,
+                    source_thought_id, extractor_model, extractor_version,
+                    source_run_id, confidence, flagged,
+                    superseded_at, superseded_by
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), $12)
+                RETURNING id
+                "#,
+                thought.scope.as_str(),
+                fact.statement,
+                fact.subject,
+                fact.predicate,
+                fact.object,
+                thought.id.into_uuid(),
+                extractor.model_id(),
+                extractor.version(),
+                run_id.0,
+                fact.confidence,
+                flagged,
+                canonical_id,
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(engram_storage::StorageError::from)?;
+
+            for m in &active_matches {
+                if m.id == canonical_id {
+                    continue;
+                }
+                sqlx::query!(
+                    r#"
+                    UPDATE facts
+                    SET superseded_by = $2, superseded_at = NOW()
+                    WHERE id = $1 AND superseded_at IS NULL
+                    "#,
+                    m.id,
+                    canonical_id,
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(engram_storage::StorageError::from)?;
+            }
+            tx.commit().await.map_err(engram_storage::StorageError::from)?;
+            // No embedding enqueue — the new row landed superseded.
+            Ok(CommitOutcome::DriftFolded)
+        }
+    }
+}
+
+/// Result of comparing two `object` values under the subsumption-aware
+/// dedup pass. Case-insensitive substring check; whitespace-trimmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubsumptionRelation {
+    /// Both objects are equal after normalisation. Caller defers to the
+    /// statement-or-triple dedup pass.
+    Equal,
+    /// Existing object is a substring of the new emission's object — the
+    /// new emission is the more-specific refinement.
+    NewIsMoreSpecific,
+    /// New emission's object is a substring of the existing — the new
+    /// emission is the more-general claim.
+    NewIsMoreGeneral,
+    /// Neither object is a substring of the other.
+    Unrelated,
+}
+
+fn subsumption_relation(existing: &str, new: &str) -> SubsumptionRelation {
+    let e = existing.trim().to_lowercase();
+    let n = new.trim().to_lowercase();
+    if e == n {
+        return SubsumptionRelation::Equal;
+    }
+    let e_in_n = n.contains(&e);
+    let n_in_e = e.contains(&n);
+    match (e_in_n, n_in_e) {
+        (true, false) => SubsumptionRelation::NewIsMoreSpecific,
+        (false, true) => SubsumptionRelation::NewIsMoreGeneral,
+        _ => SubsumptionRelation::Unrelated,
+    }
+}
+
+/// Quality-aware canonical pick for the "≥1 active match, none
+/// byte-identical" branch. Compares the new emission against each
+/// candidate via a lex tuple:
+///   1. `subject != object` (1 if true) — rejects self-referential triples.
+///   2. Both `subject` and `object` appear as case-insensitive tokens in
+///      `statement` (1 if true) — rejects inverted-SPO decompositions
+///      where the statement is correct but the triple swaps S and O.
+///   3. `created_at` (oldest first for existing candidates; new emission
+///      ranks last) — preserves the existing-first default when quality
+///      bits all tie.
+///
+/// Returns whether the new emission wins or, if an existing candidate
+/// wins, which one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QualityWinner {
+    New,
+    Existing(Uuid),
+}
+
+fn quality_aware_pick(new: &ExtractedFact, existing: &[Fact]) -> QualityWinner {
+    let new_score = quality_score(
+        &new.statement,
+        new.subject.as_deref(),
+        new.object.as_deref(),
+    );
+
+    let mut best_existing: Option<(&Fact, (i32, i32, i32))> = None;
+    for f in existing {
+        let s = quality_score(&f.statement, f.subject.as_deref(), f.object.as_deref());
+        match best_existing {
+            None => best_existing = Some((f, s)),
+            Some((_, prev)) if s > prev => best_existing = Some((f, s)),
+            _ => {}
+        }
+    }
+
+    match best_existing {
+        // No existing candidates (shouldn't happen in this branch, but
+        // defensively): new wins.
+        None => QualityWinner::New,
+        // Existing strictly outscores new: existing wins. This is the
+        // Phase A dogfood class — e.g. existing `(S=Bazel, O=Make)`
+        // wins over new emission `(S=Make, O=Bazel)` because the existing
+        // SPO matches the statement's subject-before-object order.
+        Some((f, prev)) if prev > new_score => QualityWinner::Existing(f.id),
+        // Tied or new strictly better: new wins. Ties favor the new
+        // emission so a rerun's intentional reword (or a same-quality
+        // SPO drift) propagates rather than getting frozen.
+        _ => QualityWinner::New,
+    }
+}
+
+/// Score triple in lex order, higher is better:
+///   1. `subject != object` — rejects self-referential triples (1/0).
+///   2. Both `subject` and `object` appear as case-insensitive substrings
+///      of `statement` — rejects triples whose subject doesn't anchor in
+///      the prose (1/0).
+///   3. `subject`'s first occurrence in `statement` precedes `object`'s —
+///      catches comparative-inversion ("A is more X than B" wants S=A,
+///      O=B; an inverted triple S=B/O=A loses this bit). 1/0.
+fn quality_score(
+    statement: &str,
+    subject: Option<&str>,
+    object: Option<&str>,
+) -> (i32, i32, i32) {
+    let stmt_lower = statement.to_lowercase();
+    let (Some(s), Some(o)) = (subject, object) else {
+        return (0, 0, 0);
+    };
+    let s_lower = s.trim().to_lowercase();
+    let o_lower = o.trim().to_lowercase();
+
+    let s_ne_o = if s_lower != o_lower { 1 } else { 0 };
+
+    let s_pos = stmt_lower.find(&s_lower);
+    let o_pos = stmt_lower.find(&o_lower);
+    let both_in_stmt = if s_pos.is_some() && o_pos.is_some() { 1 } else { 0 };
+    let subj_before_obj = match (s_pos, o_pos) {
+        (Some(sp), Some(op)) if sp < op => 1,
+        _ => 0,
+    };
+
+    (s_ne_o, both_in_stmt, subj_before_obj)
 }
 
 /// Re-evaluate already-facted thoughts and reconcile against the current
@@ -505,7 +915,11 @@ pub async fn run_reflector_rerun(
             {
                 Ok(CommitOutcome::Committed) => n_committed += 1,
                 Ok(CommitOutcome::Review) => n_review += 1,
-                Ok(CommitOutcome::Skipped) | Ok(CommitOutcome::NoOp) => {}
+                Ok(CommitOutcome::Skipped)
+                | Ok(CommitOutcome::NoOp)
+                | Ok(CommitOutcome::Inherited)
+                | Ok(CommitOutcome::DriftFolded)
+                | Ok(CommitOutcome::SubsumedByActive) => {}
                 Err(err) => {
                     tracing::error!(
                         run_id = %run_id,
@@ -573,6 +987,25 @@ mod tests {
             max_thoughts_per_run: 100,
             max_facts_per_thought: 8,
             review_queue_below: review_below,
+            min_confidence_to_store: 0.85,
+            subsumption_keep: SubsumptionKeep::Specific,
+        }
+    }
+
+    fn options_with(
+        review_below: f32,
+        min_to_store: f32,
+        keep: SubsumptionKeep,
+    ) -> ReflectorOptions {
+        ReflectorOptions {
+            enabled: true,
+            schedule: "0 0 3 * * *".to_string(),
+            scope_filter: None,
+            max_thoughts_per_run: 100,
+            max_facts_per_thought: 8,
+            review_queue_below: review_below,
+            min_confidence_to_store: min_to_store,
+            subsumption_keep: keep,
         }
     }
 
@@ -874,13 +1307,18 @@ mod tests {
     }
 
     /// The M2 dogfood regression: v1 produced fact `c5799e68` with statement
-    /// "current API surface is append-only" + triple ("current API surface",
-    /// "is", "append-only"); v2 produced fact `1c4a53c1` with the **same**
-    /// statement but a different triple ("thoughts in current API surface",
-    /// "are", "append-only"). The pre-M3 dedup keyed on (S, P, O) only and
-    /// missed the match, leaving both rows parallel-active. The widened
-    /// predicate (statement OR triple) catches the statement match; the
-    /// v2 row becomes canonical and the v1 row is superseded.
+    /// Same statement, different (S, P, O). Pre-M3 dedup keyed on triple
+    /// alone and missed this, leaving both rows parallel-active. Phase A
+    /// widened the predicate to "statement OR triple"; Phase C added
+    /// quality-aware canonical selection — when the statements tie but
+    /// the SPOs differ, the better-scoring SPO wins (subject literally
+    /// appears in the statement; subject precedes object in the prose).
+    ///
+    /// Concrete case (from m3-search-quality.md dogfood, thought `a7b63f3b`):
+    /// v1 SPO `(current API surface, is, append-only)` has the subject
+    /// literally in the statement; v2 SPO `(thoughts in current API
+    /// surface, are, append-only)` has a subject that does NOT appear in
+    /// the statement. Phase C keeps v1 active; v2 lands superseded.
     #[sqlx::test(migrations = "../../migrations")]
     async fn rerun_supersedes_when_statement_matches_but_triple_differs(pool: PgPool) {
         cap(&pool, "API doc thought", "global").await;
@@ -893,7 +1331,8 @@ mod tests {
         }]);
         run_reflector_once(&pool, &v1, TEST_MODEL_ID, &options(0.7)).await.unwrap();
         let v1_id = sqlx::query!(
-            r#"SELECT id FROM facts WHERE statement = 'current API surface is append-only'"#
+            r#"SELECT id FROM facts WHERE statement = 'current API surface is append-only'
+                                          AND subject = 'current API surface'"#
         )
         .fetch_one(&pool)
         .await
@@ -909,7 +1348,7 @@ mod tests {
         }]);
         run_reflector_rerun(&pool, &v2, TEST_MODEL_ID, &options(0.7), None).await.unwrap();
 
-        // Exactly one active row remains.
+        // Exactly one active row remains (Phase A dedup invariant).
         let active = sqlx::query!(
             r#"SELECT id, subject FROM facts WHERE superseded_at IS NULL"#
         )
@@ -917,22 +1356,21 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(active.len(), 1, "drift duplicate must fold into canonical");
-        // The active row is the v2-shape (different subject than v1).
-        assert_eq!(
-            active[0].subject.as_deref(),
-            Some("thoughts in current API surface")
-        );
+        // Phase C: v1 is canonical because its subject literally appears
+        // in the statement; v2's subject does not.
+        assert_eq!(active[0].id, v1_id);
+        assert_eq!(active[0].subject.as_deref(), Some("current API surface"));
 
-        // v1 is superseded with superseded_by pointing at the v2 row.
-        let v1_row = sqlx::query!(
-            r#"SELECT superseded_at, superseded_by FROM facts WHERE id = $1"#,
-            v1_id,
+        // v2 was inserted for audit and immediately superseded into v1.
+        let v2_row = sqlx::query!(
+            r#"SELECT id, superseded_at, superseded_by FROM facts
+               WHERE subject = 'thoughts in current API surface'"#,
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert!(v1_row.superseded_at.is_some());
-        assert_eq!(v1_row.superseded_by, Some(active[0].id));
+        assert!(v2_row.superseded_at.is_some());
+        assert_eq!(v2_row.superseded_by, Some(v1_id));
     }
 
     /// Pre-seed two parallel-active drift duplicates (audit-corrupt state),
@@ -1367,5 +1805,374 @@ mod tests {
         .unwrap()
         .n;
         assert_eq!(after, n_fact_pending, "no-op floor must not enqueue");
+    }
+
+    // -- M3 Phase C: three-band routing, retraction durability,
+    //                subsumption, quality-aware pick -----------------
+
+    /// Hedged claims (0.70–0.85 confidence) commit with `flagged = true`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn three_band_routes_to_facts_flagged_true_when_below_min_confidence(pool: PgPool) {
+        cap(&pool, "Hedged claim source", "global").await;
+        let e = FakeExtractor::with_confidence(0.75);
+        run_reflector_once(
+            &pool,
+            &e,
+            TEST_MODEL_ID,
+            &options_with(0.7, 0.85, SubsumptionKeep::Specific),
+        )
+        .await
+        .unwrap();
+        let rows = sqlx::query!(r#"SELECT flagged, confidence FROM facts WHERE superseded_at IS NULL"#)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].flagged, "middle-band confidence must land flagged=true");
+    }
+
+    /// Declarative claims (≥ 0.85) commit with `flagged = false`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn three_band_routes_to_facts_flagged_false_when_above(pool: PgPool) {
+        cap(&pool, "Declarative claim source", "global").await;
+        let e = FakeExtractor::with_confidence(0.92);
+        run_reflector_once(
+            &pool,
+            &e,
+            TEST_MODEL_ID,
+            &options_with(0.7, 0.85, SubsumptionKeep::Specific),
+        )
+        .await
+        .unwrap();
+        let rows = sqlx::query!(r#"SELECT flagged FROM facts WHERE superseded_at IS NULL"#)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].flagged, "high-confidence must land flagged=false");
+    }
+
+    /// Kill-switch: setting `min_confidence_to_store == review_queue_below`
+    /// collapses to two-band routing — every committed row gets
+    /// `flagged = false` regardless of confidence.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn three_band_collapses_when_min_equals_review_below(pool: PgPool) {
+        cap(&pool, "Source 1", "global").await;
+        cap(&pool, "Source 2", "global").await;
+        let opts = options_with(0.7, 0.7, SubsumptionKeep::Specific);
+        // Hedged confidence (0.75) — would normally flag but the kill-switch
+        // collapses the middle band.
+        let e1 = FakeExtractor::with_confidence(0.75);
+        run_reflector_once(&pool, &e1, TEST_MODEL_ID, &opts).await.unwrap();
+        let rows = sqlx::query!(r#"SELECT flagged FROM facts WHERE superseded_at IS NULL"#)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(
+            rows.iter().all(|r| !r.flagged),
+            "kill-switch must make every committed row flagged=false",
+        );
+    }
+
+    /// Retraction-without-replacement: the operator `correct_fact`-retracts
+    /// the trivia fact (no replacement), then a rerun re-emits both the
+    /// retracted claim and a separate keeper claim. Phase C inheritance:
+    /// the retracted claim's new emission lands superseded with
+    /// `superseded_by = NULL`, matching the original retraction shape.
+    /// The keeper claim stays active and keeps the thought visible to
+    /// `find_facted_thoughts` so the rerun loop processes it.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn retraction_durability_inherits_no_replacement_on_rerun(pool: PgPool) {
+        cap(&pool, "Trivia source", "global").await;
+        let trivia = ExtractedFact {
+            statement: "Trivia claim".into(),
+            subject: Some("trivia".into()),
+            predicate: Some("is".into()),
+            object: Some("retracted".into()),
+            confidence: 0.9,
+        };
+        let keeper = ExtractedFact {
+            statement: "Keeper claim".into(),
+            subject: Some("keeper".into()),
+            predicate: Some("is".into()),
+            object: Some("active".into()),
+            confidence: 0.9,
+        };
+        let e = FakeExtractor::with_facts(vec![trivia.clone(), keeper.clone()]);
+        run_reflector_once(&pool, &e, TEST_MODEL_ID, &options(0.7))
+            .await
+            .unwrap();
+        let trivia_id = sqlx::query!(
+            r#"SELECT id FROM facts WHERE statement = 'Trivia claim'"#
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .id;
+        // Operator retracts the trivia fact (no replacement).
+        engram_storage::supersede_fact(&pool, trivia_id, None)
+            .await
+            .unwrap();
+
+        // Rerun re-emits both claims (keeper keeps the thought in the
+        // facted set).
+        run_reflector_rerun(&pool, &e, TEST_MODEL_ID, &options(0.7), None)
+            .await
+            .unwrap();
+
+        // Trivia claim must NOT reappear active.
+        let trivia_active = sqlx::query!(
+            r#"SELECT COUNT(*) AS "n!" FROM facts
+               WHERE statement = 'Trivia claim' AND superseded_at IS NULL"#
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .n;
+        assert_eq!(trivia_active, 0, "retracted claim must not reappear active");
+
+        // A second trivia row exists (the rerun's emission) with
+        // superseded_at set and superseded_by = NULL.
+        let inherited = sqlx::query!(
+            r#"SELECT superseded_at, superseded_by FROM facts
+               WHERE statement = 'Trivia claim' AND id != $1"#,
+            trivia_id,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(inherited.superseded_at.is_some());
+        assert!(inherited.superseded_by.is_none());
+    }
+
+    /// Retraction-with-replacement: an old row was superseded into a
+    /// `correct_fact` replacement carrying *different* SPO (operator
+    /// reshaped the triple, not just the prose). A rerun re-extracts the
+    /// old claim → the new emission inherits `superseded_by = canonical`
+    /// so the operator's replacement stays the authoritative active row.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn retraction_durability_inherits_with_canonical_on_rerun(pool: PgPool) {
+        let thought_id = cap(&pool, "anchor source", "global").await;
+        let e_old = FakeExtractor::with_facts(vec![ExtractedFact {
+            statement: "Original wording".into(),
+            subject: Some("subj-old".into()),
+            predicate: Some("rel-old".into()),
+            object: Some("obj-old".into()),
+            confidence: 0.9,
+        }]);
+        run_reflector_once(&pool, &e_old, TEST_MODEL_ID, &options(0.7))
+            .await
+            .unwrap();
+        let old_id = sqlx::query!(
+            r#"SELECT id FROM facts WHERE statement = 'Original wording'"#
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .id;
+
+        // Insert a manual replacement with DIFFERENT SPO (so the rerun
+        // emission doesn't trigger the triple-match rerun-reword path —
+        // we want to exercise retraction-inherit specifically).
+        let canonical_id = engram_storage::insert_fact(
+            &pool,
+            engram_storage::NewFact {
+                scope: &Scope::new("global").unwrap(),
+                statement: "Operator-corrected wording",
+                subject: Some("subj-new"),
+                predicate: Some("rel-new"),
+                object: Some("obj-new"),
+                source_thought_id: thought_id,
+                extractor_model: "manual",
+                extractor_version: 0,
+                source_run_id: None,
+                confidence: 1.0,
+                flagged: false,
+            },
+        )
+        .await
+        .unwrap();
+        engram_storage::supersede_fact(&pool, old_id, Some(canonical_id)).await.unwrap();
+
+        // Rerun re-emits the old wording (same statement + same old SPO).
+        // Since the only active row has different statement AND different
+        // SPO, `find_matching_active_facts` is empty for this claim, and
+        // `find_matching_superseded_facts` finds the old row with
+        // `superseded_by = canonical_id`. Inheritance lands the new
+        // emission as superseded into `canonical_id`.
+        run_reflector_rerun(&pool, &e_old, TEST_MODEL_ID, &options(0.7), None)
+            .await
+            .unwrap();
+
+        let active = sqlx::query!(r#"SELECT id FROM facts WHERE superseded_at IS NULL"#)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, canonical_id);
+
+        // Verify the rerun's emission specifically inherited the canonical.
+        let inherited = sqlx::query!(
+            r#"SELECT superseded_at, superseded_by FROM facts
+               WHERE statement = 'Original wording' AND id != $1"#,
+            old_id,
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(inherited.len(), 1);
+        assert!(inherited[0].superseded_at.is_some());
+        assert_eq!(inherited[0].superseded_by, Some(canonical_id));
+    }
+
+    /// Default policy (`Specific`): when an existing active fact shares
+    /// `(subject, predicate)` and one object refines the other, drop the
+    /// more general. Regression: "Ron does not like Python" + "Ron does
+    /// not like Python for enterprise software" — only the specific
+    /// stays active.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn subsumption_keep_specific_drops_general(pool: PgPool) {
+        cap(&pool, "Source on languages", "global").await;
+        let opts = options_with(0.7, 0.85, SubsumptionKeep::Specific);
+
+        // Seed the general fact first.
+        let general = FakeExtractor::with_facts(vec![ExtractedFact {
+            statement: "Ron does not like Python".into(),
+            subject: Some("Ron".into()),
+            predicate: Some("does not like".into()),
+            object: Some("Python".into()),
+            confidence: 0.9,
+        }]);
+        run_reflector_once(&pool, &general, TEST_MODEL_ID, &opts).await.unwrap();
+
+        // Now emit the more-specific form via rerun.
+        let specific = FakeExtractor::with_facts(vec![ExtractedFact {
+            statement: "Ron does not like Python for enterprise software".into(),
+            subject: Some("Ron".into()),
+            predicate: Some("does not like".into()),
+            object: Some("Python for enterprise software".into()),
+            confidence: 0.9,
+        }]);
+        run_reflector_rerun(&pool, &specific, TEST_MODEL_ID, &opts, None)
+            .await
+            .unwrap();
+
+        let active = sqlx::query!(
+            r#"SELECT object FROM facts WHERE superseded_at IS NULL"#
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].object.as_deref(), Some("Python for enterprise software"));
+    }
+
+    /// `General` knob: invert the policy — drop the more specific, keep
+    /// the general.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn subsumption_keep_general_drops_specific(pool: PgPool) {
+        cap(&pool, "Source on languages", "global").await;
+        let opts = options_with(0.7, 0.85, SubsumptionKeep::General);
+
+        // Seed the general first.
+        let general = FakeExtractor::with_facts(vec![ExtractedFact {
+            statement: "Ron does not like Python".into(),
+            subject: Some("Ron".into()),
+            predicate: Some("does not like".into()),
+            object: Some("Python".into()),
+            confidence: 0.9,
+        }]);
+        run_reflector_once(&pool, &general, TEST_MODEL_ID, &opts).await.unwrap();
+
+        // Specific emission lands → SubsumedByActive (general kept).
+        let specific = FakeExtractor::with_facts(vec![ExtractedFact {
+            statement: "Ron does not like Python for enterprise software".into(),
+            subject: Some("Ron".into()),
+            predicate: Some("does not like".into()),
+            object: Some("Python for enterprise software".into()),
+            confidence: 0.9,
+        }]);
+        run_reflector_rerun(&pool, &specific, TEST_MODEL_ID, &opts, None)
+            .await
+            .unwrap();
+
+        let active = sqlx::query!(
+            r#"SELECT object FROM facts WHERE superseded_at IS NULL"#
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].object.as_deref(), Some("Python"));
+    }
+
+    /// Pure-function tests for `quality_aware_pick`'s tiebreakers. No DB
+    /// needed; exercises the lex tuple directly.
+    #[test]
+    fn quality_aware_pick_prefers_s_not_o_over_self_referential() {
+        let new = ExtractedFact {
+            statement: "x".into(),
+            subject: Some("a".into()),
+            predicate: Some("p".into()),
+            object: Some("a".into()), // self-referential
+            confidence: 0.9,
+        };
+        let existing = Fact {
+            id: uuid::Uuid::from_u128(1),
+            scope: Scope::new("global").unwrap(),
+            statement: "x".into(),
+            subject: Some("a".into()),
+            predicate: Some("p".into()),
+            object: Some("b".into()), // not self-referential
+            source_thought_id: ThoughtId::from(uuid::Uuid::nil()),
+            extractor_model: "fake".into(),
+            extractor_version: 1,
+            source_run_id: None,
+            confidence: 0.9,
+            flagged: false,
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+        let existing_id = existing.id;
+        match quality_aware_pick(&new, std::slice::from_ref(&existing)) {
+            QualityWinner::Existing(id) => assert_eq!(id, existing_id),
+            QualityWinner::New => panic!("expected existing to win (s != o); new is self-referential"),
+        }
+    }
+
+    /// Regression: Bazel/Make/Nix dogfood. Existing fact with correct
+    /// comparative SPO (subject before object in the statement) must beat
+    /// a new emission with inverted SPO.
+    #[test]
+    fn quality_aware_pick_prefers_subject_and_object_tokens_in_statement() {
+        let stmt = "Bazel is more powerful than Make";
+        let new_inverted = ExtractedFact {
+            statement: stmt.into(),
+            subject: Some("Make".into()),
+            predicate: Some("has a steeper learning curve than".into()),
+            object: Some("Bazel".into()),
+            confidence: 0.9,
+        };
+        let existing_correct = Fact {
+            id: uuid::Uuid::from_u128(1),
+            scope: Scope::new("global").unwrap(),
+            statement: stmt.into(),
+            subject: Some("Bazel".into()),
+            predicate: Some("is more powerful than".into()),
+            object: Some("Make".into()),
+            source_thought_id: ThoughtId::from(uuid::Uuid::nil()),
+            extractor_model: "fake".into(),
+            extractor_version: 1,
+            source_run_id: None,
+            confidence: 0.9,
+            flagged: false,
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+        let existing_id = existing_correct.id;
+        match quality_aware_pick(&new_inverted, std::slice::from_ref(&existing_correct)) {
+            QualityWinner::Existing(id) => assert_eq!(id, existing_id),
+            QualityWinner::New => {
+                panic!("expected existing (correct comparative SPO) to win over inverted new emission")
+            }
+        }
     }
 }

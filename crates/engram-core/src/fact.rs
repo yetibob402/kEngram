@@ -28,6 +28,12 @@ pub struct Fact {
     pub extractor_version: i32,
     pub source_run_id: Option<Uuid>,
     pub confidence: f32,
+    /// Three-band routing flag. False for direct-source / high-confidence
+    /// facts; true for the "stored but flagged" middle confidence band
+    /// (`[reflector] review_queue_below ≤ confidence < min_confidence_to_store`).
+    /// Default false keeps M1/M2 row shapes consistent.
+    #[serde(default)]
+    pub flagged: bool,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
@@ -52,6 +58,7 @@ mod tests {
             extractor_version: 1,
             source_run_id: Some(Uuid::from_str("00000000-0000-0000-0000-000000000002").unwrap()),
             confidence: 0.92,
+            flagged: false,
             created_at: OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
         }
     }
@@ -75,5 +82,43 @@ mod tests {
         assert!(parsed.subject.is_none());
         assert!(parsed.predicate.is_none());
         assert!(parsed.object.is_none());
+    }
+
+    #[test]
+    fn fact_row_deserializes_with_flagged_field() {
+        let json_without = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "scope": "work",
+            "statement": "Engram uses pgvector",
+            "subject": null,
+            "predicate": null,
+            "object": null,
+            "source_thought_id": "00000000-0000-0000-0000-000000000001",
+            "extractor_model": "x",
+            "extractor_version": 1,
+            "source_run_id": null,
+            "confidence": 0.9,
+            "created_at": "2026-05-15T00:00:00Z"
+        }"#;
+        let parsed: Fact = serde_json::from_str(json_without).unwrap();
+        assert!(!parsed.flagged, "missing flagged field should default to false");
+
+        let json_with = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "scope": "work",
+            "statement": "x",
+            "subject": null,
+            "predicate": null,
+            "object": null,
+            "source_thought_id": "00000000-0000-0000-0000-000000000001",
+            "extractor_model": "x",
+            "extractor_version": 1,
+            "source_run_id": null,
+            "confidence": 0.75,
+            "flagged": true,
+            "created_at": "2026-05-15T00:00:00Z"
+        }"#;
+        let parsed: Fact = serde_json::from_str(json_with).unwrap();
+        assert!(parsed.flagged);
     }
 }

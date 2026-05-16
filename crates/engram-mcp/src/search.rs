@@ -54,16 +54,13 @@ pub struct SearchHit {
     pub source: Source,
     pub created_at: OffsetDateTime,
     pub metadata: Metadata,
-    /// Final score after the pipeline (RRF → recency → optional rerank).
-    /// Consumers sorting by `score` get the final-stage ordering.
-    pub score: f32,
     /// Raw cosine similarity from the vector leg (`None` if not in that leg).
     pub vector_score: Option<f32>,
     /// Raw `word_similarity` from the trigram leg (`None` if not in that leg).
     pub trigram_score: Option<f32>,
-    /// RRF + recency-boost score, captured before rerank overwrote `score`.
-    /// `None` when rerank didn't run (in which case `score` itself is the
-    /// RRF+recency value).
+    /// RRF aggregate (optionally adjusted by recency boost). Preserved
+    /// across the rerank stage. `Some(_)` for every fused hit; `None`
+    /// would only appear in a pathological pre-fusion path.
     pub rrf_score: Option<f32>,
     /// Calibrated absolute score from the reranker (`None` if rerank was
     /// off, unavailable, or this hit fell outside the candidate pool).
@@ -126,12 +123,14 @@ pub struct SearchFactHit {
     pub predicate: Option<String>,
     pub object: Option<String>,
     pub confidence: f32,
+    /// M3 Phase C: true for the middle confidence band
+    /// (`review_queue_below ≤ confidence < min_confidence_to_store`).
+    /// Consumers may filter or de-emphasize flagged rows.
+    pub flagged: bool,
     pub source_thought_id: ThoughtId,
     pub source_thought_content: String,
     pub source_thought_scope: Scope,
     pub source_thought_created_at: OffsetDateTime,
-    /// Final score after the pipeline (RRF → recency → optional rerank).
-    pub score: f32,
     pub vector_score: Option<f32>,
     pub trigram_score: Option<f32>,
     pub rrf_score: Option<f32>,
@@ -251,7 +250,6 @@ pub async fn search_thoughts(
             source: h.thought.source,
             created_at: h.thought.created_at,
             metadata: h.thought.metadata,
-            score: h.score,
             vector_score: h.vector_score,
             trigram_score: h.trigram_score,
             rrf_score: h.rrf_score,
@@ -268,9 +266,11 @@ pub async fn search_thoughts(
 
 /// Run the cross-encoder rerank stage over the top `candidate_pool` hits.
 /// On success, mutates `hits` in place: rerank scores are written to
-/// `rerank_score` and mirrored into `score`; the un-reranked tail is
-/// **truncated** so the response contains only the reranker's verdict on
-/// the candidate pool. Re-sorts by rerank score descending.
+/// `rerank_score`; the un-reranked tail is **truncated** so the response
+/// contains only the reranker's verdict on the candidate pool. Re-sorts
+/// by rerank score descending. `rrf_score` is preserved (set by
+/// [`engram_core::search::rrf_fuse`]) so consumers can compare RRF-only
+/// ordering against rerank ordering.
 ///
 /// Truncating is necessary because rerank scores and RRF+recency scores
 /// aren't on the same scale: a small cross-encoder like MiniLM produces
@@ -305,22 +305,20 @@ async fn apply_rerank_to_thought_hits(
             return false;
         }
     };
-    // Map back to hits via RerankScore.index, capture pre-rerank `score`
-    // into `rrf_score` so the A/B harness (and inquisitive consumers) can
-    // see both rankings, then overwrite `score` with the rerank score.
+    // Map back to hits via RerankScore.index. `rrf_score` was already set
+    // by rrf_fuse / recency_boost upstream; we only write rerank_score.
     for s in scores {
         if let Some(hit) = hits.get_mut(s.index) {
-            hit.rrf_score = Some(hit.score);
             hit.rerank_score = Some(s.score);
-            hit.score = s.score;
         }
     }
-    // Drop the un-reranked tail and sort the reranked candidates by score.
+    // Drop the un-reranked tail and sort the reranked candidates by
+    // rerank_score descending. Ties fall back to rrf_score.
     hits.truncate(pool_len);
     hits.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        let av = a.rerank_score.unwrap_or(f32::MIN);
+        let bv = b.rerank_score.unwrap_or(f32::MIN);
+        bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
     });
     true
 }
@@ -360,12 +358,18 @@ pub async fn get_thought(
     })
 }
 
-/// Search over `facts` — trigram-only in Phase D inside the same response
-/// shape as `search_thoughts`. The vector leg lands in M3 (search quality)
-/// once fact embeddings are wired through the queue. The recency boost is
-/// keyed on `source_thought_created_at` — the thought's recency is a better
-/// freshness signal for a fact than the fact's own `created_at` (which is
-/// when the reflector ran, not when the underlying thought was captured).
+/// Search over `facts` with the same hybrid pipeline as `search_thoughts`:
+/// vector kNN over fact embeddings ∪ trigram similarity over
+/// `fact.statement` (and the (S, P, O) triple), fused via RRF, recency-
+/// boosted, optionally reranked. Fact embeddings landed in M3 Phase B
+/// step 1 (2026-05-14); the cross-encoder rerank stage landed in step 2
+/// (2026-05-15). The recency boost is keyed on `source_thought_created_at`
+/// — the thought's recency is a better freshness signal for a fact than
+/// the fact's own `created_at` (which is when the reflector ran, not when
+/// the underlying thought was captured). Soft-fails to trigram only when
+/// the embedder is unreachable (signaled via `vector_search_available`),
+/// and to RRF + recency order when the reranker fails (signaled via
+/// `rerank_used`).
 pub async fn search_facts(
     pool: &PgPool,
     embedder: &dyn Embedder,
@@ -441,12 +445,15 @@ pub async fn search_facts(
         for h in fused.iter_mut() {
             let age_secs = (now - h.source_thought_created_at).whole_seconds() as f32;
             let age_days = age_secs / 86_400.0;
-            h.score *= 0.5_f32.powf(age_days / half_life);
+            let factor = 0.5_f32.powf(age_days / half_life);
+            if let Some(s) = h.rrf_score {
+                h.rrf_score = Some(s * factor);
+            }
         }
         fused.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let av = a.rrf_score.unwrap_or(0.0);
+            let bv = b.rrf_score.unwrap_or(0.0);
+            bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
         });
     }
 
@@ -474,11 +481,11 @@ pub async fn search_facts(
             predicate: h.fact.predicate,
             object: h.fact.object,
             confidence: h.fact.confidence,
+            flagged: h.fact.flagged,
             source_thought_id: h.fact.source_thought_id,
             source_thought_content: h.source_thought_content,
             source_thought_scope: h.source_thought_scope,
             source_thought_created_at: h.source_thought_created_at,
-            score: h.score,
             vector_score: h.vector_score,
             trigram_score: h.trigram_score,
             rrf_score: h.rrf_score,
@@ -495,9 +502,10 @@ pub async fn search_facts(
 
 /// Fact-side counterpart of `apply_rerank_to_thought_hits`. Cross-encoder
 /// scores each fact's `statement` against the query; on success mutates
-/// hits in place (writes `rerank_score`, mirrors into `score`), truncates
-/// the un-reranked tail (see thought-side doc for why), and re-sorts the
-/// reranked candidate pool by score descending.
+/// hits in place (writes `rerank_score`), truncates the un-reranked tail
+/// (see thought-side doc for why), and re-sorts the reranked candidate
+/// pool by `rerank_score` descending. `rrf_score` was already set by
+/// the upstream `rrf_fuse_facts` + recency-boost pass.
 async fn apply_rerank_to_fact_hits(
     reranker: &dyn Reranker,
     query: &str,
@@ -529,9 +537,7 @@ async fn apply_rerank_to_fact_hits(
     let mut out_of_range = 0usize;
     for s in scores {
         if let Some(hit) = hits.get_mut(s.index) {
-            hit.rrf_score = Some(hit.score);
             hit.rerank_score = Some(s.score);
-            hit.score = s.score;
             applied += 1;
         } else {
             out_of_range += 1;
@@ -546,17 +552,17 @@ async fn apply_rerank_to_fact_hits(
     );
     hits.truncate(pool_len);
     hits.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        let av = a.rerank_score.unwrap_or(f32::MIN);
+        let bv = b.rerank_score.unwrap_or(f32::MIN);
+        bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
     });
     true
 }
 
 /// Fact-side analogue of `engram_core::search::rrf_fuse`, keyed on
 /// `fact.id` instead of `thought.id`. Same reciprocal-rank-fusion algorithm
-/// (`score = Σ 1 / (k + rank_i)`); same per-leg score preservation rule
-/// (an input's `Some(_)` always wins over an existing `None`). Inline
+/// (`rrf_score = Σ 1 / (k + rank_i)`); same per-leg score preservation
+/// rule (an input's `Some(_)` always wins over an existing `None`). Inline
 /// because `rrf_fuse` in engram-core is `Hit`-specific and the fact side
 /// has its own `FactHit` shape.
 fn rrf_fuse_facts(
@@ -572,7 +578,8 @@ fn rrf_fuse_facts(
             let id = hit.fact.id;
             match acc.get_mut(&id) {
                 Some(existing) => {
-                    existing.score += contribution;
+                    let current = existing.rrf_score.unwrap_or(0.0);
+                    existing.rrf_score = Some(current + contribution);
                     if existing.vector_score.is_none() {
                         existing.vector_score = hit.vector_score;
                     }
@@ -582,7 +589,7 @@ fn rrf_fuse_facts(
                 }
                 None => {
                     let mut merged = hit;
-                    merged.score = contribution;
+                    merged.rrf_score = Some(contribution);
                     acc.insert(id, merged);
                 }
             }
@@ -590,9 +597,9 @@ fn rrf_fuse_facts(
     }
     let mut fused: Vec<engram_storage::FactHit> = acc.into_values().collect();
     fused.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        let av = a.rrf_score.unwrap_or(0.0);
+        let bv = b.rrf_score.unwrap_or(0.0);
+        bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
     });
     fused
 }
@@ -831,6 +838,7 @@ mod tests {
                 extractor_version: 1,
                 source_run_id: Some(run_id),
                 confidence,
+                flagged: false,
             },
         )
         .await

@@ -190,7 +190,7 @@ provider = "openai-compatible"           # also "openrouter"
 endpoint = "http://localhost:8000/v1"    # vLLM default; OpenRouter is https://openrouter.ai/api/v1
 model_name = "qwen2.5-7b-instruct"       # the model the backend serves
 model_id = "vllm/qwen2.5-7b-instruct"    # provenance written into facts.extractor_model
-model_version = 3                        # bump when prompt/schema changes; v3 = SPO decomposition rules + tighter confidence rubric + new episodic negatives (2026-05-14)
+model_version = 4                        # bump when prompt/schema changes; v4 = relations rule + reinforced SPO few-shots for the dogfood leak set + flagged-band framing (2026-05-15, M3 Phase C). v3 = SPO decomposition rules + tighter confidence rubric + episodic negatives (2026-05-14).
 timeout_seconds = 60                     # vLLM JSON-Schema responses can run long
 temperature = 0.2
 max_facts_per_thought = 8
@@ -206,7 +206,9 @@ schedule = "0 0 3 * * *"                 # 6-field cron: sec min hour dom month 
 scope_filter = ""                        # leave blank for all scopes
 max_thoughts_per_run = 1000
 max_facts_per_thought = 8
-review_queue_below = 0.7                 # confidence below → facts_review_queue; ≥ → facts
+review_queue_below = 0.7                 # confidence < this → facts_review_queue (M3 Phase C three-band lower bound)
+min_confidence_to_store = 0.85           # M3 Phase C: review_queue_below ≤ confidence < this → facts with flagged=true; ≥ → facts with flagged=false. Kill-switch: set equal to review_queue_below to collapse back to two-band routing (every committed row flagged=false).
+subsumption_keep = "specific"            # M3 Phase C: when two facts on the same thought share (subject, predicate) and one's object refines the other, keep the more "specific" (default) or "general"
 
 [reranker]                                              # M3 Phase B step 2; opt-in
 provider = "tei"                                        # "" = disabled (default); "tei" = TEI sidecar

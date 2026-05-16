@@ -204,7 +204,7 @@ impl EngramServer {
             .map_err(|e| format!("response serialization error: {e}"))
     }
 
-    #[tool(description = "Hybrid search across captured thoughts. Combines vector kNN (over the active embedding model) with trigram lexical similarity via reciprocal rank fusion, then applies a recency boost. Returns the top-N matching thoughts with score. If the embedder is unreachable, results still come back from the trigram leg only and `vector_search_available` is false.")]
+    #[tool(description = "Hybrid search across captured thoughts. Combines vector kNN (over the active embedding model) with trigram lexical similarity via reciprocal rank fusion, then applies a recency boost. When a cross-encoder reranker is configured, the top `candidate_pool` post-RRF hits are re-scored and returned in rerank order. Results are returned in post-pipeline order; per-hit per-leg fields (`vector_score`, `trigram_score`, `rrf_score`, `rerank_score`) carry every signal — pick `rerank_score ?? rrf_score` for thresholding. If the embedder is unreachable, results still come back from the trigram leg and `vector_search_available` is false; if the reranker fails, results come back in RRF + recency order and `rerank_used` is false.")]
     async fn search_thoughts(
         &self,
         Parameters(args): Parameters<SearchThoughtsArgs>,
@@ -259,7 +259,7 @@ impl EngramServer {
             .map_err(|e| format!("response serialization error: {e}"))
     }
 
-    #[tool(description = "Fetch a single thought by ID along with its provenance: whether it's been embedded ('indexed' or 'pending'), when it was embedded, and the active (non-superseded) facts derived from it.")]
+    #[tool(description = "Fetch a single thought by ID along with its provenance: whether it's been embedded ('indexed' or 'pending'), when it was embedded, and the active (non-superseded) facts derived from it. Each linked fact carries `flagged: true` for middle-band-confidence claims (under `min_confidence_to_store`); consumers may filter or de-emphasize.")]
     async fn get_thought(
         &self,
         Parameters(args): Parameters<GetThoughtArgs>,
@@ -275,7 +275,7 @@ impl EngramServer {
             .map_err(|e| format!("response serialization error: {e}"))
     }
 
-    #[tool(description = "Search across extracted facts via trigram similarity over fact.statement, filtered to active (non-superseded) facts. Each result includes the fact's S/P/O triple, confidence, score, and the source thought's content/scope/created_at so the agent doesn't need a follow-up get_thought call.")]
+    #[tool(description = "Hybrid search across extracted facts. Combines vector kNN over fact embeddings with trigram lexical similarity over fact.statement (and the SPO triple), fused via RRF, with optional cross-encoder rerank. Filters to active (non-superseded) facts whose source thought is also not retracted. Each result carries the fact's S/P/O triple, `confidence`, `flagged` (true for middle-band-confidence claims), and the source thought's content/scope/created_at — no follow-up get_thought call needed. Per-leg fields (`vector_score`, `trigram_score`, `rrf_score`, `rerank_score`) expose every signal; for thresholding use `rerank_score ?? rrf_score`.")]
     async fn search_facts(
         &self,
         Parameters(args): Parameters<SearchFactsArgs>,
@@ -423,7 +423,6 @@ fn search_response_json(resp: &SearchResponse) -> serde_json::Value {
                 "source": h.source.as_str(),
                 "created_at": h.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
                 "metadata": h.metadata.as_value(),
-                "score": h.score,
                 "vector_score": h.vector_score,
                 "trigram_score": h.trigram_score,
                 "rrf_score": h.rrf_score,
@@ -468,6 +467,7 @@ fn get_thought_response_json(resp: &GetThoughtResponse) -> serde_json::Value {
                 "predicate": f.predicate,
                 "object": f.object,
                 "confidence": f.confidence,
+                "flagged": f.flagged,
                 "extractor_model": f.extractor_model,
                 "extractor_version": f.extractor_version,
                 "created_at": f.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
@@ -509,7 +509,7 @@ fn search_facts_response_json(resp: &SearchFactsResponse) -> serde_json::Value {
                 "source_thought_content": h.source_thought_content,
                 "source_thought_scope": h.source_thought_scope.as_str(),
                 "source_thought_created_at": h.source_thought_created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
-                "score": h.score,
+                "flagged": h.flagged,
                 "vector_score": h.vector_score,
                 "trigram_score": h.trigram_score,
                 "rrf_score": h.rrf_score,
@@ -606,6 +606,43 @@ mod tests {
         assert!(!results.is_empty());
         assert!(results[0]["thought_id"].is_string());
         assert!(results[0]["content"].as_str().unwrap().contains("tcgplayer"));
+    }
+
+    /// Regression: M3 Phase C dropped the unified `score` field. Per-leg
+    /// fields (`rrf_score`, plus `rerank_score` when reranked, plus the
+    /// raw leg signals) carry every signal; consumers no longer rely on
+    /// a single sortable scalar.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_response_omits_score_field(pool: PgPool) {
+        let s = server(pool);
+        s.capture(Parameters(CaptureArgs {
+            content: "reproducible builds via Nix".into(),
+            source: "test".into(),
+            scope: None,
+            metadata: None,
+        }))
+        .await
+        .unwrap();
+
+        let raw = s
+            .search_thoughts(Parameters(SearchThoughtsArgs {
+                query: "Nix".into(),
+                scope: None,
+                limit: None,
+                recency_half_life_days: None, rerank: None, candidate_pool: None,
+            }))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let results = json["results"].as_array().unwrap();
+        assert!(!results.is_empty());
+        let first = &results[0];
+        assert!(
+            first.get("score").is_none(),
+            "Phase C dropped `score` from search_thoughts hits"
+        );
+        // Per-leg signals are present (rrf_score should always be set on a fused hit).
+        assert!(first.get("rrf_score").is_some());
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -718,6 +755,7 @@ mod tests {
                 extractor_version: 1,
                 source_run_id: Some(run_id),
                 confidence: 0.9,
+                flagged: false,
             },
         )
         .await
@@ -746,6 +784,38 @@ mod tests {
         assert_eq!(results[0]["statement"], "pgvector is the vector store");
         assert_eq!(results[0]["source_thought_content"], "Engram uses pgvector");
         assert_eq!(results[0]["source_thought_scope"], "global");
+    }
+
+    /// Regression: M3 Phase C dropped the unified `score` field from
+    /// `search_facts` hits; consumers use `rerank_score ?? rrf_score`
+    /// for thresholding. Also pins `flagged` as a top-level boolean field.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_facts_response_omits_score_field(pool: PgPool) {
+        seed_fact_for_tool_test(&pool, "Engram uses pgvector", "pgvector is the vector store")
+            .await;
+        let s = server(pool);
+        let raw = s
+            .search_facts(Parameters(SearchFactsArgs {
+                query: "pgvector".to_string(),
+                scope: None,
+                limit: None,
+                recency_half_life_days: Some(0.0),
+                rerank: None,
+                candidate_pool: None,
+            }))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let results = json["results"].as_array().unwrap();
+        assert!(!results.is_empty());
+        let first = &results[0];
+        assert!(
+            first.get("score").is_none(),
+            "Phase C dropped `score` from search_facts hits"
+        );
+        assert!(first.get("rrf_score").is_some());
+        // `flagged` always present (defaults false for seeded fact at 0.9 confidence).
+        assert_eq!(first["flagged"], serde_json::Value::Bool(false));
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -838,6 +908,50 @@ mod tests {
         // Fresh thought has no retraction state.
         assert!(json["provenance"]["retracted_at"].is_null());
         assert!(json["provenance"]["retracted_reason"].is_null());
+    }
+
+    /// M3 Phase C: linked_facts items carry `flagged: bool` so consumers
+    /// can filter middle-band-confidence claims from a `get_thought`
+    /// response.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn get_thought_response_linked_facts_carry_flagged(pool: PgPool) {
+        let (thought_id, _fact_id) =
+            seed_fact_for_tool_test(&pool, "fact source", "claim text").await;
+        let s = server(pool);
+
+        let raw = s
+            .get_thought(Parameters(GetThoughtArgs { thought_id }))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let facts = json["provenance"]["linked_facts"].as_array().unwrap();
+        assert_eq!(facts.len(), 1);
+        // Seeded fact has confidence 0.9 (above default min_confidence_to_store).
+        assert_eq!(facts[0]["flagged"], serde_json::Value::Bool(false));
+    }
+
+    /// M3 Phase C: `search_facts` responses carry `flagged: bool` per hit
+    /// so consumers can threshold downstream.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_facts_response_carries_flagged(pool: PgPool) {
+        seed_fact_for_tool_test(&pool, "anchor source", "queryable claim").await;
+        let s = server(pool);
+        let raw = s
+            .search_facts(Parameters(SearchFactsArgs {
+                query: "queryable".to_string(),
+                scope: None,
+                limit: None,
+                recency_half_life_days: Some(0.0),
+                rerank: None,
+                candidate_pool: None,
+            }))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let results = json["results"].as_array().unwrap();
+        assert!(!results.is_empty());
+        let first = &results[0];
+        assert_eq!(first["flagged"], serde_json::Value::Bool(false));
     }
 
     #[sqlx::test(migrations = "../../migrations")]

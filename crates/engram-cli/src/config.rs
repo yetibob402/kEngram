@@ -183,11 +183,12 @@ impl Default for ExtractorConfig {
             endpoint: "http://localhost:8000/v1".to_string(),
             model_name: "qwen2.5-7b-instruct".to_string(),
             model_id: "vllm/qwen2.5-7b-instruct".to_string(),
-            // v3 = SPO decomposition rules + tighter confidence rubric +
-            // two new episodic-skip negatives + JSON envelope in prose
-            // (2026-05-14, M3 Phase A). See
+            // v4 = relations rule + reinforced SPO few-shots for leak set
+            // (Bazel/Make, Nix/Make, Redis conditional, SIMD self-reference)
+            // + flagged-band confidence framing + "no same-statement-different-
+            // SPO" rule (2026-05-15, M3 Phase C). See
             // crates/engram-extract/src/openai_compatible.rs.
-            model_version: 3,
+            model_version: 4,
             api_key: None,
             timeout_seconds: 60,
             temperature: 0.2,
@@ -261,11 +262,12 @@ mod tests {
         assert_eq!(c.extractor.endpoint, "http://localhost:8000/v1");
         assert_eq!(c.extractor.model_name, "qwen2.5-7b-instruct");
         assert_eq!(c.extractor.model_id, "vllm/qwen2.5-7b-instruct");
-        // Bumped to 3 on 2026-05-14 (M3 Phase A) when the system prompt
-        // gained SPO decomposition rules, tighter confidence rubric, and
-        // two new episodic-skip negatives. (v2 = 2026-05-13: confidence
-        // rubric anchors + episodic-content skip.)
-        assert_eq!(c.extractor.model_version, 3);
+        // Bumped to 4 on 2026-05-15 (M3 Phase C) when the system prompt
+        // gained the relations rule, reinforced SPO few-shots for the
+        // Phase A + Phase B step 2 leak set, and flagged-band confidence
+        // framing. (v3 = 2026-05-14, M3 Phase A: SPO decomposition rules
+        // + tighter confidence rubric + episodic-skip negatives.)
+        assert_eq!(c.extractor.model_version, 4);
         assert!(c.extractor.api_key.is_none());
         assert_eq!(c.extractor.max_facts_per_thought, 8);
         // Default is the bundled prompt — no file override.
@@ -288,5 +290,35 @@ mod tests {
     fn default_reflector_review_queue_below_is_0_7() {
         let c = Config::default();
         assert!((c.reflector.review_queue_below - 0.7).abs() < f32::EPSILON);
+    }
+
+    /// M3 Phase C: middle confidence band defaults to 0.85, matching the
+    /// design-doc §10 framing. Subsumption-keep defaults to `Specific`.
+    #[test]
+    fn reflector_config_loads_min_confidence_and_subsumption_keep() {
+        // Defaults.
+        let c = Config::default();
+        assert!((c.reflector.min_confidence_to_store - 0.85).abs() < f32::EPSILON);
+        assert_eq!(
+            c.reflector.subsumption_keep,
+            engram_mcp::SubsumptionKeep::Specific,
+        );
+
+        // TOML override round-trips both fields.
+        let toml = r#"
+            [reflector]
+            min_confidence_to_store = 0.9
+            subsumption_keep = "general"
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert!((c.reflector.min_confidence_to_store - 0.9).abs() < f32::EPSILON);
+        assert_eq!(
+            c.reflector.subsumption_keep,
+            engram_mcp::SubsumptionKeep::General,
+        );
     }
 }

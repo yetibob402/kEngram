@@ -57,10 +57,16 @@ impl OpenAICompatibleConfig {
             // v3 = SPO decomposition rules (comparative S/O mapping,
             // self-referential rejection, conditional-as-subject), tighter
             // confidence rubric, two new episodic-skip negatives, JSON
-            // envelope restated in prose (2026-05-14, M3 Phase A). Earlier
-            // facts carry version=1 or 2 and can be re-extracted via
+            // envelope restated in prose (2026-05-14, M3 Phase A). v4
+            // (2026-05-15, M3 Phase C) folds in: structured-relations
+            // rule for "A prefers X over Y"; reinforced few-shots for
+            // the Phase A + Phase B step 2 leak set (Bazel/Make, Nix/Make
+            // comparative, Redis conditional, SIMD self-reference);
+            // 0.70–0.85 framed as the "stored but flagged" middle band;
+            // explicit "no same-statement-different-SPO" rule. Earlier
+            // facts carry version=1, 2, or 3 and can be re-extracted via
             // `engram reflect --rerun`.
-            model_version: 3,
+            model_version: 4,
             api_key: None,
             timeout: Duration::from_secs(60),
             temperature: 0.2,
@@ -78,7 +84,7 @@ impl OpenAICompatibleConfig {
             endpoint: "https://openrouter.ai/api/v1".to_string(),
             model_id: format!("openrouter/{model_name}"),
             model_name,
-            model_version: 3, // see `vllm_local()` for rationale on the bump
+            model_version: 4, // see `vllm_local()` for rationale on the bump
             api_key: Some(api_key),
             timeout: Duration::from_secs(60),
             temperature: 0.2,
@@ -206,20 +212,34 @@ Each fact has:
 
 Subject and object must be *distinct* entities. If you cannot identify two distinct entities, set subject and/or object to null and rely on the statement to carry the claim.
 
-For comparatives (\"A is more X than B\" / \"A is simpler than B\" / \"A outperforms B\"): the subject is A and the object is B.
-  Example: \"Bazel is more powerful than Make\" → subject=\"Bazel\", predicate=\"is more powerful than\", object=\"Make\". NOT subject=\"Make\".
+Both subject and object SHOULD appear (as substrings, case-insensitive) inside the statement. If your decomposition leaves either out, you have the SPO wrong — revisit it.
+
+For comparatives (\"A is more X than B\" / \"A is simpler than B\" / \"A outperforms B\"): the subject is A and the object is B. Subject must appear before object in the statement.
+  DO emit: \"Bazel is more powerful than Make\" → subject=\"Bazel\", predicate=\"is more powerful than\", object=\"Make\".
+  DO NOT emit: subject=\"Make\", object=\"Bazel\". The second clause of a compound sentence (\"…but has a steeper learning curve\") does NOT make Make the subject — it is still a comparison of Bazel against Make.
+  DO emit: \"Nix is more reproducible than Make\" → subject=\"Nix\", object=\"Make\".
+  DO NOT emit: subject=\"Make\", object=\"Nix\".
+  DO emit: \"SIMD-accelerated JSON parsing outperforms scalar implementations\" → subject=\"SIMD-accelerated JSON parsing\", object=\"scalar implementations\".
+  DO NOT emit: subject=object=\"SIMD-accelerated JSON parsing\" (self-referential).
+
+For relative / preference claims naming two entities (\"A prefers X over Y\" / \"A favors X to Y\" / \"A picks X over Y\"): emit ONE fact whose object names both sides of the comparison. The comparison is one claim, not two.
+  DO emit: \"Ron prefers Rust over Go for software projects\" → subject=\"Ron\", predicate=\"prefers over\", object=\"Rust to Go\".
+  DO NOT emit two facts (\"Ron prefers Rust\" + \"Go is the next choice when Rust isn't available\") — flatten into a single ranking claim.
 
 For conditionals (\"If <condition>, A is the right choice for X\"): the subject is A; the condition belongs in the statement context, not in the subject slot.
-  Example: \"If you need sub-millisecond reads at high throughput, Redis is usually the right choice\" → subject=\"Redis\", NOT subject=\"sub-millisecond reads at high throughput\".
+  DO emit: \"If you need sub-millisecond reads at high throughput, Redis is usually the right choice\" → subject=\"Redis\", predicate=\"is the right choice when\".
+  DO NOT emit: subject=\"sub-millisecond reads at high throughput\" (the conditional clause).
 
 # Confidence calibration
 
 Pick the band the source actually supports — DO NOT default to a single value. Vary across hedged vs declarative claims.
 - 0.95–1.00: direct quotation or near-verbatim restatement. The source unambiguously asserts this exact claim, in roughly these words.
 - 0.90–0.95: clean paraphrase of a declarative statement, no hedging in the source, no added inference.
-- 0.70–0.90: declarative claim that required moderate paraphrase, or a claim qualified by mild hedges ('usually', 'most', 'tends to').
+- 0.70–0.90: declarative claim that required moderate paraphrase, or a claim qualified by mild hedges ('usually', 'most', 'tends to'). This is the \"stored but flagged\" middle band — useful claims that are not as load-bearing as direct quotations. Use it intentionally rather than as a default.
 - 0.50–0.70: claim is strongly hedged in the source ('likely', 'might', 'I suspect', 'often but not always'), or requires inference from surrounding context.
 - below 0.50: speculative; a human should review.
+
+Declarative paraphrase-of-source belongs at 0.90+, not in the middle band.
 
 # Rules
 
@@ -230,7 +250,7 @@ Pick the band the source actually supports — DO NOT default to a single value.
 - Skip hardware-spec / session-metadata phrasings ('The benchmark was conducted on this hardware (M2 Pro, 16GB)'). These are observational context, not durable claims.
 - Useful sanity check: would this claim still be useful to a reader six months from now, independent of when it was captured? If no, skip.
 - For mixed-content thoughts (a thought containing both a durable finding and a transient session-narrative): extract only the finding.
-- One fact per claim. Don't bundle multiple distinct claims into a single statement.
+- One fact per claim. Don't bundle multiple distinct claims into a single statement, and don't emit two facts with the same statement but different SPO decompositions — pick the one that follows the rules above.
 - Return at most {MAX_FACTS} facts.";
 
 /// Additional system message appended after [`BUNDLED_SYSTEM_PROMPT`] when
@@ -468,6 +488,33 @@ mod tests {
 
     fn ctx(max: usize) -> ExtractionContext {
         ExtractionContext::new(Scope::global(), max)
+    }
+
+    /// Phase C v4 prompt content pin: relations rule, reinforced few-shots
+    /// for the leak set, and the flagged-band framing must all be present.
+    /// Catches accidental deletions during downstream edits.
+    #[test]
+    fn bundled_prompt_v4_contains_relations_rule_and_flagged_band_note() {
+        let p = BUNDLED_SYSTEM_PROMPT;
+        // Relations rule + canonical example.
+        assert!(
+            p.contains("relative / preference claims") || p.contains("Ron prefers Rust over Go"),
+            "v4 relations rule missing",
+        );
+        // Reinforced few-shots for the leak set.
+        assert!(p.contains("Nix is more reproducible than Make"), "Nix/Make few-shot missing");
+        assert!(p.contains("subject=object"), "self-referential rejection example missing");
+        // Confidence rubric calls out the 0.70–0.85 middle band as
+        // "stored but flagged".
+        assert!(
+            p.contains("stored but flagged"),
+            "flagged-band confidence framing missing",
+        );
+        // Vllm + open_router presets bumped to v4.
+        let cfg = OpenAICompatibleConfig::vllm_local();
+        assert_eq!(cfg.model_version, 4);
+        let cfg = OpenAICompatibleConfig::open_router("k".into(), "m".into());
+        assert_eq!(cfg.model_version, 4);
     }
 
     fn config_for(endpoint: String, api_key: Option<String>) -> OpenAICompatibleConfig {

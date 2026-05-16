@@ -14,15 +14,15 @@ For design rationale see [`docs/engram-design-v0.md`](docs/engram-design-v0.md);
 
 ## What you get (MCP surface)
 
-**Status:** M1 and M2 are shipped (capture, hybrid search, facts pipeline, seven MCP tools — `retract_thought` was added in 2026-05-13 from dogfood feedback). M3–M5 are planned — see the [Roadmap](#roadmap) at the end of this doc.
+**Status:** M1 and M2 are shipped (capture, hybrid search, facts pipeline, seven MCP tools — `retract_thought` was added in 2026-05-13 from dogfood feedback). M3 (search & extraction quality) is mostly shipped: fact embeddings, the cross-encoder reranker (see [Reranking search results](#reranking-search-results) below), the v4 extractor prompt, the per-thought `extract` flag, three-band confidence routing (`flagged`), per-claim retraction durability, subsumption-aware dedup, and quality-aware canonical selection are all live as of 2026-05-15. Phase B step 3 (A/B benchmarking harness) and Phase D (operator dogfood + close-out) remain. M4–M5 are planned — see the [Roadmap](#roadmap) at the end of this doc.
 
 | Tool | What it does |
 |---|---|
 | `capture` | Record a thought. Returns `thought_id` + `embedding_status: "pending"`; the `engram worker` drains the embed queue on its tick. |
-| `search_thoughts` | Hybrid retrieval (vector kNN ∪ trigram, fused by RRF, recency-boosted). Gracefully degrades to trigram-only when the embedder is unreachable; result includes `vector_search_available: bool`. Excludes retracted thoughts. |
+| `search_thoughts` | Hybrid retrieval (vector kNN ∪ trigram, fused by RRF, recency-boosted, optionally reranked by a cross-encoder — see [Reranking](#reranking-search-results)). Gracefully degrades to trigram-only when the embedder is unreachable; result includes `vector_search_available: bool`. Excludes retracted thoughts. |
 | `recent_thoughts` | Browse by recency in a (optional) scope. Excludes retracted thoughts. |
 | `get_thought` | Full thought + provenance (embedding status, embedded-at, active `linked_facts`, retraction state). Direct lookup by ID returns the row even if retracted — this is the audit path. |
-| `search_facts` | Trigram search over `facts.statement`, filtered to active (non-superseded) rows whose source thought is also not retracted. Each result includes the fact's S/P/O triple plus the source thought's content/scope/created_at. M3 adds the vector leg. |
+| `search_facts` | Hybrid retrieval (vector kNN ∪ trigram over `facts.statement`, fused by RRF, optionally reranked) filtered to active (non-superseded) rows whose source thought is also not retracted. Each result includes the fact's S/P/O triple plus the source thought's content/scope/created_at. |
 | `correct_fact` | Operator-driven correction. With a replacement, inserts a manual-author fact (`extractor_model="manual"`, `extractor_version=0`, `confidence=1.0`) and supersedes the old row, preserving the audit trail. Without a replacement, retracts via supersede. Operates on a single fact. |
 | `retract_thought` | Mark a thought as untrusted (e.g. you captured a wrong claim). Atomically sets `thoughts.retracted_at` *and* auto-supersedes every active fact derived from it — so a subsequent reflector run can't re-extract from the untrusted source. The row stays in the DB; `get_thought` still returns it with retraction state. Use this rather than `correct_fact`-ing each derived fact one at a time. |
 
@@ -327,6 +327,87 @@ The reflector uses structured outputs, so the model + serving stack must:
 - **Support `response_format: { type: "json_schema" }`** — vLLM's `xgrammar` and `outlines` guided-decoding backends do; most OpenRouter chat models do.
 - **Be instruction-following enough to populate the (S, P, O) triple cleanly** — Qwen 2.5 7B/14B Instruct, Llama 3.1 8B+, Claude Haiku / Sonnet via OpenRouter all work well. Smaller / non-instruct models often return malformed payloads (logged as `ExtractorError::MalformedResponse` and soft-failed per Q9).
 
+## Reranking search results
+
+Hybrid retrieval (vector ∪ trigram fused by RRF) gives Engram strong **recall** — both meaning-similar and lexically-similar candidates surface together. The catch: RRF scores are rank-based (`1 / (60 + rank)`) and *uncalibrated* — two adjacent results differ by ~0.005 whether they're equally relevant or one is clearly better. Recency tilts the order toward fresh thoughts, but recency is not relevance.
+
+The **reranker** stage closes that gap. After RRF + recency, the top *K* candidates (default 32) are sent to a **cross-encoder** that scores each `(query, candidate)` pair *jointly* and returns calibrated absolute relevance scores. Cross-encoders are too slow to use as the initial retriever (they re-run the model per pair), but they're the highest-quality re-scorer available — and re-ranking a small, RRF-shortlisted pool keeps the cost bounded.
+
+Concrete example from dogfood: a query like *"tooling for compiling codebases reproducibly"* surfaces Redis-related thoughts via trigram (shared tokens like "tooling") and via vector similarity (some semantic overlap with infrastructure topics). RRF can't tell which lexical hit is closer in *meaning*; the reranker can — and reorders the Nix-reproducibility fact ahead of Redis where it belongs.
+
+### Where it sits in the pipeline
+
+```
+search_thoughts / search_facts
+  │
+  ├── vector kNN  (cosine similarity, top 100)   ─┐
+  │                                                ├── RRF fuse ──── recency boost ──── rerank (top K) ──── return top N
+  ├── trigram     (word_similarity, top 100)     ─┘                                       ↑
+  │                                                                                       │
+  └── (each leg populates vector_score / trigram_score on its hits)             (optional; skipped if disabled / unavailable)
+```
+
+Each hit exposes every per-stage signal independently — `vector_score`, `trigram_score`, `rrf_score`, and `rerank_score` — rather than a single post-pipeline scalar. Results come back sorted in post-pipeline order; consumers building threshold logic pick the appropriate signal (typically `rerank_score ?? rrf_score`) and A/B comparisons between RRF-only and reranked orderings don't need a second request.
+
+### Setup
+
+The reranker is **opt-in**. It runs in [Hugging Face TEI](https://github.com/huggingface/text-embeddings-inference) — a Rust HTTP server purpose-built for embedding and rerank workloads. `docker-compose.yml` ships a `tei` service that wraps the dev default model:
+
+```bash
+docker compose up -d tei
+# First boot downloads ~85 MB (cross-encoder/ms-marco-MiniLM-L-6-v2);
+# warms up in seconds on Apple Silicon CPU.
+
+# Smoke:
+curl -s http://localhost:8080/rerank \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"reproducibility","texts":["Nix is reproducible","Redis is fast"]}' | jq .
+# expect: [{ "index": 0, "score": ~0.9x }, { "index": 1, "score": ~0.0x }]
+```
+
+Then add a `[reranker]` section to `~/.config/engram/engram.toml`:
+
+```toml
+[reranker]
+provider        = "tei"                                    # "" = disabled (default); "tei" = TEI sidecar
+endpoint        = "http://localhost:8080"                  # no /v1 suffix; the impl appends /rerank
+model_id        = "cross-encoder/ms-marco-MiniLM-L-6-v2"   # ~22M params, ONNX-exported; fast on Mac CPU
+timeout_seconds = 30
+```
+
+Restart `engram serve` — the startup log shows `reranker resolved provider=tei model_id=…` when the section is picked up.
+
+### Model choice
+
+| Model | Params | TEI backend | Notes |
+|---|---|---|---|
+| `cross-encoder/ms-marco-MiniLM-L-6-v2` | ~22M | ORT (ONNX) | Default for dev. Sub-100ms per call on Apple Silicon CPU. Trained on MS MARCO; quality is fine for single-user dogfood. |
+| `BAAI/bge-reranker-v2-m3` | ~568M | Candle | Production-grade multilingual reranker. Too slow on CPU; use only with a GPU host. |
+
+In production with a GPU sidecar, override `[reranker].model_id` (and `endpoint` if the service is remote). The HTTP shape is identical, so swapping models is config-only.
+
+### Per-call controls
+
+`search_thoughts` and `search_facts` accept two optional parameters:
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `rerank` | `true` when a reranker is configured | Set `false` to return the pre-rerank (RRF + recency) order — useful for A/B comparison and debugging. |
+| `candidate_pool` | `32` | How many post-RRF candidates to send to the reranker. Matches TEI's default `--max-client-batch-size`; raise it for GPU deployments that can handle larger batches. |
+
+The response shape gains two additions (additive — existing consumers ignore unknown fields):
+
+- Top-level **`rerank_used: bool`** — disambiguates a `null` `rerank_score` ("rerank was off" vs "this hit fell outside the candidate pool").
+- Per-hit **`rerank_score: Option<f32>`** and **`rrf_score: Option<f32>`** — the calibrated rerank score and the pre-rerank RRF aggregate. The pre-rerank RRF score is preserved so consumers can compare rankings without a second request.
+
+### Soft-fail semantics
+
+- **`[reranker]` section omitted** → reranker silently disabled. `rerank_used: false`. No error, no warning. The pipeline degrades to RRF + recency, which is the M1/M2 behavior.
+- **TEI unreachable or 5xx mid-request** → the rerank stage is skipped for that request; a `debug`-level log records the failure. `rerank_used: false`. The RRF + recency results return normally — search must never fail because the rerank sidecar is down. `RerankerError::is_transient()` distinguishes infra blips from misconfiguration.
+- **`rerank: false` per-request override** → skip rerank for that call only. `rerank_used: false`.
+
+This matches the embedder's degradation pattern: a missing or down sidecar narrows quality, never blocks search.
+
 ## Repo layout
 
 ```
@@ -351,7 +432,7 @@ Built in five capability milestones (M1 → M5), preceded by an environment mile
 | [M0 — dev environment](docs/milestones/m0-dev-environment.md) | ✅ | Docker Postgres + Ollama dev path |
 | [M1 — capture & search](docs/milestones/m1-capture-and-search.md) | ✅ | `capture`, `search_thoughts`, `recent_thoughts`, `get_thought` over MCP |
 | [M2 — facts pipeline](docs/milestones/m2-facts-pipeline.md) | ✅ | Async embedding seam, reflector cron, `search_facts`, `correct_fact`, `engram reflect` |
-| [M3 — search & extraction quality](docs/milestones/m3-search-quality.md) | ⏳ | Cross-encoder reranker; fact embeddings (vector leg in `search_facts`); v3 extractor prompt; capture-time `extract` flag; paraphrase-aware rerun; three-band confidence routing |
+| [M3 — search & extraction quality](docs/milestones/m3-search-quality.md) | ⏳ | Cross-encoder reranker; fact embeddings (vector leg in `search_facts`); v4 extractor prompt; capture-time `extract` flag; dedup-via-supersession on rerun; three-band confidence routing with `flagged`; per-claim retraction durability; subsumption-aware dedup; quality-aware canonical selection. Phase B step 3 (A/B harness) + Phase D (operator dogfood) remain. |
 | [M4 — artifacts](docs/milestones/m4-artifacts.md) | ⏳ | Long-form document ingestion |
 | [M5 — operational maturity](docs/milestones/m5-operational-maturity.md) | ⏳ | Metrics, Tier 2 auth, eval suite, backups |
 

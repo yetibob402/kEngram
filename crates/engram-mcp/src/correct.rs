@@ -187,6 +187,7 @@ mod tests {
                 extractor_version: 1,
                 source_run_id: Some(run_id),
                 confidence: 0.9,
+                flagged: false,
             },
         )
         .await

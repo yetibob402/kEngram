@@ -25,6 +25,7 @@ pub use correct::{
 pub use drain::{drain_pending_embeddings, DrainError, DrainReport};
 pub use reflect::{
     run_reflector_once, run_reflector_rerun, ReflectorError, ReflectorOptions, ReflectorReport,
+    SubsumptionKeep,
 };
 pub use retract::{
     retract_thought, RetractError, RetractThoughtRequest, RetractThoughtResponse,

@@ -77,7 +77,7 @@ pub struct SearchThoughtsArgs {
     pub candidate_pool: Option<usize>,
 
     #[schemars(
-        description = "Optional JSONB-containment filter against thought tags. Examples: {\"kind\": \"task\"} returns only thoughts the tagger classified as tasks; {\"people\": [\"Sarah\"]} returns thoughts whose people-tag contains Sarah; {\"topics\": [\"rust\"], \"kind\": \"idea\"} combines both. Empty object {} is a no-op."
+        description = "Optional JSONB-containment filter applied to each thought's `tags` field. Tags are LLM-extracted metadata with shape: { people: string[], action_items: string[], topics: string[] (1-3 short lowercase tags), dates_mentioned: string[], kind: 'observation' | 'task' | 'idea' | 'reference' | 'person_note' | 'session' | null }. The `kind` enum is closed at the values listed; the array fields are open-vocabulary strings. Examples: {\"kind\": \"task\"} returns only thoughts the tagger classified as tasks; {\"people\": [\"Sarah\"]} returns thoughts whose people-tag contains Sarah; {\"topics\": [\"rust\"], \"kind\": \"idea\"} combines both (top-level keys AND together; array values are subset-match). Empty object {} is a no-op. Filters compose with `scope`."
     )]
     pub tag_filter: Option<serde_json::Value>,
 }
@@ -409,15 +409,39 @@ fn get_thought_response_json(resp: &GetThoughtResponse) -> serde_json::Value {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for EngramServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Engram — self-hosted MCP-native memory service. \
-                 Use `capture` to record a thought, `search_thoughts` for hybrid retrieval \
-                 (with optional JSONB tag_filter), `recent_thoughts` to browse by recency, \
-                 `get_thought` for full provenance, and `retract_thought` to mark a thought \
-                 untrusted.",
-        )
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(SERVER_INSTRUCTIONS)
     }
 }
+
+/// Server-level instructions surfaced during the MCP initialization
+/// handshake. Cross-cutting orientation that doesn't belong on any single
+/// tool — primarily the `tags` shape, since `tag_filter` is the one MCP
+/// argument whose valid values aren't fully derivable from the JSON Schema
+/// alone (the schema admits any JSONB object; we want clients to know the
+/// closed `kind` enum and the open-vocabulary array fields).
+pub const SERVER_INSTRUCTIONS: &str = "\
+Engram — self-hosted MCP-native memory service.
+
+Storage model: thoughts are the unit. Each thought has:
+- scope: per-thought string label (exact-match filter; keep flat).
+- metadata: agent-supplied JSONB blob (e.g. {client_name, session_id, tool_name}).
+- tags: LLM-extracted metadata sidecar (advisory; advisory means consumers may filter or de-emphasize, but tags don't gate retrieval).
+
+`tags` shape (auto-extracted by the tagger, distinct from `metadata`):
+  { people: string[], action_items: string[], topics: string[] (1-3 short lowercase tags),
+    dates_mentioned: string[],
+    kind: 'observation' | 'task' | 'idea' | 'reference' | 'person_note' | 'session' | null }
+The `kind` enum is closed at those six values (plus null). Array fields are open-vocabulary strings.
+
+Use `tag_filter` on `search_thoughts` for JSONB-containment filtering. Examples:
+  {\"kind\": \"task\"}           → only task-classified thoughts
+  {\"people\": [\"Sarah\"]}    → only thoughts mentioning Sarah
+  {\"topics\": [\"rust\"]}     → only thoughts tagged with rust
+Top-level keys AND together; array values match by subset containment.
+
+`capture` is idempotent on content via SHA-256 fingerprint: same content captured twice returns the existing `thought_id` with `is_duplicate: true` and no new embedding/tag jobs enqueue.
+Tools: `capture`, `search_thoughts`, `recent_thoughts`, `get_thought`, `retract_thought`.";
 
 #[cfg(test)]
 mod tests {
@@ -427,6 +451,45 @@ mod tests {
 
     fn server(pool: PgPool) -> EngramServer {
         EngramServer::new(pool, Arc::new(FakeEmbedder::new()), None, None)
+    }
+
+    /// Regression pin: the server-level instructions surface the `tags`
+    /// shape at the MCP initialization handshake so connecting clients
+    /// have orientation on the closed `kind` enum + open-vocabulary array
+    /// fields without having to discover them by reading per-tool schemas.
+    /// If the SERVER_INSTRUCTIONS text drifts and loses this orientation,
+    /// agents lose their reliable mental model for `tag_filter` values.
+    #[test]
+    fn server_instructions_advertise_tags_shape_and_kind_enum() {
+        let s = SERVER_INSTRUCTIONS;
+        // Tag fields named.
+        assert!(s.contains("people"), "instructions should name the `people` field");
+        assert!(s.contains("action_items"));
+        assert!(s.contains("topics"));
+        assert!(s.contains("dates_mentioned"));
+        // The closed kind enum is the load-bearing part — every value must appear.
+        for variant in [
+            "observation",
+            "task",
+            "idea",
+            "reference",
+            "person_note",
+            "session",
+        ] {
+            assert!(
+                s.contains(variant),
+                "instructions should list kind variant `{variant}`",
+            );
+        }
+        // The agent-supplied `metadata` vs auto-extracted `tags` disambiguation
+        // is the terminology landmine — keep it pinned.
+        assert!(
+            s.contains("metadata") && s.contains("tags"),
+            "instructions should disambiguate `metadata` (agent-supplied) from `tags` (LLM-extracted)",
+        );
+        // Capture-time idempotency is worth advertising — agents that
+        // double-capture should expect `is_duplicate: true`.
+        assert!(s.contains("is_duplicate"));
     }
 
     fn server_with_tagger(pool: PgPool) -> EngramServer {

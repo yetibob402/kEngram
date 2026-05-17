@@ -18,7 +18,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use crate::reranker::{Reranker, RerankerError, RerankScore};
+use crate::reranker::{RerankScore, Reranker, RerankerError};
 
 #[derive(Debug, Clone)]
 pub struct TeiRerankerConfig {
@@ -230,10 +230,7 @@ mod tests {
             .await;
 
         let r = TeiReranker::new(config_for(server.uri())).unwrap();
-        let out = r
-            .rerank("query", &["a", "b", "c"])
-            .await
-            .unwrap();
+        let out = r.rerank("query", &["a", "b", "c"]).await.unwrap();
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].index, 2);
         assert!((out[0].score - 0.99).abs() < 1e-5);
@@ -305,7 +302,10 @@ mod tests {
         let r = TeiReranker::new(config_for("http://127.0.0.1:1".into())).unwrap();
         let err = r.rerank("q", &["a"]).await.unwrap_err();
         assert!(
-            matches!(err, RerankerError::Unreachable(_) | RerankerError::Timeout { .. }),
+            matches!(
+                err,
+                RerankerError::Unreachable(_) | RerankerError::Timeout { .. }
+            ),
             "expected Unreachable or Timeout, got {err:?}"
         );
         assert!(err.is_transient());

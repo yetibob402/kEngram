@@ -65,9 +65,14 @@ The system is built in six capability milestones, preceded by a small environmen
 **M4 — Collapse to thoughts-only (Path B-OB1).**
 - The M3 Phase D dogfood showed the facts pipeline's structured-triple abstraction was the wrong shape for the operator's use case (statements faithful, triples broken; 7 dogfood rounds). M4 collapses the schema: facts table goes away, replaced by a JSONB `tags` sidecar column on `thoughts` populated by an LLM tagger drainer.
 - Content-fingerprint dedup at the thought level (SHA-256 unique constraint) so duplicate captures collapse to the same `thought_id`.
-- `engram-extract` repurposed: `Extractor`/`ExtractedFact`/SPO machinery gone; `Tagger`/`Tags`/JSONB output. The five tag fields are `people`, `action_items`, `topics`, `dates_mentioned`, `kind`.
+- `engram-extract` repurposed: `Extractor`/`ExtractedFact`/SPO machinery gone; `Tagger`/`Tags`/JSONB output. Initial M4 tag fields are `people`, `action_items`, `topics`, `dates_mentioned`, `kind` (M4.1 adds `entities`).
 - MCP surface shrinks: `search_facts` and `correct_fact` removed; `search_thoughts` gains an optional `tag_filter` (JSONB containment); `capture` response gains `is_duplicate`.
 - CLI surface: `engram reflect` → `engram tag` (same shape; tags are advisory and overwritten on `--rerun` rather than supersede-chained).
+
+**M4.1 — v2 tagging.**
+- Dogfood on the M4 v1 tagger surfaced two patterns: (1) the model already half-distinguished named-entities from inferred-categories but the v1 schema collapsed them; (2) topics were phrase-driven, producing divergent terms across paraphrases of the same concept. M4.1 ships a v2 prompt + small trait/storage/drainer adjustments to address both.
+- `Tags` gains an `entities` field separate from `topics`. Schema is additive (JSONB-backed; no migration). The `Tagger` trait gains an optional `vocab: &ScopeVocab` parameter; the drainer pre-fetches the top-N most-frequent topic + entity terms in the thought's scope and renders them into the prompt as a controlled-vocabulary hint.
+- Tagger version bumps 1→2; operator runs `engram tag --rerun --since 1970-01-01T00:00:00Z` to backfill existing rows.
 
 **M5 — Artifacts.**
 - Long-form ingestion: `artifacts` and `artifact_chunks` populated. Chunking strategy lands here.
@@ -260,7 +265,7 @@ There are two write paths. Both terminate in the same `thoughts` row plus an emb
 
 ## 6.5 Tagging sidecar
 
-[M4+] The tagger reads each new thought and writes a JSONB metadata blob onto the same row. Five fields: `people`, `action_items`, `topics`, `dates_mentioned`, `kind`. Tags are advisory metadata — they don't gate storage or supersede each other; they're an optional filtering signal at retrieval time and a UX-time annotation in `search_thoughts` responses.
+[M4+] The tagger reads each new thought and writes a JSONB metadata blob onto the same row. Six fields: `people`, `entities`, `action_items`, `topics`, `dates_mentioned`, `kind`. `entities` and `topics` are separate slots ([M4.1+]): `entities` lists proper-noun-style identifiers the prose mentions by name (projects, products, libraries, named concepts); `topics` lists broader subject categories the thought falls under. Keeping them separate lets `tag_filter` distinguish "thoughts that mention engram by name" from "thoughts categorized under memory-systems." Tags are advisory metadata — they don't gate storage or supersede each other; they're an optional filtering signal at retrieval time and a UX-time annotation in `search_thoughts` responses.
 
 **Why a sidecar, not a separate table.** M2 shipped a `facts` pipeline that decomposed each thought into structured `(subject, predicate, object, confidence, statement)` rows. M3 Phase D dogfood (7 rounds, 2026-05-13 → 2026-05-16) produced a consistent finding: the *statement* field came back faithful to the source thought, but the *triples* came back broken — comparative S/O inversion, self-referential subjects, conditional-as-subject, predicate verbosity, polarity contradictions, triple-semantic drift. The producer (local 30B-class coding model) couldn't reliably emit triples; the consumer (LLM agents reading prose) didn't query by `(S, P, O)`. M4 collapsed the pipeline: drop the `facts` table, write a JSONB sidecar on the thought instead, and treat tagger output as *overwriteable* rather than supersede-chained. The architectural antecedent is OB1's `metadata` column; the design philosophy is *raw data is permanent, derived signals are recomputable*.
 
@@ -268,15 +273,16 @@ There are two write paths. Both terminate in the same `thoughts` row plus an emb
 
 1. **Drain.** `SELECT thought_id, tagger_model_id FROM pending_tags ORDER BY enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT $batch_size`. Fetched in the same idempotent style as `pending_embeddings`.
 
-2. **Tag.** Call `Tagger::tag(content)`. The default impl (`OpenAICompatibleTagger`) POSTs to `/v1/chat/completions` with the v1 prompt + `response_format: { type: "json_schema", strict: true, schema: { ... } }`. Schema (locked in [`docs/milestones/m4-spec.md`](milestones/m4-spec.md)):
+2. **Tag.** Call `Tagger::tag(content, vocab)`. The default impl (`OpenAICompatibleTagger`) POSTs to `/v1/chat/completions` with the v2 prompt + `response_format: { type: "json_schema", strict: true, schema: { ... } }`. Schema (live in `crates/engram-extract/src/openai_compatible.rs`):
 
     ```json
     {
       "type": "object",
       "additionalProperties": false,
-      "required": ["people", "action_items", "topics", "dates_mentioned", "kind"],
+      "required": ["people", "entities", "action_items", "topics", "dates_mentioned", "kind"],
       "properties": {
         "people":          { "type": "array", "items": { "type": "string" } },
+        "entities":        { "type": "array", "items": { "type": "string" }, "maxItems": 5 },
         "action_items":    { "type": "array", "items": { "type": "string" } },
         "topics":          { "type": "array", "items": { "type": "string" }, "maxItems": 3 },
         "dates_mentioned": { "type": "array", "items": { "type": "string" } },
@@ -286,7 +292,9 @@ There are two write paths. Both terminate in the same `thoughts` row plus an emb
     }
     ```
 
-    On per-thought tagger failure (`Timeout`, `Unreachable`, `Backend 5xx`, `MalformedResponse`), the drainer **soft-fails**: logs a warning with `transient = err.is_transient()`, increments the row's `attempts` counter, and leaves it in `pending_tags`. Next tick retries.
+    [M4.1+] Before the tagger call, the drainer optionally pre-fetches the top-N most-frequent topic and entity terms from the thought's scope (via `engram_storage::fetch_scope_vocab`) and passes them to `Tagger::tag(content, Some(&vocab))`. The default `OpenAICompatibleTagger` renders the vocab into a "controlled vocabulary" section appended to the system prompt — the model is told to prefer established terms when they fit and coin new ones only for genuinely unseen concepts. This produces consistent topic vocabulary at the corpus level: the same author writing about the same subject in different prose now lands in overlapping topic terms, addressing v1's phrase-driven divergence. Controlled by `[tagger].scope_vocab_enabled` (default `true`) and `[tagger].scope_vocab_size` (default `50`).
+
+    On per-thought tagger failure (`Timeout`, `Unreachable`, `Backend 5xx`, `MalformedResponse`), the drainer **soft-fails**: logs a warning with `transient = err.is_transient()`, increments the row's `attempts` counter, and leaves it in `pending_tags`. Next tick retries. Vocab-fetch failure folds into the same transient bucket.
 
 3. **Write.** `UPDATE thoughts SET tags = $tags, tags_extractor_model = $model_id, tags_extractor_version = $version, tags_extracted_at = NOW() WHERE id = $thought_id`; then `DELETE FROM pending_tags WHERE thought_id = $thought_id`. The two statements run in one transaction. There is no supersede chain — the tags column is overwritten on every successful tagger pass.
 
@@ -297,6 +305,7 @@ There are two write paths. Both terminate in the same `thoughts` row plus an emb
 ```json
 {
   "people": ["Sarah"],
+  "entities": ["migration #0042"],
   "action_items": ["fast-track migration #0042"],
   "topics": ["pr-backlog", "release-process"],
   "dates_mentioned": ["Thursday"],
@@ -381,13 +390,21 @@ pub trait Reranker: Send + Sync {
 pub trait Tagger: Send + Sync {
     fn model_id(&self) -> &str;                  // e.g. "vllm/qwen2.5-7b-instruct"
     fn version(&self) -> i32;                    // bumped when tagger prompt/schema changes
-    async fn tag(&self, thought_content: &str) -> Result<Tags, TaggerError>;
+    // [M4.1] vocab is the top-N established topic + entity terms in the
+    // thought's scope; rendered into the prompt as a controlled-vocabulary hint.
+    async fn tag(&self, thought_content: &str, vocab: Option<&ScopeVocab>) -> Result<Tags, TaggerError>;
+}
+
+pub struct ScopeVocab {              // [M4.1] — controlled-vocabulary hint per scope
+    pub topics: Vec<String>,
+    pub entities: Vec<String>,
 }
 
 pub struct Tags {                   // [M4] — tagger output, written to thoughts.tags
     pub people: Vec<String>,
+    pub entities: Vec<String>,           // [M4.1] proper-noun-style identifiers mentioned by name
     pub action_items: Vec<String>,
-    pub topics: Vec<String>,             // 1-3 short lowercase tags
+    pub topics: Vec<String>,             // 1-3 short lowercase subject categories
     pub dates_mentioned: Vec<String>,    // free-text dates as the LLM emits them
     pub kind: Option<TagKind>,           // observation | task | idea | reference | person_note | session
 }
@@ -593,3 +610,4 @@ Carrying forward:
 - **2026-05-13** — Added §6.5 "Fact extraction pipeline" as the affirmative companion to §10. §6.5 leads with *why facts matter* (the structured-second-layer story: same captures, two queryable surfaces, thought stays source-of-truth), walks the six-step pipeline (open run → walk unfacted thoughts → extract via JSON-Schema-guided decoding → route by confidence → close run → optional operator review/rerun), shows the exact `response_format` JSON Schema, gives a worked example (a casual conversation capture becoming two facts), and ends with operator-facing SQL ("here are the queries that become trivial once you have a facts table"). §10 reframed as the drift-defense counterweight — same content, but explicitly positioned as the defensive complement to §6.5 rather than the only place facts are discussed.
 - **2026-05-13** — M3 starter shipped early in response to M2 dogfood: first-class thought retraction. Migration `0003_thoughts_retraction.sql` adds `thoughts.retracted_at` + `thoughts.retracted_reason` and an `(scope, created_at DESC) WHERE retracted_at IS NULL` partial index. New `retract_thought(thought_id, reason?)` MCP tool and `engram-storage::retract_thought` fn atomically (a) sets the trust-state column and (b) auto-supersedes every active fact derived from the thought. All retrieval paths (`recent_thoughts`, `search_trigram`, `search_vector_knn`, `search_facts_trigram`) and reflector paths (`find_unfacted_thoughts`, `find_facted_thoughts`, `enqueue_unembedded_thoughts`) now filter `retracted_at IS NULL`; `get_thought` is the audit path and still returns the row with `retracted_at` / `retracted_reason` exposed on the response. Motivation: M2 dogfood (see `docs/milestones/m2-progress.md` 2026-05-13 history) showed that the previous workaround — retract every derived fact one at a time via `correct_fact` — fails as soon as the operator misses any fact, because the unretracted-thought-with-one-active-fact stays in the reflector's `find_facted_thoughts` set and gets re-extracted on the next `engram reflect --rerun`. The atomic supersede + DB-invariant filter closes that gap. Note: this expands the M3 scope (M3 was originally search-quality only) but the work was pulled in early because it gates honest dogfood — operators iterating on captures will inevitably need a way to mark wrong claims as untrusted. The reranker + fact embeddings remain the rest of M3.
 - **2026-05-16** — **M4 collapse to thoughts-only (Path B-OB1).** Major doc revision following the M3 Phase D dogfood negative-knowledge outcome (statements faithful, triples broken across 7 rounds). Roadmap renumbered: M2 (facts pipeline) marked retired-by-M4; M3 closed out at retrieval portion; **M4 = collapse to thoughts-only with metadata-tagging sidecar**; what was M4 (artifacts) shifts to M5; what was M5 (operational maturity) shifts to M6. Schema: `facts`, `facts_review_queue`, `reflector_runs` dropped via migration 0006; `thoughts` extended with `content_fingerprint BYTEA UNIQUE` (SHA-256 dedup), `tags JSONB` (LLM-tagger output: people / action_items / topics / dates_mentioned / kind), and the three `tags_extractor_*` provenance columns. New `pending_tags` queue table feeding a tag drainer in `engram worker`. §6 rewritten as "Ingest path" + "Tagging sidecar"; §10 rewritten as "Operational shape" — operational guarantees rather than drift-defense ceremony (no confidence-band routing, no supersede chain on tagger output, no `facts_review_queue`, no `correct_fact`). §8 MCP surface: `search_facts` and `correct_fact` removed; `search_thoughts` gains `tag_filter`; `capture` gains `is_duplicate`; `retract_thought` simplified (no fact-cascade). §9: `Tagger` trait replaces `Extractor`; config `[tagger]` replaces `[extractor]` + `[reflector]` (drainer is always-on when `[tagger].provider` is non-empty, silent-disable when empty). CLI: `engram reflect` → `engram tag`. The full M4 contract lives in `docs/milestones/m4-spec.md`; architectural narrative in `docs/milestones/m4-collapse-to-thoughts.md`.
+- **2026-05-16** — **M4.1 v2 tagging.** Dogfood on the M4 v1 tagger surfaced two patterns ("memory-systems" inference: model already half-distinguished entities from category-inferred terms; Probe 2-style runs: topics were phrase-driven, producing divergent terms across paraphrases of the same concept). M4.1 splits `Tags.topics` into `Tags.entities` (proper-noun-style identifiers mentioned by name) + `Tags.topics` (broader subject categories) and adds an optional `ScopeVocab` parameter to `Tagger::tag()` — the drainer pre-fetches the top-N most-frequent topic + entity terms in the thought's scope (via the new `engram_storage::fetch_scope_vocab` helper) and renders them into the prompt as a controlled-vocabulary section so the model prefers established terms over coining new ones. Tagger version bumps 1→2; operator runs `engram tag --rerun --since 1970-01-01T00:00:00Z` to backfill. No schema migration (tags is JSONB; the `entities` key is additive). Config: `[tagger]` gains `scope_vocab_enabled` (default `true`) and `scope_vocab_size` (default `50`). MCP wire surface: `SearchHit.tags` carries `entities` for free; `SearchThoughtsArgs.tag_filter` and `SERVER_INSTRUCTIONS` updated to advertise the new shape and document the entities-vs-topics distinction. Selective relations (the M5 candidate) and Probes 1-3 remain deferred. The M4.1 contract + dogfood plan live in `docs/milestones/m4.1-tagging-v2.md`.

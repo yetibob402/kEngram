@@ -9,7 +9,7 @@
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 
-use crate::reranker::{Reranker, RerankerError, RerankScore};
+use crate::reranker::{RerankScore, Reranker, RerankerError};
 
 #[derive(Debug, Clone)]
 pub struct FakeReranker {
@@ -92,7 +92,10 @@ impl FakeReranker {
     /// arguments. Tests assert against this to confirm the search
     /// orchestrator passed the right query + candidate list.
     pub fn last_call(&self) -> Option<RecordedRerank> {
-        self.last_call.lock().expect("last_call mutex poisoned").clone()
+        self.last_call
+            .lock()
+            .expect("last_call mutex poisoned")
+            .clone()
     }
 }
 
@@ -171,8 +174,9 @@ mod tests {
 
     #[tokio::test]
     async fn substring_boost_picks_matching_candidate() {
-        let r =
-            FakeReranker::with_scoring(FakeRerankerScoring::SubstringBoost { needle: "Nix".into() });
+        let r = FakeReranker::with_scoring(FakeRerankerScoring::SubstringBoost {
+            needle: "Nix".into(),
+        });
         let scores = r
             .rerank(
                 "reproducibility",

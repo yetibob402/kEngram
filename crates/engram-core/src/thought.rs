@@ -100,21 +100,21 @@ pub mod content_fingerprint_serde {
 
         // Try hex first (the canonical encoding produced by `serialize`).
         if let Ok(decoded) = hex::decode(&s) {
-            return decoded
-                .try_into()
-                .map_err(|v: Vec<u8>| {
-                    D::Error::custom(format!(
-                        "content_fingerprint must decode to 32 bytes, got {}",
-                        v.len()
-                    ))
-                });
+            return decoded.try_into().map_err(|v: Vec<u8>| {
+                D::Error::custom(format!(
+                    "content_fingerprint must decode to 32 bytes, got {}",
+                    v.len()
+                ))
+            });
         }
 
         // Fall back to standard padded base64 for callers emitting raw
         // byte arrays in JSON.
-        let decoded = B64
-            .decode(s.as_bytes())
-            .map_err(|e| D::Error::custom(format!("content_fingerprint is neither hex nor base64: {e}")))?;
+        let decoded = B64.decode(s.as_bytes()).map_err(|e| {
+            D::Error::custom(format!(
+                "content_fingerprint is neither hex nor base64: {e}"
+            ))
+        })?;
         decoded.try_into().map_err(|v: Vec<u8>| {
             D::Error::custom(format!(
                 "content_fingerprint must decode to 32 bytes, got {}",
@@ -220,7 +220,8 @@ mod tests {
         v["content_fingerprint"] = serde_json::Value::String("not-hex-not-base64!@#$".to_string());
         let err = serde_json::from_value::<Thought>(v).unwrap_err();
         assert!(
-            err.to_string().contains("neither hex nor base64") || err.to_string().contains("32 bytes"),
+            err.to_string().contains("neither hex nor base64")
+                || err.to_string().contains("32 bytes"),
             "expected decode error, got: {err}"
         );
     }

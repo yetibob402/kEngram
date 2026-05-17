@@ -196,8 +196,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let e = OpenAICompatibleEmbedder::new(config_for(format!("{}/v1", server.uri()), 8))
-            .unwrap();
+        let e =
+            OpenAICompatibleEmbedder::new(config_for(format!("{}/v1", server.uri()), 8)).unwrap();
         e.embed(&["hello".to_string()]).await.unwrap();
         // If the mock matched, the request body had the expected shape.
     }
@@ -211,12 +211,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let e = OpenAICompatibleEmbedder::new(config_for(format!("{}/v1", server.uri()), 8))
-            .unwrap();
-        let out = e
-            .embed(&["a".to_string(), "b".to_string()])
-            .await
-            .unwrap();
+        let e =
+            OpenAICompatibleEmbedder::new(config_for(format!("{}/v1", server.uri()), 8)).unwrap();
+        let out = e.embed(&["a".to_string(), "b".to_string()]).await.unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].len(), 8);
         assert_eq!(out[1].len(), 8);
@@ -232,8 +229,8 @@ mod tests {
             .await;
 
         // We expect 8 dims but the server returns 4.
-        let e = OpenAICompatibleEmbedder::new(config_for(format!("{}/v1", server.uri()), 8))
-            .unwrap();
+        let e =
+            OpenAICompatibleEmbedder::new(config_for(format!("{}/v1", server.uri()), 8)).unwrap();
         let err = e.embed(&["hello".to_string()]).await.unwrap_err();
         assert!(matches!(
             err,
@@ -253,8 +250,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let e = OpenAICompatibleEmbedder::new(config_for(format!("{}/v1", server.uri()), 8))
-            .unwrap();
+        let e =
+            OpenAICompatibleEmbedder::new(config_for(format!("{}/v1", server.uri()), 8)).unwrap();
         let err = e.embed(&["hello".to_string()]).await.unwrap_err();
         assert!(matches!(err, EmbedderError::MalformedResponse(_)));
     }
@@ -268,8 +265,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let e = OpenAICompatibleEmbedder::new(config_for(format!("{}/v1", server.uri()), 8))
-            .unwrap();
+        let e =
+            OpenAICompatibleEmbedder::new(config_for(format!("{}/v1", server.uri()), 8)).unwrap();
         let err = e.embed(&["hello".to_string()]).await.unwrap_err();
         match err {
             EmbedderError::Backend { status, .. } => assert_eq!(status, 503),
@@ -286,8 +283,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let e = OpenAICompatibleEmbedder::new(config_for(format!("{}/v1", server.uri()), 8))
-            .unwrap();
+        let e =
+            OpenAICompatibleEmbedder::new(config_for(format!("{}/v1", server.uri()), 8)).unwrap();
         let err = e.embed(&["hello".to_string()]).await.unwrap_err();
         match err {
             EmbedderError::Backend { status, .. } => assert_eq!(status, 401),
@@ -299,12 +296,14 @@ mod tests {
     #[tokio::test]
     async fn errors_on_unreachable_endpoint() {
         // Port 1 is reliably refused on macOS and Linux.
-        let e =
-            OpenAICompatibleEmbedder::new(config_for("http://127.0.0.1:1/v1".to_string(), 8))
-                .unwrap();
+        let e = OpenAICompatibleEmbedder::new(config_for("http://127.0.0.1:1/v1".to_string(), 8))
+            .unwrap();
         let err = e.embed(&["hello".to_string()]).await.unwrap_err();
         assert!(
-            matches!(err, EmbedderError::Unreachable(_) | EmbedderError::Timeout { .. }),
+            matches!(
+                err,
+                EmbedderError::Unreachable(_) | EmbedderError::Timeout { .. }
+            ),
             "expected Unreachable or Timeout, got {err:?}"
         );
         assert!(err.is_transient());
@@ -312,11 +311,8 @@ mod tests {
 
     #[tokio::test]
     async fn empty_batch_errors_before_http_call() {
-        let e = OpenAICompatibleEmbedder::new(config_for(
-            "http://127.0.0.1:1/v1".to_string(),
-            8,
-        ))
-        .unwrap();
+        let e = OpenAICompatibleEmbedder::new(config_for("http://127.0.0.1:1/v1".to_string(), 8))
+            .unwrap();
         assert!(matches!(e.embed(&[]).await, Err(EmbedderError::EmptyBatch)));
     }
 

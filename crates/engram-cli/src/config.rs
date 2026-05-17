@@ -176,9 +176,11 @@ pub struct TaggerConfig {
     /// Engram-side stable identity written into `thoughts.tags_extractor_model`.
     /// Conventionally `<vendor>/<model>`. Defaults to `"vllm/qwen2.5-7b-instruct"`.
     pub model_id: String,
-    /// Schema-version for `thoughts.tags_extractor_version`. Starts at `1`
-    /// for the v1 tagger prompt; bump when the prompt or schema changes
-    /// such that prior tags shouldn't be considered comparable.
+    /// Schema-version for `thoughts.tags_extractor_version`. Default tracks
+    /// `engram_extract::BUNDLED_TAGGER_VERSION` (currently 2 — the M4.1
+    /// entities-split + scope-vocabulary prompt). Bump when the prompt or
+    /// schema changes such that prior tags shouldn't be considered comparable;
+    /// `engram tag --rerun --since 1970-01-01T00:00:00Z` then backfills.
     pub model_version: i32,
     pub api_key: Option<String>,
     pub timeout_seconds: u64,
@@ -189,6 +191,16 @@ pub struct TaggerConfig {
     /// `model_version` so `thoughts.tags_extractor_version` remains
     /// meaningful provenance.
     pub system_prompt_file: Option<PathBuf>,
+    /// When true, the tagger receives a controlled-vocabulary hint section
+    /// listing the top topic and entity terms already used in the thought's
+    /// scope. Encourages the model to prefer established terms over coining
+    /// new ones — addresses the v1 corpus-coherence finding. Default true.
+    pub scope_vocab_enabled: bool,
+    /// Maximum number of established topic terms and entity terms (each)
+    /// fed into the tagger's controlled-vocabulary section. Larger values
+    /// give the model more context but cost prompt tokens; smaller values
+    /// let new terms emerge faster. Default 50.
+    pub scope_vocab_size: u32,
 }
 
 impl Default for TaggerConfig {
@@ -200,12 +212,15 @@ impl Default for TaggerConfig {
             endpoint: "http://localhost:8000/v1".to_string(),
             model_name: "qwen2.5-7b-instruct".to_string(),
             model_id: "vllm/qwen2.5-7b-instruct".to_string(),
-            // v1 of the tagger prompt; separate from the M3 extractor's v4.
-            model_version: 1,
+            // Tracks engram_extract::BUNDLED_TAGGER_VERSION; bumped to 2 in
+            // M4.1 for the entities split + scope vocabulary v2 prompt.
+            model_version: 2,
             api_key: None,
             timeout_seconds: 60,
             temperature: 0.2,
             system_prompt_file: None,
+            scope_vocab_enabled: true,
+            scope_vocab_size: 50,
         }
     }
 }
@@ -279,12 +294,15 @@ mod tests {
         assert_eq!(c.tagger.endpoint, "http://localhost:8000/v1");
         assert_eq!(c.tagger.model_name, "qwen2.5-7b-instruct");
         assert_eq!(c.tagger.model_id, "vllm/qwen2.5-7b-instruct");
-        // v1 of the tagger prompt — fresh version line; not comparable to
-        // the M3 extractor's v4.
-        assert_eq!(c.tagger.model_version, 1);
+        // Tracks engram_extract::BUNDLED_TAGGER_VERSION; bumped to 2 in
+        // M4.1 for the entities split + scope vocabulary v2 prompt.
+        assert_eq!(c.tagger.model_version, 2);
         assert!(c.tagger.api_key.is_none());
         // Default is the bundled prompt — no file override.
         assert!(c.tagger.system_prompt_file.is_none());
+        // Scope vocabulary injection is enabled by default at 50 terms each.
+        assert!(c.tagger.scope_vocab_enabled);
+        assert_eq!(c.tagger.scope_vocab_size, 50);
     }
 
     /// Operator opt-in: setting `[tagger].provider = "openai-compatible"`
@@ -302,6 +320,25 @@ mod tests {
             .unwrap();
         assert_eq!(c.tagger.provider, "openai-compatible");
         assert_eq!(c.tagger.endpoint, "http://localhost:8000/v1");
-        assert_eq!(c.tagger.model_version, 1);
+        assert_eq!(c.tagger.model_version, 2);
+    }
+
+    /// Operator can disable scope-vocabulary injection or tune its size via
+    /// TOML — both knobs round-trip cleanly through figment.
+    #[test]
+    fn tagger_scope_vocab_overrides_round_trip_from_toml() {
+        let toml = r#"
+            [tagger]
+            provider = "openai-compatible"
+            scope_vocab_enabled = false
+            scope_vocab_size = 20
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert!(!c.tagger.scope_vocab_enabled);
+        assert_eq!(c.tagger.scope_vocab_size, 20);
     }
 }

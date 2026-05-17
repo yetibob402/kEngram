@@ -148,9 +148,21 @@ cargo run --bin engram -- tag --scope work --limit 100
 # supersede semantics, no audit chain. Pair with --since to bound the
 # rerun to recent thoughts. Use `--since 1970-01-01T00:00:00Z` to
 # re-tag the entire corpus (e.g. after enabling the tagger for the
-# first time on a previously-captured backlog).
+# first time on a previously-captured backlog, or after M4.1's v1→v2
+# bump for the entities split + scope vocabulary prompt).
 cargo run --bin engram -- tag --rerun --scope work
 cargo run --bin engram -- tag --rerun --since 2026-04-01T00:00:00Z
+
+# M4.1 backfill recipe: after deploying v2, refresh the entire corpus
+# under the new schema. The new `entities` field starts empty on v1-tagged
+# rows; this run populates it.
+cargo run --bin engram -- tag --rerun --since 1970-01-01T00:00:00Z
+
+# Caveat: agents that hardcoded tag_filter queries against v1's shape
+# (e.g. {"topics": ["engram"]}) may need updating to use the new
+# {"entities": [...]} field once a term gets reclassified. The v1 query
+# still matches v1-tagged rows but misses v2-tagged rows once the
+# tagger moves a term into entities.
 
 # A/B-benchmark the reranker against RRF-only on an operator-curated
 # fixture corpus. Prints a markdown table to stdout with per-query
@@ -192,12 +204,14 @@ provider = "openai-compatible"           # also "openrouter"; "" = disabled
 endpoint = "http://localhost:8000/v1"    # vLLM default; OpenRouter is https://openrouter.ai/api/v1
 model_name = "qwen2.5-7b-instruct"       # the model the backend serves
 model_id = "vllm/qwen2.5-7b-instruct"    # provenance written into thoughts.tags_extractor_model
-model_version = 1                        # tagger prompt/schema version; bump on change and `engram tag --rerun` to re-tag rows whose stored version is older.
+model_version = 2                        # tagger prompt/schema version (M4.1 bumped to 2 for the entities split + vocab v2 prompt); bump on change and `engram tag --rerun` to re-tag rows whose stored version is older.
 api_key = ""                             # bearer token for hosted endpoints (OpenRouter, etc.)
 timeout_seconds = 60                     # vLLM JSON-Schema responses can run long
 temperature = 0.2
+scope_vocab_enabled = true               # M4.1: inject the top topic + entity terms from the thought's scope into the tagger prompt as a controlled-vocabulary hint. Encourages consistent term reuse across captures.
+scope_vocab_size = 50                    # M4.1: top-N established terms (each for topics and entities) fed to the tagger. Larger = more vocabulary stability; smaller = faster emergence of new terms.
 # system_prompt_file = "~/.config/engram/tagger-prompt.txt"
-# When set, the file's contents replace the bundled v1 tagger prompt.
+# When set, the file's contents replace the bundled v2 tagger prompt.
 # Operator is responsible for bumping model_version when the prompt changes.
 
 [reranker]                                              # M3 Phase B step 2; opt-in

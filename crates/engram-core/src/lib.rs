@@ -22,5 +22,5 @@ pub use scope::{Scope, ScopeError};
 pub use search::{DEFAULT_RECENCY_HALF_LIFE_DAYS, DEFAULT_RRF_K, Hit, recency_boost, rrf_fuse};
 pub use source::{Source, SourceError};
 pub use tagger::{Tagger, TaggerError};
-pub use tags::{TagKind, Tags};
+pub use tags::{ScopeVocab, TagKind, Tags};
 pub use thought::{Thought, ThoughtId};

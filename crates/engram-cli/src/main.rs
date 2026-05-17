@@ -16,12 +16,10 @@ use engram_core::{Embedder, EmbeddingModel, Tagger};
 use engram_embed::{
     OpenAICompatibleConfig, OpenAICompatibleEmbedder, Reranker, TeiReranker, TeiRerankerConfig,
 };
-use engram_extract::{
-    OpenAICompatibleConfig as TaggerConfigBuilder, OpenAICompatibleTagger,
-};
+use engram_extract::{OpenAICompatibleConfig as TaggerConfigBuilder, OpenAICompatibleTagger};
 use engram_mcp::EngramServer;
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpService, StreamableHttpServerConfig, session::local::LocalSessionManager,
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
@@ -29,7 +27,11 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{Config, EmbedderConfig, RerankerConfig, TaggerConfig, WorkerConfig};
 
 #[derive(Parser, Debug)]
-#[command(name = "engram", version, about = "Self-hosted MCP-native memory service")]
+#[command(
+    name = "engram",
+    version,
+    about = "Self-hosted MCP-native memory service"
+)]
 struct Cli {
     /// Path to an `engram.toml` config file. Overrides `~/.config/engram/engram.toml`.
     #[arg(long, global = true)]
@@ -126,9 +128,7 @@ fn build_embedder(c: &EmbedderConfig) -> anyhow::Result<Arc<dyn Embedder>> {
             .with_context(|| format!("constructing embedder for endpoint {}", c.endpoint))?;
             Ok(Arc::new(embedder))
         }
-        other => anyhow::bail!(
-            "unknown embedder provider: {other:?} (valid: 'openai-compatible')"
-        ),
+        other => anyhow::bail!("unknown embedder provider: {other:?} (valid: 'openai-compatible')"),
     }
 }
 
@@ -195,12 +195,13 @@ fn build_tagger(c: &TaggerConfig) -> anyhow::Result<ResolvedTagger> {
     // Resolve the system prompt: bundled by default; load from a file when
     // `system_prompt_file` is set. The path is anyhow-context'd so errors
     // surface with the path the operator typed.
-    let system_prompt = match c.system_prompt_file.as_ref() {
-        Some(path) => Some(std::fs::read_to_string(path).with_context(|| {
-            format!("reading tagger system_prompt_file at {}", path.display())
-        })?),
-        None => None,
-    };
+    let system_prompt =
+        match c.system_prompt_file.as_ref() {
+            Some(path) => Some(std::fs::read_to_string(path).with_context(|| {
+                format!("reading tagger system_prompt_file at {}", path.display())
+            })?),
+            None => None,
+        };
     tracing::info!(
         provider = %c.provider,
         endpoint = %c.endpoint,
@@ -374,8 +375,25 @@ async fn run_worker(config: Config) -> anyhow::Result<()> {
     let drain_embedder = embedder.clone();
     let drain_cancel = cancel.clone();
     set.spawn(async move {
-        embed_drainer_loop(drain_pool, drain_embedder, interval, batch_size, drain_cancel).await;
+        embed_drainer_loop(
+            drain_pool,
+            drain_embedder,
+            interval,
+            batch_size,
+            drain_cancel,
+        )
+        .await;
     });
+
+    // Scope-vocabulary injection: when enabled and size > 0, the drainer
+    // pre-fetches the top-N established terms in each thought's scope and
+    // passes them to the tagger as controlled-vocabulary hints.
+    let scope_vocab_limit: Option<i64> =
+        if config.tagger.scope_vocab_enabled && config.tagger.scope_vocab_size > 0 {
+            Some(i64::from(config.tagger.scope_vocab_size))
+        } else {
+            None
+        };
 
     // Tag drainer is silent-disabled when [tagger] isn't configured —
     // mirrors the capture-side enqueue gate. No tag rows can exist in the
@@ -388,7 +406,15 @@ async fn run_worker(config: Config) -> anyhow::Result<()> {
             let tag_cancel = cancel.clone();
             let model_id = t.model_id().to_string();
             set.spawn(async move {
-                tag_drainer_loop(tag_pool, tag_tagger, interval, batch_size, tag_cancel).await;
+                tag_drainer_loop(
+                    tag_pool,
+                    tag_tagger,
+                    interval,
+                    batch_size,
+                    scope_vocab_limit,
+                    tag_cancel,
+                )
+                .await;
             });
             format!("enabled ({model_id})")
         }
@@ -402,6 +428,7 @@ async fn run_worker(config: Config) -> anyhow::Result<()> {
         model_id = %config.embedder.model_id,
         tagger = %tagger_summary,
         tagger_model_id = ?tagger_model_id,
+        scope_vocab_limit = ?scope_vocab_limit,
         "engram worker started"
     );
 
@@ -470,6 +497,7 @@ async fn tag_drainer_loop(
     tagger: std::sync::Arc<dyn Tagger>,
     interval: Duration,
     batch_size: i64,
+    scope_vocab_limit: Option<i64>,
     cancel: CancellationToken,
 ) {
     let mut ticker = tokio::time::interval(interval);
@@ -483,7 +511,14 @@ async fn tag_drainer_loop(
                 return;
             }
             _ = ticker.tick() => {
-                match engram_mcp::drain_pending_tags(&pool, tagger.as_ref(), batch_size).await {
+                match engram_mcp::drain_pending_tags(
+                    &pool,
+                    tagger.as_ref(),
+                    batch_size,
+                    scope_vocab_limit,
+                )
+                .await
+                {
                     Ok(report) if report.processed > 0 => tracing::info!(
                         processed = report.processed,
                         completed = report.completed,
@@ -516,13 +551,9 @@ async fn run_embed_backfill(
     // applied elsewhere on the config side).
     let scope_filter = scope.filter(|s| !s.is_empty());
 
-    let report = engram_mcp::embed_backfill(
-        &pool,
-        embedder.as_ref(),
-        scope_filter.as_deref(),
-        limit,
-    )
-    .await?;
+    let report =
+        engram_mcp::embed_backfill(&pool, embedder.as_ref(), scope_filter.as_deref(), limit)
+            .await?;
 
     tracing::info!(
         healed = report.healed,
@@ -575,9 +606,17 @@ async fn run_tag(
         model_id: _,
         version: tagger_version,
     } = build_tagger(&config.tagger)?;
-    let tagger = tagger.context(
-        "`engram tag` requires a configured `[tagger]` section; see DEVELOPMENT.md",
-    )?;
+    let tagger = tagger
+        .context("`engram tag` requires a configured `[tagger]` section; see DEVELOPMENT.md")?;
+
+    // Mirror the worker's scope-vocab resolution so one-shot tagging applies
+    // the same controlled-vocabulary behavior the drainer would.
+    let scope_vocab_limit: Option<i64> =
+        if config.tagger.scope_vocab_enabled && config.tagger.scope_vocab_size > 0 {
+            Some(i64::from(config.tagger.scope_vocab_size))
+        } else {
+            None
+        };
 
     // Treat `--scope ""` as "no filter" (matches the empty-string-as-None
     // normalisation applied elsewhere).
@@ -589,6 +628,7 @@ async fn run_tag(
         rerun,
         since = ?parsed_since,
         target_version = tagger_version,
+        scope_vocab_limit = ?scope_vocab_limit,
         "engram tag starting",
     );
 
@@ -609,7 +649,25 @@ async fn run_tag(
     let model_id = tagger.model_id().to_string();
 
     for t in candidates {
-        match tagger.tag(&t.content).await {
+        let vocab = match scope_vocab_limit {
+            Some(n) if n > 0 => {
+                match engram_storage::fetch_scope_vocab(&pool, t.scope.as_str(), n).await {
+                    Ok(v) if v.is_empty() => None,
+                    Ok(v) => Some(v),
+                    Err(err) => {
+                        tracing::warn!(
+                            thought_id = %t.id,
+                            scope = %t.scope.as_str(),
+                            error = ?err,
+                            "engram tag: scope vocab fetch failed; tagging without vocab",
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        match tagger.tag(&t.content, vocab.as_ref()).await {
             Ok(tags) => {
                 if let Err(err) = engram_storage::update_thought_tags(
                     &pool,
@@ -641,12 +699,7 @@ async fn run_tag(
         }
     }
 
-    tracing::info!(
-        n_candidates,
-        tagged,
-        failed,
-        "engram tag complete",
-    );
+    tracing::info!(n_candidates, tagged, failed, "engram tag complete",);
 
     if failed > 0 {
         anyhow::bail!(
@@ -689,8 +742,7 @@ async fn run_bench_rerank(config: Config, corpus: PathBuf) -> anyhow::Result<()>
         .with_context(|| format!("connecting to {}", config.database.url))?;
 
     let embedder = build_embedder(&config.embedder)?;
-    let reranker = build_reranker(&config.reranker)?.context(
-        "bench rerank requires a configured [reranker] section; see DEVELOPMENT.md",
-    )?;
+    let reranker = build_reranker(&config.reranker)?
+        .context("bench rerank requires a configured [reranker] section; see DEVELOPMENT.md")?;
     bench::run_bench_rerank(&pool, embedder, reranker, &corpus).await
 }

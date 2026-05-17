@@ -8,7 +8,7 @@
 //! `http://localhost:8000/v1`.
 
 use async_trait::async_trait;
-use engram_core::{Tagger, TaggerError, Tags};
+use engram_core::{ScopeVocab, Tagger, TaggerError, Tags};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -52,9 +52,7 @@ impl OpenAICompatibleConfig {
             endpoint: "http://localhost:8000/v1".to_string(),
             model_name: "qwen2.5-7b-instruct".to_string(),
             model_id: "vllm/qwen2.5-7b-instruct".to_string(),
-            // v1 of the tagger prompt — starts fresh; not comparable to
-            // the M3 extractor versioning.
-            model_version: 1,
+            model_version: BUNDLED_TAGGER_VERSION,
             api_key: None,
             timeout: Duration::from_secs(60),
             temperature: 0.2,
@@ -71,7 +69,7 @@ impl OpenAICompatibleConfig {
             endpoint: "https://openrouter.ai/api/v1".to_string(),
             model_id: format!("openrouter/{model_name}"),
             model_name,
-            model_version: 1,
+            model_version: BUNDLED_TAGGER_VERSION,
             api_key: Some(api_key),
             timeout: Duration::from_secs(60),
             temperature: 0.2,
@@ -79,6 +77,18 @@ impl OpenAICompatibleConfig {
         }
     }
 }
+
+/// Version of the bundled tagger prompt + response schema. Paired with the
+/// model_version field on each thought row's tag provenance. Bump when the
+/// prompt or schema changes such that prior tags shouldn't be considered
+/// comparable. Operator runs `engram tag --rerun --since 1970-01-01T00:00:00Z`
+/// to backfill after a bump.
+///
+/// History: v1 was the initial M4 thoughts-only tagger; v2 (M4.1) split
+/// `topics` into `entities` (proper-noun-style identifiers) + `topics`
+/// (subject categories) and added the optional scope-vocabulary
+/// controlled-vocabulary section.
+pub const BUNDLED_TAGGER_VERSION: i32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct OpenAICompatibleTagger {
@@ -162,12 +172,13 @@ pub const BUNDLED_TAGGER_PROMPT: &str = "\
 You are a tagging assistant. Given a single thought from a memory service, return its metadata tags as JSON.
 
 # Output shape
-{ \"people\": [...], \"action_items\": [...], \"topics\": [...], \"dates_mentioned\": [...], \"kind\": \"...\" }
+{ \"people\": [...], \"entities\": [...], \"action_items\": [...], \"topics\": [...], \"dates_mentioned\": [...], \"kind\": \"...\" }
 
 # Field semantics
 - people: bare names of people mentioned. Empty array if none.
+- entities: named, proper-noun-style identifiers explicitly mentioned in the thought — projects, products, libraries, tools, technologies, named concepts (e.g., \"engram\", \"pgvector\", \"vLLM\", \"PostgreSQL\", \"MCP\"). Preserve the casing the thought uses, or the canonical casing if the thought is inconsistent. Empty array if none.
 - action_items: short imperative phrases describing tasks the thought commits to or implies (e.g., \"fix the login bug\", \"review the migration plan\"). Empty array if none.
-- topics: 1-3 short tag-like topics, lowercase, no punctuation. What is this thought ABOUT at a high level? Examples: \"rust\", \"build-systems\", \"team-management\".
+- topics: 1-3 short tag-like subject categories, lowercase, hyphen-separated, no punctuation. What broad SUBJECT AREA is this thought about? Examples: \"rust\", \"build-systems\", \"team-management\", \"memory-systems\". Distinct from entities: a topic is a category the thought falls under; an entity is a specific named thing the thought mentions. A thought naming \"engram\" and \"pgvector\" might have entities [\"engram\", \"pgvector\"] and topics [\"memory-systems\", \"databases\"].
 - dates_mentioned: any dates or temporal references appearing in the prose (\"next Thursday\", \"Q3\", \"2026-05-15\", \"before the release\"). Free-form strings, copied roughly as they appear. Empty array if none.
 - kind: a single classification. Use null if uncertain. Categories:
   - observation: a factual claim about the world (\"Rust has stronger memory safety than C\").
@@ -178,10 +189,39 @@ You are a tagging assistant. Given a single thought from a memory service, retur
   - session: transient session/test narrative (\"the search returned 3 results\", \"I just ran the migration\"). These should also have otherwise-empty arrays.
 
 # Rules
-- Only extract what is explicitly present in the thought. Do not infer.
+- Entities require explicit mention by name in the thought. Do not invent entities.
+- Topics may be inferred from prose context when the subject is clear, even if the exact topic word doesn't appear.
 - Empty arrays are correct for any field that has no content.
 - One classification only; pick the most-load-bearing category. If genuinely ambiguous, return null.
 - This is a tagging pass, not a paraphrase or rewrite. Do not rephrase the thought's content; only emit metadata.";
+
+/// Render the optional controlled-vocabulary section appended to the system
+/// prompt when scope vocabulary is available. Returns an empty string when
+/// the vocab is `None` or completely empty, so callers can unconditionally
+/// concatenate the result.
+fn render_vocab_section(vocab: Option<&ScopeVocab>) -> String {
+    let Some(v) = vocab else {
+        return String::new();
+    };
+    if v.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n\n# Controlled vocabulary (this scope's established terms)\n");
+    if !v.topics.is_empty() {
+        out.push_str("Topics already used in this scope: ");
+        out.push_str(&v.topics.join(", "));
+        out.push_str(".\n");
+    }
+    if !v.entities.is_empty() {
+        out.push_str("Entities already used in this scope: ");
+        out.push_str(&v.entities.join(", "));
+        out.push_str(".\n");
+    }
+    out.push_str(
+        "When a concept in the thought matches one of these established terms, prefer the established form. Coin a new term only when the prose introduces something genuinely unseen.",
+    );
+    out
+}
 
 #[derive(Serialize)]
 struct ChatRequestBody<'a> {
@@ -222,13 +262,27 @@ impl Tagger for OpenAICompatibleTagger {
         self.model_version
     }
 
-    async fn tag(&self, thought_content: &str) -> Result<Tags, TaggerError> {
+    async fn tag(
+        &self,
+        thought_content: &str,
+        vocab: Option<&ScopeVocab>,
+    ) -> Result<Tags, TaggerError> {
         let url = format!("{}/chat/completions", self.endpoint.trim_end_matches('/'));
 
+        let system_content = {
+            let vocab_section = render_vocab_section(vocab);
+            if vocab_section.is_empty() {
+                self.system_prompt.clone()
+            } else {
+                let mut s = self.system_prompt.clone();
+                s.push_str(&vocab_section);
+                s
+            }
+        };
         let messages: Vec<ChatMessage<'_>> = vec![
             ChatMessage {
                 role: "system",
-                content: self.system_prompt.clone(),
+                content: system_content,
             },
             ChatMessage {
                 role: "user",
@@ -283,9 +337,9 @@ impl Tagger for OpenAICompatibleTagger {
 }
 
 /// The `response_format` JSON object sent to the chat completions API. The
-/// schema constrains the model to the `Tags` wire shape with five required
-/// fields; `topics` is capped at 3 items and `kind` is nullable with an
-/// enum of `TagKind` snake_case variants.
+/// schema constrains the model to the `Tags` wire shape with six required
+/// fields; `topics` is capped at 3 items, `entities` at 5, and `kind` is
+/// nullable with an enum of `TagKind` snake_case variants.
 fn tags_response_format() -> serde_json::Value {
     serde_json::json!({
         "type": "json_schema",
@@ -295,9 +349,10 @@ fn tags_response_format() -> serde_json::Value {
             "schema": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["people", "action_items", "topics", "dates_mentioned", "kind"],
+                "required": ["people", "entities", "action_items", "topics", "dates_mentioned", "kind"],
                 "properties": {
                     "people": { "type": "array", "items": { "type": "string" } },
+                    "entities": { "type": "array", "items": { "type": "string" }, "maxItems": 5 },
                     "action_items": { "type": "array", "items": { "type": "string" } },
                     "topics": { "type": "array", "items": { "type": "string" }, "maxItems": 3 },
                     "dates_mentioned": { "type": "array", "items": { "type": "string" } },
@@ -370,6 +425,7 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(chat_response_with_tags(json!({
                     "people": ["Sarah", "Ron"],
+                    "entities": ["engram", "pgvector"],
                     "action_items": ["fix the login bug"],
                     "topics": ["rust", "build-systems"],
                     "dates_mentioned": ["next Thursday"],
@@ -381,8 +437,12 @@ mod tests {
 
         let t =
             OpenAICompatibleTagger::new(config_for(format!("{}/v1", server.uri()), None)).unwrap();
-        let tags = t.tag("anything").await.unwrap();
+        let tags = t.tag("anything", None).await.unwrap();
         assert_eq!(tags.people, vec!["Sarah".to_string(), "Ron".to_string()]);
+        assert_eq!(
+            tags.entities,
+            vec!["engram".to_string(), "pgvector".to_string()]
+        );
         assert_eq!(tags.action_items, vec!["fix the login bug".to_string()]);
         assert_eq!(
             tags.topics,
@@ -405,7 +465,7 @@ mod tests {
 
         let t =
             OpenAICompatibleTagger::new(config_for(format!("{}/v1", server.uri()), None)).unwrap();
-        let err = t.tag("x").await.unwrap_err();
+        let err = t.tag("x", None).await.unwrap_err();
         assert!(matches!(err, TaggerError::MalformedResponse(_)));
         assert!(!err.is_transient());
     }
@@ -429,7 +489,7 @@ mod tests {
 
         let t =
             OpenAICompatibleTagger::new(config_for(format!("{}/v1", server.uri()), None)).unwrap();
-        let err = t.tag("x").await.unwrap_err();
+        let err = t.tag("x", None).await.unwrap_err();
         assert!(
             matches!(err, TaggerError::Timeout { .. }),
             "expected Timeout, got {err:?}"
@@ -448,7 +508,7 @@ mod tests {
 
         let t =
             OpenAICompatibleTagger::new(config_for(format!("{}/v1", server.uri()), None)).unwrap();
-        let err = t.tag("x").await.unwrap_err();
+        let err = t.tag("x", None).await.unwrap_err();
         match err {
             TaggerError::Backend { status, .. } => assert_eq!(status, 503),
             other => panic!("expected Backend error, got {other:?}"),
@@ -467,7 +527,7 @@ mod tests {
 
         let t =
             OpenAICompatibleTagger::new(config_for(format!("{}/v1", server.uri()), None)).unwrap();
-        let err = t.tag("x").await.unwrap_err();
+        let err = t.tag("x", None).await.unwrap_err();
         match &err {
             TaggerError::Backend { status, .. } => assert_eq!(*status, 400),
             other => panic!("expected Backend error, got {other:?}"),
@@ -480,7 +540,7 @@ mod tests {
         // Port 1 is reliably refused on macOS/Linux.
         let t = OpenAICompatibleTagger::new(config_for("http://127.0.0.1:1/v1".to_string(), None))
             .unwrap();
-        let err = t.tag("x").await.unwrap_err();
+        let err = t.tag("x", None).await.unwrap_err();
         assert!(
             matches!(
                 err,
@@ -512,7 +572,7 @@ mod tests {
         ))
         .unwrap();
         // If the auth header is wrong, wiremock returns 404 and the parse fails.
-        t.tag("x").await.expect("auth header must match");
+        t.tag("x", None).await.expect("auth header must match");
     }
 
     #[tokio::test]
@@ -549,7 +609,7 @@ mod tests {
         cfg.system_prompt =
             Some("Custom prompt for the dogfood week. Return tags only.".to_string());
         let t = OpenAICompatibleTagger::new(cfg).unwrap();
-        let _ = t.tag("x").await;
+        let _ = t.tag("x", None).await;
 
         let received = server.received_requests().await.unwrap();
         let last = received.last().expect("at least one request");
@@ -560,34 +620,42 @@ mod tests {
         assert!(!sys.contains("Field semantics"));
     }
 
-    /// v1 prompt content pin: the tagger prompt must mention field semantics
-    /// and list each of the five fields. Catches accidental deletions during
-    /// downstream edits.
+    /// v2 prompt content pin: the tagger prompt must mention field semantics
+    /// and list each of the six fields, including the new `entities` field
+    /// added in M4.1. Catches accidental deletions during downstream edits.
     #[test]
-    fn tagger_v1_prompt_contains_field_semantics_section() {
+    fn tagger_v2_prompt_contains_field_semantics_and_entities() {
         let p = BUNDLED_TAGGER_PROMPT;
         assert!(
             p.contains("Field semantics"),
-            "v1 prompt must contain a 'Field semantics' section"
+            "v2 prompt must contain a 'Field semantics' section"
         );
         for field in [
             "people",
+            "entities",
             "action_items",
             "topics",
             "dates_mentioned",
             "kind",
         ] {
-            assert!(p.contains(field), "v1 prompt must mention field {field}");
+            assert!(p.contains(field), "v2 prompt must mention field {field}");
         }
-        // Presets pinned to v1.
+        // The entities/topics distinction must be explicit in the prompt so
+        // the model can disambiguate the two open-vocabulary slots.
+        assert!(
+            p.contains("Distinct from entities"),
+            "v2 prompt must explicitly distinguish entities from topics"
+        );
+        // Presets pinned to the bundled version (2 as of M4.1).
+        assert_eq!(BUNDLED_TAGGER_VERSION, 2);
         let cfg = OpenAICompatibleConfig::vllm_local();
-        assert_eq!(cfg.model_version, 1);
+        assert_eq!(cfg.model_version, BUNDLED_TAGGER_VERSION);
         let cfg = OpenAICompatibleConfig::open_router("k".into(), "m".into());
-        assert_eq!(cfg.model_version, 1);
+        assert_eq!(cfg.model_version, BUNDLED_TAGGER_VERSION);
     }
 
     #[test]
-    fn tags_response_format_pins_topics_max_and_kind_nullable() {
+    fn tags_response_format_pins_v2_shape() {
         let v = tags_response_format();
         let schema = &v["json_schema"]["schema"];
         let required = schema["required"].as_array().unwrap();
@@ -596,6 +664,7 @@ mod tests {
             required,
             vec![
                 "people",
+                "entities",
                 "action_items",
                 "topics",
                 "dates_mentioned",
@@ -603,11 +672,104 @@ mod tests {
             ]
         );
         assert_eq!(schema["properties"]["topics"]["maxItems"], 3);
+        assert_eq!(schema["properties"]["entities"]["maxItems"], 5);
         // `kind` must allow null on the wire.
         let kind_type = &schema["properties"]["kind"]["type"];
         assert!(
             kind_type.as_array().unwrap().iter().any(|x| x == "null"),
             "kind must be nullable: {kind_type:?}"
+        );
+    }
+
+    #[test]
+    fn render_vocab_section_handles_none_and_empty() {
+        assert_eq!(render_vocab_section(None), "");
+        assert_eq!(render_vocab_section(Some(&ScopeVocab::default())), "");
+    }
+
+    #[test]
+    fn render_vocab_section_lists_topics_and_entities() {
+        let v = ScopeVocab {
+            topics: vec!["rust".into(), "memory-systems".into()],
+            entities: vec!["engram".into(), "pgvector".into()],
+        };
+        let rendered = render_vocab_section(Some(&v));
+        assert!(rendered.contains("Controlled vocabulary"));
+        assert!(rendered.contains("rust, memory-systems"));
+        assert!(rendered.contains("engram, pgvector"));
+        assert!(rendered.contains("prefer the established form"));
+    }
+
+    #[test]
+    fn render_vocab_section_omits_empty_arm() {
+        let topics_only = ScopeVocab {
+            topics: vec!["rust".into()],
+            entities: vec![],
+        };
+        let rendered = render_vocab_section(Some(&topics_only));
+        assert!(rendered.contains("Topics already used"));
+        assert!(!rendered.contains("Entities already used"));
+    }
+
+    #[tokio::test]
+    async fn vocab_section_flows_into_request_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_response_with_tags(json!({
+                    "people": [], "entities": [], "action_items": [], "topics": [],
+                    "dates_mentioned": [], "kind": null
+                }))),
+            )
+            .mount(&server)
+            .await;
+
+        let t =
+            OpenAICompatibleTagger::new(config_for(format!("{}/v1", server.uri()), None)).unwrap();
+        let vocab = ScopeVocab {
+            topics: vec!["memory-systems".into()],
+            entities: vec!["engram".into()],
+        };
+        let _ = t.tag("any thought", Some(&vocab)).await;
+
+        let received = server.received_requests().await.unwrap();
+        let last = received.last().expect("at least one request");
+        let body: serde_json::Value = serde_json::from_slice(&last.body).unwrap();
+        let sys = body["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            sys.contains("Controlled vocabulary"),
+            "vocab section must be present in system message"
+        );
+        assert!(sys.contains("memory-systems"));
+        assert!(sys.contains("engram"));
+    }
+
+    #[tokio::test]
+    async fn no_vocab_omits_section_from_request_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_response_with_tags(json!({
+                    "people": [], "entities": [], "action_items": [], "topics": [],
+                    "dates_mentioned": [], "kind": null
+                }))),
+            )
+            .mount(&server)
+            .await;
+
+        let t =
+            OpenAICompatibleTagger::new(config_for(format!("{}/v1", server.uri()), None)).unwrap();
+        let _ = t.tag("any thought", None).await;
+
+        let received = server.received_requests().await.unwrap();
+        let last = received.last().expect("at least one request");
+        let body: serde_json::Value = serde_json::from_slice(&last.body).unwrap();
+        let sys = body["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            !sys.contains("Controlled vocabulary"),
+            "vocab section must be absent when vocab is None"
         );
     }
 
@@ -620,7 +782,10 @@ mod tests {
         let cfg = OpenAICompatibleConfig::vllm_local();
         let t = OpenAICompatibleTagger::new(cfg).unwrap();
         let tags = t
-            .tag("Engram uses pgvector for vector storage. Sarah will review the migration plan.")
+            .tag(
+                "Engram uses pgvector for vector storage. Sarah will review the migration plan.",
+                None,
+            )
             .await
             .expect("vLLM unreachable — is it running on :8000?");
         // We can't assert specific tags (model output varies) but the call

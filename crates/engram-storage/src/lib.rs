@@ -6,8 +6,8 @@
 //! the way of the macro (currently: only `insert_embedding`).
 
 use engram_core::{
-    Embedding, EmbeddingModel, EmbeddingStatus, Hit, Metadata, Scope, ScopeError, Source,
-    SourceError, Tags, Thought, ThoughtId,
+    Embedding, EmbeddingModel, EmbeddingStatus, Hit, Metadata, Scope, ScopeError, ScopeVocab,
+    Source, SourceError, Tags, Thought, ThoughtId,
 };
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -191,10 +191,7 @@ pub async fn insert_thought_embedding(
 }
 
 /// Look up a thought by id. Returns `None` if not found.
-pub async fn fetch_thought(
-    pool: &PgPool,
-    id: ThoughtId,
-) -> Result<Option<Thought>, StorageError> {
+pub async fn fetch_thought(pool: &PgPool, id: ThoughtId) -> Result<Option<Thought>, StorageError> {
     let row = sqlx::query!(
         r#"
         SELECT id, scope, content, source, created_at, metadata,
@@ -592,11 +589,9 @@ pub async fn enqueue_unembedded_thoughts(
 /// Total rows currently in `pending_embeddings`. Cheap; intended for tests
 /// and operator-driven observability.
 pub async fn count_pending(pool: &PgPool) -> Result<i64, StorageError> {
-    let row = sqlx::query!(
-        r#"SELECT COUNT(*) AS "count!" FROM pending_embeddings"#
-    )
-    .fetch_one(pool)
-    .await?;
+    let row = sqlx::query!(r#"SELECT COUNT(*) AS "count!" FROM pending_embeddings"#)
+        .fetch_one(pool)
+        .await?;
     Ok(row.count)
 }
 
@@ -731,10 +726,7 @@ pub async fn fetch_pending_tag_jobs(
 }
 
 /// Remove a tag job from the queue after a successful tagger.tag() call.
-pub async fn complete_tag_job(
-    pool: &PgPool,
-    thought_id: ThoughtId,
-) -> Result<(), StorageError> {
+pub async fn complete_tag_job(pool: &PgPool, thought_id: ThoughtId) -> Result<(), StorageError> {
     sqlx::query!(
         r#"DELETE FROM pending_tags WHERE thought_id = $1"#,
         thought_id.into_uuid(),
@@ -812,6 +804,65 @@ pub async fn find_untagged_or_stale_thoughts(
             })
         })
         .collect()
+}
+
+/// Compute the established topic + entity vocabulary for a given scope. Used
+/// by the tag drainer to supply the tagger with a controlled-vocabulary hint
+/// section so it prefers established terms over coining new ones — addresses
+/// the v1 corpus-coherence finding (same author's different prose produced
+/// divergent topics).
+///
+/// Returns the top-`limit` most-frequent terms in each of `topics` and
+/// `entities`, ranked by occurrence count desc then term asc (stable tie-break).
+/// Empty results are valid — they signal "no established vocabulary yet" and
+/// the tagger falls back to free-form term coinage.
+///
+/// Retracted thoughts are excluded so retracted-vocab doesn't bleed into new
+/// captures' tags.
+pub async fn fetch_scope_vocab(
+    pool: &PgPool,
+    scope: &str,
+    limit: i64,
+) -> Result<ScopeVocab, StorageError> {
+    let topics = sqlx::query!(
+        r#"
+        SELECT term AS "term!"
+        FROM thoughts,
+             LATERAL jsonb_array_elements_text(tags->'topics') AS term
+        WHERE scope = $1 AND retracted_at IS NULL
+        GROUP BY term
+        ORDER BY COUNT(*) DESC, term ASC
+        LIMIT $2
+        "#,
+        scope,
+        limit,
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|r| r.term)
+    .collect();
+
+    let entities = sqlx::query!(
+        r#"
+        SELECT term AS "term!"
+        FROM thoughts,
+             LATERAL jsonb_array_elements_text(tags->'entities') AS term
+        WHERE scope = $1 AND retracted_at IS NULL
+        GROUP BY term
+        ORDER BY COUNT(*) DESC, term ASC
+        LIMIT $2
+        "#,
+        scope,
+        limit,
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|r| r.term)
+    .collect();
+
+    Ok(ScopeVocab { topics, entities })
 }
 
 // -- thought retraction (simplified post-M4; no fact cascade) --------------
@@ -962,16 +1013,21 @@ mod tests {
         let source = Source::new("manual").unwrap();
         let metadata = Metadata::from(json!({"client_name": "test"}));
 
-        let (inserted, is_new) =
-            insert_thought(&pool, new_thought(&scope, &source, &metadata, "remember this"))
-                .await
-                .unwrap();
+        let (inserted, is_new) = insert_thought(
+            &pool,
+            new_thought(&scope, &source, &metadata, "remember this"),
+        )
+        .await
+        .unwrap();
 
         assert!(is_new);
         assert_ne!(*inserted.id.as_uuid(), Uuid::nil());
         let now = OffsetDateTime::now_utc();
         let drift = (now - inserted.created_at).whole_seconds().abs();
-        assert!(drift < 10, "created_at not within 10s of now: drift={drift}s");
+        assert!(
+            drift < 10,
+            "created_at not within 10s of now: drift={drift}s"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -980,10 +1036,12 @@ mod tests {
         let source = Source::new("manual").unwrap();
         let metadata = Metadata::empty();
 
-        let (first, first_is_new) =
-            insert_thought(&pool, new_thought(&scope, &source, &metadata, "same content"))
-                .await
-                .unwrap();
+        let (first, first_is_new) = insert_thought(
+            &pool,
+            new_thought(&scope, &source, &metadata, "same content"),
+        )
+        .await
+        .unwrap();
         assert!(first_is_new);
 
         // Different metadata is fine — fingerprint is over content only.
@@ -995,7 +1053,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!second_is_new, "duplicate fingerprint must return is_new=false");
+        assert!(
+            !second_is_new,
+            "duplicate fingerprint must return is_new=false"
+        );
         assert_eq!(first.id, second.id, "duplicate must return the existing id");
     }
 
@@ -1005,14 +1066,12 @@ mod tests {
         let source = Source::new("manual").unwrap();
         let metadata = Metadata::empty();
 
-        let (a, a_is_new) =
-            insert_thought(&pool, new_thought(&scope, &source, &metadata, "alpha"))
-                .await
-                .unwrap();
-        let (b, b_is_new) =
-            insert_thought(&pool, new_thought(&scope, &source, &metadata, "beta"))
-                .await
-                .unwrap();
+        let (a, a_is_new) = insert_thought(&pool, new_thought(&scope, &source, &metadata, "alpha"))
+            .await
+            .unwrap();
+        let (b, b_is_new) = insert_thought(&pool, new_thought(&scope, &source, &metadata, "beta"))
+            .await
+            .unwrap();
 
         assert!(a_is_new);
         assert!(b_is_new);
@@ -1079,7 +1138,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(thought_has_embedding(&pool, inserted.id, &model).await.unwrap());
+        assert!(
+            thought_has_embedding(&pool, inserted.id, &model)
+                .await
+                .unwrap()
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -1094,7 +1157,11 @@ mod tests {
         .await
         .unwrap();
         let model = EmbeddingModel::bge_m3();
-        assert!(!thought_has_embedding(&pool, inserted.id, &model).await.unwrap());
+        assert!(
+            !thought_has_embedding(&pool, inserted.id, &model)
+                .await
+                .unwrap()
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -1114,7 +1181,11 @@ mod tests {
         insert_thought_embedding(&pool, inserted.id, &embedding)
             .await
             .unwrap();
-        assert!(thought_has_embedding(&pool, inserted.id, &model).await.unwrap());
+        assert!(
+            thought_has_embedding(&pool, inserted.id, &model)
+                .await
+                .unwrap()
+        );
     }
 
     /// Helper: insert a thought with the given content + scope, return its id.
@@ -1122,10 +1193,9 @@ mod tests {
         let scope = Scope::new(scope).unwrap();
         let source = Source::new("test").unwrap();
         let metadata = Metadata::empty();
-        let (inserted, _) =
-            insert_thought(pool, new_thought(&scope, &source, &metadata, content))
-                .await
-                .unwrap();
+        let (inserted, _) = insert_thought(pool, new_thought(&scope, &source, &metadata, content))
+            .await
+            .unwrap();
         inserted.id
     }
 
@@ -1180,7 +1250,9 @@ mod tests {
         insert_test_thought(&pool, "tcgplayer info", "work").await;
         insert_test_thought(&pool, "tcgplayer info two", "personal").await;
 
-        let hits = search_trigram(&pool, "tcgplayer", Some("work"), 10).await.unwrap();
+        let hits = search_trigram(&pool, "tcgplayer", Some("work"), 10)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].thought.scope.as_str(), "work");
     }
@@ -1188,7 +1260,9 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_trigram_returns_empty_for_no_match(pool: PgPool) {
         insert_test_thought(&pool, "completely unrelated text", "global").await;
-        let hits = search_trigram(&pool, "xyzzyqwerty", None, 10).await.unwrap();
+        let hits = search_trigram(&pool, "xyzzyqwerty", None, 10)
+            .await
+            .unwrap();
         assert!(hits.is_empty());
     }
 
@@ -1208,14 +1282,20 @@ mod tests {
         let va = unit_vector_1024(0);
         let vb = unit_vector_1024(1);
 
-        insert_thought_embedding(&pool, id_a, &Embedding::new(model.clone(), va.clone()).unwrap())
-            .await
-            .unwrap();
+        insert_thought_embedding(
+            &pool,
+            id_a,
+            &Embedding::new(model.clone(), va.clone()).unwrap(),
+        )
+        .await
+        .unwrap();
         insert_thought_embedding(&pool, id_b, &Embedding::new(model.clone(), vb).unwrap())
             .await
             .unwrap();
 
-        let hits = search_vector_knn(&pool, va, &model, None, 10).await.unwrap();
+        let hits = search_vector_knn(&pool, va, &model, None, 10)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].thought.id, id_a);
         assert!((hits[0].vector_score.unwrap() - 1.0).abs() < 1e-4);
@@ -1228,12 +1308,18 @@ mod tests {
 
         let id = insert_test_thought(&pool, "thought", "global").await;
         let va = unit_vector_1024(0);
-        insert_thought_embedding(&pool, id, &Embedding::new(model_a.clone(), va.clone()).unwrap())
-            .await
-            .unwrap();
+        insert_thought_embedding(
+            &pool,
+            id,
+            &Embedding::new(model_a.clone(), va.clone()).unwrap(),
+        )
+        .await
+        .unwrap();
 
         // Query with model_b — no embeddings → no hits.
-        let hits = search_vector_knn(&pool, va, &model_b, None, 10).await.unwrap();
+        let hits = search_vector_knn(&pool, va, &model_b, None, 10)
+            .await
+            .unwrap();
         assert!(hits.is_empty());
     }
 
@@ -1250,7 +1336,9 @@ mod tests {
             .await
             .unwrap();
 
-        let unembedded = find_unembedded_thoughts(&pool, &model, None, 100).await.unwrap();
+        let unembedded = find_unembedded_thoughts(&pool, &model, None, 100)
+            .await
+            .unwrap();
         assert_eq!(unembedded.len(), 1);
         assert_eq!(unembedded[0].content, "b");
     }
@@ -1340,7 +1428,9 @@ mod tests {
             .await
             .unwrap();
 
-        let enqueued = enqueue_unembedded_thoughts(&pool, &model.id, None, 100).await.unwrap();
+        let enqueued = enqueue_unembedded_thoughts(&pool, &model.id, None, 100)
+            .await
+            .unwrap();
         assert_eq!(enqueued, 1, "only `b` should be enqueued");
     }
 
@@ -1352,6 +1442,7 @@ mod tests {
 
         let tags = Tags {
             people: vec!["Sarah".into()],
+            entities: vec!["engram".into()],
             action_items: vec!["follow up".into()],
             topics: vec!["meetings".into()],
             dates_mentioned: vec!["Thursday".into()],
@@ -1363,7 +1454,10 @@ mod tests {
 
         let read = fetch_thought_tags(&pool, id).await.unwrap().unwrap();
         assert_eq!(read.tags, tags);
-        assert_eq!(read.tagger_model_id.as_deref(), Some("vllm/qwen2.5-7b-instruct"));
+        assert_eq!(
+            read.tagger_model_id.as_deref(),
+            Some("vllm/qwen2.5-7b-instruct")
+        );
         assert_eq!(read.tagger_version, Some(1));
         assert!(read.tagged_at.is_some());
     }
@@ -1427,9 +1521,11 @@ mod tests {
             .await
             .unwrap();
 
-        let walk = find_untagged_or_stale_thoughts(&pool, /*target_version*/ 1, /*rerun*/ false, None, None, 100)
-            .await
-            .unwrap();
+        let walk = find_untagged_or_stale_thoughts(
+            &pool, /*target_version*/ 1, /*rerun*/ false, None, None, 100,
+        )
+        .await
+        .unwrap();
         let ids: Vec<ThoughtId> = walk.iter().map(|t| t.id).collect();
         assert!(ids.contains(&untagged));
         assert!(!ids.contains(&already_tagged));
@@ -1463,12 +1559,178 @@ mod tests {
         assert!(fetch_thought_tags(&pool, id).await.unwrap().is_none());
     }
 
+    // -- M4.1: scope vocabulary -------------------------------------------
+
+    /// Helper for fetch_scope_vocab tests — insert a thought and immediately
+    /// attach the given tags. Keeps each test body terse and focused on the
+    /// vocabulary aggregation behavior.
+    async fn seed_tagged(pool: &PgPool, scope: &str, content: &str, tags: Tags) -> ThoughtId {
+        let id = insert_test_thought(pool, content, scope).await;
+        update_thought_tags(pool, id, &tags, "test-model", 1)
+            .await
+            .unwrap();
+        id
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetch_scope_vocab_ranks_by_count_desc_then_term_asc(pool: PgPool) {
+        // Three thoughts in the same scope sharing "rust" (3x), with "build-systems"
+        // appearing twice and "team-management" once. Ties on count fall back to
+        // term-ascending for stable ranking.
+        seed_tagged(
+            &pool,
+            "work",
+            "a",
+            Tags {
+                topics: vec!["rust".into(), "build-systems".into()],
+                ..Tags::default()
+            },
+        )
+        .await;
+        seed_tagged(
+            &pool,
+            "work",
+            "b",
+            Tags {
+                topics: vec![
+                    "rust".into(),
+                    "build-systems".into(),
+                    "team-management".into(),
+                ],
+                ..Tags::default()
+            },
+        )
+        .await;
+        seed_tagged(
+            &pool,
+            "work",
+            "c",
+            Tags {
+                topics: vec!["rust".into()],
+                ..Tags::default()
+            },
+        )
+        .await;
+
+        let v = fetch_scope_vocab(&pool, "work", 10).await.unwrap();
+        assert_eq!(
+            v.topics,
+            vec![
+                "rust".to_string(),
+                "build-systems".to_string(),
+                "team-management".to_string(),
+            ]
+        );
+        assert!(v.entities.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetch_scope_vocab_isolates_by_scope(pool: PgPool) {
+        seed_tagged(
+            &pool,
+            "work",
+            "a",
+            Tags {
+                topics: vec!["work-only".into()],
+                entities: vec!["engram".into()],
+                ..Tags::default()
+            },
+        )
+        .await;
+        seed_tagged(
+            &pool,
+            "personal",
+            "b",
+            Tags {
+                topics: vec!["personal-only".into()],
+                entities: vec!["garmin".into()],
+                ..Tags::default()
+            },
+        )
+        .await;
+
+        let work_v = fetch_scope_vocab(&pool, "work", 10).await.unwrap();
+        assert_eq!(work_v.topics, vec!["work-only".to_string()]);
+        assert_eq!(work_v.entities, vec!["engram".to_string()]);
+
+        let personal_v = fetch_scope_vocab(&pool, "personal", 10).await.unwrap();
+        assert_eq!(personal_v.topics, vec!["personal-only".to_string()]);
+        assert_eq!(personal_v.entities, vec!["garmin".to_string()]);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetch_scope_vocab_honors_limit(pool: PgPool) {
+        seed_tagged(
+            &pool,
+            "global",
+            "a",
+            Tags {
+                topics: vec!["t1".into(), "t2".into(), "t3".into()],
+                ..Tags::default()
+            },
+        )
+        .await;
+
+        let v = fetch_scope_vocab(&pool, "global", 2).await.unwrap();
+        assert_eq!(v.topics.len(), 2);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetch_scope_vocab_excludes_retracted_thoughts(pool: PgPool) {
+        let retracted = seed_tagged(
+            &pool,
+            "global",
+            "retracted",
+            Tags {
+                topics: vec!["dropped".into()],
+                entities: vec!["ghost".into()],
+                ..Tags::default()
+            },
+        )
+        .await;
+        seed_tagged(
+            &pool,
+            "global",
+            "active",
+            Tags {
+                topics: vec!["kept".into()],
+                entities: vec!["real".into()],
+                ..Tags::default()
+            },
+        )
+        .await;
+        retract_thought(&pool, retracted, None).await.unwrap();
+
+        let v = fetch_scope_vocab(&pool, "global", 10).await.unwrap();
+        assert_eq!(v.topics, vec!["kept".to_string()]);
+        assert_eq!(v.entities, vec!["real".to_string()]);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetch_scope_vocab_empty_scope_returns_empty_vocab(pool: PgPool) {
+        seed_tagged(
+            &pool,
+            "elsewhere",
+            "a",
+            Tags {
+                topics: vec!["foo".into()],
+                ..Tags::default()
+            },
+        )
+        .await;
+
+        let v = fetch_scope_vocab(&pool, "nonexistent", 10).await.unwrap();
+        assert!(v.is_empty());
+    }
+
     // -- M4: retraction (simplified — no fact cascade) ----------------------
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn retract_thought_sets_retracted_at(pool: PgPool) {
         let id = insert_test_thought(&pool, "to retract", "global").await;
-        let outcome = retract_thought(&pool, id, Some("test reason")).await.unwrap();
+        let outcome = retract_thought(&pool, id, Some("test reason"))
+            .await
+            .unwrap();
         assert!(outcome.retracted);
 
         let row = sqlx::query!(
@@ -1493,7 +1755,9 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn retract_thought_on_missing_id_reports_no_op(pool: PgPool) {
-        let outcome = retract_thought(&pool, ThoughtId::new(), None).await.unwrap();
+        let outcome = retract_thought(&pool, ThoughtId::new(), None)
+            .await
+            .unwrap();
         assert!(!outcome.retracted);
     }
 
@@ -1515,7 +1779,9 @@ mod tests {
         let retracted = insert_test_thought(&pool, "unique_keyword retracted", "global").await;
         retract_thought(&pool, retracted, None).await.unwrap();
 
-        let hits = search_trigram(&pool, "unique_keyword", None, 10).await.unwrap();
+        let hits = search_trigram(&pool, "unique_keyword", None, 10)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_ne!(hits[0].thought.id, retracted);
     }
@@ -1537,7 +1803,9 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn fetch_thought_with_provenance_surfaces_retracted_at(pool: PgPool) {
         let id = insert_test_thought(&pool, "to retract", "global").await;
-        retract_thought(&pool, id, Some("operator decision")).await.unwrap();
+        retract_thought(&pool, id, Some("operator decision"))
+            .await
+            .unwrap();
 
         let model = EmbeddingModel::bge_m3();
         let prov = fetch_thought_with_provenance(&pool, id, &model)

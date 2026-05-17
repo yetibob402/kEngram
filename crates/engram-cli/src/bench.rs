@@ -103,12 +103,13 @@ async fn run_pair(
     reranker: &dyn Reranker,
     q: &BenchQuery,
 ) -> anyhow::Result<(Vec<Uuid>, Vec<Uuid>)> {
-    let scope = match &q.scope {
-        Some(s) => Some(Scope::new(s.clone()).map_err(|e: ScopeError| {
-            anyhow::anyhow!("invalid scope {s:?} in bench query: {e}")
-        })?),
-        None => None,
-    };
+    let scope =
+        match &q.scope {
+            Some(s) => Some(Scope::new(s.clone()).map_err(|e: ScopeError| {
+                anyhow::anyhow!("invalid scope {s:?} in bench query: {e}")
+            })?),
+            None => None,
+        };
 
     let mk = |rerank: bool| SearchRequest {
         query: q.query.clone(),
@@ -126,8 +127,16 @@ async fn run_pair(
         .await
         .context("search_thoughts (reranked) failed")?;
     Ok((
-        r_rrf.results.into_iter().map(|h| h.thought_id.into_uuid()).collect(),
-        r_rerank.results.into_iter().map(|h| h.thought_id.into_uuid()).collect(),
+        r_rrf
+            .results
+            .into_iter()
+            .map(|h| h.thought_id.into_uuid())
+            .collect(),
+        r_rerank
+            .results
+            .into_iter()
+            .map(|h| h.thought_id.into_uuid())
+            .collect(),
     ))
 }
 
@@ -173,7 +182,8 @@ fn print_table(rows: &[QueryRow]) {
         "| {q:<54} | rel | nDCG@10 (rrf) | nDCG@10 (rerank) | Δ      | MRR (rrf) | MRR (rerank) | Δ      |",
         q = "query",
     );
-    println!("|{q}|-----|---------------|------------------|--------|-----------|--------------|--------|",
+    println!(
+        "|{q}|-----|---------------|------------------|--------|-----------|--------------|--------|",
         q = "-".repeat(56),
     );
 
@@ -209,7 +219,8 @@ fn print_table(rows: &[QueryRow]) {
     let avg_mrr_rrf = sum_mrr_rrf / n;
     let avg_mrr_rerank = sum_mrr_rerank / n;
 
-    println!("|{q}|-----|---------------|------------------|--------|-----------|--------------|--------|",
+    println!(
+        "|{q}|-----|---------------|------------------|--------|-----------|--------------|--------|",
         q = "-".repeat(56),
     );
     println!(

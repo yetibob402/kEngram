@@ -9,7 +9,7 @@
 
 use async_trait::async_trait;
 
-use crate::Tags;
+use crate::{ScopeVocab, Tags};
 
 #[async_trait]
 pub trait Tagger: Send + Sync {
@@ -24,9 +24,20 @@ pub trait Tagger: Send + Sync {
     /// `thoughts.tags_extractor_version`.
     fn version(&self) -> i32;
 
-    /// Tag a single thought's content. Returning a `Tags::default()` is a
-    /// valid "no extractable tags here" answer and is not a failure.
-    async fn tag(&self, thought_content: &str) -> Result<Tags, TaggerError>;
+    /// Tag a single thought's content. `vocab`, when supplied, lists the
+    /// established topic and entity terms most frequently used in the
+    /// thought's scope; implementations should encourage the model to prefer
+    /// those terms when they fit, and coin new ones only for genuinely
+    /// unseen concepts. Passing `None` runs the tagger without any
+    /// vocabulary guidance.
+    ///
+    /// Returning a `Tags::default()` is a valid "no extractable tags here"
+    /// answer and is not a failure.
+    async fn tag(
+        &self,
+        thought_content: &str,
+        vocab: Option<&ScopeVocab>,
+    ) -> Result<Tags, TaggerError>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -55,7 +66,12 @@ impl TaggerError {
     pub fn is_transient(&self) -> bool {
         matches!(
             self,
-            Self::Unreachable(_) | Self::Timeout { .. } | Self::Backend { status: 500..=599, .. }
+            Self::Unreachable(_)
+                | Self::Timeout { .. }
+                | Self::Backend {
+                    status: 500..=599,
+                    ..
+                }
         )
     }
 }

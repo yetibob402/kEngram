@@ -60,9 +60,9 @@ impl Embedder for FakeEmbedder {
         }
         match self.behavior {
             FakeBehavior::Timeout => Err(EmbedderError::Timeout { seconds: 5 }),
-            FakeBehavior::Unreachable => {
-                Err(EmbedderError::Unreachable("fake embedder configured to fail".into()))
-            }
+            FakeBehavior::Unreachable => Err(EmbedderError::Unreachable(
+                "fake embedder configured to fail".into(),
+            )),
             FakeBehavior::Deterministic => Ok(texts
                 .iter()
                 .map(|t| deterministic_vector(t, self.model.dimensions))
@@ -74,9 +74,9 @@ impl Embedder for FakeEmbedder {
 /// Produce a deterministic vector from a string. Not cryptographic; just
 /// stable across calls within a process. Output range: roughly [-1, 1].
 fn deterministic_vector(input: &str, dim: usize) -> Vec<f32> {
-    let seed: u64 = input
-        .bytes()
-        .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(u64::from(b)));
+    let seed: u64 = input.bytes().fold(0u64, |acc, b| {
+        acc.wrapping_mul(31).wrapping_add(u64::from(b))
+    });
     (0..dim)
         .map(|i| {
             let mut x = seed.wrapping_add(i as u64);

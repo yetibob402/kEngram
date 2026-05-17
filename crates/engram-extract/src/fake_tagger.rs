@@ -8,7 +8,7 @@
 //! Mirrors `engram-embed::FakeEmbedder` in shape.
 
 use async_trait::async_trait;
-use engram_core::{Tagger, TaggerError, Tags};
+use engram_core::{ScopeVocab, Tagger, TaggerError, Tags};
 use std::sync::{Arc, Mutex};
 
 /// Failure-mode selector. `Deterministic` succeeds and returns whatever
@@ -41,11 +41,13 @@ pub enum FakeTaggerOutput {
     Substring(Vec<(String, Tags)>),
 }
 
-/// One observed call to `tag()` — content the drainer passed in. Tests
-/// inspect this to confirm the drainer wired the thought through correctly.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One observed call to `tag()` — content and optional scope vocabulary the
+/// drainer passed in. Tests inspect this to confirm the drainer wired both
+/// the thought content and (when enabled) the controlled vocabulary through.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RecordedTag {
     pub content: String,
+    pub vocab: Option<ScopeVocab>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,9 +134,14 @@ impl Tagger for FakeTagger {
         self.version
     }
 
-    async fn tag(&self, thought_content: &str) -> Result<Tags, TaggerError> {
+    async fn tag(
+        &self,
+        thought_content: &str,
+        vocab: Option<&ScopeVocab>,
+    ) -> Result<Tags, TaggerError> {
         *self.last_call.lock().expect("last_call mutex poisoned") = Some(RecordedTag {
             content: thought_content.to_string(),
+            vocab: vocab.cloned(),
         });
         match self.behavior {
             FakeBehavior::Timeout => Err(TaggerError::Timeout { seconds: 5 }),
@@ -165,6 +172,7 @@ mod tests {
     fn sample_tags() -> Tags {
         Tags {
             people: vec!["Sarah".to_string()],
+            entities: vec!["engram".to_string()],
             action_items: vec!["review the migration".to_string()],
             topics: vec!["rust".to_string()],
             dates_mentioned: vec!["next Thursday".to_string()],
@@ -175,14 +183,14 @@ mod tests {
     #[tokio::test]
     async fn fake_tagger_empty_returns_default_tags() {
         let t = FakeTagger::new();
-        let tags = t.tag("anything").await.unwrap();
+        let tags = t.tag("anything", None).await.unwrap();
         assert_eq!(tags, Tags::default());
     }
 
     #[tokio::test]
     async fn fake_tagger_canned_returns_given_tags() {
         let t = FakeTagger::with_canned(sample_tags());
-        let tags = t.tag("any content goes here").await.unwrap();
+        let tags = t.tag("any content goes here", None).await.unwrap();
         assert_eq!(tags, sample_tags());
     }
 
@@ -206,15 +214,15 @@ mod tests {
         ];
         let t = FakeTagger::with_substring(rules);
 
-        let hit_sarah = t.tag("Met with Sarah yesterday").await.unwrap();
+        let hit_sarah = t.tag("Met with Sarah yesterday", None).await.unwrap();
         assert_eq!(hit_sarah.people, vec!["Sarah".to_string()]);
         assert!(hit_sarah.topics.is_empty());
 
-        let hit_rust = t.tag("learning rust ownership").await.unwrap();
+        let hit_rust = t.tag("learning rust ownership", None).await.unwrap();
         assert_eq!(hit_rust.topics, vec!["rust".to_string()]);
         assert!(hit_rust.people.is_empty());
 
-        let no_match = t.tag("nothing here").await.unwrap();
+        let no_match = t.tag("nothing here", None).await.unwrap();
         assert_eq!(no_match, Tags::default());
     }
 
@@ -222,26 +230,40 @@ mod tests {
     async fn fake_tagger_records_last_call() {
         let t = FakeTagger::new();
         assert!(t.last_call().is_none());
-        let _ = t.tag("first call content").await.unwrap();
+        let _ = t.tag("first call content", None).await.unwrap();
         assert_eq!(
             t.last_call(),
             Some(RecordedTag {
-                content: "first call content".to_string()
+                content: "first call content".to_string(),
+                vocab: None,
             })
         );
-        let _ = t.tag("second call content").await.unwrap();
+        let _ = t.tag("second call content", None).await.unwrap();
         assert_eq!(
             t.last_call(),
             Some(RecordedTag {
-                content: "second call content".to_string()
+                content: "second call content".to_string(),
+                vocab: None,
             })
         );
     }
 
     #[tokio::test]
+    async fn fake_tagger_records_vocab_when_supplied() {
+        let t = FakeTagger::new();
+        let vocab = ScopeVocab {
+            topics: vec!["rust".to_string()],
+            entities: vec!["engram".to_string()],
+        };
+        let _ = t.tag("content", Some(&vocab)).await.unwrap();
+        let rec = t.last_call().expect("call recorded");
+        assert_eq!(rec.vocab, Some(vocab));
+    }
+
+    #[tokio::test]
     async fn fake_tagger_timeout_behavior_returns_timeout_error() {
         let t = FakeTagger::always_failing(FakeBehavior::Timeout);
-        let err = t.tag("x").await.unwrap_err();
+        let err = t.tag("x", None).await.unwrap_err();
         assert!(matches!(err, TaggerError::Timeout { .. }));
         assert!(err.is_transient());
     }
@@ -249,7 +271,7 @@ mod tests {
     #[tokio::test]
     async fn fake_tagger_unreachable_behavior_returns_unreachable_error() {
         let t = FakeTagger::always_failing(FakeBehavior::Unreachable);
-        let err = t.tag("x").await.unwrap_err();
+        let err = t.tag("x", None).await.unwrap_err();
         assert!(matches!(err, TaggerError::Unreachable(_)));
         assert!(err.is_transient());
     }
@@ -257,7 +279,7 @@ mod tests {
     #[tokio::test]
     async fn fake_tagger_misconfigured_behavior_returns_misconfigured_error() {
         let t = FakeTagger::always_failing(FakeBehavior::Misconfigured);
-        let err = t.tag("x").await.unwrap_err();
+        let err = t.tag("x", None).await.unwrap_err();
         assert!(matches!(err, TaggerError::Misconfigured(_)));
         assert!(!err.is_transient());
     }
@@ -265,11 +287,12 @@ mod tests {
     #[tokio::test]
     async fn fake_tagger_records_call_even_on_failure() {
         let t = FakeTagger::always_failing(FakeBehavior::Timeout);
-        let _ = t.tag("captured on failure").await;
+        let _ = t.tag("captured on failure", None).await;
         assert_eq!(
             t.last_call(),
             Some(RecordedTag {
-                content: "captured on failure".to_string()
+                content: "captured on failure".to_string(),
+                vocab: None,
             })
         );
     }

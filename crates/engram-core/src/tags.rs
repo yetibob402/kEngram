@@ -20,6 +20,8 @@ pub struct Tags {
     #[serde(default)]
     pub people: Vec<String>,
     #[serde(default)]
+    pub entities: Vec<String>,
+    #[serde(default)]
     pub action_items: Vec<String>,
     #[serde(default)]
     pub topics: Vec<String>,
@@ -27,6 +29,25 @@ pub struct Tags {
     pub dates_mentioned: Vec<String>,
     #[serde(default)]
     pub kind: Option<TagKind>,
+}
+
+/// Top-N established tag terms from a given scope, supplied to the tagger as
+/// controlled-vocabulary hints. Helps the tagger emit consistent terms when
+/// it sees similar concepts in different prose, addressing v1's phrase-driven
+/// divergence at corpus level.
+///
+/// Empty vectors are valid — they signal "no established vocabulary yet" and
+/// the tagger falls back to free-form term coinage.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ScopeVocab {
+    pub topics: Vec<String>,
+    pub entities: Vec<String>,
+}
+
+impl ScopeVocab {
+    pub fn is_empty(&self) -> bool {
+        self.topics.is_empty() && self.entities.is_empty()
+    }
 }
 
 /// Single high-level classification a thought belongs to. `PersonNote`
@@ -53,10 +74,28 @@ mod tests {
         // Default emits every field as empty/null, not as a literal `{}`,
         // but the inverse direction below confirms `{}` is accepted as default.
         assert_eq!(json["people"], serde_json::json!([]));
+        assert_eq!(json["entities"], serde_json::json!([]));
         assert_eq!(json["action_items"], serde_json::json!([]));
         assert_eq!(json["topics"], serde_json::json!([]));
         assert_eq!(json["dates_mentioned"], serde_json::json!([]));
         assert_eq!(json["kind"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn v1_shape_without_entities_deserializes_with_empty_entities() {
+        // Backward-compat: rows tagged under v1 (no `entities` key) must still
+        // parse, with `entities` defaulting to `vec![]`.
+        let v1_json = r#"{
+            "people":["Sarah"],
+            "action_items":[],
+            "topics":["rust"],
+            "dates_mentioned":[],
+            "kind":"observation"
+        }"#;
+        let t: Tags = serde_json::from_str(v1_json).unwrap();
+        assert_eq!(t.entities, Vec::<String>::new());
+        assert_eq!(t.topics, vec!["rust".to_string()]);
+        assert_eq!(t.kind, Some(TagKind::Observation));
     }
 
     #[test]
@@ -69,6 +108,7 @@ mod tests {
     fn full_field_serde_roundtrip() {
         let t = Tags {
             people: vec!["Sarah".to_string(), "Ron".to_string()],
+            entities: vec!["engram".to_string(), "pgvector".to_string()],
             action_items: vec!["fix the login bug".to_string()],
             topics: vec!["rust".to_string(), "build-systems".to_string()],
             dates_mentioned: vec!["next Thursday".to_string(), "Q3".to_string()],
@@ -80,19 +120,23 @@ mod tests {
     }
 
     #[test]
+    fn scope_vocab_is_empty_helper() {
+        assert!(ScopeVocab::default().is_empty());
+        let v = ScopeVocab {
+            topics: vec!["rust".to_string()],
+            entities: vec![],
+        };
+        assert!(!v.is_empty());
+    }
+
+    #[test]
     fn tag_kind_serializes_snake_case() {
         assert_eq!(
             serde_json::to_string(&TagKind::Observation).unwrap(),
             "\"observation\""
         );
-        assert_eq!(
-            serde_json::to_string(&TagKind::Task).unwrap(),
-            "\"task\""
-        );
-        assert_eq!(
-            serde_json::to_string(&TagKind::Idea).unwrap(),
-            "\"idea\""
-        );
+        assert_eq!(serde_json::to_string(&TagKind::Task).unwrap(), "\"task\"");
+        assert_eq!(serde_json::to_string(&TagKind::Idea).unwrap(), "\"idea\"");
         assert_eq!(
             serde_json::to_string(&TagKind::Reference).unwrap(),
             "\"reference\""
@@ -117,7 +161,7 @@ mod tests {
 
     #[test]
     fn kind_null_deserializes_to_none() {
-        let json = r#"{"people":[],"action_items":[],"topics":[],"dates_mentioned":[],"kind":null}"#;
+        let json = r#"{"people":[],"entities":[],"action_items":[],"topics":[],"dates_mentioned":[],"kind":null}"#;
         let t: Tags = serde_json::from_str(json).unwrap();
         assert!(t.kind.is_none());
     }

@@ -19,7 +19,7 @@ For design rationale see [`docs/engram-design-v0.md`](docs/engram-design-v0.md);
 | Tool | What it does |
 |---|---|
 | `capture` | Record a thought. Returns `thought_id`, `embedding_status: "pending"`, and `is_duplicate: bool`. Same content captured twice (SHA-256 fingerprint match) returns the existing `thought_id` with `is_duplicate: true` and no new embedding/tag jobs enqueued. New captures enqueue both the embed job and the tag job; the `engram worker` drains both. |
-| `search_thoughts` | Hybrid retrieval (vector kNN ∪ trigram, fused by RRF, recency-boosted, optionally reranked by a cross-encoder — see [Reranking](#reranking-search-results)). Gracefully degrades to trigram-only when the embedder is unreachable; result includes `vector_search_available: bool`. Accepts an optional `tag_filter` (JSONB containment against `thoughts.tags` — e.g. `{"kind": "task"}` or `{"people": ["Sarah"]}`) and surfaces each hit's full `tags` object alongside the content. Excludes retracted thoughts. |
+| `search_thoughts` | Hybrid retrieval (vector kNN ∪ trigram, fused by RRF, recency-boosted, optionally reranked by a cross-encoder — see [Reranking](#reranking-search-results)). Gracefully degrades to trigram-only when the embedder is unreachable; result includes `vector_search_available: bool`. Accepts an optional `tag_filter` (JSONB containment against `thoughts.tags` — e.g. `{"kind": "task"}`, `{"entities": ["engram"]}`, or `{"people": ["Sarah"]}`) and surfaces each hit's full `tags` object alongside the content. Excludes retracted thoughts. |
 | `recent_thoughts` | Browse by recency in a (optional) scope. Excludes retracted thoughts. |
 | `get_thought` | Full thought + provenance (embedding status, embedded-at, tags, tagger provenance — `tags_extractor_model` / `tags_extractor_version` / `tags_extracted_at` —, retraction state). Direct lookup by ID returns the row even if retracted — this is the audit path. |
 | `retract_thought` | Mark a thought as untrusted (e.g. you captured a wrong claim). Sets `thoughts.retracted_at` so the row is excluded from retrieval. The row stays in the DB; `get_thought` still returns it with retraction state surfaced. |
@@ -36,21 +36,24 @@ The lifecycle, end to end:
 
 **2. Drain.** The `engram worker` process runs two drainers in parallel, both on the `[worker] tick_interval_seconds` cadence. The embed drainer calls the configured `[embedder]` and inserts vectors; the tag drainer calls the configured `[tagger]` and writes the JSONB `tags` column plus provenance (`tags_extractor_model`, `tags_extractor_version`, `tags_extracted_at`).
 
-**3. Tag shape.** The tagger speaks OpenAI's `/v1/chat/completions` with `response_format: { type: "json_schema", strict: true, ... }`. Guided decoding (vLLM's `xgrammar`, OpenRouter's structured-outputs) makes the response guaranteed-parseable. The schema and v1 prompt are defined in [`docs/milestones/m4-spec.md`](docs/milestones/m4-spec.md). The output shape:
+**3. Tag shape.** The tagger speaks OpenAI's `/v1/chat/completions` with `response_format: { type: "json_schema", strict: true, ... }`. Guided decoding (vLLM's `xgrammar`, OpenRouter's structured-outputs) makes the response guaranteed-parseable. The schema and v2 prompt live in `crates/engram-extract/src/openai_compatible.rs` (constants `BUNDLED_TAGGER_PROMPT` and `BUNDLED_TAGGER_VERSION`). The output shape:
 
 ```json
 {
   "people": ["Sarah"],
+  "entities": ["engram", "pgvector"],
   "action_items": ["fast-track migration #0042"],
-  "topics": ["pr-backlog", "release-process"],
+  "topics": ["memory-systems", "release-process"],
   "dates_mentioned": ["Thursday"],
   "kind": "task"
 }
 ```
 
-`kind` is one of `observation | task | idea | reference | person_note | session` (or `null` if the model is unsure). Tags are **advisory metadata** — they don't gate storage, don't supersede each other, and a wrong tag is low-impact because retrieval still works against the raw content via vector + trigram.
+`entities` are proper-noun-style identifiers the prose mentions by name — projects, products, libraries, tools, named concepts. `topics` are broader subject categories the thought falls under, capped at 3. Keeping them separate (added in M4.1) lets `tag_filter` distinguish "thoughts that mention engram by name" from "thoughts categorized under memory-systems." `kind` is one of `observation | task | idea | reference | person_note | session` (or `null` if the model is unsure). Tags are **advisory metadata** — they don't gate storage, don't supersede each other, and a wrong tag is low-impact because retrieval still works against the raw content via vector + trigram.
 
-**4. Filter at search time.** `search_thoughts(query, tag_filter?)` can scope retrieval to thoughts whose `tags` JSONB contains a given fragment. Implementation is `WHERE tags @> $tag_filter` (JSONB containment, GIN-indexed). Examples: `{"kind": "task"}`, `{"people": ["Sarah"]}`, `{"topics": ["rust"], "kind": "idea"}`. When `tag_filter` is omitted, no filter applies.
+**3a. Scope-aware vocabulary.** Before tagging, the drainer fetches the top-N most-frequent topic and entity terms used in the same scope and injects them into the prompt as a "controlled vocabulary" hint. The model is told to prefer established terms when they fit and coin new ones only for genuinely unseen concepts. This addresses v1's phrase-driven divergence — the same author writing about the same subject in different prose now lands in a consistent topic vocabulary at the corpus level. Configurable via `[tagger].scope_vocab_enabled` (default `true`) and `[tagger].scope_vocab_size` (default `50`).
+
+**4. Filter at search time.** `search_thoughts(query, tag_filter?)` can scope retrieval to thoughts whose `tags` JSONB contains a given fragment. Implementation is `WHERE tags @> $tag_filter` (JSONB containment, GIN-indexed). Examples: `{"kind": "task"}`, `{"people": ["Sarah"]}`, `{"entities": ["engram"]}`, `{"topics": ["rust"], "kind": "idea"}`. When `tag_filter` is omitted, no filter applies.
 
 **5. Re-tag.** `engram tag [--rerun --since <RFC3339>] [--scope X] [--limit N]` runs the tagger on demand. Without `--rerun`, tags thoughts where `tags_extractor_version IS NULL`. With `--rerun`, re-tags thoughts whose `tags_extractor_version` is below the current tagger version (i.e., the prompt or schema has changed). Tags are simply overwritten — no supersede semantics, no audit chain. The raw thought stays untouched.
 
@@ -491,6 +494,7 @@ Built in six capability milestones (M1 → M6), preceded by an environment miles
 | [M2 — facts pipeline](docs/milestones/m2-facts-pipeline.md) | ✅ | Async embedding seam, reflector cron, `search_facts`, `correct_fact`, `engram reflect`. *(Superseded by M4; the facts pipeline was retired and replaced by a tagging sidecar.)* |
 | [M3 — search & extraction quality](docs/milestones/m3-search-quality.md) | ✅ | Cross-encoder reranker; fact embeddings (M4-retired); v4 extractor prompt (M4-retired); A/B benchmarking harness. Retrieval portion shipped; extraction-side dogfood produced negative knowledge that motivated M4. |
 | [M4 — collapse to thoughts-only](docs/milestones/m4-collapse-to-thoughts.md) | ✅ | Drop the facts pipeline; thoughts-only with content-fingerprint dedup and a JSONB tagging sidecar (people / action_items / topics / dates_mentioned / kind). `search_thoughts` gains `tag_filter`. Tagger is silent-disable. |
+| [M4.1 — v2 tagging](docs/milestones/m4.1-tagging-v2.md) | ✅ | Split `topics` into `entities` (named identifiers) + `topics` (subject categories); add scope-aware controlled-vocabulary injection so the tagger prefers established terms over coining new ones. Tagger version 1→2; operator runs `engram tag --rerun --since 1970-01-01T00:00:00Z` to backfill. |
 | [M5 — artifacts](docs/milestones/m5-artifacts.md) | ⏳ | Long-form document ingestion |
 | [M6 — operational maturity](docs/milestones/m6-operational-maturity.md) | ⏳ | Metrics, Tier 2 auth, eval suite, backups |
 

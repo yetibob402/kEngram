@@ -67,7 +67,12 @@ impl RerankerError {
     pub fn is_transient(&self) -> bool {
         matches!(
             self,
-            Self::Timeout { .. } | Self::Unreachable(_) | Self::Backend { status: 500..=599, .. }
+            Self::Timeout { .. }
+                | Self::Unreachable(_)
+                | Self::Backend {
+                    status: 500..=599,
+                    ..
+                }
         )
     }
 }

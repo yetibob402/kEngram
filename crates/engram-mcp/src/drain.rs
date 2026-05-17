@@ -169,18 +169,26 @@ pub struct DrainTagsReport {
 
 /// Drain up to `batch_size` jobs from `pending_tags`.
 ///
+/// `scope_vocab_limit`, when `Some(n)`, instructs the drainer to pre-fetch the
+/// top-`n` established topic and entity terms for each thought's scope and
+/// pass them to the tagger as controlled-vocabulary hints. `None` runs the
+/// tagger without any vocab guidance (legacy behavior).
+///
 /// For each job:
-/// 1. Fetch the thought's content (skip-with-permanent-fail if the thought
-///    no longer exists).
-/// 2. Call `tagger.tag(content)`.
-/// 3. On Ok: `update_thought_tags` + `complete_tag_job`.
-/// 4. On Err(transient): `increment_tag_job_attempts` (job stays).
-/// 5. On Err(non-transient): log, `complete_tag_job` (job dropped).
-/// 6. After `MAX_TAG_ATTEMPTS` regardless of transience, `complete_tag_job`.
+/// 1. Fetch the thought (skip-with-permanent-fail if the thought no longer exists).
+/// 2. When `scope_vocab_limit` is `Some`, fetch the scope's vocabulary. Vocab
+///    fetch failure folds into transient-failure semantics so the next tick
+///    retries.
+/// 3. Call `tagger.tag(content, vocab)`.
+/// 4. On Ok: `update_thought_tags` + `complete_tag_job`.
+/// 5. On Err(transient): `increment_tag_job_attempts` (job stays).
+/// 6. On Err(non-transient): log, `complete_tag_job` (job dropped).
+/// 7. After `MAX_TAG_ATTEMPTS` regardless of transience, `complete_tag_job`.
 pub async fn drain_pending_tags(
     pool: &PgPool,
     tagger: &dyn Tagger,
     batch_size: i64,
+    scope_vocab_limit: Option<i64>,
 ) -> Result<DrainTagsReport, DrainError> {
     let jobs = engram_storage::fetch_pending_tag_jobs(pool, batch_size).await?;
     let mut report = DrainTagsReport {
@@ -189,7 +197,7 @@ pub async fn drain_pending_tags(
     };
 
     for job in jobs {
-        match process_tag_job(pool, tagger, &job).await {
+        match process_tag_job(pool, tagger, scope_vocab_limit, &job).await {
             TagJobOutcome::Completed => report.completed += 1,
             TagJobOutcome::Transient => report.failed_transient += 1,
             TagJobOutcome::Permanent => report.failed_permanent += 1,
@@ -208,6 +216,7 @@ enum TagJobOutcome {
 async fn process_tag_job(
     pool: &PgPool,
     tagger: &dyn Tagger,
+    scope_vocab_limit: Option<i64>,
     job: &engram_storage::PendingTagJob,
 ) -> TagJobOutcome {
     // Fetch the thought's content.
@@ -232,7 +241,29 @@ async fn process_tag_job(
         }
     };
 
-    match tagger.tag(&thought.content).await {
+    // Optionally fetch controlled-vocabulary hints for the thought's scope.
+    // A storage failure here is transient — leaves the job queued for retry.
+    let vocab = match scope_vocab_limit {
+        Some(limit) if limit > 0 => {
+            match engram_storage::fetch_scope_vocab(pool, thought.scope.as_str(), limit).await {
+                Ok(v) if v.is_empty() => None,
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(
+                        thought_id = %job.thought_id,
+                        scope = %thought.scope.as_str(),
+                        error = %e,
+                        "tag-drain: scope vocab fetch failed; leaving job for retry",
+                    );
+                    let _ = engram_storage::increment_tag_job_attempts(pool, job.thought_id).await;
+                    return TagJobOutcome::Transient;
+                }
+            }
+        }
+        _ => None,
+    };
+
+    match tagger.tag(&thought.content, vocab.as_ref()).await {
         Ok(tags) => {
             if let Err(e) = engram_storage::update_thought_tags(
                 pool,
@@ -443,7 +474,7 @@ mod tests {
         };
         let tagger = FakeTagger::with_canned(tags.clone());
 
-        let report = drain_pending_tags(&pool, &tagger, 10).await.unwrap();
+        let report = drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
         assert_eq!(report.processed, 1);
         assert_eq!(report.completed, 1);
         assert_eq!(report.failed_transient, 0);
@@ -472,7 +503,7 @@ mod tests {
         let id = capture_and_enqueue_tag(&pool, "transient-fail content").await;
 
         let tagger = FakeTagger::always_failing(TaggerFakeBehavior::Timeout);
-        let report = drain_pending_tags(&pool, &tagger, 10).await.unwrap();
+        let report = drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
         assert_eq!(report.processed, 1);
         assert_eq!(report.completed, 0);
         assert_eq!(report.failed_transient, 1);
@@ -507,7 +538,7 @@ mod tests {
         }
 
         let tagger = FakeTagger::always_failing(TaggerFakeBehavior::Timeout);
-        let report = drain_pending_tags(&pool, &tagger, 10).await.unwrap();
+        let report = drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
         assert_eq!(report.processed, 1);
         assert_eq!(report.failed_permanent, 1);
 
@@ -523,7 +554,7 @@ mod tests {
         let _id = capture_and_enqueue_tag(&pool, "misconfigured tagger").await;
 
         let tagger = FakeTagger::always_failing(TaggerFakeBehavior::Misconfigured);
-        let report = drain_pending_tags(&pool, &tagger, 10).await.unwrap();
+        let report = drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
         assert_eq!(report.processed, 1);
         assert_eq!(report.failed_permanent, 1);
 
@@ -537,8 +568,97 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn drain_tags_empty_queue_is_a_noop(pool: PgPool) {
         let tagger = FakeTagger::new();
-        let report = drain_pending_tags(&pool, &tagger, 10).await.unwrap();
+        let report = drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
         assert_eq!(report.processed, 0);
         assert_eq!(report.completed, 0);
+    }
+
+    // -- M4.1: scope-vocab injection -------------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drain_tags_passes_scope_vocab_when_limit_some(pool: PgPool) {
+        // Seed an earlier tagged thought in the same scope so vocab has terms.
+        let prior = capture_and_enqueue_tag(&pool, "prior context").await;
+        engram_storage::update_thought_tags(
+            &pool,
+            prior,
+            &Tags {
+                topics: vec!["memory-systems".into()],
+                entities: vec!["engram".into()],
+                ..Tags::default()
+            },
+            "fake/tagger",
+            2,
+        )
+        .await
+        .unwrap();
+        engram_storage::complete_tag_job(&pool, prior)
+            .await
+            .unwrap();
+
+        // Enqueue a fresh thought to be tagged.
+        let _id = capture_and_enqueue_tag(&pool, "fresh thought needing vocab").await;
+
+        let tagger = FakeTagger::new();
+        let report = drain_pending_tags(&pool, &tagger, 10, Some(50))
+            .await
+            .unwrap();
+        assert_eq!(report.completed, 1);
+
+        let rec = tagger.last_call().expect("tag call recorded");
+        let vocab = rec.vocab.expect("vocab must be supplied when limit > 0");
+        assert!(vocab.topics.contains(&"memory-systems".to_string()));
+        assert!(vocab.entities.contains(&"engram".to_string()));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drain_tags_omits_vocab_when_limit_none(pool: PgPool) {
+        // Same setup as above but pass `None` as the vocab limit — vocab
+        // must NOT be supplied to the tagger.
+        let prior = capture_and_enqueue_tag(&pool, "prior context").await;
+        engram_storage::update_thought_tags(
+            &pool,
+            prior,
+            &Tags {
+                topics: vec!["memory-systems".into()],
+                ..Tags::default()
+            },
+            "fake/tagger",
+            2,
+        )
+        .await
+        .unwrap();
+        engram_storage::complete_tag_job(&pool, prior)
+            .await
+            .unwrap();
+
+        let _id = capture_and_enqueue_tag(&pool, "fresh thought").await;
+
+        let tagger = FakeTagger::new();
+        let report = drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
+        assert_eq!(report.completed, 1);
+
+        let rec = tagger.last_call().expect("tag call recorded");
+        assert!(rec.vocab.is_none(), "vocab must be None when limit is None");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drain_tags_omits_vocab_when_scope_has_no_history(pool: PgPool) {
+        // Limit is Some, but no prior tagged thoughts in the scope — vocab
+        // resolves to empty and the drainer should pass None to the tagger
+        // (avoids sending an empty controlled-vocabulary section).
+        let _id = capture_and_enqueue_tag(&pool, "first-ever thought in this scope").await;
+
+        let tagger = FakeTagger::new();
+        let report = drain_pending_tags(&pool, &tagger, 10, Some(50))
+            .await
+            .unwrap();
+        assert_eq!(report.completed, 1);
+
+        let rec = tagger.last_call().expect("tag call recorded");
+        assert!(
+            rec.vocab.is_none(),
+            "empty vocab should be normalized to None"
+        );
     }
 }

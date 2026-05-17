@@ -15,12 +15,19 @@ use crate::ThoughtId;
 
 /// Closed relation vocabulary. Serializes to/from snake_case strings on the
 /// wire and matches the CHECK constraint values on `thought_links.relation`.
+///
+/// v1 shipped six relations; M5.1 added `supports` after day-one dogfood
+/// revealed `references` was over-firing on what was actually evidence /
+/// corroboration ("experimental result confirming a claim"). The split
+/// separates "I cite for context" (`references`) from "I confirm a claim"
+/// (`supports`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RelationKind {
     Replaces,
     Requires,
     References,
+    Supports,
     BelongsTo,
     DecidedBy,
     Refines,
@@ -36,17 +43,19 @@ impl RelationKind {
             Self::Replaces => "replaces",
             Self::Requires => "requires",
             Self::References => "references",
+            Self::Supports => "supports",
             Self::BelongsTo => "belongs_to",
             Self::DecidedBy => "decided_by",
             Self::Refines => "refines",
         }
     }
 
-    /// All six variants, useful for documentation and exhaustive iteration.
-    pub const ALL: [RelationKind; 6] = [
+    /// All variants, useful for documentation and exhaustive iteration.
+    pub const ALL: [RelationKind; 7] = [
         Self::Replaces,
         Self::Requires,
         Self::References,
+        Self::Supports,
         Self::BelongsTo,
         Self::DecidedBy,
         Self::Refines,
@@ -66,6 +75,7 @@ impl FromStr for RelationKind {
             "replaces" => Ok(Self::Replaces),
             "requires" => Ok(Self::Requires),
             "references" => Ok(Self::References),
+            "supports" => Ok(Self::Supports),
             "belongs_to" => Ok(Self::BelongsTo),
             "decided_by" => Ok(Self::DecidedBy),
             "refines" => Ok(Self::Refines),
@@ -76,7 +86,7 @@ impl FromStr for RelationKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "unknown relation kind: {0:?} (expected one of replaces, requires, references, belongs_to, decided_by, refines)"
+    "unknown relation kind: {0:?} (expected one of replaces, requires, references, supports, belongs_to, decided_by, refines)"
 )]
 pub struct UnknownRelationKind(pub String);
 

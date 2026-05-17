@@ -1,6 +1,6 @@
 # M5 — Selective relations (thought-to-thought graph layer)
 
-**Status:** ✅ shipped 2026-05-17.
+**Status:** ✅ shipped 2026-05-17. **M5.1 iteration** shipped 2026-05-17 (see end of doc); vocabulary now has seven relations.
 
 **One-line:** thought-to-thought edges in a closed six-relation vocabulary, agent-supplied via three new MCP tools.
 
@@ -160,3 +160,67 @@ No new subcommands. Linking is MCP-only — operators link via Claude Code/Deskt
 - **`get_related_thoughts` returns content_preview, not full content.** Previews keep response sizes bounded for callers building UI; the full content is one `get_thought` call away if needed.
 - **Edges survive thought retraction.** Soft-retraction sets `retracted_at` but doesn't delete the row, so FK is still valid. Surfacing `retracted: true` in responses lets consumers decide whether to show, dim, or hide; we don't gate retrieval at the storage layer because that's a UX policy, not a data property.
 - **No `link_id`-based deletion.** Edges are identified by their (from, relation, to) triple, not by link_id. Operators see edges as relationships, not as rows with surrogate keys. `unlink_thoughts(from, relation, to)` matches that mental model.
+
+---
+
+## M5.1 iteration (2026-05-17)
+
+Day-one dogfood on the v1 vocabulary (17 agent-supplied edges + 2 captured findings) surfaced two priorities. M5.1 is a small additive iteration that addresses Priority 1 (vocabulary gap) and Priority 3 (tool description anti-patterns) from the dogfood notes. Priority 2 (heterogeneous targets) earned promotion from M5.x to a near-term M5.2 iteration; tracked separately.
+
+### Priority 1: `references` was over-firing
+
+Four functionally distinct edge types collapsed into `references` across 17 edges:
+- **Weak cite** — passing prose mention (`6d2ef58e → 8a533e15`).
+- **Experimental evidence / corroboration** — `74eb781c → 6d2ef58e`.
+- **Summary cite** — result aggregates source data points (`74eb781c → 63ad01e0`, `74eb781c → 047d0ce8`).
+- **Sibling grouping** — peer findings (`618f5a6b → 0ce53ec2`).
+
+The `note` field carried the semantics in practice and `get_related_thoughts` returns notes, so careful consumers can disambiguate by inspection. But aggregation tooling that counts edges by relation type can't ask `relations: ["evidences"]` — it has to ask `relations: ["references"]` and string-match notes, which is fragile.
+
+The cleanest factoring: split the evidence-vs-context divide. M5.1 adds **`supports`** as the seventh relation, separating "I cite for context" (`references`) from "I confirm a claim" (`supports` — experimental evidence, corroborating data, logical support). The other three overloads (weak cite, summary cite, sibling) are tolerable; the evidence-vs-context conflation was the one that bit hardest.
+
+Why `supports` over `evidences` / `corroborates`:
+- Reads cleanly in agent-natural sentence shape ("B supports A").
+- Covers both experimental and logical support.
+- Matches the closed-vocab pattern of existing relations (single English verb, snake_case-friendly).
+- `evidences` is slightly stilted as a verb; `corroborates` is too narrow (only fits experimental confirmation).
+
+### Priority 3: tool-description anti-patterns
+
+The dogfood revealed the proposed citation chain `137dba1d refines 6d2ef58e refines 8a533e15` collapsed citation-of-evidence into a refinement chain — `6d2ef58e refines 8a533e15` is wrong because the bootstrap is a charter, not a proposition with updated thinking. The mistake is natural (both feel chain-shaped) but nothing in the v1 description actively flagged the anti-pattern.
+
+M5.1 extends `link_thoughts.relation`'s schemars description with a "Common mistakes to avoid" decision-tree block listing five anti-patterns:
+- Don't use `refines` for citation or evidence — use `references` (or `supports` if it confirms a claim).
+- Don't use `belongs_to` when the target is a peer or sibling — model the parent (e.g., the experiment, the session) explicitly as its own thought.
+- Don't use `decided_by` without a clear decision-maker attribution — "the research suggests X" is `supports`, not `decided_by`.
+- Don't use `replaces` for refinement — `replaces` means the older thought is no longer the current thinking; `refines` is when both stand.
+- Don't use `references` when the newer thought confirms a claim made in the older one — use `supports`.
+
+Cost: ~600 chars of additional prompt context in the `relation` schemars description. Tradeoff: longer prompt vs. fewer agent mistakes. For LLM-agent callers (the primary caller class), the cost is worth it.
+
+### Schema impact
+
+Migration 0008 is a pure CHECK constraint relax — drops the old `thought_links_relation_check` and adds a new one including `supports`. No data migration needed; existing rows are unaffected. Operators don't need to re-link anything; the new `supports` value just becomes available for new (or re-asserted) edges.
+
+### Files changed
+
+- `crates/engram-core/src/relation.rs` — added `Supports` variant to `RelationKind` enum; `as_str`, `FromStr`, `ALL`, error message text all updated. `ALL` is now `[RelationKind; 7]`.
+- `migrations/0008_relation_supports.sql` — CHECK constraint extension.
+- `crates/engram-mcp/src/server.rs` — `LinkThoughtsArgs.relation` description gains the `supports` entry + "Common mistakes" block; `UnlinkThoughtsArgs.relation` and `GetRelatedThoughtsArgs.relations` descriptions mention `supports`; `SERVER_INSTRUCTIONS` lists all seven relations + the `references`/`supports` distinction; regression test `server_instructions_advertise_*` pins `supports`.
+- `README.md`, `docs/engram-design-v0.md` — vocabulary table / §6.6 / §9 / revision history updated.
+
+### Dogfood plan (post-merge)
+
+1. Re-link `74eb781c → 6d2ef58e` and `74eb781c → 63ad01e0` / `74eb781c → 047d0ce8` from `references` to `supports` (where they're evidential/aggregation cases). Verify `get_related_thoughts(74eb781c, relations: ["supports"])` returns the expected edges.
+2. Observe agent behavior under the new vocab + anti-pattern doc: do new captures pick the right relation more often? (Particularly: do refinement-vs-citation distinctions land correctly?)
+3. Exercise the dedup path: re-call an existing edge and verify the response is `is_new: false` with the same `link_id` (Priority 4 from the dogfood notes — spec was right but never exercised live).
+4. Capture findings as thoughts; link them using the new vocabulary.
+
+### Priority 2 — promoted to M5.2 (not in this iteration)
+
+Heterogeneous targets (link-to-entity, link-to-person, link-to-URL) materialized as a real need on day one — Probe 2A and 2B are sibling variants under "Probe 2 experiment" which is not a thought. The tactical workaround (capture an experiment-thought, then `belongs_to`) is a capture-overhead tax that doesn't apply retroactively. The architectural fix is heterogeneous targets, promoted from M5.x to a near-term M5.2 iteration. M5.2 deserves its own plan-mode conversation — the schema change is non-trivial (polymorphic target column with no FK guarantee for non-thought rows) and the design space has real choices (polymorphic single table vs. separate `thought_external_links` table). Out of scope for M5.1.
+
+### Lessons
+
+- **Closed-vocab relation design needs the same anti-pattern documentation discipline as closed-enum kind classification.** The M4.1 v3 negative-example backfire taught us that listing forbidden phrases can reinforce them; the M5 v1 dogfood taught us that *not* listing anti-patterns lets natural-but-wrong applications slip through. The right shape is decision-tree rules ("don't use X for Y; use Z instead") in the tool description, not negative-example lists.
+- **Day-one dogfood is the right cadence.** v1 had been live for hours; 17 edges across the operator's existing corpus was enough to falsify the closed-vocab choice. Vocabulary additions are cheap (one CHECK constraint relax); the cost of *not* iterating on the vocab is downstream brittleness in aggregation tooling.

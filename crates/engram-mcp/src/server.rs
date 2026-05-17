@@ -116,7 +116,7 @@ pub struct LinkThoughtsArgs {
     pub from_thought_id: String,
 
     #[schemars(
-        description = "Relation type. Must be one of the closed vocabulary: 'replaces' (this thought replaces an earlier one — most recent supersedes), 'requires' (this thought depends on another), 'references' (this thought points at another for context, like a citation), 'belongs_to' (this thought is a member/sub-element of another, e.g. a finding under a parent thread), 'decided_by' (this thought is a decision attributed to another, e.g. a person-note or session-anchor), 'refines' (this thought is a refinement/iteration of an earlier one — both stand, but the newer thought represents updated thinking)."
+        description = "Relation type. Must be one of the closed vocabulary: 'replaces' (this thought replaces an earlier one — most recent supersedes), 'requires' (this thought depends on another), 'references' (this thought points at another for context, like a citation), 'supports' (this thought confirms a claim made in another — experimental evidence, corroborating data, logical support), 'belongs_to' (this thought is a member/sub-element of another, e.g. a finding under a parent thread), 'decided_by' (this thought is a decision attributed to another, e.g. a person-note or session-anchor), 'refines' (this thought is a refinement/iteration of an earlier one — both stand, but the newer thought represents updated thinking).\n\nCommon mistakes to avoid:\n- DO NOT use `refines` for citation or evidence. `refines` means the newer thought represents updated thinking on the SAME proposition — not 'the newer thought cites the older one for context.' Use `references` (or `supports` if the newer thought confirms a claim) instead.\n- DO NOT use `belongs_to` when the target is a peer or sibling — the v1 vocabulary lacks a sibling/peer-grouping relation. Model the parent (e.g., the experiment, the session) explicitly as its own thought and use `belongs_to` against that. If the parent isn't naturally a thought, capture one for it (one-line description is fine).\n- DO NOT use `decided_by` unless there is a clear decision-maker attribution. 'The team converged on X' is `decided_by` Team; 'the research suggests X' is `supports`, not `decided_by`.\n- DO NOT use `replaces` for refinement. `replaces` means the older thought is no longer the current thinking; use `refines` when both stand and the newer one just represents updated thinking.\n- DO NOT use `references` when the newer thought confirms a claim made in the older one — use `supports`. (`references` is for prose-level mention; `supports` is for evidential / corroborative relationship.)"
     )]
     pub relation: String,
 
@@ -135,7 +135,7 @@ pub struct UnlinkThoughtsArgs {
     pub from_thought_id: String,
 
     #[schemars(
-        description = "Relation type (same closed vocabulary as link_thoughts: replaces, requires, references, belongs_to, decided_by, refines)."
+        description = "Relation type (same closed vocabulary as link_thoughts: replaces, requires, references, supports, belongs_to, decided_by, refines)."
     )]
     pub relation: String,
 
@@ -149,7 +149,7 @@ pub struct GetRelatedThoughtsArgs {
     pub thought_id: String,
 
     #[schemars(
-        description = "Optional filter to a subset of relation types (e.g. ['refines','replaces']). Each item must be in the closed vocabulary: replaces, requires, references, belongs_to, decided_by, refines. Omit to return edges of every type."
+        description = "Optional filter to a subset of relation types (e.g. ['refines','replaces']). Each item must be in the closed vocabulary: replaces, requires, references, supports, belongs_to, decided_by, refines. Omit to return edges of every type."
     )]
     pub relations: Option<Vec<String>>,
 
@@ -664,9 +664,9 @@ Top-level keys AND together; array values match by subset containment.
 
 `capture` is idempotent on content via SHA-256 fingerprint: same content captured twice returns the existing `thought_id` with `is_duplicate: true` and no new embedding/tag jobs enqueue.
 
-Relations (M5+): thoughts can be linked with a closed-vocabulary `(from, relation, to)` edge. Six relations:
-  replaces, requires, references, belongs_to, decided_by, refines
-Endpoints are thought_ids only — heterogeneous targets (entities, people, URLs) and tagger-extracted relations are not in M5. Use:
+Relations (M5+): thoughts can be linked with a closed-vocabulary `(from, relation, to)` edge. Seven relations (M5 shipped 6; M5.1 added `supports` after dogfood):
+  replaces, requires, references, supports, belongs_to, decided_by, refines
+Distinguish `references` (prose-level citation / contextual mention) from `supports` (evidential / corroborative — the newer thought confirms a claim made in the older one). Endpoints are thought_ids only — heterogeneous targets (entities, people, URLs) and tagger-extracted relations are not in M5. Use:
   - `link_thoughts(from_thought_id, relation, to_thought_id, note?)` → idempotent on the (from, relation, to) triple; returns `is_new` + the link_id.
   - `unlink_thoughts(from_thought_id, relation, to_thought_id)` → idempotent on already-deleted.
   - `get_related_thoughts(thought_id, relations?, direction?)` → grouped `outbound` + `inbound` arrays with full edge metadata and a content_preview for each related thought.
@@ -733,13 +733,15 @@ mod tests {
         // Capture-time idempotency is worth advertising — agents that
         // double-capture should expect `is_duplicate: true`.
         assert!(s.contains("is_duplicate"));
-        // M5: the relation vocabulary is the load-bearing closed set; every
+        // M5+: the relation vocabulary is the load-bearing closed set; every
         // value must appear so agents have a reliable reference for the
-        // link/unlink/get_related_thoughts tools.
+        // link/unlink/get_related_thoughts tools. `supports` was added in
+        // M5.1 after day-one dogfood showed `references` was over-firing.
         for relation in [
             "replaces",
             "requires",
             "references",
+            "supports",
             "belongs_to",
             "decided_by",
             "refines",

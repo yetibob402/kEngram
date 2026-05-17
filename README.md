@@ -66,13 +66,14 @@ The lifecycle, end to end:
 
 ## How relations work
 
-[M5+] Thoughts can be linked into a graph via a closed vocabulary of six relations:
+[M5+] Thoughts can be linked into a graph via a closed vocabulary of seven relations (M5 shipped six; M5.1 added `supports` after day-one dogfood revealed `references` was over-firing on evidential cases):
 
 | relation | meaning |
 |---|---|
 | `replaces` | newer thought supersedes an earlier one (decision changed; both stay, retrieval prefers newer) |
 | `requires` | this thought depends on another (decision presupposes a constraint; refinement presupposes an earlier finding) |
 | `references` | this thought points at another for context (citation, follow-up, related observation) |
+| `supports` | this thought confirms a claim made in another (experimental evidence, corroborating data, logical support). Distinct from `references`: a citation that *endorses*, not just *cites*. |
 | `belongs_to` | membership / containment (a finding under a parent thread; a decision under a session) |
 | `decided_by` | provenance: this thought is a decision attributable to a person or session anchor |
 | `refines` | newer thought refines an earlier one (both stand; the newer one represents updated thinking) |
@@ -521,7 +522,7 @@ Built in six capability milestones (M1 → M6), preceded by an environment miles
 | [M3 — search & extraction quality](docs/milestones/m3-search-quality.md) | ✅ | Cross-encoder reranker; fact embeddings (M4-retired); v4 extractor prompt (M4-retired); A/B benchmarking harness. Retrieval portion shipped; extraction-side dogfood produced negative knowledge that motivated M4. |
 | [M4 — collapse to thoughts-only](docs/milestones/m4-collapse-to-thoughts.md) | ✅ | Drop the facts pipeline; thoughts-only with content-fingerprint dedup and a JSONB tagging sidecar (people / action_items / topics / dates_mentioned / kind). `search_thoughts` gains `tag_filter`. Tagger is silent-disable. |
 | [M4.1 — v2 tagging](docs/milestones/m4.1-tagging-v2.md) | ✅ | Split `topics` into `entities` (named identifiers) + `topics` (subject categories); add scope-aware controlled-vocabulary injection so the tagger prefers established terms over coining new ones. Initial v2 prompt shipped at tagger version 2; the v3 iteration added entities anti-padding + kind isolation (version 3); the v4 iteration restructured entities to lead-with-empty + softened vocab to tie-break after v3 dogfood revealed the negative-example list backfired (version 4). Operator runs `engram tag --rerun --since 1970-01-01T00:00:00Z` to backfill. |
-| [M5 — selective relations](docs/milestones/m5-selective-relations.md) | ✅ | Thought-to-thought graph layer: closed relation vocabulary (`replaces`, `requires`, `references`, `belongs_to`, `decided_by`, `refines`), `thought_links` table, three new MCP tools (`link_thoughts`, `unlink_thoughts`, `get_related_thoughts`). Agent-supplied edges only; heterogeneous targets + tagger-extracted relations deferred. |
+| [M5 — selective relations](docs/milestones/m5-selective-relations.md) | ✅ | Thought-to-thought graph layer: closed relation vocabulary (initially `replaces`, `requires`, `references`, `belongs_to`, `decided_by`, `refines`; M5.1 added `supports` after dogfood), `thought_links` table, three new MCP tools (`link_thoughts`, `unlink_thoughts`, `get_related_thoughts`). Agent-supplied edges only; heterogeneous targets + tagger-extracted relations deferred. |
 | [M6 — artifacts](docs/milestones/m6-artifacts.md) | ⏳ | Long-form document ingestion |
 | [M7 — operational maturity](docs/milestones/m7-operational-maturity.md) | ⏳ | Metrics, Tier 2 auth, eval suite, backups |
 

@@ -47,7 +47,7 @@ pub struct CaptureArgs {
     pub scope: Option<String>,
 
     #[schemars(
-        description = "Optional free-form metadata object. Recommended keys: client_name, session_id, tool_name, agent_role."
+        description = "Optional free-form metadata object. Recommended keys: client_name, session_id, tool_name, agent_role, for_audience. DO NOT use this field to encode references to other thoughts (refines, replaces, etc.) — metadata is opaque to retrieval and graph traversal. For cross-thought structure, use `link_thoughts` after capture."
     )]
     pub metadata: Option<serde_json::Value>,
 }
@@ -208,7 +208,7 @@ impl std::fmt::Debug for EngramServer {
 #[tool_router]
 impl EngramServer {
     #[tool(
-        description = "Capture a thought into engram's persistent memory. Returns the thought_id and embedding_status='pending'. The thought is durable and findable by trigram (lexical) search immediately; vector search picks it up on the next worker tick (default 5 seconds). Identical content (SHA-256 of the bytes) is deduplicated — the response will include `is_duplicate: true` and the pre-existing thought_id when the fingerprint collides."
+        description = "Capture a thought into engram's persistent memory. Returns the thought_id and embedding_status='pending'. The thought is durable and findable by trigram (lexical) search immediately; vector search picks it up on the next worker tick (default 5 seconds). Identical content (SHA-256 of the bytes) is deduplicated — the response will include `is_duplicate: true` and the pre-existing thought_id when the fingerprint collides. To express that this thought refines, replaces, references, supports, depends on, belongs under, or was decided by another thought, use `link_thoughts` after capture — these relations are queryable via `get_related_thoughts`. Do NOT encode cross-thought relationships in the `metadata` field; metadata is opaque to retrieval and graph traversal."
     )]
     async fn capture(&self, Parameters(args): Parameters<CaptureArgs>) -> Result<String, String> {
         let source = Source::new(args.source).map_err(|e| format!("invalid source: {e}"))?;
@@ -246,7 +246,7 @@ impl EngramServer {
     }
 
     #[tool(
-        description = "Hybrid search across captured thoughts. Combines vector kNN (over the active embedding model) with trigram lexical similarity via reciprocal rank fusion, then applies a recency boost. When a cross-encoder reranker is configured, the top `candidate_pool` post-RRF hits are re-scored and returned in rerank order. Optional `tag_filter` narrows to thoughts whose tags JSONB satisfies a containment query. If the embedder is unreachable, results still come back from the trigram leg and `vector_search_available` is false; if the reranker fails, results come back in RRF + recency order and `rerank_used` is false. Each hit carries the thought's tags so consumers can show / threshold without a follow-up get_thought."
+        description = "Hybrid search across captured thoughts. Combines vector kNN (over the active embedding model) with trigram lexical similarity via reciprocal rank fusion, then applies a recency boost. When a cross-encoder reranker is configured, the top `candidate_pool` post-RRF hits are re-scored and returned in rerank order. Optional `tag_filter` narrows to thoughts whose tags JSONB satisfies a containment query. If the embedder is unreachable, results still come back from the trigram leg and `vector_search_available` is false; if the reranker fails, results come back in RRF + recency order and `rerank_used` is false. Each hit carries the thought's tags so consumers can show / threshold without a follow-up get_thought. For each hit, follow up with `get_related_thoughts(thought_id)` to walk the graph layer — refinements, replacements, supports, citations, and other edges the agent has linked. The search-then-traverse pattern is how a discovery walk arrives at the relational context of a hit."
     )]
     async fn search_thoughts(
         &self,
@@ -350,7 +350,7 @@ impl EngramServer {
     }
 
     #[tool(
-        description = "Create a thought-to-thought relation in the M5 graph layer. Asserts an edge with one of seven closed-vocabulary relations: replaces, requires, references, supports, belongs_to, decided_by, refines. Idempotent on the (from, relation, to) triple — re-asserting the same edge returns is_new=false and the existing link_id. Validates that both endpoints exist and that from != to; returns clear error strings otherwise. Use this to link a thought to one it refines, replaces, references, supports (confirms a claim made by), depends on, belongs under, or that decided it. Heterogeneous targets (to-entity, to-person, to-URL) and tagger-extracted relations are not in M5 — use `link_thoughts` agent-side."
+        description = "Create a thought-to-thought relation in the M5 graph layer. Asserts an edge with one of seven closed-vocabulary relations: replaces, requires, references, supports, belongs_to, decided_by, refines. Idempotent on the (from, relation, to) triple — re-asserting the same edge returns is_new=false and the existing link_id. Validates that both endpoints exist and that from != to; returns clear error strings otherwise. Use this to link a thought to one it refines, replaces, references, supports (confirms a claim made by), depends on, belongs under, or that decided it. Heterogeneous targets (to-entity, to-person, to-URL) and tagger-extracted relations are not in M5 — model those agent-side in your own structure, or capture an intermediate thought (e.g. for an experiment, session, or external resource) and link to that thought instead."
     )]
     async fn link_thoughts(
         &self,
@@ -414,7 +414,7 @@ impl EngramServer {
     }
 
     #[tool(
-        description = "Walk the M5 thought-to-thought graph from a single thought. Returns grouped `outbound` (edges where this thought is `from`) and `inbound` (edges where it's `to`) arrays. Each entry carries the related thought's id, scope, content_preview (first 400 chars), retracted-state flag, the edge's relation/note/source, and timestamps. Optional `relations` array restricts to specific relation types; optional `direction` ('outbound' | 'inbound' | 'both') is the traversal scope (default 'both'). Retracted thoughts on either side are included with `retracted: true` — the caller decides whether to show, dim, or hide them."
+        description = "Walk the M5 thought-to-thought graph from a single thought. Returns grouped `outbound` (edges where this thought is `from`) and `inbound` (edges where it's `to`) arrays. Each entry carries the related thought's id, scope, content_preview (first 400 chars), retracted-state flag, the edge's relation/note/source, and timestamps. Optional `relations` array restricts to specific relation types; optional `direction` ('outbound' | 'inbound' | 'both') is the traversal scope (default 'both'). Retracted thoughts on either side are included with `retracted: true` — the caller decides whether to show, dim, or hide them. Edges are agent-supplied via `link_thoughts(from, relation, to, note?)` and removed via `unlink_thoughts(from, relation, to)` — both idempotent on the (from, relation, to) triple. If the response is empty, no edges have been linked from/to this thought yet — `link_thoughts` is how the graph gets built."
     )]
     async fn get_related_thoughts(
         &self,
@@ -671,6 +671,8 @@ Distinguish `references` (prose-level citation / contextual mention) from `suppo
   - `unlink_thoughts(from_thought_id, relation, to_thought_id)` → idempotent on already-deleted.
   - `get_related_thoughts(thought_id, relations?, direction?)` → grouped `outbound` + `inbound` arrays with full edge metadata and a content_preview for each related thought.
 Edges survive thought retraction (retracted thoughts surface with `retracted: true`); to fully sever a link, use `unlink_thoughts`.
+
+Workflow shape: after capturing a thought, use `link_thoughts` to express structural relationships — these are queryable via `get_related_thoughts` and not encodable in `metadata`. After a search, follow up with `get_related_thoughts(thought_id)` on a hit to walk the graph from there.
 
 Tools: `capture`, `search_thoughts`, `recent_thoughts`, `get_thought`, `retract_thought`, `link_thoughts`, `unlink_thoughts`, `get_related_thoughts`.";
 

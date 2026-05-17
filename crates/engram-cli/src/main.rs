@@ -287,21 +287,34 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
     // mcp-remote bridge) comes back after idling past the 5-minute default.
     // `json_response: true` pairs naturally — replies are plain JSON, no SSE
     // framing overhead.
-    let mcp_service = StreamableHttpService::new(
-        factory,
-        LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default()
-            .with_stateful_mode(false)
-            .with_json_response(true),
-    );
+    // DNS-rebinding protection: rmcp ships with a safe default allowlist
+    // (`localhost` / `127.0.0.1` / `::1`). Operators binding to a non-loopback
+    // interface (Tailnet, LAN) must extend the allowlist via
+    // `[server].allowed_hosts` in engram.toml, or the rmcp transport rejects
+    // every request whose Host header isn't `localhost`. Empty config list =
+    // keep rmcp's default; non-empty replaces it.
+    let mut http_cfg = StreamableHttpServerConfig::default()
+        .with_stateful_mode(false)
+        .with_json_response(true);
+    if !config.server.allowed_hosts.is_empty() {
+        http_cfg = http_cfg.with_allowed_hosts(config.server.allowed_hosts.clone());
+    }
+    let mcp_service =
+        StreamableHttpService::new(factory, LocalSessionManager::default().into(), http_cfg);
 
     let app = axum::Router::new().nest_service("/mcp", mcp_service);
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding HTTP server to {bind}"))?;
 
+    let allowed_hosts_summary = if config.server.allowed_hosts.is_empty() {
+        "rmcp default (localhost / 127.0.0.1 / ::1)".to_string()
+    } else {
+        format!("custom: {:?}", config.server.allowed_hosts)
+    };
     tracing::info!(
         bind = %bind,
+        allowed_hosts = %allowed_hosts_summary,
         embedder_endpoint = %config.embedder.endpoint,
         model_id = %config.embedder.model_id,
         tagger = %match tagger_model_id.as_deref() {

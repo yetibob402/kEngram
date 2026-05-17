@@ -33,15 +33,44 @@ pub struct Config {
 #[serde(default)]
 pub struct ServerConfig {
     /// Bind address. Tier 0 (localhost) is the M1 default. Tier 1 (Tailnet)
-    /// is achieved by changing this to the Tailscale interface IP — no code
-    /// change.
+    /// is achieved by changing this to the Tailscale interface IP (or
+    /// `0.0.0.0:<port>`) — no code change.
     pub bind: String,
+
+    /// Host names / IPs the MCP server's DNS-rebinding protection accepts on
+    /// the `Host` header. Empty = use rmcp's safe default
+    /// (`localhost` / `127.0.0.1` / `::1`); a non-empty list REPLACES the
+    /// default and is the operator-managed allowlist (the rmcp transport
+    /// rejects any request whose `Host` header isn't in this list with a
+    /// "rejected request with disallowed Host header" warning).
+    ///
+    /// When binding to a non-loopback interface (Tailnet, LAN), add the
+    /// hostname AND `hostname:port` forms the client uses, plus the IP and
+    /// `ip:port` forms. The rmcp matcher checks both:
+    ///
+    /// ```toml
+    /// [server]
+    /// bind = "0.0.0.0:8081"
+    /// allowed_hosts = [
+    ///     "localhost", "127.0.0.1", "::1",
+    ///     "repromax", "repromax:8081",
+    ///     "100.110.75.74", "100.110.75.74:8081",
+    /// ]
+    /// ```
+    ///
+    /// Leaving this list empty when bind is non-loopback effectively rejects
+    /// every non-localhost request — the symptom is "rejected request"
+    /// warnings in the serve log and connection failures from remote
+    /// clients. Bypass-all (clearing the rmcp default entirely) is
+    /// intentionally not exposed; if you need it, edit the source.
+    pub allowed_hosts: Vec<String>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:8080".to_string(),
+            allowed_hosts: Vec::new(),
         }
     }
 }
@@ -259,6 +288,35 @@ mod tests {
     fn default_config_has_localhost_bind() {
         let c = Config::default();
         assert_eq!(c.server.bind, "127.0.0.1:8080");
+        // Empty allowed_hosts = use rmcp's safe default (localhost-only).
+        // Operator must extend this list when binding non-loopback.
+        assert!(c.server.allowed_hosts.is_empty());
+    }
+
+    /// Operator-provided allowed_hosts round-trips through figment. Common
+    /// usage when binding to a Tailnet interface or 0.0.0.0 — include both
+    /// bare-hostname and hostname:port forms since the rmcp matcher
+    /// distinguishes them.
+    #[test]
+    fn server_allowed_hosts_round_trips_from_toml() {
+        let toml = r#"
+            [server]
+            bind = "0.0.0.0:8081"
+            allowed_hosts = ["localhost", "127.0.0.1", "::1", "repromax", "repromax:8081"]
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert_eq!(c.server.bind, "0.0.0.0:8081");
+        assert_eq!(c.server.allowed_hosts.len(), 5);
+        assert!(c.server.allowed_hosts.contains(&"repromax".to_string()));
+        assert!(
+            c.server
+                .allowed_hosts
+                .contains(&"repromax:8081".to_string())
+        );
     }
 
     #[test]

@@ -33,11 +33,12 @@ pub use relate::{
 };
 pub use retract::{RetractError, RetractThoughtRequest, RetractThoughtResponse, retract_thought};
 pub use search::{
-    DEFAULT_SEARCH_LIMIT, DEFAULT_TOP_K_PER_LEG, GetThoughtResponse, MAX_SEARCH_LIMIT, ReadError,
-    RecentRequest, RecentResponse, SearchHit, SearchRequest, SearchResponse, get_thought,
+    DEFAULT_SEARCH_LIMIT, DEFAULT_TOP_K_PER_LEG, GetThoughtResponse, ListScopesRequest,
+    ListScopesResponse, MAX_SEARCH_LIMIT, ReadError, RecentRequest, RecentResponse,
+    ScopeSummaryHit, SearchHit, SearchRequest, SearchResponse, get_thought, list_scopes,
     recent_thoughts, search_thoughts,
 };
 pub use server::{
     CaptureArgs, EngramServer, GetRelatedThoughtsArgs, GetThoughtArgs, LinkThoughtsArgs,
-    RecentThoughtsArgs, RetractThoughtArgs, SearchThoughtsArgs, UnlinkThoughtsArgs,
+    ListScopesArgs, RecentThoughtsArgs, RetractThoughtArgs, SearchThoughtsArgs, UnlinkThoughtsArgs,
 };

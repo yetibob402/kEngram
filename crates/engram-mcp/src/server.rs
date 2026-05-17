@@ -27,8 +27,8 @@ use crate::link::{self, LinkError, LinkThoughtsRequest, MAX_LINK_NOTE_LEN};
 use crate::relate::{self, GetRelatedThoughtsRequest, RelateError};
 use crate::retract::{self, RetractError, RetractThoughtRequest};
 use crate::search::{
-    self, GetThoughtResponse, ReadError, RecentRequest, RecentResponse, SearchRequest,
-    SearchResponse,
+    self, GetThoughtResponse, ListScopesRequest, ListScopesResponse, ReadError, RecentRequest,
+    RecentResponse, SearchRequest, SearchResponse,
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -57,8 +57,15 @@ pub struct SearchThoughtsArgs {
     #[schemars(description = "Search query. Required, non-empty.")]
     pub query: String,
 
-    #[schemars(description = "Scope filter. Optional; when omitted, searches across all scopes.")]
+    #[schemars(
+        description = "Scope filter (exact match). Optional; when omitted, searches across all scopes. For prefix-mode filtering across a namespace of scopes (e.g. all `rjf.*` scopes), use `scope_prefix` instead. Mutually exclusive with `scope_prefix` — supplying both returns an error. Call `list_scopes` to discover what's in use."
+    )]
     pub scope: Option<String>,
+
+    #[schemars(
+        description = "Prefix filter on scope. Optional; matches scopes starting with this string (e.g. `scope_prefix: \"rjf.\"` returns hits from `rjf.professional.cto`, `rjf.personal.health`, etc.). Mutually exclusive with `scope` (exact match) — supply at most one. Pair with `list_scopes(prefix=...)` for a discover-then-query workflow across a namespace of related scopes."
+    )]
+    pub scope_prefix: Option<String>,
 
     #[schemars(description = "Max results. Optional; defaults to 10, max 100.")]
     pub limit: Option<usize>,
@@ -79,18 +86,33 @@ pub struct SearchThoughtsArgs {
     pub candidate_pool: Option<usize>,
 
     #[schemars(
-        description = "Optional JSONB-containment filter applied to each thought's `tags` field. Tags are LLM-extracted metadata with shape: { people: string[], entities: string[] (named proper-noun-style identifiers — projects, products, libraries, tools, e.g. \"engram\", \"pgvector\"), action_items: string[], topics: string[] (1-3 short lowercase subject categories — e.g. \"rust\", \"memory-systems\"), dates_mentioned: string[], kind: 'observation' | 'task' | 'idea' | 'reference' | 'person_note' | 'session' | null }. Distinguish `entities` (specific named things mentioned by name) from `topics` (broader subject categories the thought falls under). The `kind` enum is closed at the values listed; the array fields are open-vocabulary strings. Examples: {\"kind\": \"task\"} returns only thoughts the tagger classified as tasks; {\"people\": [\"Sarah\"]} returns thoughts whose people-tag contains Sarah; {\"entities\": [\"engram\"]} returns thoughts mentioning engram by name; {\"topics\": [\"rust\"], \"kind\": \"idea\"} combines both (top-level keys AND together; array values are subset-match). Empty object {} is a no-op. Filters compose with `scope`."
+        description = "Optional JSONB-containment filter applied to each thought's `tags` field. Tags are LLM-extracted metadata with shape: { people: string[], entities: string[] (named proper-noun-style identifiers — projects, products, libraries, tools, e.g. \"engram\", \"pgvector\"), action_items: string[], topics: string[] (1-3 short lowercase subject categories — e.g. \"rust\", \"memory-systems\"), dates_mentioned: string[], kind: 'observation' | 'task' | 'idea' | 'reference' | 'person_note' | 'session' | null }. Distinguish `entities` (specific named things mentioned by name) from `topics` (broader subject categories the thought falls under). The `kind` enum is closed at the values listed; the array fields are open-vocabulary strings. Examples: {\"kind\": \"task\"} returns only thoughts the tagger classified as tasks; {\"people\": [\"Sarah\"]} returns thoughts whose people-tag contains Sarah; {\"entities\": [\"engram\"]} returns thoughts mentioning engram by name; {\"topics\": [\"rust\"], \"kind\": \"idea\"} combines both (top-level keys AND together; array values are subset-match). Empty object {} is a no-op. Filters compose with `scope` (or `scope_prefix`, whichever is set) via AND."
     )]
     pub tag_filter: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RecentThoughtsArgs {
-    #[schemars(description = "Scope filter. Optional; when omitted, returns across all scopes.")]
+    #[schemars(
+        description = "Scope filter (exact match). Optional; when omitted, returns across all scopes. For prefix-mode filtering, use `scope_prefix` instead. Mutually exclusive with `scope_prefix`."
+    )]
     pub scope: Option<String>,
+
+    #[schemars(
+        description = "Prefix filter on scope (e.g. `scope_prefix: \"rjf.\"` matches `rjf.professional.cto`, `rjf.personal.health`, etc.). Mutually exclusive with `scope` — supplying both returns an error."
+    )]
+    pub scope_prefix: Option<String>,
 
     #[schemars(description = "Max results. Optional; defaults to 10, max 100.")]
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListScopesArgs {
+    #[schemars(
+        description = "Optional prefix filter. When supplied, only scopes starting with this string are returned (e.g. `prefix: \"rjf.\"` returns `rjf.professional.cto`, `rjf.personal.health`, etc.). Omit for the full scope set."
+    )]
+    pub prefix: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -208,7 +230,7 @@ impl std::fmt::Debug for EngramServer {
 #[tool_router]
 impl EngramServer {
     #[tool(
-        description = "Capture a thought into engram's persistent memory. Returns the thought_id and embedding_status='pending'. The thought is durable and findable by trigram (lexical) search immediately; vector search picks it up on the next worker tick (default 5 seconds). Identical content (SHA-256 of the bytes) is deduplicated — the response will include `is_duplicate: true` and the pre-existing thought_id when the fingerprint collides. To express that this thought refines, replaces, references, supports, depends on, belongs under, or was decided by another thought, use `link_thoughts` after capture — these relations are queryable via `get_related_thoughts`. Do NOT encode cross-thought relationships in the `metadata` field; metadata is opaque to retrieval and graph traversal."
+        description = "Capture a thought into engram's persistent memory. Returns the thought_id and embedding_status='pending'. The thought is durable and findable by trigram (lexical) search immediately; vector search picks it up on the next worker tick (default 5 seconds). Identical content (SHA-256 of the bytes) is deduplicated — the response will include `is_duplicate: true` and the pre-existing thought_id when the fingerprint collides. To express that this thought refines, replaces, references, supports, depends on, belongs under, or was decided by another thought, use `link_thoughts` after capture — these relations are queryable via `get_related_thoughts`. Do NOT encode cross-thought relationships in the `metadata` field; metadata is opaque to retrieval and graph traversal. To make a term filterable as an entity or topic, put it in the opening sentence — the tagger lifts phrases from prose surface vocabulary, with extraction probability falling off after the opening."
     )]
     async fn capture(&self, Parameters(args): Parameters<CaptureArgs>) -> Result<String, String> {
         let source = Source::new(args.source).map_err(|e| format!("invalid source: {e}"))?;
@@ -246,7 +268,7 @@ impl EngramServer {
     }
 
     #[tool(
-        description = "Hybrid search across captured thoughts. Combines vector kNN (over the active embedding model) with trigram lexical similarity via reciprocal rank fusion, then applies a recency boost. When a cross-encoder reranker is configured, the top `candidate_pool` post-RRF hits are re-scored and returned in rerank order. Optional `tag_filter` narrows to thoughts whose tags JSONB satisfies a containment query. If the embedder is unreachable, results still come back from the trigram leg and `vector_search_available` is false; if the reranker fails, results come back in RRF + recency order and `rerank_used` is false. Each hit carries the thought's tags so consumers can show / threshold without a follow-up get_thought. For each hit, follow up with `get_related_thoughts(thought_id)` to walk the graph layer — refinements, replacements, supports, citations, and other edges the agent has linked. The search-then-traverse pattern is how a discovery walk arrives at the relational context of a hit."
+        description = "Hybrid search across captured thoughts. Combines vector kNN (over the active embedding model) with trigram lexical similarity via reciprocal rank fusion, then applies a recency boost. On natural-language queries the trigram leg's surface-similarity threshold typically gates everything out, so it primarily contributes a co-occurrence boost when a query hits exact surface terms (acronyms, proper nouns, code identifiers) and serves as the retrieval fallback when the embedder is unreachable. For typical content-search the candidate pool is dominated by vector kNN with rerank as the final discriminator. When a cross-encoder reranker is configured, the top `candidate_pool` post-RRF hits are re-scored and returned in rerank order. Scope filtering: use `scope` for exact match or `scope_prefix` for namespace match — supply at most one (mutually exclusive; supplying both returns an error). Optional `tag_filter` narrows to thoughts whose tags JSONB satisfies a containment query. Scope filter (whichever you pick), `tag_filter`, and the search query all compose via AND. If the embedder is unreachable, results still come back from the trigram leg and `vector_search_available` is false; if the reranker fails, results come back in RRF + recency order and `rerank_used` is false. Each hit carries the thought's tags so consumers can show / threshold without a follow-up get_thought. For each hit, follow up with `get_related_thoughts(thought_id)` to walk the graph layer — refinements, replacements, supports, citations, and other edges the agent has linked. The search-then-traverse pattern is how a discovery walk arrives at the relational context of a hit."
     )]
     async fn search_thoughts(
         &self,
@@ -260,6 +282,7 @@ impl EngramServer {
         let request = SearchRequest {
             query: args.query,
             scope,
+            scope_prefix: args.scope_prefix,
             limit: args.limit,
             recency_half_life_days: args.recency_half_life_days,
             rerank: args.rerank,
@@ -294,6 +317,7 @@ impl EngramServer {
 
         let request = RecentRequest {
             scope,
+            scope_prefix: args.scope_prefix,
             limit: args.limit,
         };
 
@@ -302,6 +326,24 @@ impl EngramServer {
             .map_err(map_read_error)?;
 
         serde_json::to_string(&recent_response_json(&resp))
+            .map_err(|e| format!("response serialization error: {e}"))
+    }
+
+    #[tool(
+        description = "Enumerate scopes currently in use in the corpus. Returns each scope with its `thought_count`, `first_activity_at` (when the scope first appeared), and `last_activity_at` (when it was most recently used). Optional `prefix` filter matches scopes starting with the given string (e.g. `prefix: \"rjf.\"` returns all `rjf.*` scopes). Sorted by `last_activity_at` descending — most recently used scopes first. Retracted thoughts are excluded from counts (scopes whose every thought is retracted don't appear). Use this before capturing to pick an existing scope; do not invent new scopes silently. Combine with `scope_prefix` on `search_thoughts` or `recent_thoughts` to query across a namespace of related scopes."
+    )]
+    async fn list_scopes(
+        &self,
+        Parameters(args): Parameters<ListScopesArgs>,
+    ) -> Result<String, String> {
+        let request = ListScopesRequest {
+            prefix: args.prefix,
+        };
+        let resp = search::list_scopes(&self.pool, request)
+            .await
+            .map_err(map_read_error)?;
+
+        serde_json::to_string(&list_scopes_response_json(&resp))
             .map_err(|e| format!("response serialization error: {e}"))
     }
 
@@ -480,6 +522,9 @@ fn map_read_error(err: ReadError) -> String {
             format!("limit out of bounds: {got} (must be 1..={max})")
         }
         ReadError::NotFound => "thought not found".to_string(),
+        ReadError::ScopeAndPrefixBothSet => {
+            "scope and scope_prefix are mutually exclusive; supply at most one".to_string()
+        }
         ReadError::Storage(e) => {
             tracing::error!(error = %e, "read storage error");
             "internal database error".to_string()
@@ -604,6 +649,28 @@ fn recent_response_json(resp: &RecentResponse) -> serde_json::Value {
     serde_json::json!({ "results": results })
 }
 
+fn list_scopes_response_json(resp: &ListScopesResponse) -> serde_json::Value {
+    let scopes: Vec<serde_json::Value> = resp
+        .scopes
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "scope": s.scope,
+                "thought_count": s.thought_count,
+                "first_activity_at": s
+                    .first_activity_at
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+                "last_activity_at": s
+                    .last_activity_at
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+            })
+        })
+        .collect();
+    serde_json::json!({ "scopes": scopes })
+}
+
 fn get_thought_response_json(resp: &GetThoughtResponse) -> serde_json::Value {
     serde_json::json!({
         "thought": {
@@ -672,9 +739,9 @@ Distinguish `references` (prose-level citation / contextual mention) from `suppo
   - `get_related_thoughts(thought_id, relations?, direction?)` → grouped `outbound` + `inbound` arrays with full edge metadata and a content_preview for each related thought.
 Edges survive thought retraction (retracted thoughts surface with `retracted: true`); to fully sever a link, use `unlink_thoughts`.
 
-Workflow shape: after capturing a thought, use `link_thoughts` to express structural relationships — these are queryable via `get_related_thoughts` and not encodable in `metadata`. After a search, follow up with `get_related_thoughts(thought_id)` on a hit to walk the graph from there.
+Workflow shape: after capturing a thought, use `link_thoughts` to express structural relationships — these are queryable via `get_related_thoughts` and not encodable in `metadata`. After a search, follow up with `get_related_thoughts(thought_id)` on a hit to walk the graph from there. Before capturing, call `list_scopes(prefix?)` to discover what scopes are in use — don't invent new scope names silently. Pass the same prefix to `search_thoughts(scope_prefix=...)` or `recent_thoughts(scope_prefix=...)` to query across a namespace of related scopes (exact-match `scope` and prefix-match `scope_prefix` are mutually exclusive).
 
-Tools: `capture`, `search_thoughts`, `recent_thoughts`, `get_thought`, `retract_thought`, `link_thoughts`, `unlink_thoughts`, `get_related_thoughts`.";
+Tools: `capture`, `search_thoughts`, `recent_thoughts`, `list_scopes`, `get_thought`, `retract_thought`, `link_thoughts`, `unlink_thoughts`, `get_related_thoughts`.";
 
 #[cfg(test)]
 mod tests {
@@ -753,7 +820,12 @@ mod tests {
                 "instructions should list relation `{relation}`",
             );
         }
-        for tool in ["link_thoughts", "unlink_thoughts", "get_related_thoughts"] {
+        for tool in [
+            "link_thoughts",
+            "unlink_thoughts",
+            "get_related_thoughts",
+            "list_scopes",
+        ] {
             assert!(
                 s.contains(tool),
                 "instructions should advertise tool `{tool}`"
@@ -848,6 +920,7 @@ mod tests {
             .search_thoughts(Parameters(SearchThoughtsArgs {
                 query: "tcgplayer".into(),
                 scope: None,
+                scope_prefix: None,
                 limit: None,
                 recency_half_life_days: None,
                 rerank: None,
@@ -900,6 +973,7 @@ mod tests {
             .search_thoughts(Parameters(SearchThoughtsArgs {
                 query: "tcgplayer".into(),
                 scope: None,
+                scope_prefix: None,
                 limit: None,
                 recency_half_life_days: Some(0.0),
                 rerank: None,
@@ -960,6 +1034,7 @@ mod tests {
             .search_thoughts(Parameters(SearchThoughtsArgs {
                 query: "keyword".into(),
                 scope: None,
+                scope_prefix: None,
                 limit: None,
                 recency_half_life_days: Some(0.0),
                 rerank: None,
@@ -991,6 +1066,7 @@ mod tests {
             .search_thoughts(Parameters(SearchThoughtsArgs {
                 query: "Nix".into(),
                 scope: None,
+                scope_prefix: None,
                 limit: None,
                 recency_half_life_days: None,
                 rerank: None,
@@ -1033,6 +1109,7 @@ mod tests {
         let raw = s
             .recent_thoughts(Parameters(RecentThoughtsArgs {
                 scope: None,
+                scope_prefix: None,
                 limit: None,
             }))
             .await

@@ -330,6 +330,7 @@ pub async fn fetch_thought_with_provenance(
 pub async fn recent_thoughts(
     pool: &PgPool,
     scope: Option<&str>,
+    scope_prefix: Option<&str>,
     limit: i64,
 ) -> Result<Vec<Thought>, StorageError> {
     let rows = sqlx::query!(
@@ -339,11 +340,13 @@ pub async fn recent_thoughts(
                tags_extractor_model, tags_extractor_version, tags_extracted_at
         FROM thoughts
         WHERE ($1::text IS NULL OR scope = $1)
+          AND ($2::text IS NULL OR scope LIKE $2 || '%')
           AND retracted_at IS NULL
         ORDER BY created_at DESC
-        LIMIT $2
+        LIMIT $3
         "#,
         scope,
+        scope_prefix,
         limit,
     )
     .fetch_all(pool)
@@ -368,6 +371,59 @@ pub async fn recent_thoughts(
         .collect()
 }
 
+/// Per-scope rollup row returned by [`list_scopes`]. Aggregates active
+/// (non-retracted) thoughts by scope value and surfaces a count plus the
+/// first / last activity timestamps so agents can discover what scopes
+/// exist and operators can see scope sprawl at a glance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeSummary {
+    pub scope: Scope,
+    pub thought_count: i64,
+    pub first_activity_at: OffsetDateTime,
+    pub last_activity_at: OffsetDateTime,
+}
+
+/// Enumerate scopes currently in use, with per-scope counts and activity
+/// timestamps. Optional `prefix` matches scopes starting with the given
+/// string (e.g., `prefix = Some("rjf.")` matches `rjf.professional.cto`,
+/// `rjf.personal.health`, etc.). Retracted thoughts are excluded from
+/// counts and from the visible scope set; if every thought in a scope is
+/// retracted the scope doesn't appear. Sorted by `last_activity_at`
+/// descending (most recently used first).
+pub async fn list_scopes(
+    pool: &PgPool,
+    prefix: Option<&str>,
+) -> Result<Vec<ScopeSummary>, StorageError> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT
+            scope AS "scope!",
+            COUNT(*) AS "thought_count!",
+            MIN(created_at) AS "first_activity_at!",
+            MAX(created_at) AS "last_activity_at!"
+        FROM thoughts
+        WHERE retracted_at IS NULL
+          AND ($1::text IS NULL OR scope LIKE $1 || '%')
+        GROUP BY scope
+        ORDER BY MAX(created_at) DESC
+        "#,
+        prefix,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|r| {
+            Ok(ScopeSummary {
+                scope: Scope::new(r.scope)?,
+                thought_count: r.thought_count,
+                first_activity_at: r.first_activity_at,
+                last_activity_at: r.last_activity_at,
+            })
+        })
+        .collect()
+}
+
 /// Trigram-similarity search over `thoughts.content`. Hits are returned in
 /// descending order of `similarity(content, query)` and filtered to a minimum
 /// similarity of 0.1.
@@ -375,6 +431,7 @@ pub async fn search_trigram(
     pool: &PgPool,
     query: &str,
     scope: Option<&str>,
+    scope_prefix: Option<&str>,
     limit: i64,
 ) -> Result<Vec<Hit>, StorageError> {
     let rows = sqlx::query!(
@@ -386,12 +443,14 @@ pub async fn search_trigram(
         FROM thoughts
         WHERE similarity(content, $1) > 0.1
           AND ($2::text IS NULL OR scope = $2)
+          AND ($3::text IS NULL OR scope LIKE $3 || '%')
           AND retracted_at IS NULL
         ORDER BY similarity(content, $1) DESC
-        LIMIT $3
+        LIMIT $4
         "#,
         query,
         scope,
+        scope_prefix,
         limit,
     )
     .fetch_all(pool)
@@ -1142,6 +1201,7 @@ pub async fn search_vector_knn(
     query_vector: Vec<f32>,
     model: &EmbeddingModel,
     scope: Option<&str>,
+    scope_prefix: Option<&str>,
     limit: i64,
 ) -> Result<Vec<Hit>, StorageError> {
     let pgv = pgvector::Vector::from(query_vector);
@@ -1156,14 +1216,16 @@ pub async fn search_vector_knn(
         JOIN embeddings e ON e.target_kind = 'thought' AND e.target_id = t.id
         WHERE e.model_id = $2
           AND ($3::text IS NULL OR t.scope = $3)
+          AND ($4::text IS NULL OR t.scope LIKE $4 || '%')
           AND t.retracted_at IS NULL
         ORDER BY e.vector <=> $1
-        LIMIT $4
+        LIMIT $5
         "#,
     )
     .bind(pgv)
     .bind(&model.id)
     .bind(scope)
+    .bind(scope_prefix)
     .bind(limit)
     .fetch_all(pool)
     .await?;
@@ -1437,7 +1499,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         let _c = insert_test_thought(&pool, "third", "global").await;
 
-        let results = recent_thoughts(&pool, None, 10).await.unwrap();
+        let results = recent_thoughts(&pool, None, None, 10).await.unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].content, "third");
         assert_eq!(results[1].content, "second");
@@ -1450,7 +1512,9 @@ mod tests {
         insert_test_thought(&pool, "personal-1", "personal").await;
         insert_test_thought(&pool, "work-2", "work").await;
 
-        let work = recent_thoughts(&pool, Some("work"), 10).await.unwrap();
+        let work = recent_thoughts(&pool, Some("work"), None, 10)
+            .await
+            .unwrap();
         assert_eq!(work.len(), 2);
         assert!(work.iter().all(|t| t.scope.as_str() == "work"));
     }
@@ -1460,7 +1524,7 @@ mod tests {
         for i in 0..5 {
             insert_test_thought(&pool, &format!("t{i}"), "global").await;
         }
-        let r = recent_thoughts(&pool, None, 2).await.unwrap();
+        let r = recent_thoughts(&pool, None, None, 2).await.unwrap();
         assert_eq!(r.len(), 2);
     }
 
@@ -1469,7 +1533,9 @@ mod tests {
         insert_test_thought(&pool, "remembering tcgplayer integration", "work").await;
         insert_test_thought(&pool, "weather is nice today", "personal").await;
 
-        let hits = search_trigram(&pool, "tcgplayer", None, 10).await.unwrap();
+        let hits = search_trigram(&pool, "tcgplayer", None, None, 10)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].thought.content.contains("tcgplayer"));
         assert!(hits[0].trigram_score.unwrap() > 0.0);
@@ -1480,7 +1546,7 @@ mod tests {
         insert_test_thought(&pool, "tcgplayer info", "work").await;
         insert_test_thought(&pool, "tcgplayer info two", "personal").await;
 
-        let hits = search_trigram(&pool, "tcgplayer", Some("work"), 10)
+        let hits = search_trigram(&pool, "tcgplayer", Some("work"), None, 10)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -1490,7 +1556,7 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_trigram_returns_empty_for_no_match(pool: PgPool) {
         insert_test_thought(&pool, "completely unrelated text", "global").await;
-        let hits = search_trigram(&pool, "xyzzyqwerty", None, 10)
+        let hits = search_trigram(&pool, "xyzzyqwerty", None, None, 10)
             .await
             .unwrap();
         assert!(hits.is_empty());
@@ -1523,7 +1589,7 @@ mod tests {
             .await
             .unwrap();
 
-        let hits = search_vector_knn(&pool, va, &model, None, 10)
+        let hits = search_vector_knn(&pool, va, &model, None, None, 10)
             .await
             .unwrap();
         assert_eq!(hits.len(), 2);
@@ -1547,7 +1613,7 @@ mod tests {
         .unwrap();
 
         // Query with model_b — no embeddings → no hits.
-        let hits = search_vector_knn(&pool, va, &model_b, None, 10)
+        let hits = search_vector_knn(&pool, va, &model_b, None, None, 10)
             .await
             .unwrap();
         assert!(hits.is_empty());
@@ -2218,6 +2284,101 @@ mod tests {
         );
     }
 
+    // -- M5.x: scope discoverability (list_scopes + scope_prefix) -----------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_scopes_returns_summary_with_counts_and_timestamps(pool: PgPool) {
+        insert_test_thought(&pool, "a1", "work.tcgplayer").await;
+        insert_test_thought(&pool, "a2", "work.tcgplayer").await;
+        insert_test_thought(&pool, "b1", "project.engram").await;
+
+        let scopes = list_scopes(&pool, None).await.unwrap();
+        assert_eq!(scopes.len(), 2);
+        let by_scope: std::collections::HashMap<&str, &ScopeSummary> =
+            scopes.iter().map(|s| (s.scope.as_str(), s)).collect();
+        assert_eq!(by_scope.get("work.tcgplayer").unwrap().thought_count, 2);
+        assert_eq!(by_scope.get("project.engram").unwrap().thought_count, 1);
+        // first_activity_at <= last_activity_at always.
+        for s in &scopes {
+            assert!(s.first_activity_at <= s.last_activity_at);
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_scopes_prefix_filter_matches_namespace(pool: PgPool) {
+        insert_test_thought(&pool, "x", "rjf.a").await;
+        insert_test_thought(&pool, "y", "rjf.b").await;
+        insert_test_thought(&pool, "z", "other").await;
+
+        let rjf_scopes = list_scopes(&pool, Some("rjf.")).await.unwrap();
+        let names: Vec<&str> = rjf_scopes.iter().map(|s| s.scope.as_str()).collect();
+        assert_eq!(rjf_scopes.len(), 2);
+        assert!(names.contains(&"rjf.a"));
+        assert!(names.contains(&"rjf.b"));
+        assert!(!names.contains(&"other"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_scopes_excludes_retracted_thoughts(pool: PgPool) {
+        let only = insert_test_thought(&pool, "doomed", "ephemeral").await;
+        insert_test_thought(&pool, "kept", "kept").await;
+        retract_thought(&pool, only, None).await.unwrap();
+
+        let scopes = list_scopes(&pool, None).await.unwrap();
+        let names: Vec<&str> = scopes.iter().map(|s| s.scope.as_str()).collect();
+        assert!(!names.contains(&"ephemeral"));
+        assert!(names.contains(&"kept"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_scopes_empty_corpus_returns_empty_vec(pool: PgPool) {
+        let scopes = list_scopes(&pool, None).await.unwrap();
+        assert!(scopes.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_scopes_orders_by_last_activity_desc(pool: PgPool) {
+        // First insert lives in scope A; later inserts in scope B and then C.
+        // Expectation: order is C, B, A (most recent last_activity_at first).
+        insert_test_thought(&pool, "early", "scope.a").await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        insert_test_thought(&pool, "middle", "scope.b").await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        insert_test_thought(&pool, "late", "scope.c").await;
+
+        let scopes = list_scopes(&pool, None).await.unwrap();
+        let order: Vec<&str> = scopes.iter().map(|s| s.scope.as_str()).collect();
+        assert_eq!(order, vec!["scope.c", "scope.b", "scope.a"]);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn recent_thoughts_scope_prefix_matches_multiple_scopes(pool: PgPool) {
+        insert_test_thought(&pool, "alpha", "rjf.a").await;
+        insert_test_thought(&pool, "beta", "rjf.b").await;
+        insert_test_thought(&pool, "gamma", "other").await;
+
+        let hits = recent_thoughts(&pool, None, Some("rjf."), 10)
+            .await
+            .unwrap();
+        let scopes: Vec<&str> = hits.iter().map(|t| t.scope.as_str()).collect();
+        assert_eq!(hits.len(), 2);
+        assert!(scopes.iter().all(|s| s.starts_with("rjf.")));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_trigram_scope_prefix_matches_multiple_scopes(pool: PgPool) {
+        insert_test_thought(&pool, "unique_keyword in rjf.a", "rjf.a").await;
+        insert_test_thought(&pool, "unique_keyword in rjf.b", "rjf.b").await;
+        insert_test_thought(&pool, "unique_keyword in other", "other").await;
+
+        let hits = search_trigram(&pool, "unique_keyword", None, Some("rjf."), 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        let scopes: Vec<&str> = hits.iter().map(|h| h.thought.scope.as_str()).collect();
+        assert!(scopes.iter().all(|s| s.starts_with("rjf.")));
+    }
+
     // -- M4: retraction (simplified — no fact cascade) ----------------------
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -2262,7 +2423,7 @@ mod tests {
         let retracted = insert_test_thought(&pool, "retracted", "global").await;
         retract_thought(&pool, retracted, None).await.unwrap();
 
-        let recent = recent_thoughts(&pool, None, 10).await.unwrap();
+        let recent = recent_thoughts(&pool, None, None, 10).await.unwrap();
         let ids: Vec<ThoughtId> = recent.iter().map(|t| t.id).collect();
         assert!(ids.contains(&active));
         assert!(!ids.contains(&retracted));
@@ -2274,7 +2435,7 @@ mod tests {
         let retracted = insert_test_thought(&pool, "unique_keyword retracted", "global").await;
         retract_thought(&pool, retracted, None).await.unwrap();
 
-        let hits = search_trigram(&pool, "unique_keyword", None, 10)
+        let hits = search_trigram(&pool, "unique_keyword", None, None, 10)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);

@@ -332,9 +332,9 @@ Concrete example from dogfood: a query like *"tooling for compiling codebases re
 ```
 search_thoughts
   │
-  ├── vector kNN  (cosine similarity, top 100)   ─┐
+  ├── vector kNN  (cosine similarity, top 50)    ─┐
   │                                                ├── RRF fuse ──── recency boost ──── rerank (top K) ──── return top N
-  ├── trigram     (word_similarity, top 100)     ─┘                                       ↑
+  ├── trigram     (pg_trgm similarity, top 50)   ─┘                                       ↑
   │                                                                                       │
   └── (each leg populates vector_score / trigram_score on its hits)             (optional; skipped if disabled / unavailable)
 ```

@@ -114,6 +114,7 @@ async fn run_pair(
     let mk = |rerank: bool| SearchRequest {
         query: q.query.clone(),
         scope: scope.clone(),
+        scope_prefix: None,
         limit: Some(SEARCH_LIMIT),
         recency_half_life_days: None,
         rerank: Some(rerank),

@@ -31,7 +31,7 @@ pub const DEFAULT_RECENCY_HALF_LIFE_DAYS: f32 = 30.0;
 ///
 /// Per-leg fields capture each pipeline stage's signal:
 ///   - `vector_score`: raw cosine similarity from the vector kNN leg.
-///   - `trigram_score`: raw `word_similarity` from the trigram leg.
+///   - `trigram_score`: raw `similarity` from the trigram leg.
 ///   - `rrf_score`: RRF aggregate `Σ 1/(k + rank_i)` after fusion; updated
 ///     in-place by [`recency_boost`] (multiplied by the decay factor).
 ///   - `rerank_score`: calibrated absolute relevance from the cross-encoder,
@@ -48,8 +48,8 @@ pub struct Hit {
     /// did not appear in the vector leg (trigram-only match or vector leg
     /// unavailable).
     pub vector_score: Option<f32>,
-    /// Raw `word_similarity` from the trigram leg. `None` when the hit did
-    /// not appear in the trigram leg.
+    /// Raw `similarity` (pg_trgm symmetric n-gram Jaccard) from the trigram
+    /// leg. `None` when the hit did not appear in the trigram leg.
     pub trigram_score: Option<f32>,
     /// Reciprocal Rank Fusion aggregate, optionally adjusted by
     /// [`recency_boost`]. Set by [`rrf_fuse`]; `None` on raw leg hits
@@ -77,14 +77,14 @@ impl Hit {
         }
     }
 
-    /// Construct a hit produced by the trigram leg. The raw `word_similarity`
-    /// lands in `trigram_score`; vector + rerank + RRF fields default to
-    /// `None`.
-    pub fn from_trigram_leg(thought: Thought, word_similarity: f32) -> Self {
+    /// Construct a hit produced by the trigram leg. The raw `similarity`
+    /// (pg_trgm symmetric n-gram Jaccard) lands in `trigram_score`; vector +
+    /// rerank + RRF fields default to `None`.
+    pub fn from_trigram_leg(thought: Thought, similarity: f32) -> Self {
         Self {
             thought,
             vector_score: None,
-            trigram_score: Some(word_similarity),
+            trigram_score: Some(similarity),
             rrf_score: None,
             rerank_score: None,
         }

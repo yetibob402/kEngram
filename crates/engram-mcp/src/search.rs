@@ -36,7 +36,13 @@ pub const DEFAULT_RERANK_CANDIDATE_POOL: usize = 32;
 #[derive(Debug, Clone)]
 pub struct SearchRequest {
     pub query: String,
+    /// Exact-match scope filter. Mutually exclusive with `scope_prefix`.
     pub scope: Option<Scope>,
+    /// Prefix-match scope filter (matches scopes starting with this string,
+    /// e.g. `"rjf."` matches `rjf.professional.cto` and `rjf.personal.health`).
+    /// Mutually exclusive with `scope`; supplying both errors with
+    /// [`ReadError::ScopeAndPrefixBothSet`].
+    pub scope_prefix: Option<String>,
     pub limit: Option<usize>,
     pub recency_half_life_days: Option<f32>,
     /// Apply the cross-encoder rerank stage over the top `candidate_pool`
@@ -70,7 +76,8 @@ pub struct SearchHit {
     pub tags: Tags,
     /// Raw cosine similarity from the vector leg (`None` if not in that leg).
     pub vector_score: Option<f32>,
-    /// Raw `word_similarity` from the trigram leg (`None` if not in that leg).
+    /// Raw `similarity` (pg_trgm symmetric n-gram Jaccard) from the trigram
+    /// leg (`None` if not in that leg).
     pub trigram_score: Option<f32>,
     /// RRF aggregate (optionally adjusted by recency boost).
     pub rrf_score: Option<f32>,
@@ -88,13 +95,40 @@ pub struct SearchResponse {
 
 #[derive(Debug, Clone)]
 pub struct RecentRequest {
+    /// Exact-match scope filter. Mutually exclusive with `scope_prefix`.
     pub scope: Option<Scope>,
+    /// Prefix-match scope filter. Mutually exclusive with `scope`.
+    pub scope_prefix: Option<String>,
     pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RecentResponse {
     pub results: Vec<Thought>,
+}
+
+/// Request for the `list_scopes` orchestrator. Optional `prefix` filters
+/// scopes to those starting with the given string; `None` returns every
+/// scope currently in use.
+#[derive(Debug, Clone, Default)]
+pub struct ListScopesRequest {
+    pub prefix: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListScopesResponse {
+    pub scopes: Vec<ScopeSummaryHit>,
+}
+
+/// One row in the [`ListScopesResponse`]. Wire-shape version of
+/// `engram_storage::ScopeSummary` — the `scope` is stringified for clients
+/// that don't share the `Scope` newtype.
+#[derive(Debug, Clone)]
+pub struct ScopeSummaryHit {
+    pub scope: String,
+    pub thought_count: i64,
+    pub first_activity_at: OffsetDateTime,
+    pub last_activity_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +156,9 @@ pub enum ReadError {
     #[error("thought not found")]
     NotFound,
 
+    #[error("scope and scope_prefix are mutually exclusive; supply at most one")]
+    ScopeAndPrefixBothSet,
+
     #[error("storage error: {0}")]
     Storage(#[from] engram_storage::StorageError),
 }
@@ -142,7 +179,11 @@ pub async fn search_thoughts(
             max: MAX_SEARCH_LIMIT,
         });
     }
+    if request.scope.is_some() && request.scope_prefix.is_some() {
+        return Err(ReadError::ScopeAndPrefixBothSet);
+    }
     let scope_filter = request.scope.as_ref().map(Scope::as_str);
+    let scope_prefix_filter = request.scope_prefix.as_deref();
 
     // Vector leg (soft-fail to empty + flag).
     let (vector_hits, vector_search_available) = match embedder
@@ -158,6 +199,7 @@ pub async fn search_thoughts(
                 v,
                 embedder.model(),
                 scope_filter,
+                scope_prefix_filter,
                 DEFAULT_TOP_K_PER_LEG as i64,
             )
             .await
@@ -180,6 +222,7 @@ pub async fn search_thoughts(
         pool,
         &request.query,
         scope_filter,
+        scope_prefix_filter,
         DEFAULT_TOP_K_PER_LEG as i64,
     )
     .await?;
@@ -342,10 +385,36 @@ pub async fn recent_thoughts(
             max: MAX_SEARCH_LIMIT,
         });
     }
+    if request.scope.is_some() && request.scope_prefix.is_some() {
+        return Err(ReadError::ScopeAndPrefixBothSet);
+    }
     let scope_filter = request.scope.as_ref().map(Scope::as_str);
+    let scope_prefix_filter = request.scope_prefix.as_deref();
 
-    let results = engram_storage::recent_thoughts(pool, scope_filter, limit as i64).await?;
+    let results =
+        engram_storage::recent_thoughts(pool, scope_filter, scope_prefix_filter, limit as i64)
+            .await?;
     Ok(RecentResponse { results })
+}
+
+/// Enumerate scopes currently in use, optionally narrowed to a prefix.
+/// Wraps [`engram_storage::list_scopes`] and converts the storage-side
+/// [`engram_storage::ScopeSummary`] to wire-shape [`ScopeSummaryHit`].
+pub async fn list_scopes(
+    pool: &PgPool,
+    request: ListScopesRequest,
+) -> Result<ListScopesResponse, ReadError> {
+    let rows = engram_storage::list_scopes(pool, request.prefix.as_deref()).await?;
+    let scopes = rows
+        .into_iter()
+        .map(|s| ScopeSummaryHit {
+            scope: s.scope.into_string(),
+            thought_count: s.thought_count,
+            first_activity_at: s.first_activity_at,
+            last_activity_at: s.last_activity_at,
+        })
+        .collect();
+    Ok(ListScopesResponse { scopes })
 }
 
 pub async fn get_thought(
@@ -418,6 +487,7 @@ mod tests {
             SearchRequest {
                 query: "alpha".to_string(),
                 scope: None,
+                scope_prefix: None,
                 limit: Some(10),
                 recency_half_life_days: None,
                 rerank: None,
@@ -445,6 +515,7 @@ mod tests {
             SearchRequest {
                 query: "tcgplayer".to_string(),
                 scope: None,
+                scope_prefix: None,
                 limit: Some(10),
                 recency_half_life_days: None,
                 rerank: None,
@@ -470,6 +541,7 @@ mod tests {
             SearchRequest {
                 query: String::new(),
                 scope: None,
+                scope_prefix: None,
                 limit: None,
                 recency_half_life_days: None,
                 rerank: None,
@@ -492,6 +564,7 @@ mod tests {
             SearchRequest {
                 query: "x".to_string(),
                 scope: None,
+                scope_prefix: None,
                 limit: Some(1000),
                 recency_half_life_days: None,
                 rerank: None,
@@ -517,6 +590,7 @@ mod tests {
             SearchRequest {
                 query: "tcgplayer".to_string(),
                 scope: Some(Scope::new("work").unwrap()),
+                scope_prefix: None,
                 limit: Some(10),
                 recency_half_life_days: None,
                 rerank: None,
@@ -540,6 +614,7 @@ mod tests {
             &pool,
             RecentRequest {
                 scope: None,
+                scope_prefix: None,
                 limit: Some(10),
             },
         )
@@ -618,6 +693,7 @@ mod tests {
             SearchRequest {
                 query: "needs doing".to_string(),
                 scope: None,
+                scope_prefix: None,
                 limit: Some(10),
                 recency_half_life_days: Some(0.0),
                 rerank: None,
@@ -662,6 +738,7 @@ mod tests {
             SearchRequest {
                 query: "meeting".to_string(),
                 scope: None,
+                scope_prefix: None,
                 limit: Some(10),
                 recency_half_life_days: Some(0.0),
                 rerank: None,
@@ -690,6 +767,7 @@ mod tests {
             SearchRequest {
                 query: "keyword".to_string(),
                 scope: None,
+                scope_prefix: None,
                 limit: Some(10),
                 recency_half_life_days: Some(0.0),
                 rerank: None,
@@ -723,6 +801,7 @@ mod tests {
             SearchRequest {
                 query: "tagged".to_string(),
                 scope: None,
+                scope_prefix: None,
                 limit: Some(10),
                 recency_half_life_days: Some(0.0),
                 rerank: None,

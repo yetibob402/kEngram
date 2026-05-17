@@ -195,6 +195,21 @@ Example `engram.toml`:
 ```toml
 [server]
 bind = "127.0.0.1:8080"
+# Optional `allowed_hosts` extends the MCP DNS-rebinding allowlist beyond
+# rmcp's safe default (localhost / 127.0.0.1 / ::1). When binding non-
+# loopback (Tailnet, LAN, 0.0.0.0), include both the bare hostname AND
+# `hostname:port` forms the client uses, plus IP and `ip:port` forms.
+# Leaving this list empty when bind is non-loopback rejects every non-
+# localhost request (look for "rejected request with disallowed Host
+# header" warnings in the serve log). Bypass-all is intentionally not
+# exposed — Tailnet ACLs plus an explicit allowlist is Tier 1 auth.
+# Example for a Tailnet bind:
+#   bind = "0.0.0.0:8081"
+#   allowed_hosts = [
+#     "localhost", "127.0.0.1", "::1",
+#     "repromax", "repromax:8081",
+#     "100.110.75.74", "100.110.75.74:8081",
+#   ]
 
 [database]
 url = "postgres://engram:engram@localhost:5432/engram"

@@ -6,8 +6,9 @@
 //! the way of the macro (currently: only `insert_embedding`).
 
 use engram_core::{
-    Embedding, EmbeddingModel, EmbeddingStatus, Hit, Metadata, Scope, ScopeError, ScopeVocab,
-    Source, SourceError, Tags, Thought, ThoughtId,
+    Embedding, EmbeddingModel, EmbeddingStatus, Hit, LinkDirection, LinkId, LinkSource, Metadata,
+    RelationKind, Scope, ScopeError, ScopeVocab, Source, SourceError, Tags, Thought, ThoughtId,
+    UnknownLinkSource, UnknownRelationKind,
 };
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -40,6 +41,12 @@ pub enum StorageError {
 
     #[error("invalid tags JSON decoded from database: {0}")]
     InvalidTags(#[from] serde_json::Error),
+
+    #[error("invalid relation kind decoded from database: {0}")]
+    InvalidRelationKind(#[from] UnknownRelationKind),
+
+    #[error("invalid link source decoded from database: {0}")]
+    InvalidLinkSource(#[from] UnknownLinkSource),
 }
 
 /// Convert a BYTEA `content_fingerprint` blob from the database into the
@@ -863,6 +870,229 @@ pub async fn fetch_scope_vocab(
     .collect();
 
     Ok(ScopeVocab { topics, entities })
+}
+
+// -- M5: selective relations (thought-to-thought edges) -----------------
+
+/// One related thought returned by `fetch_related_thoughts`. Carries the
+/// edge metadata plus enough enrichment from the joined `thoughts` row that
+/// callers can render results without a follow-up `get_thought`.
+///
+/// `direction` is `Outbound` when the queried thought sits on the edge's
+/// `from` side (so `thought_id` is the `to` side here) and `Inbound`
+/// otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelatedThought {
+    pub link_id: LinkId,
+    pub relation: RelationKind,
+    pub direction: LinkDirection,
+    pub thought_id: ThoughtId,
+    pub scope: Scope,
+    pub content: String,
+    pub thought_created_at: OffsetDateTime,
+    pub link_created_at: OffsetDateTime,
+    pub link_source: LinkSource,
+    pub note: Option<String>,
+    pub retracted: bool,
+}
+
+/// Insert a thought-to-thought edge. Idempotent on the `(from, relation, to)`
+/// triple via the `thought_links_unique_edge` constraint: re-asserting the
+/// same edge returns the existing row's `LinkId` with `is_new = false` and
+/// is a no-op otherwise.
+///
+/// Foreign-key violations (either endpoint missing in `thoughts`) are
+/// surfaced as `StorageError::Database`. The MCP layer should pre-validate
+/// endpoint existence so the operator-facing error is actionable; this
+/// layer is the last line of defense.
+pub async fn insert_link(
+    pool: &PgPool,
+    from: ThoughtId,
+    relation: RelationKind,
+    to: ThoughtId,
+    source: LinkSource,
+    note: Option<&str>,
+) -> Result<(LinkId, bool), StorageError> {
+    let row = sqlx::query!(
+        r#"
+        INSERT INTO thought_links (from_thought_id, relation, to_thought_id, source, note)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT ON CONSTRAINT thought_links_unique_edge DO NOTHING
+        RETURNING id
+        "#,
+        from.into_uuid(),
+        relation.as_str(),
+        to.into_uuid(),
+        source.as_str(),
+        note,
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some(r) = row {
+        return Ok((LinkId::from(r.id), true));
+    }
+
+    // ON CONFLICT path: fetch the existing row's id so the caller has a
+    // stable identifier regardless of whether the insert was a no-op.
+    let existing = sqlx::query!(
+        r#"
+        SELECT id
+        FROM thought_links
+        WHERE from_thought_id = $1 AND relation = $2 AND to_thought_id = $3
+        "#,
+        from.into_uuid(),
+        relation.as_str(),
+        to.into_uuid(),
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok((LinkId::from(existing.id), false))
+}
+
+/// Delete a thought-to-thought edge identified by `(from, relation, to)`.
+/// Returns `true` when a row was deleted, `false` when no edge matched
+/// (idempotent on already-deleted).
+pub async fn delete_link(
+    pool: &PgPool,
+    from: ThoughtId,
+    relation: RelationKind,
+    to: ThoughtId,
+) -> Result<bool, StorageError> {
+    let result = sqlx::query!(
+        r#"
+        DELETE FROM thought_links
+        WHERE from_thought_id = $1 AND relation = $2 AND to_thought_id = $3
+        "#,
+        from.into_uuid(),
+        relation.as_str(),
+        to.into_uuid(),
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Walk thought-to-thought edges from a given thought. `direction` selects
+/// whether to traverse outbound (where `thought_id` is `from`), inbound
+/// (where `thought_id` is `to`), or both. `relations`, when supplied,
+/// restricts to that subset of the closed vocabulary.
+///
+/// The returned `RelatedThought` rows carry the *other* end of each edge
+/// (so callers can render them directly) along with the edge's metadata.
+/// Retracted thoughts on the far end aren't filtered out — the `retracted`
+/// flag is surfaced so consumers can decide whether to show/dim/hide.
+pub async fn fetch_related_thoughts(
+    pool: &PgPool,
+    thought_id: ThoughtId,
+    relations: Option<&[RelationKind]>,
+    direction: LinkDirection,
+) -> Result<Vec<RelatedThought>, StorageError> {
+    // sqlx::query!'s compile-time check doesn't play well with conditional
+    // ANY($N::text[]) when the bound type is Option<Vec<String>>, so we
+    // pre-flatten the relation filter into a Vec<String> and use the empty
+    // case as the "no filter" sentinel via cardinality(...) = 0 OR ANY(...).
+    let relation_filter: Vec<String> = relations
+        .map(|rs| rs.iter().map(|r| r.as_str().to_string()).collect())
+        .unwrap_or_default();
+
+    let mut rows = Vec::new();
+
+    if matches!(direction, LinkDirection::Outbound | LinkDirection::Both) {
+        let out = sqlx::query!(
+            r#"
+            SELECT
+                tl.id AS link_id,
+                tl.relation,
+                tl.created_at AS link_created_at,
+                tl.source AS link_source,
+                tl.note,
+                t.id AS thought_id,
+                t.scope,
+                t.content,
+                t.created_at AS thought_created_at,
+                (t.retracted_at IS NOT NULL) AS "retracted!"
+            FROM thought_links tl
+            JOIN thoughts t ON t.id = tl.to_thought_id
+            WHERE tl.from_thought_id = $1
+              AND (cardinality($2::text[]) = 0 OR tl.relation = ANY($2::text[]))
+            ORDER BY tl.created_at DESC
+            "#,
+            thought_id.into_uuid(),
+            &relation_filter,
+        )
+        .fetch_all(pool)
+        .await?;
+
+        for r in out {
+            rows.push(RelatedThought {
+                link_id: LinkId::from(r.link_id),
+                relation: r.relation.parse()?,
+                direction: LinkDirection::Outbound,
+                thought_id: ThoughtId::from(r.thought_id),
+                scope: Scope::new(r.scope)?,
+                content: r.content,
+                thought_created_at: r.thought_created_at,
+                link_created_at: r.link_created_at,
+                link_source: r.link_source.parse()?,
+                note: r.note,
+                retracted: r.retracted,
+            });
+        }
+    }
+
+    if matches!(direction, LinkDirection::Inbound | LinkDirection::Both) {
+        let inb = sqlx::query!(
+            r#"
+            SELECT
+                tl.id AS link_id,
+                tl.relation,
+                tl.created_at AS link_created_at,
+                tl.source AS link_source,
+                tl.note,
+                t.id AS thought_id,
+                t.scope,
+                t.content,
+                t.created_at AS thought_created_at,
+                (t.retracted_at IS NOT NULL) AS "retracted!"
+            FROM thought_links tl
+            JOIN thoughts t ON t.id = tl.from_thought_id
+            WHERE tl.to_thought_id = $1
+              AND (cardinality($2::text[]) = 0 OR tl.relation = ANY($2::text[]))
+            ORDER BY tl.created_at DESC
+            "#,
+            thought_id.into_uuid(),
+            &relation_filter,
+        )
+        .fetch_all(pool)
+        .await?;
+
+        for r in inb {
+            rows.push(RelatedThought {
+                link_id: LinkId::from(r.link_id),
+                relation: r.relation.parse()?,
+                direction: LinkDirection::Inbound,
+                thought_id: ThoughtId::from(r.thought_id),
+                scope: Scope::new(r.scope)?,
+                content: r.content,
+                thought_created_at: r.thought_created_at,
+                link_created_at: r.link_created_at,
+                link_source: r.link_source.parse()?,
+                note: r.note,
+                retracted: r.retracted,
+            });
+        }
+    }
+
+    // Both-direction queries are stable-sorted by link_created_at DESC across
+    // the union. Outbound rows are already in order from their fetch; inbound
+    // rows likewise; merge by re-sorting the combined Vec.
+    if matches!(direction, LinkDirection::Both) {
+        rows.sort_by_key(|r| std::cmp::Reverse(r.link_created_at));
+    }
+
+    Ok(rows)
 }
 
 // -- thought retraction (simplified post-M4; no fact cascade) --------------
@@ -1721,6 +1951,271 @@ mod tests {
 
         let v = fetch_scope_vocab(&pool, "nonexistent", 10).await.unwrap();
         assert!(v.is_empty());
+    }
+
+    // -- M5: selective relations (thought-to-thought edges) -----------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn insert_link_returns_id_and_is_new(pool: PgPool) {
+        let a = insert_test_thought(&pool, "thought A", "global").await;
+        let b = insert_test_thought(&pool, "thought B", "global").await;
+
+        let (link_id, is_new) =
+            insert_link(&pool, a, RelationKind::Refines, b, LinkSource::Agent, None)
+                .await
+                .unwrap();
+        assert!(is_new);
+        assert_ne!(*link_id.as_uuid(), Uuid::nil());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn insert_link_duplicate_triple_is_idempotent(pool: PgPool) {
+        let a = insert_test_thought(&pool, "A", "global").await;
+        let b = insert_test_thought(&pool, "B", "global").await;
+
+        let (first_id, first_is_new) =
+            insert_link(&pool, a, RelationKind::Refines, b, LinkSource::Agent, None)
+                .await
+                .unwrap();
+        let (second_id, second_is_new) =
+            insert_link(&pool, a, RelationKind::Refines, b, LinkSource::Agent, None)
+                .await
+                .unwrap();
+
+        assert!(first_is_new);
+        assert!(!second_is_new, "second insert of same triple must be no-op");
+        assert_eq!(first_id, second_id, "must return same link id on conflict");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn insert_link_self_reference_rejected_by_db(pool: PgPool) {
+        let a = insert_test_thought(&pool, "A", "global").await;
+        let err = insert_link(&pool, a, RelationKind::Refines, a, LinkSource::Agent, None)
+            .await
+            .unwrap_err();
+        // CHECK constraint surfaces as a Database error; the MCP layer
+        // should pre-validate so callers never hit this path.
+        assert!(matches!(err, StorageError::Database(_)));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn insert_link_unknown_thought_rejected_by_fk(pool: PgPool) {
+        let a = insert_test_thought(&pool, "A", "global").await;
+        let phantom = ThoughtId::new();
+        let err = insert_link(
+            &pool,
+            a,
+            RelationKind::References,
+            phantom,
+            LinkSource::Agent,
+            None,
+        )
+        .await
+        .unwrap_err();
+        // Foreign-key violation surfaces as a Database error.
+        assert!(matches!(err, StorageError::Database(_)));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn insert_link_persists_note_and_source(pool: PgPool) {
+        let a = insert_test_thought(&pool, "A", "global").await;
+        let b = insert_test_thought(&pool, "B", "global").await;
+
+        let (_id, _is_new) = insert_link(
+            &pool,
+            a,
+            RelationKind::Refines,
+            b,
+            LinkSource::Agent,
+            Some("first refinement during dogfood"),
+        )
+        .await
+        .unwrap();
+
+        let related = fetch_related_thoughts(&pool, a, None, LinkDirection::Outbound)
+            .await
+            .unwrap();
+        assert_eq!(related.len(), 1);
+        assert_eq!(
+            related[0].note.as_deref(),
+            Some("first refinement during dogfood")
+        );
+        assert_eq!(related[0].link_source, LinkSource::Agent);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn delete_link_returns_existed_then_false(pool: PgPool) {
+        let a = insert_test_thought(&pool, "A", "global").await;
+        let b = insert_test_thought(&pool, "B", "global").await;
+        insert_link(&pool, a, RelationKind::Refines, b, LinkSource::Agent, None)
+            .await
+            .unwrap();
+
+        let existed = delete_link(&pool, a, RelationKind::Refines, b)
+            .await
+            .unwrap();
+        assert!(existed);
+
+        let existed_again = delete_link(&pool, a, RelationKind::Refines, b)
+            .await
+            .unwrap();
+        assert!(
+            !existed_again,
+            "second delete on missing edge must be no-op"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetch_related_outbound_returns_to_side_only(pool: PgPool) {
+        let a = insert_test_thought(&pool, "A", "global").await;
+        let b = insert_test_thought(&pool, "B", "global").await;
+        insert_link(&pool, a, RelationKind::Refines, b, LinkSource::Agent, None)
+            .await
+            .unwrap();
+
+        let from_a = fetch_related_thoughts(&pool, a, None, LinkDirection::Outbound)
+            .await
+            .unwrap();
+        assert_eq!(from_a.len(), 1);
+        assert_eq!(from_a[0].thought_id, b);
+        assert_eq!(from_a[0].direction, LinkDirection::Outbound);
+
+        let from_b = fetch_related_thoughts(&pool, b, None, LinkDirection::Outbound)
+            .await
+            .unwrap();
+        assert!(from_b.is_empty(), "B has no outbound edges");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetch_related_inbound_returns_from_side_only(pool: PgPool) {
+        let a = insert_test_thought(&pool, "A", "global").await;
+        let b = insert_test_thought(&pool, "B", "global").await;
+        insert_link(&pool, a, RelationKind::Refines, b, LinkSource::Agent, None)
+            .await
+            .unwrap();
+
+        let into_b = fetch_related_thoughts(&pool, b, None, LinkDirection::Inbound)
+            .await
+            .unwrap();
+        assert_eq!(into_b.len(), 1);
+        assert_eq!(into_b[0].thought_id, a);
+        assert_eq!(into_b[0].direction, LinkDirection::Inbound);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetch_related_both_returns_outbound_plus_inbound(pool: PgPool) {
+        let a = insert_test_thought(&pool, "A", "global").await;
+        let b = insert_test_thought(&pool, "B", "global").await;
+        let c = insert_test_thought(&pool, "C", "global").await;
+        // A refines B; C refines A. So A has 1 outbound + 1 inbound edge.
+        insert_link(&pool, a, RelationKind::Refines, b, LinkSource::Agent, None)
+            .await
+            .unwrap();
+        insert_link(&pool, c, RelationKind::Refines, a, LinkSource::Agent, None)
+            .await
+            .unwrap();
+
+        let related = fetch_related_thoughts(&pool, a, None, LinkDirection::Both)
+            .await
+            .unwrap();
+        assert_eq!(related.len(), 2);
+        let directions: Vec<LinkDirection> = related.iter().map(|r| r.direction).collect();
+        assert!(directions.contains(&LinkDirection::Outbound));
+        assert!(directions.contains(&LinkDirection::Inbound));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetch_related_filtered_by_relation(pool: PgPool) {
+        let a = insert_test_thought(&pool, "A", "global").await;
+        let b = insert_test_thought(&pool, "B", "global").await;
+        let c = insert_test_thought(&pool, "C", "global").await;
+        insert_link(&pool, a, RelationKind::Refines, b, LinkSource::Agent, None)
+            .await
+            .unwrap();
+        insert_link(&pool, a, RelationKind::Replaces, c, LinkSource::Agent, None)
+            .await
+            .unwrap();
+
+        let only_refines = fetch_related_thoughts(
+            &pool,
+            a,
+            Some(&[RelationKind::Refines]),
+            LinkDirection::Outbound,
+        )
+        .await
+        .unwrap();
+        assert_eq!(only_refines.len(), 1);
+        assert_eq!(only_refines[0].relation, RelationKind::Refines);
+
+        let multi = fetch_related_thoughts(
+            &pool,
+            a,
+            Some(&[RelationKind::Refines, RelationKind::Replaces]),
+            LinkDirection::Outbound,
+        )
+        .await
+        .unwrap();
+        assert_eq!(multi.len(), 2);
+
+        let only_requires = fetch_related_thoughts(
+            &pool,
+            a,
+            Some(&[RelationKind::Requires]),
+            LinkDirection::Outbound,
+        )
+        .await
+        .unwrap();
+        assert!(
+            only_requires.is_empty(),
+            "filter must exclude non-matching relations"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetch_related_surfaces_retracted_state(pool: PgPool) {
+        let a = insert_test_thought(&pool, "A", "global").await;
+        let b = insert_test_thought(&pool, "B", "global").await;
+        insert_link(&pool, a, RelationKind::Refines, b, LinkSource::Agent, None)
+            .await
+            .unwrap();
+        retract_thought(&pool, b, Some("dogfood retraction"))
+            .await
+            .unwrap();
+
+        let related = fetch_related_thoughts(&pool, a, None, LinkDirection::Outbound)
+            .await
+            .unwrap();
+        // Soft retraction preserves the edge — it just surfaces the flag.
+        assert_eq!(related.len(), 1);
+        assert!(
+            related[0].retracted,
+            "retracted state must propagate to the response"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn cascade_on_thought_hard_delete_removes_edges(pool: PgPool) {
+        // Direct DELETE FROM thoughts triggers the ON DELETE CASCADE on
+        // thought_links. Engram itself uses soft-retraction, but the DB
+        // invariant should still hold for any future hard-delete pathway.
+        let a = insert_test_thought(&pool, "A", "global").await;
+        let b = insert_test_thought(&pool, "B", "global").await;
+        insert_link(&pool, a, RelationKind::Refines, b, LinkSource::Agent, None)
+            .await
+            .unwrap();
+
+        sqlx::query!("DELETE FROM thoughts WHERE id = $1", b.into_uuid())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let related = fetch_related_thoughts(&pool, a, None, LinkDirection::Outbound)
+            .await
+            .unwrap();
+        assert!(
+            related.is_empty(),
+            "edge must be CASCADE-deleted with the thought"
+        );
     }
 
     // -- M4: retraction (simplified — no fact cascade) ----------------------

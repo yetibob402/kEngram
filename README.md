@@ -23,6 +23,9 @@ For design rationale see [`docs/engram-design-v0.md`](docs/engram-design-v0.md);
 | `recent_thoughts` | Browse by recency in a (optional) scope. Excludes retracted thoughts. |
 | `get_thought` | Full thought + provenance (embedding status, embedded-at, tags, tagger provenance — `tags_extractor_model` / `tags_extractor_version` / `tags_extracted_at` —, retraction state). Direct lookup by ID returns the row even if retracted — this is the audit path. |
 | `retract_thought` | Mark a thought as untrusted (e.g. you captured a wrong claim). Sets `thoughts.retracted_at` so the row is excluded from retrieval. The row stays in the DB; `get_thought` still returns it with retraction state surfaced. |
+| `link_thoughts` | Create a thought-to-thought edge in the M5 graph layer with one of six closed-vocabulary relations (`replaces`, `requires`, `references`, `belongs_to`, `decided_by`, `refines`). Idempotent on the `(from, relation, to)` triple. |
+| `unlink_thoughts` | Delete a thought-to-thought edge by `(from, relation, to)`. Idempotent on already-deleted. |
+| `get_related_thoughts` | Walk the thought graph from a thought. Returns `outbound` + `inbound` groups, each with the related thought's content-preview, retraction state, and edge metadata. Optional filters by relation type and direction. |
 
 CLI subcommands: `engram serve`, `engram worker`, `engram migrate`, `engram embed-backfill`, `engram tag [--rerun --since <RFC3339>]`. Operational details in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 
@@ -60,6 +63,29 @@ The lifecycle, end to end:
 **6. Dedup.** Same content captured twice — by the same agent within a session, or by two different agents at different times — collapses to the same `thought_id` via the SHA-256 unique constraint. This is the OB1 invariant: raw data is permanent and uniquely-keyed, derived signals (embeddings, tags) are recomputable on top.
 
 **What this gives you.** A single source of truth (the thought) with two derived layers that can be re-computed independently: the embedding for hybrid retrieval, and the JSONB tags for structured filtering. No drift-defense ceremony, no supersession chains on extracted claims — the tagger's output is overwritten freely on every run because the raw text is what's queryable. The simplification was the M4 outcome of M3 dogfood (see `docs/milestones/m4-collapse-to-thoughts.md` for the rationale).
+
+## How relations work
+
+[M5+] Thoughts can be linked into a graph via a closed vocabulary of six relations:
+
+| relation | meaning |
+|---|---|
+| `replaces` | newer thought supersedes an earlier one (decision changed; both stay, retrieval prefers newer) |
+| `requires` | this thought depends on another (decision presupposes a constraint; refinement presupposes an earlier finding) |
+| `references` | this thought points at another for context (citation, follow-up, related observation) |
+| `belongs_to` | membership / containment (a finding under a parent thread; a decision under a session) |
+| `decided_by` | provenance: this thought is a decision attributable to a person or session anchor |
+| `refines` | newer thought refines an earlier one (both stand; the newer one represents updated thinking) |
+
+Edges are agent-supplied via MCP (`link_thoughts(from, relation, to, note?)`) — there's no LLM extraction at M5. The closed vocab is intentionally small: it captures the relational structure that actually shows up in conversation memory without trying to be a general knowledge graph. Tractable for downstream tooling because every query is "give me thoughts where (this_id, R, ?) or (?, R, this_id) holds" with R drawn from a six-element set.
+
+**Idempotency.** `link_thoughts` is idempotent on the `(from, relation, to)` triple — re-asserting the same edge returns the existing `link_id` with `is_new: false`. Mirrors `capture`'s content-fingerprint dedup. To remove an edge, use `unlink_thoughts(from, relation, to)`.
+
+**Traversal.** `get_related_thoughts(thought_id, relations?, direction?)` returns grouped `outbound` (edges where this thought is `from`) and `inbound` (edges where it's `to`) arrays, each carrying the related thought's `content_preview` (first 400 chars), `scope`, retraction state, edge `note`/`source`, and timestamps. Optional filters by relation type and direction (`outbound` / `inbound` / `both`, default `both`).
+
+**Retraction interaction.** Edges survive thought retraction — retracted thoughts on either side surface with `retracted: true` in `get_related_thoughts` responses rather than being filtered out. To fully sever the link, use `unlink_thoughts`. Hard-delete of a thought (not currently exposed by the system; soft-retraction is the operator path) CASCADE-deletes its edges via the foreign-key constraint.
+
+**Out of scope for M5.** Tagger-extracted relations (the LLM finding "this refines the earlier finding" in prose and emitting an edge automatically) — that's M5.x; requires entity resolution. Heterogeneous targets (`to-entity`, `to-person`, `to-URL`) — deferred; M5 is thought-to-thought only.
 
 ## Quick start
 
@@ -495,8 +521,9 @@ Built in six capability milestones (M1 → M6), preceded by an environment miles
 | [M3 — search & extraction quality](docs/milestones/m3-search-quality.md) | ✅ | Cross-encoder reranker; fact embeddings (M4-retired); v4 extractor prompt (M4-retired); A/B benchmarking harness. Retrieval portion shipped; extraction-side dogfood produced negative knowledge that motivated M4. |
 | [M4 — collapse to thoughts-only](docs/milestones/m4-collapse-to-thoughts.md) | ✅ | Drop the facts pipeline; thoughts-only with content-fingerprint dedup and a JSONB tagging sidecar (people / action_items / topics / dates_mentioned / kind). `search_thoughts` gains `tag_filter`. Tagger is silent-disable. |
 | [M4.1 — v2 tagging](docs/milestones/m4.1-tagging-v2.md) | ✅ | Split `topics` into `entities` (named identifiers) + `topics` (subject categories); add scope-aware controlled-vocabulary injection so the tagger prefers established terms over coining new ones. Initial v2 prompt shipped at tagger version 2; the v3 iteration added entities anti-padding + kind isolation (version 3); the v4 iteration restructured entities to lead-with-empty + softened vocab to tie-break after v3 dogfood revealed the negative-example list backfired (version 4). Operator runs `engram tag --rerun --since 1970-01-01T00:00:00Z` to backfill. |
-| [M5 — artifacts](docs/milestones/m5-artifacts.md) | ⏳ | Long-form document ingestion |
-| [M6 — operational maturity](docs/milestones/m6-operational-maturity.md) | ⏳ | Metrics, Tier 2 auth, eval suite, backups |
+| [M5 — selective relations](docs/milestones/m5-selective-relations.md) | ✅ | Thought-to-thought graph layer: closed relation vocabulary (`replaces`, `requires`, `references`, `belongs_to`, `decided_by`, `refines`), `thought_links` table, three new MCP tools (`link_thoughts`, `unlink_thoughts`, `get_related_thoughts`). Agent-supplied edges only; heterogeneous targets + tagger-extracted relations deferred. |
+| [M6 — artifacts](docs/milestones/m6-artifacts.md) | ⏳ | Long-form document ingestion |
+| [M7 — operational maturity](docs/milestones/m7-operational-maturity.md) | ⏳ | Metrics, Tier 2 auth, eval suite, backups |
 
 Per-milestone progress is tracked in `docs/milestones/m{N}-progress.md`.
 

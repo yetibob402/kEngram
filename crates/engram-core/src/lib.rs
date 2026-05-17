@@ -7,6 +7,7 @@ pub mod embedder;
 pub mod embedding;
 pub mod metadata;
 pub mod metrics;
+pub mod relation;
 pub mod scope;
 pub mod search;
 pub mod source;
@@ -18,6 +19,10 @@ pub use embedder::{Embedder, EmbedderError};
 pub use embedding::{Embedding, EmbeddingError, EmbeddingModel, EmbeddingStatus};
 pub use metadata::Metadata;
 pub use metrics::{ndcg_at_k, reciprocal_rank};
+pub use relation::{
+    LinkDirection, LinkId, LinkSource, RelationKind, ThoughtLink, UnknownLinkDirection,
+    UnknownLinkSource, UnknownRelationKind,
+};
 pub use scope::{Scope, ScopeError};
 pub use search::{DEFAULT_RECENCY_HALF_LIFE_DAYS, DEFAULT_RRF_K, Hit, recency_boost, rrf_fuse};
 pub use source::{Source, SourceError};

@@ -74,19 +74,24 @@ The system is built in six capability milestones, preceded by a small environmen
 - `Tags` gains an `entities` field separate from `topics`. Schema is additive (JSONB-backed; no migration). The `Tagger` trait gains an optional `vocab: &ScopeVocab` parameter; the drainer pre-fetches the top-N most-frequent topic + entity terms in the thought's scope and renders them into the prompt as a controlled-vocabulary hint.
 - Tagger version bumps 1→2; operator runs `engram tag --rerun --since 1970-01-01T00:00:00Z` to backfill existing rows.
 
-**M5 — Artifacts.**
+**M5 — Selective relations.**
+- Thought-to-thought graph layer on top of the M4 substrate. Closed relation vocabulary (`replaces`, `requires`, `references`, `belongs_to`, `decided_by`, `refines`); thought-to-thought edges only at M5 (heterogeneous targets and tagger-extracted edges deferred to M5.x).
+- New `thought_links` table; new MCP tools `link_thoughts`, `unlink_thoughts`, `get_related_thoughts`.
+- Captures the relational structure that actually shows up in conversation memory (decisions, references, dependencies, refinements) without trying to be a general knowledge graph.
+
+**M6 — Artifacts.**
 - Long-form ingestion: `artifacts` and `artifact_chunks` populated. Chunking strategy lands here.
 - New MCP tool: `ingest_artifact`.
 - Search results unify thoughts and chunks under one ranking.
 
-**M6 — Operational maturity.**
+**M7 — Operational maturity.**
 - Prometheus `/metrics` endpoint.
 - Tier 2 bearer-token auth + audit log.
 - Backup tooling (scripts, retention policy).
 - Eval suite (capture-recall, cross-model retrieval consistency, LongMemEval-style).
 - The `stats` MCP tool.
 
-**Order rationale.** M1 is the floor: nothing else makes sense without capture and retrieval. M2 (facts) before M3 (rerank) because at the time facts added capability and rerank improved quality, and quality without capability felt unmotivated. M3 dogfood produced negative knowledge that motivated M4 (collapse to thoughts-only) — the facts pipeline didn't earn its complexity for the operator's actual queries. M5 (artifacts) before M6 (operational) because ingesting existing notes/transcripts earns its keep faster than auth/eval ceremony for a single-operator tool.
+**Order rationale.** M1 is the floor: nothing else makes sense without capture and retrieval. M2 (facts) before M3 (rerank) because at the time facts added capability and rerank improved quality, and quality without capability felt unmotivated. M3 dogfood produced negative knowledge that motivated M4 (collapse to thoughts-only) — the facts pipeline didn't earn its complexity for the operator's actual queries. M5 (selective relations) comes after M4 because the citation-chain pattern that emerged from the M4.1 dogfood (thoughts referencing and refining each other in prose) was the strongest signal for the next architectural addition — making implicit graph structure first-class. M6 (artifacts) before M7 (operational) because ingesting existing notes/transcripts earns its keep faster than auth/eval ceremony for a single-operator tool.
 
 ## 4. High-level architecture
 
@@ -257,7 +262,7 @@ There are two write paths. Both terminate in the same `thoughts` row plus an emb
 
 1. **Direct capture.** [M1 + M4 dedup] Agent calls `capture(content, scope?, source?, metadata?)`. The handler computes `content_fingerprint = sha256(content)` and runs `INSERT INTO thoughts (..., content_fingerprint, tags) VALUES (..., $fp, '{}') ON CONFLICT (content_fingerprint) DO NOTHING RETURNING id`. On insert: enqueue an embedding job and (if `[tagger]` is configured) a tag job; return `{thought_id, embedding_status: "pending", is_duplicate: false}`. On conflict: SELECT the existing `thought_id` by fingerprint and return `{thought_id, embedding_status: <existing state>, is_duplicate: true}` — no new jobs enqueued.
 
-2. **Artifact ingestion.** [M5] Agent calls `ingest_artifact(uri, kind, scope?)`. The handler inserts the artifact row and hands off to the worker, which fetches, chunks, embeds, and writes `artifact_chunks` plus their embeddings.
+2. **Artifact ingestion.** [M6] Agent calls `ingest_artifact(uri, kind, scope?)`. The handler inserts the artifact row and hands off to the worker, which fetches, chunks, embeds, and writes `artifact_chunks` plus their embeddings.
 
 **Designed-in seam for async embedding.** [M2+] In M1 the capture handler called `Embedder::embed(...)` directly. From M2, the worker process exists, and the capture handler enqueues a row in `pending_embeddings`; the worker drains the queue. The MCP contract is identical to M1; the embedding row becomes available shortly after capture returns (with a brief window during which `search_thoughts` may not surface the brand-new thought via vector — trigram still finds it).
 
@@ -317,6 +322,49 @@ The blob lands in `thoughts.tags` via the drainer. A subsequent `search_thoughts
 
 **What this gives you, in plain English.** A single source of truth (the thought) with two derived layers — embeddings for retrieval, tags for filtering — both recomputable independently from the raw text. No drift-defense, no supersession chain, no review queue, no audit trail on tagger output. The raw thought stays immutable (§10); the tagger output is overwritten as model and prompt drift. A wrong tag on a single thought is a low-impact failure mode because retrieval still works on the content.
 
+## 6.6 Selective relations (graph layer)
+
+[M5+] On top of the tagging sidecar, M5 adds a graph layer of thought-to-thought edges in a small closed vocabulary. Six relations: `replaces`, `requires`, `references`, `belongs_to`, `decided_by`, `refines`. Edges live in `thought_links` (migration 0007) keyed by `(from_thought_id, relation, to_thought_id)` with a UNIQUE constraint enforcing idempotency on the triple.
+
+**Why selective, not general.** The M3 facts pipeline tried full open-vocabulary `(subject, predicate, object)` extraction and the dogfood (see Revision history 2026-05-16 entries) showed the predicate slot broke under small-model limitations. M5's closed vocabulary trades coverage for tractability — six relations the operator can predict, queries that always have a fixed-cardinality dispatch, and no extraction prompt to break under load. The vocabulary was picked from observation of the M4.1 dogfood corpus: the citation chain `137dba1d → 6d2ef58e → 8a533e15` is exactly the `refines`-style structure operators kept building in prose.
+
+**Schema.**
+
+```sql
+CREATE TABLE thought_links (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    from_thought_id UUID NOT NULL REFERENCES thoughts(id) ON DELETE CASCADE,
+    relation TEXT NOT NULL,
+    to_thought_id UUID NOT NULL REFERENCES thoughts(id) ON DELETE CASCADE,
+    source TEXT NOT NULL DEFAULT 'agent',
+    note TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (relation IN ('replaces','requires','references','belongs_to','decided_by','refines')),
+    CHECK (source IN ('agent','tagger')),
+    CHECK (from_thought_id <> to_thought_id),
+    UNIQUE (from_thought_id, relation, to_thought_id)
+);
+```
+
+`source` distinguishes agent-supplied (M5) from tagger-extracted (M5.x). `note` is an optional free-text annotation (max 1000 chars enforced at the MCP layer). `ON DELETE CASCADE` is safe because retraction is soft — edges resolve against retracted thoughts and just surface the `retracted: true` flag rather than disappear.
+
+**Pipeline.** No background drainer at M5 — edges are agent-supplied via MCP, not extracted from prose:
+
+1. **`link_thoughts(from, relation, to, note?)`** validates self-link, note length, and both-endpoint existence, then calls `engram_storage::insert_link` with ON CONFLICT idempotency. Returns `is_new: bool` (mirrors `capture`'s `is_duplicate` polarity) plus the `link_id`.
+2. **`unlink_thoughts(from, relation, to)`** is the inverse — DELETE on the triple, idempotent on already-missing. Returns `existed: bool`.
+3. **`get_related_thoughts(thought_id, relations?, direction?)`** walks the graph from a single thought. Returns grouped `outbound` (edges where this thought is `from`) and `inbound` (edges where it's `to`) arrays. Each entry carries enough enrichment (related thought's content_preview, scope, retraction state, edge metadata) to render without a follow-up `get_thought`.
+
+**Concrete example.** Three thoughts in the citation chain: `8a533e15` (original observation), `6d2ef58e` (a refinement), `137dba1d` (a further refinement of `6d2ef58e`). Agent links them:
+
+```text
+link_thoughts(137dba1d, "refines", 6d2ef58e, "post-Probe-2 refinement")
+link_thoughts(6d2ef58e, "refines", 8a533e15, "first refinement")
+```
+
+`get_related_thoughts(8a533e15, direction: "inbound")` returns the inbound `refines` edge from `6d2ef58e`. `get_related_thoughts(6d2ef58e, direction: "both")` returns both the outbound `refines→8a533e15` and the inbound `refines←137dba1d`. The implicit-in-prose citation chain is now first-class.
+
+**M5 out of scope.** Tagger-extracted relations (LLM finds the edge from prose; the breakthrough capability, deferred to M5.x because it requires entity resolution and its own dogfood loop). Heterogeneous targets (to-entity, to-person, to-URL — deferred because the polymorphic schema is real future work). Bulk-link MCP tooling, multi-hop traversal (`get_thoughts_n_hops_away`), and `engram link` CLI — deferred per usage demand.
+
 ## 7. Retrieval path
 
 Three retrieval primitives, composable:
@@ -360,8 +408,11 @@ Tools and the milestone in which each ships. Names and signatures are part of th
 | `recent_thoughts` | M1 | Browse by recency in a scope. Excludes retracted thoughts. |
 | `get_thought` | M1 (M3 retraction; M4 tags) | Full thought + provenance (`embedding_status`, `embedded_at`, `tags`, `tags_extractor_model`, `tags_extractor_version`, `tags_extracted_at`, `retracted_at`, `retracted_reason`). Direct lookup returns the row even if retracted — this is the audit path. |
 | `retract_thought` | M3 | Mark a thought as untrusted. Sets `thoughts.retracted_at`; the row is excluded from retrieval but stays in the DB for audit. |
-| `ingest_artifact` | M5 | Async ingest of a longer document. |
-| `stats` | M6 | Per-scope counts, last activity, embedding model version, tagger model version. |
+| `link_thoughts` | M5 | Create a thought-to-thought edge with one of six closed-vocabulary relations (`replaces`, `requires`, `references`, `belongs_to`, `decided_by`, `refines`). Idempotent on `(from, relation, to)`. |
+| `unlink_thoughts` | M5 | Delete a thought-to-thought edge by `(from, relation, to)`. Idempotent on already-deleted. |
+| `get_related_thoughts` | M5 | Walk the thought graph. Returns grouped `outbound` + `inbound` arrays; each entry carries the related thought's content_preview, retraction state, and edge metadata. Optional filters by relation type and direction. |
+| `ingest_artifact` | M6 | Async ingest of a longer document. |
+| `stats` | M7 | Per-scope counts, last activity, embedding model version, tagger model version. |
 
 `search_facts` and `correct_fact` shipped in M2 and were removed in M4 when the facts pipeline was retired. Operators correcting a wrong claim now `retract_thought` and capture a corrected one; tags are advisory and re-derivable, so per-tag operator correction was unnecessary.
 
@@ -407,6 +458,25 @@ pub struct Tags {                   // [M4] — tagger output, written to though
     pub topics: Vec<String>,             // 1-3 short lowercase subject categories
     pub dates_mentioned: Vec<String>,    // free-text dates as the LLM emits them
     pub kind: Option<TagKind>,           // observation | task | idea | reference | person_note | session
+}
+
+pub enum RelationKind {              // [M5] — closed thought-to-thought vocabulary
+    Replaces,
+    Requires,
+    References,
+    BelongsTo,
+    DecidedBy,
+    Refines,
+}
+
+pub struct ThoughtLink {             // [M5] — row-shape of `thought_links`
+    pub id: LinkId,
+    pub from_thought_id: ThoughtId,
+    pub relation: RelationKind,
+    pub to_thought_id: ThoughtId,
+    pub source: LinkSource,          // Agent | Tagger (Tagger reserved for M5.x)
+    pub note: Option<String>,
+    pub created_at: OffsetDateTime,
 }
 ```
 
@@ -521,7 +591,7 @@ vLLM's `--tensor-parallel-size 2` is the obvious deployment shape. The embedder 
 - **No supersede chain on tagger output.** Tags are overwritten on `engram tag --rerun`. There's no `tags_superseded_by`, no history table, no audit trail on what the tagger said last week. The provenance triplet (`tags_extractor_model`, `tags_extractor_version`, `tags_extracted_at`) tells you what produced the *current* tags; if the operator wants pre-`--rerun` state, they restore from a backup.
 - **No fact-review queue.** The `facts_review_queue` table was dropped by migration 0006. Tagger output goes straight onto the row; there's no operator-review gate.
 - **No `correct_fact` MCP tool.** Operators who notice a wrong tag don't correct it; they ignore it (tags are advisory) or `retract_thought` if the underlying content is wrong. The cost of being wrong about a tag is small enough that operator-correction infrastructure isn't worth the complexity.
-- **No drift-defense `engram audit` job.** M2's audit story keyed on extractor drift across model versions; M4's tags are recomputable from raw text whenever the operator wants. The corresponding `stats` MCP tool ([M6]) surfaces current state, not drift.
+- **No drift-defense `engram audit` job.** M2's audit story keyed on extractor drift across model versions; M4's tags are recomputable from raw text whenever the operator wants. The corresponding `stats` MCP tool ([M7]) surfaces current state, not drift.
 
 **The pre-M4 design (preserved here for history).** M2 shipped a `facts` table with `(subject, predicate, object, confidence, statement)` rows, a reflector cron, a confidence-band review queue, `correct_fact` MCP tool, and a `--rerun` flow with supersede-via-statement-or-triple-match dedup. M3 Phase D dogfood (commits `34ba756` → `2000059` on the m4-collapse-to-thoughts branch tell the full story) revealed that the (S, P, O) abstraction was generating most of the operator-visible failure modes (inverted comparatives, self-referential subjects, conditional-as-subject, predicate verbosity, polarity contradictions, triple-semantic drift). Statements were faithful; triples were brittle. **None of the M2-era drift-defense machinery was the wrong design for a fact store — it was the right design for the wrong abstraction.** M4 swapped the abstraction; the defensive machinery went with it.
 
@@ -544,7 +614,7 @@ vLLM's `--tensor-parallel-size 2` is the obvious deployment shape. The embedder 
 
 **Migrations:** `sqlx migrate`. Schema changes ship with the binary.
 
-**Observability** [M6]. Structured `tracing` logs to journald are present from M1. The Prometheus `/metrics` endpoint exposing capture-rate, search-latency P50/P95/P99, embedding-queue depth, embed/tag failure counts, and queue ages lands at M6.
+**Observability** [M7]. Structured `tracing` logs to journald are present from M1. The Prometheus `/metrics` endpoint exposing capture-rate, search-latency P50/P95/P99, embedding-queue depth, embed/tag failure counts, and queue ages lands at M7.
 
 ## 12. Auth & network exposure
 
@@ -560,11 +630,11 @@ A "Tier 3 — public + multi-user" option exists in principle but is **explicitl
 
 **Tier 1 is the recommended endpoint for single-user deployment.** Engram binds to the Tailnet interface and is reachable as `engram.tailXXXX.ts.net` from every personal device, using the same MagicDNS pattern as vLLM. No code change vs. Tier 0; only the bind address.
 
-**Auth at Tier 2** [M6]. Bearer token validated against a hashed allowlist in `engram_tokens`. Tokens carry a scope-list — a token can be locked to `work.*` and not see `personal.*`. Audit log records `(token_id, tool, args_hash, ts)` for every call.
+**Auth at Tier 2** [M7]. Bearer token validated against a hashed allowlist in `engram_tokens`. Tokens carry a scope-list — a token can be locked to `work.*` and not see `personal.*`. Audit log records `(token_id, tool, args_hash, ts)` for every call.
 
 ## 13. Evaluation
 
-[M6] — eval suite ships at the operational-maturity milestone. We don't ship without it because "did the model swap regress retrieval" is the kind of question we'll ask ourselves often.
+[M7] — eval suite ships at the operational-maturity milestone. We don't ship without it because "did the model swap regress retrieval" is the kind of question we'll ask ourselves often.
 
 **Three suites, all reproducible from a fixture corpus:**
 
@@ -613,3 +683,4 @@ Carrying forward:
 - **2026-05-16** — **M4.1 v2 tagging.** Dogfood on the M4 v1 tagger surfaced two patterns ("memory-systems" inference: model already half-distinguished entities from category-inferred terms; Probe 2-style runs: topics were phrase-driven, producing divergent terms across paraphrases of the same concept). M4.1 splits `Tags.topics` into `Tags.entities` (proper-noun-style identifiers mentioned by name) + `Tags.topics` (broader subject categories) and adds an optional `ScopeVocab` parameter to `Tagger::tag()` — the drainer pre-fetches the top-N most-frequent topic + entity terms in the thought's scope (via the new `engram_storage::fetch_scope_vocab` helper) and renders them into the prompt as a controlled-vocabulary section so the model prefers established terms over coining new ones. Tagger version bumps 1→2; operator runs `engram tag --rerun --since 1970-01-01T00:00:00Z` to backfill. No schema migration (tags is JSONB; the `entities` key is additive). Config: `[tagger]` gains `scope_vocab_enabled` (default `true`) and `scope_vocab_size` (default `50`). MCP wire surface: `SearchHit.tags` carries `entities` for free; `SearchThoughtsArgs.tag_filter` and `SERVER_INSTRUCTIONS` updated to advertise the new shape and document the entities-vs-topics distinction. Selective relations (the M5 candidate) and Probes 1-3 remain deferred. The M4.1 contract + dogfood plan live in `docs/milestones/m4.1-tagging-v2.md`.
 - **2026-05-17** — **M4.1 v3 prompt iteration.** Dogfood on the v2 tagger surfaced two failure modes: (1) entities degraded to noun-phrase extraction when no proper nouns were present (the model padded the slot with descriptive phrases like "agent memory protocol", "cross-encoder", "lexical signals" to fill a required field); (2) kind classification drifted across re-tag cycles. A kind-stability diagnostic (N=10 per fixture on six fixtures) showed within-tagger kind is deterministic at temperature 0.2 (10/10 same kind per fixture) but vocab presence shifts the kind prior on bistable content (8a533e15: task→observation at 8/10 with vocab) and other fixtures' stored kinds aren't reachable from current model+vocab state (22bccb3a stored as `reference`; both vocab-off and vocab-on diagnostics produce `observation` 10/10). v3 ships three prompt changes: (a) tightens `entities` definition to "canonical proper names of specific named things ... recognizable as named entities to someone outside the conversation," dropping the v2 "named concepts" phrasing that was the padding vector; (b) adds an explicit `RETURN [] IF THE THOUGHT CONTAINS NO SUCH NAMED ENTITIES` anti-padding rule with a verbatim list of v2-padding negative examples; (c) adds a kind-isolation clause framing kind as intrinsic-shape classification with an explicit Rules-section line forbidding the controlled vocabulary from influencing kind. Schema unchanged. `BUNDLED_TAGGER_VERSION` bumps 2→3; operator runs `engram tag --rerun --since 1970-01-01T00:00:00Z` to backfill. The kind-stability diagnostics in `crates/engram-extract/src/openai_compatible.rs` (`kind_stability_diagnostic` and `kind_stability_diagnostic_with_vocab`, both gated on `--features integration` and `--ignored`) are operator-runnable for post-v3 verification.
 - **2026-05-17** — **M4.1 v4 prompt iteration.** Dogfood on the v3 tagger across 23 v3-tagged thoughts revealed the v3 entities anti-padding fix was half-landed (works for proper-noun-anchored content sometimes, fails for proper-noun-free content) and the v3 negative-example list was *counterproductive* — `047d0ce8` (a proper-noun-free thought) emitted `["agent memory protocol", "embedding-based", "lexical signals", "cross-encoder"]`, four of the seven verbatim items in the v3 prompt's "NOT entities" list, the model substituting them precisely because they appeared as noun phrases in the content. Additionally, scope-aware vocabulary injection began sacrificing topic precision in practice — `74eb781c`, `45cd2001` slot-padded entities even on proper-noun-anchored content (maxItems=5 read as "fill 5" not "up to 5"). v4 ships three prompt changes: (a) restructures the entities description to lead with `entities: default to []` (empty-as-default instead of empty-as-constraint) and replaces the v3 negative-example list with a structural NAME-vs-DESCRIBE test ("does this phrase NAME a specific thing or does the thought DESCRIBE an action using a noun phrase?"); (b) lowers `entities.maxItems` from 5 to 3 to force selectivity; (c) softens the scope-vocabulary section from "prefer the established form ... coin new terms only when genuinely unseen" to "use a vocab term when it accurately describes the thought's subject ... precision over consistency" — vocab moves from dominator to tie-breaker. Kind isolation from v3 retained. `BUNDLED_TAGGER_VERSION` bumps 3→4; operator runs `engram tag --rerun --since 1970-01-01T00:00:00Z` to backfill. The v3 negative-example list lesson — don't list the phrases you want excluded; the listing itself reinforces them — is itself a noteworthy finding about prompt-engineering this model class.
+- **2026-05-17** — **M5 selective relations.** New milestone adding a thought-to-thought graph layer on top of the M4 substrate. Six-relation closed vocabulary (`replaces`, `requires`, `references`, `belongs_to`, `decided_by`, `refines`) — chosen by intuition about conversation-memory structure and validated against the M4.1 dogfood corpus where the citation chain `137dba1d → 6d2ef58e → 8a533e15` was exactly the implicit-`refines` pattern. New `thought_links` table (migration 0007) with `(from, relation, to)` UNIQUE constraint for idempotency, CHECK constraints on the closed vocab + self-link prohibition + `source` enum (`agent`|`tagger`), ON DELETE CASCADE on both endpoint FKs. New core types `RelationKind`, `LinkSource`, `LinkDirection`, `LinkId`, `ThoughtLink`. New storage helpers `insert_link`, `delete_link`, `fetch_related_thoughts` returning `RelatedThought` enrichment rows. New MCP tools `link_thoughts(from, relation, to, note?)` (idempotent on triple; pre-validates endpoint existence with actionable errors for SelfLink / FromThoughtMissing / ToThoughtMissing / NoteTooLong), `unlink_thoughts(from, relation, to)` (idempotent on already-deleted), and `get_related_thoughts(thought_id, relations?, direction?)` (grouped `outbound` + `inbound` arrays with content_preview, retraction state, and edge metadata). `SERVER_INSTRUCTIONS` extended with the relation vocab + tool listing; regression test pins the documentation. Roadmap renumbered: M5 = selective relations, M6 = artifacts (was M5), M7 = operational maturity (was M6); milestone docs renamed via `git mv`. M5 is agent-supplied and thought-to-thought only at this milestone; tagger-extracted relations (M5.x — requires entity resolution) and heterogeneous targets (M5.x or M6 — polymorphic schema work) are explicit deferrals. The M5 milestone doc lives at `docs/milestones/m5-selective-relations.md`.

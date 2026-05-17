@@ -9,7 +9,7 @@
 //! `capture`, `search_thoughts`, `recent_thoughts`, `get_thought`,
 //! `retract_thought`. Tag drainage lives in the worker, not here.
 
-use engram_core::{Embedder, Metadata, Scope, Source, ThoughtId};
+use engram_core::{Embedder, LinkDirection, Metadata, RelationKind, Scope, Source, ThoughtId};
 use engram_embed::Reranker;
 use rmcp::{
     ServerHandler,
@@ -23,6 +23,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::capture::{self, CaptureError, CaptureRequest, MAX_CONTENT_LEN};
+use crate::link::{self, LinkError, LinkThoughtsRequest, MAX_LINK_NOTE_LEN};
+use crate::relate::{self, GetRelatedThoughtsRequest, RelateError};
 use crate::retract::{self, RetractError, RetractThoughtRequest};
 use crate::search::{
     self, GetThoughtResponse, ReadError, RecentRequest, RecentResponse, SearchRequest,
@@ -106,6 +108,55 @@ pub struct RetractThoughtArgs {
         description = "Optional free-text reason for the retraction (e.g. 'wrong claim — see thought <new id> for correction'). Stored on thoughts.retracted_reason for audit; max 1000 chars."
     )]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LinkThoughtsArgs {
+    #[schemars(description = "Source thought ID (the 'from' side of the relation). UUID string.")]
+    pub from_thought_id: String,
+
+    #[schemars(
+        description = "Relation type. Must be one of the closed vocabulary: 'replaces' (this thought replaces an earlier one — most recent supersedes), 'requires' (this thought depends on another), 'references' (this thought points at another for context, like a citation), 'belongs_to' (this thought is a member/sub-element of another, e.g. a finding under a parent thread), 'decided_by' (this thought is a decision attributed to another, e.g. a person-note or session-anchor), 'refines' (this thought is a refinement/iteration of an earlier one — both stand, but the newer thought represents updated thinking)."
+    )]
+    pub relation: String,
+
+    #[schemars(description = "Target thought ID (the 'to' side of the relation). UUID string.")]
+    pub to_thought_id: String,
+
+    #[schemars(
+        description = "Optional free-text annotation explaining the link (e.g. 'refines after probe 2B dogfood'). Stored on thought_links.note; max 1000 chars."
+    )]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UnlinkThoughtsArgs {
+    #[schemars(description = "Source thought ID (the 'from' side). UUID string.")]
+    pub from_thought_id: String,
+
+    #[schemars(
+        description = "Relation type (same closed vocabulary as link_thoughts: replaces, requires, references, belongs_to, decided_by, refines)."
+    )]
+    pub relation: String,
+
+    #[schemars(description = "Target thought ID (the 'to' side). UUID string.")]
+    pub to_thought_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetRelatedThoughtsArgs {
+    #[schemars(description = "Thought ID (UUID string) to traverse from.")]
+    pub thought_id: String,
+
+    #[schemars(
+        description = "Optional filter to a subset of relation types (e.g. ['refines','replaces']). Each item must be in the closed vocabulary: replaces, requires, references, belongs_to, decided_by, refines. Omit to return edges of every type."
+    )]
+    pub relations: Option<Vec<String>>,
+
+    #[schemars(
+        description = "Traversal direction: 'outbound' (edges where the queried thought is the source — 'this refines X'), 'inbound' (edges where it is the target — 'X refines this'), or 'both' (default). Response always groups results into separate `outbound` and `inbound` arrays regardless."
+    )]
+    pub direction: Option<String>,
 }
 
 #[derive(Clone)]
@@ -297,6 +348,116 @@ impl EngramServer {
         });
         serde_json::to_string(&body).map_err(|e| format!("response serialization error: {e}"))
     }
+
+    #[tool(
+        description = "Create a thought-to-thought relation in the M5 graph layer. Asserts an edge with one of six closed-vocabulary relations: replaces, requires, references, belongs_to, decided_by, refines. Idempotent on the (from, relation, to) triple — re-asserting the same edge returns is_new=false and the existing link_id. Validates that both endpoints exist and that from != to; returns clear error strings otherwise. Use this to link a thought to one it refines, replaces, references, depends on, belongs under, or that decided it. Heterogeneous targets (to-entity, to-person, to-URL) and tagger-extracted relations are not in M5 — use `link_thoughts` agent-side."
+    )]
+    async fn link_thoughts(
+        &self,
+        Parameters(args): Parameters<LinkThoughtsArgs>,
+    ) -> Result<String, String> {
+        let from = ThoughtId::from_str(&args.from_thought_id)
+            .map_err(|e| format!("invalid from_thought_id: {e}"))?;
+        let to = ThoughtId::from_str(&args.to_thought_id)
+            .map_err(|e| format!("invalid to_thought_id: {e}"))?;
+        let relation: RelationKind = args
+            .relation
+            .parse()
+            .map_err(|e: engram_core::UnknownRelationKind| e.to_string())?;
+
+        let resp = link::link_thoughts(
+            &self.pool,
+            LinkThoughtsRequest {
+                from_thought_id: from,
+                relation,
+                to_thought_id: to,
+                note: args.note,
+            },
+        )
+        .await
+        .map_err(map_link_error)?;
+
+        let body = serde_json::json!({
+            "link_id": resp.link_id.to_string(),
+            "from_thought_id": resp.from_thought_id.to_string(),
+            "relation": resp.relation.as_str(),
+            "to_thought_id": resp.to_thought_id.to_string(),
+            "is_new": resp.is_new,
+        });
+        serde_json::to_string(&body).map_err(|e| format!("response serialization error: {e}"))
+    }
+
+    #[tool(
+        description = "Delete a thought-to-thought edge by its (from, relation, to) triple. Idempotent — deleting an already-missing edge returns existed=false and is not an error. Mirrors `link_thoughts`'s argument shape (without `note`)."
+    )]
+    async fn unlink_thoughts(
+        &self,
+        Parameters(args): Parameters<UnlinkThoughtsArgs>,
+    ) -> Result<String, String> {
+        let from = ThoughtId::from_str(&args.from_thought_id)
+            .map_err(|e| format!("invalid from_thought_id: {e}"))?;
+        let to = ThoughtId::from_str(&args.to_thought_id)
+            .map_err(|e| format!("invalid to_thought_id: {e}"))?;
+        let relation: RelationKind = args
+            .relation
+            .parse()
+            .map_err(|e: engram_core::UnknownRelationKind| e.to_string())?;
+
+        let resp = link::unlink_thoughts(&self.pool, from, relation, to)
+            .await
+            .map_err(map_link_error)?;
+
+        let body = serde_json::json!({
+            "existed": resp.existed,
+        });
+        serde_json::to_string(&body).map_err(|e| format!("response serialization error: {e}"))
+    }
+
+    #[tool(
+        description = "Walk the M5 thought-to-thought graph from a single thought. Returns grouped `outbound` (edges where this thought is `from`) and `inbound` (edges where it's `to`) arrays. Each entry carries the related thought's id, scope, content_preview (first 400 chars), retracted-state flag, the edge's relation/note/source, and timestamps. Optional `relations` array restricts to specific relation types; optional `direction` ('outbound' | 'inbound' | 'both') is the traversal scope (default 'both'). Retracted thoughts on either side are included with `retracted: true` — the caller decides whether to show, dim, or hide them."
+    )]
+    async fn get_related_thoughts(
+        &self,
+        Parameters(args): Parameters<GetRelatedThoughtsArgs>,
+    ) -> Result<String, String> {
+        let thought_id = ThoughtId::from_str(&args.thought_id)
+            .map_err(|e| format!("invalid thought_id: {e}"))?;
+
+        let relations = match args.relations {
+            Some(rs) => {
+                let mut parsed = Vec::with_capacity(rs.len());
+                for r in rs {
+                    let kind: RelationKind = r
+                        .parse()
+                        .map_err(|e: engram_core::UnknownRelationKind| e.to_string())?;
+                    parsed.push(kind);
+                }
+                Some(parsed)
+            }
+            None => None,
+        };
+
+        let direction = match args.direction.as_deref() {
+            Some(s) => s
+                .parse()
+                .map_err(|e: engram_core::UnknownLinkDirection| e.to_string())?,
+            None => LinkDirection::default(),
+        };
+
+        let resp = relate::get_related_thoughts(
+            &self.pool,
+            GetRelatedThoughtsRequest {
+                thought_id,
+                relations,
+                direction,
+            },
+        )
+        .await
+        .map_err(map_relate_error)?;
+
+        let body = related_thoughts_response_json(&resp);
+        serde_json::to_string(&body).map_err(|e| format!("response serialization error: {e}"))
+    }
 }
 
 fn map_capture_error(err: CaptureError) -> String {
@@ -336,6 +497,66 @@ fn map_retract_error(err: RetractError) -> String {
             "internal database error".to_string()
         }
     }
+}
+
+fn map_link_error(err: LinkError) -> String {
+    match err {
+        LinkError::SelfLink => {
+            "from_thought_id and to_thought_id must differ — self-links are not supported"
+                .to_string()
+        }
+        LinkError::FromThoughtMissing(id) => format!("from_thought_id {id} not found"),
+        LinkError::ToThoughtMissing(id) => format!("to_thought_id {id} not found"),
+        LinkError::NoteTooLong { got, max } => {
+            format!("note too long: {got} bytes (max {max} = {MAX_LINK_NOTE_LEN})")
+        }
+        LinkError::Storage(e) => {
+            tracing::error!(error = %e, "link/unlink storage error");
+            "internal database error".to_string()
+        }
+    }
+}
+
+fn map_relate_error(err: RelateError) -> String {
+    match err {
+        RelateError::ThoughtNotFound(id) => format!("thought not found: {id}"),
+        RelateError::Storage(e) => {
+            tracing::error!(error = %e, "get_related_thoughts storage error");
+            "internal database error".to_string()
+        }
+    }
+}
+
+fn related_thoughts_response_json(
+    resp: &crate::relate::GetRelatedThoughtsResponse,
+) -> serde_json::Value {
+    fn hit_to_json(h: &crate::relate::RelatedThoughtHit) -> serde_json::Value {
+        serde_json::json!({
+            "link_id": h.link_id.to_string(),
+            "relation": h.relation.as_str(),
+            "thought_id": h.thought_id.to_string(),
+            "scope": h.scope.as_str(),
+            "content_preview": h.content_preview,
+            "content_truncated": h.content_truncated,
+            "thought_created_at": h.thought_created_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            "link_created_at": h.link_created_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            "link_source": h.link_source.as_str(),
+            "note": h.note,
+            "retracted": h.retracted,
+        })
+    }
+
+    let outbound: Vec<_> = resp.outbound.iter().map(hit_to_json).collect();
+    let inbound: Vec<_> = resp.inbound.iter().map(hit_to_json).collect();
+    serde_json::json!({
+        "thought_id": resp.thought_id.to_string(),
+        "outbound": outbound,
+        "inbound": inbound,
+    })
 }
 
 fn search_response_json(resp: &SearchResponse) -> serde_json::Value {
@@ -442,7 +663,16 @@ Use `tag_filter` on `search_thoughts` for JSONB-containment filtering. Examples:
 Top-level keys AND together; array values match by subset containment.
 
 `capture` is idempotent on content via SHA-256 fingerprint: same content captured twice returns the existing `thought_id` with `is_duplicate: true` and no new embedding/tag jobs enqueue.
-Tools: `capture`, `search_thoughts`, `recent_thoughts`, `get_thought`, `retract_thought`.";
+
+Relations (M5+): thoughts can be linked with a closed-vocabulary `(from, relation, to)` edge. Six relations:
+  replaces, requires, references, belongs_to, decided_by, refines
+Endpoints are thought_ids only — heterogeneous targets (entities, people, URLs) and tagger-extracted relations are not in M5. Use:
+  - `link_thoughts(from_thought_id, relation, to_thought_id, note?)` → idempotent on the (from, relation, to) triple; returns `is_new` + the link_id.
+  - `unlink_thoughts(from_thought_id, relation, to_thought_id)` → idempotent on already-deleted.
+  - `get_related_thoughts(thought_id, relations?, direction?)` → grouped `outbound` + `inbound` arrays with full edge metadata and a content_preview for each related thought.
+Edges survive thought retraction (retracted thoughts surface with `retracted: true`); to fully sever a link, use `unlink_thoughts`.
+
+Tools: `capture`, `search_thoughts`, `recent_thoughts`, `get_thought`, `retract_thought`, `link_thoughts`, `unlink_thoughts`, `get_related_thoughts`.";
 
 #[cfg(test)]
 mod tests {
@@ -503,6 +733,28 @@ mod tests {
         // Capture-time idempotency is worth advertising — agents that
         // double-capture should expect `is_duplicate: true`.
         assert!(s.contains("is_duplicate"));
+        // M5: the relation vocabulary is the load-bearing closed set; every
+        // value must appear so agents have a reliable reference for the
+        // link/unlink/get_related_thoughts tools.
+        for relation in [
+            "replaces",
+            "requires",
+            "references",
+            "belongs_to",
+            "decided_by",
+            "refines",
+        ] {
+            assert!(
+                s.contains(relation),
+                "instructions should list relation `{relation}`",
+            );
+        }
+        for tool in ["link_thoughts", "unlink_thoughts", "get_related_thoughts"] {
+            assert!(
+                s.contains(tool),
+                "instructions should advertise tool `{tool}`"
+            );
+        }
     }
 
     fn server_with_tagger(pool: PgPool) -> EngramServer {

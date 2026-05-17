@@ -11,6 +11,8 @@
 pub mod backfill;
 pub mod capture;
 pub mod drain;
+pub mod link;
+pub mod relate;
 pub mod retract;
 pub mod search;
 pub mod server;
@@ -21,6 +23,14 @@ pub use drain::{
     DrainError, DrainReport, DrainTagsReport, MAX_TAG_ATTEMPTS, drain_pending_embeddings,
     drain_pending_tags,
 };
+pub use link::{
+    LinkError, LinkThoughtsRequest, LinkThoughtsResponse, MAX_LINK_NOTE_LEN,
+    UnlinkThoughtsResponse, link_thoughts, unlink_thoughts,
+};
+pub use relate::{
+    GetRelatedThoughtsRequest, GetRelatedThoughtsResponse, RELATED_CONTENT_PREVIEW_LEN,
+    RelateError, RelatedThoughtHit, get_related_thoughts,
+};
 pub use retract::{RetractError, RetractThoughtRequest, RetractThoughtResponse, retract_thought};
 pub use search::{
     DEFAULT_SEARCH_LIMIT, DEFAULT_TOP_K_PER_LEG, GetThoughtResponse, MAX_SEARCH_LIMIT, ReadError,
@@ -28,6 +38,6 @@ pub use search::{
     recent_thoughts, search_thoughts,
 };
 pub use server::{
-    CaptureArgs, EngramServer, GetThoughtArgs, RecentThoughtsArgs, RetractThoughtArgs,
-    SearchThoughtsArgs,
+    CaptureArgs, EngramServer, GetRelatedThoughtsArgs, GetThoughtArgs, LinkThoughtsArgs,
+    RecentThoughtsArgs, RetractThoughtArgs, SearchThoughtsArgs, UnlinkThoughtsArgs,
 };

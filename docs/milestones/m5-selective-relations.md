@@ -224,3 +224,55 @@ Heterogeneous targets (link-to-entity, link-to-person, link-to-URL) materialized
 
 - **Closed-vocab relation design needs the same anti-pattern documentation discipline as closed-enum kind classification.** The M4.1 v3 negative-example backfire taught us that listing forbidden phrases can reinforce them; the M5 v1 dogfood taught us that *not* listing anti-patterns lets natural-but-wrong applications slip through. The right shape is decision-tree rules ("don't use X for Y; use Z instead") in the tool description, not negative-example lists.
 - **Day-one dogfood is the right cadence.** v1 had been live for hours; 17 edges across the operator's existing corpus was enough to falsify the closed-vocab choice. Vocabulary additions are cheap (one CHECK constraint relax); the cost of *not* iterating on the vocab is downstream brittleness in aggregation tooling.
+
+---
+
+## M5.1.1 follow-up (2026-05-17)
+
+Day-one M5.1 dogfood (immediately after the M5.1 commit) executed the suggested first moves cleanly — `supports` conversion landed, idempotency verified on an existing edge, filtered walk works as designed. Two findings + three smaller items returned for follow-up.
+
+### Refined `supports` semantic
+
+The original M5.1 description framed `supports` as "this thought confirms a claim made in another." Dogfood revealed this was under-specified — operators read it ambiguously. The clarification: `supports` is **active confirmation, not passive citation**. The FROM thought must itself make a claim that confirms TO's claim. Summary/aggregation edges and passive prose mentions stay as `references`.
+
+Direction convention is **FROM=confirmer, TO=claim-maker** — consistent with the "this thought does X to another" shape of the other relations (the FROM thought is the actor; the TO thought is the target).
+
+The agent decision rule that disambiguates cleanly: ask *"does the FROM thought itself make a confirming claim?"* — not *"is this thought evidence-shaped?"* The evidence-shaped framing pulls operators toward false positives on summary/aggregation cases.
+
+M5.1.1 tightens the `link_thoughts.relation` tool description with this clarification plus an explicit anti-pattern: "DO NOT use `supports` for passive citation or summarization. ... Summary/aggregation edges (FROM summarizes data points TO) are `references`, not `supports`."
+
+The dogfood scope: M5.1's suggested "convert the summary cites too" was wrong. Only one edge (`74eb781c supports 6d2ef58e`) was a true `supports` conversion; the summary cites (`74eb781c → 63ad01e0`, `74eb781c → 047d0ce8`) stay as `references`.
+
+### Silent-edge-removal investigation
+
+Day-one dogfood reported a `74eb781c references 6d2ef58e` edge (link_id `9b1c0d78-...`, created in-session) as missing after the M5.1 restart, with the hypothesis that migration 0008 may have pattern-matched its note text and removed it.
+
+Investigation rules this out. Migration 0008 is a four-line `ALTER TABLE thought_links DROP CONSTRAINT ... ADD CONSTRAINT ...` — a pure CHECK relax with no DELETE / UPDATE clauses. Verified by inspecting the file. Direct DB inspection confirms 6 surviving edges involving `74eb781c` (3 outbound, 3 inbound), with `74eb781c references 6d2ef58e` absent. The new `74eb781c supports 6d2ef58e` (link_id `b5bfa573-...`) carries note "converted from references — ...", indicating an intentional unlink-then-link conversion procedure.
+
+Most parsimonious diagnosis: the conversion was a two-step (`unlink_thoughts` then `link_thoughts`) procedure where the unlink step was performed but not retained in operator memory. This isn't a bug; it's a consequence of conversion-as-unlink+link being the only path under the current MCP surface.
+
+Two operator-visible improvements would prevent this class of confusion in M5.x:
+
+1. **Migration audit signal.** When `engram migrate` applies an edge-affecting migration (delete / update of `thought_links` rows), record the row count delta into a `migration_audit` table or emit a structured tracing event with the migration version + delta. Operators can then distinguish "the migration touched my edges" from "the migration was schema-only." Migration 0008 has zero edge-affecting clauses; future migrations should self-classify so the operator-visible signal is unambiguous.
+
+2. **`unlink_thoughts` discriminator.** Distinguish "never-existed" from "previously-removed" in the response. Cheapest implementation: a soft-delete model on `thought_links` (`deleted_at TIMESTAMPTZ`). Edges resolve in queries by filtering `WHERE deleted_at IS NULL`; `unlink_thoughts` returns `existed: false, previously_removed: true | null`. More expensive: a `thought_links_history` table tracking inserts + deletes with timestamps and source. Either gives operators an "I unlinked this myself" vs. "something else happened" diagnostic bit.
+
+Both promoted to the **M5.x backlog** under "audit & operator diagnostics." Not load-bearing for M5.2's heterogeneous-targets work; can land independently.
+
+### Doc-bug fixes
+
+Three places still said "one of six closed-vocabulary relations" while enumerating seven (live `link_thoughts` tool description; README MCP surface table; design-v0 §8 MCP surface table). Plus the §6.6 rationale paragraph said "six relations the operator can predict." All fixed in M5.1.1.
+
+### Sqlx migrations table state (operator action item)
+
+`_sqlx_migrations` records only versions 1-6. Migrations 0007 and 0008 were applied directly via `docker exec psql` during M5 / M5.1 development sessions, so the migrations table doesn't reflect them. The schema state is correct (verified via `\d thought_links`) but the migrations table is stale.
+
+The fix is operator-side: run `engram migrate` to record the applied migrations. sqlx::migrate should recognize the existing schema state and update the table accordingly (or, if it complains about applied-but-not-recorded migrations, the resolution is a manual `INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES ...` for the two missing entries).
+
+Tracked as an M5.x cleanup item; not urgent.
+
+### Notable edge structure observed
+
+The dogfood ran the refinement chain in the wild: `82256109` (silent-edge-removal finding) and `8751f1aa` (supports-semantic finding) both `references` the M5 milestone thought `74eb781c`; `8751f1aa` then `refines` `618f5a6b` (the original references-ambiguity finding from earlier in the dogfood). The dialectical chain is first-class: references-ambiguity → `supports` lands → refined finding on `supports` semantics. Walkable via `get_related_thoughts(618f5a6b, relations: ["refines"])` from the inbound direction.
+
+This is the citation-chain pattern the M5 milestone was motivated by, now visible in the live graph and queryable by relation type — the M4.1 dogfood's implicit-in-prose chain made explicit at M5+.

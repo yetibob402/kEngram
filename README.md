@@ -23,7 +23,7 @@ For design rationale see [`docs/engram-design-v0.md`](docs/engram-design-v0.md);
 | `recent_thoughts` | Browse by recency in a (optional) scope. Excludes retracted thoughts. |
 | `get_thought` | Full thought + provenance (embedding status, embedded-at, tags, tagger provenance — `tags_extractor_model` / `tags_extractor_version` / `tags_extracted_at` —, retraction state). Direct lookup by ID returns the row even if retracted — this is the audit path. |
 | `retract_thought` | Mark a thought as untrusted (e.g. you captured a wrong claim). Sets `thoughts.retracted_at` so the row is excluded from retrieval. The row stays in the DB; `get_thought` still returns it with retraction state surfaced. |
-| `link_thoughts` | Create a thought-to-thought edge in the M5 graph layer with one of six closed-vocabulary relations (`replaces`, `requires`, `references`, `belongs_to`, `decided_by`, `refines`). Idempotent on the `(from, relation, to)` triple. |
+| `link_thoughts` | Create a thought-to-thought edge in the M5 graph layer with one of seven closed-vocabulary relations (`replaces`, `requires`, `references`, `supports`, `belongs_to`, `decided_by`, `refines`). Idempotent on the `(from, relation, to)` triple. |
 | `unlink_thoughts` | Delete a thought-to-thought edge by `(from, relation, to)`. Idempotent on already-deleted. |
 | `get_related_thoughts` | Walk the thought graph from a thought. Returns `outbound` + `inbound` groups, each with the related thought's content-preview, retraction state, and edge metadata. Optional filters by relation type and direction. |
 

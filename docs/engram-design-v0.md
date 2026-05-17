@@ -326,7 +326,7 @@ The blob lands in `thoughts.tags` via the drainer. A subsequent `search_thoughts
 
 [M5+] On top of the tagging sidecar, M5 adds a graph layer of thought-to-thought edges in a small closed vocabulary. M5 shipped six relations; M5.1 added a seventh after day-one dogfood (see Revision history): `replaces`, `requires`, `references`, `supports`, `belongs_to`, `decided_by`, `refines`. `supports` separates evidential / corroborative relationships ("this confirms a claim made there") from `references` (prose-level citation). Edges live in `thought_links` (migration 0007) keyed by `(from_thought_id, relation, to_thought_id)` with a UNIQUE constraint enforcing idempotency on the triple.
 
-**Why selective, not general.** The M3 facts pipeline tried full open-vocabulary `(subject, predicate, object)` extraction and the dogfood (see Revision history 2026-05-16 entries) showed the predicate slot broke under small-model limitations. M5's closed vocabulary trades coverage for tractability — six relations the operator can predict, queries that always have a fixed-cardinality dispatch, and no extraction prompt to break under load. The vocabulary was picked from observation of the M4.1 dogfood corpus: the citation chain `137dba1d → 6d2ef58e → 8a533e15` is exactly the `refines`-style structure operators kept building in prose.
+**Why selective, not general.** The M3 facts pipeline tried full open-vocabulary `(subject, predicate, object)` extraction and the dogfood (see Revision history 2026-05-16 entries) showed the predicate slot broke under small-model limitations. M5's closed vocabulary trades coverage for tractability — seven relations the operator can predict (six at M5 launch; `supports` added in M5.1), queries that always have a fixed-cardinality dispatch, and no extraction prompt to break under load. The vocabulary was picked from observation of the M4.1 dogfood corpus: the citation chain `137dba1d → 6d2ef58e → 8a533e15` is exactly the `refines`-style structure operators kept building in prose.
 
 **Schema.**
 
@@ -408,7 +408,7 @@ Tools and the milestone in which each ships. Names and signatures are part of th
 | `recent_thoughts` | M1 | Browse by recency in a scope. Excludes retracted thoughts. |
 | `get_thought` | M1 (M3 retraction; M4 tags) | Full thought + provenance (`embedding_status`, `embedded_at`, `tags`, `tags_extractor_model`, `tags_extractor_version`, `tags_extracted_at`, `retracted_at`, `retracted_reason`). Direct lookup returns the row even if retracted — this is the audit path. |
 | `retract_thought` | M3 | Mark a thought as untrusted. Sets `thoughts.retracted_at`; the row is excluded from retrieval but stays in the DB for audit. |
-| `link_thoughts` | M5 | Create a thought-to-thought edge with one of six closed-vocabulary relations (`replaces`, `requires`, `references`, `belongs_to`, `decided_by`, `refines`). Idempotent on `(from, relation, to)`. |
+| `link_thoughts` | M5 | Create a thought-to-thought edge with one of seven closed-vocabulary relations (`replaces`, `requires`, `references`, `supports`, `belongs_to`, `decided_by`, `refines`). Idempotent on `(from, relation, to)`. |
 | `unlink_thoughts` | M5 | Delete a thought-to-thought edge by `(from, relation, to)`. Idempotent on already-deleted. |
 | `get_related_thoughts` | M5 | Walk the thought graph. Returns grouped `outbound` + `inbound` arrays; each entry carries the related thought's content_preview, retraction state, and edge metadata. Optional filters by relation type and direction. |
 | `ingest_artifact` | M6 | Async ingest of a longer document. |

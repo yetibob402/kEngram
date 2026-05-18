@@ -4,7 +4,7 @@
 **Working name:** Engram (placeholder; trivial to rename)
 **Author:** [you]
 **Reviewers:** [TBD]
-**Last updated:** 2026-05-16
+**Last updated:** 2026-05-18
 
 ---
 
@@ -95,7 +95,6 @@ The system is built in six capability milestones, preceded by a small environmen
 - Tier 2 bearer-token auth + audit log.
 - Backup tooling (scripts, retention policy).
 - Eval suite (capture-recall, cross-model retrieval consistency, LongMemEval-style).
-- The `stats` MCP tool.
 
 **Order rationale.** M1 is the floor: nothing else makes sense without capture and retrieval. M2 (facts) before M3 (rerank) because at the time facts added capability and rerank improved quality, and quality without capability felt unmotivated. M3 dogfood produced negative knowledge that motivated M4 (collapse to thoughts-only) — the facts pipeline didn't earn its complexity for the operator's actual queries. M5 (selective relations) comes after M4 because the citation-chain pattern that emerged from the M4.1 dogfood (thoughts referencing and refining each other in prose) was the strongest signal for the next architectural addition — making implicit graph structure first-class. M6's original "artifacts/long-form ingestion" plan was dropped after a live-corpus measurement showed engram occupies a high-signal-density sweet spot that long-form ingestion would dilute; the reshaped M6 ships `engram stats` and tagger-extracted relations instead (see revision history 2026-05-17). M7 (operational maturity) closes out the v0 plan.
 
@@ -133,7 +132,7 @@ The system is built in six capability milestones, preceded by a small environmen
                                       │
                                       ▼
                             ┌──────────────────┐
-                            │  RTX 3090(s)     │
+                            │  Inference GPU(s)│
                             └──────────────────┘
 ```
 
@@ -563,39 +562,7 @@ temperature     = 0.2
 
 The `[extractor]` and `[reflector]` sections that shipped in M2 were removed by M4. The tagger drainer is always-on when `[tagger].provider` is non-empty — no cron, no opt-in flag, no confidence-band routing.
 
-**Hardware sizing — concrete on the Phase 1 / Phase 2 BOM, single-user.**
-
-The box is a personal inference server: one operator, one active session at a time, accessed over Tailscale from wherever the operator is. There is no concurrent multi-user load to budget for. The binding constraint is fitting the served instruct model + embedder + a single session's KV cache in available VRAM.
-
-**Phase 1 (single RTX 3090, 24 GB VRAM):**
-
-The default optimizes for tool-use quality, since the operator's stated use case is opencode / Claude Code against the local endpoint:
-
-| Component | Choice | VRAM |
-|---|---|---|
-| vLLM-served instruct | Qwen2.5-Coder-32B-Instruct AWQ-int4 | ~19 GB |
-| Embedder | BGE-M3 in TEI, **CPU build** | 0 GB (system RAM) |
-| **KV cache headroom** | | **~5 GB → ~32K tokens single-session** |
-
-CPU embeddings via TEI on the 9800X3D run at ~50–150 ms per call. Engram's actual call rate is a few embeddings per minute at peak personal use, not thousands, so the latency is invisible. The trade is real: capture latency goes from ~10 ms (GPU TEI) to ~100 ms (CPU TEI), and ~5 GB of KV cache headroom comes back to vLLM. For single-user code-agent work that almost always stays under 32K tokens, this is the right deal.
-
-**Why Coder-32B over a smaller model.** For strong tool use against opencode / Claude Code, model quality at the tool-call schema and multi-step planning level matters more than peak throughput. Qwen2.5-Coder-32B is one of the few open models where tool calling holds up under real agent loops — error recovery, multi-step planning, long tool-result reasoning. A 14B class model is sufficient for Engram's *own* tagger needs but underperforms on the operator's primary use case.
-
-**Tagger cost** [M4+]. A tagger call on a single thought is ~200–500 input tokens → ~50–150 structured output. At Coder-32B's vLLM throughput on a 3090 (≈75 tok/s per stream per the BOM), one thought tags in 1–2 seconds. The drainer runs on the `[worker] tick_interval_seconds` cadence (default 5 s) and processes up to `batch_size` thoughts per tick (default 16). For dev/test, drive a one-shot batch with `engram tag [--scope <s>] [--limit <n>]`. Unlike M2's nightly reflector cron, there's no scheduled cron — the drainer simply catches up as the queue fills.
-
-**Embedder placement is a deployment-time choice, not a code change.** TEI ships CPU and CUDA builds with identical HTTP APIs (`ghcr.io/huggingface/text-embeddings-inference:cpu-1.x` vs `:1.x`). Switching is a systemd unit edit; the Engram TOML doesn't change. CPU is the v0 default; GPU is appropriate later if capture rate grows or the operator wants sub-100ms capture latency for some interaction pattern.
-
-**Phase 2 (dual RTX 3090, 48 GB VRAM):**
-
-Phase 2 is a quality upgrade rather than a necessity-driven one — Phase 1 single-user is genuinely a credible primary daily driver. The upgrade unlocks:
-
-- Qwen2.5-Coder-32B at Q6/Q8 (better quality than AWQ-int4) with full KV cache via tensor-parallel
-- 70B-class general models at Q4 (Llama 3.3 70B, Qwen 2.5 72B) for harder reasoning tasks, ~32 tok/s per the BOM
-- DeepSeek-V2.5/V3 (235B MoE, ~21B active) at Q4 — explicitly strong at agentic work, ~25 tok/s per the BOM
-
-vLLM's `--tensor-parallel-size 2` is the obvious deployment shape. The embedder either stays on CPU or moves to a single card via TEI's CUDA build; both are easy.
-
-**System RAM and storage.** Postgres + pgvector will be MB-to-low-GB scale even with 100k+ thoughts; the 64 GB system RAM is overprovisioned for Engram's purposes (and is there for vLLM's CPU offload / weights loading anyway). With CPU embedding the embedder also runs out of system RAM — BGE-M3 is ~2 GB resident — well within budget. On the 2 TB NVMe, Engram's footprint is dominated by the database (single-digit GB at realistic scale); vLLM model weights are the actual storage hog.
+**Embedder placement is a deployment-time choice, not a code change.** TEI ships CPU and CUDA builds with identical HTTP APIs (`ghcr.io/huggingface/text-embeddings-inference:cpu-1.x` vs `:1.x`). Switching is a systemd unit edit; the Engram TOML doesn't change.
 
 ## 10. Operational shape — what makes the store honest
 
@@ -619,22 +586,22 @@ vLLM's `--tensor-parallel-size 2` is the obvious deployment shape. The embedder 
 - **No supersede chain on tagger output.** Tags are overwritten on `engram tag --rerun`. There's no `tags_superseded_by`, no history table, no audit trail on what the tagger said last week. The provenance triplet (`tags_extractor_model`, `tags_extractor_version`, `tags_extracted_at`) tells you what produced the *current* tags; if the operator wants pre-`--rerun` state, they restore from a backup.
 - **No fact-review queue.** The `facts_review_queue` table was dropped by migration 0006. Tagger output goes straight onto the row; there's no operator-review gate.
 - **No `correct_fact` MCP tool.** Operators who notice a wrong tag don't correct it; they ignore it (tags are advisory) or `retract_thought` if the underlying content is wrong. The cost of being wrong about a tag is small enough that operator-correction infrastructure isn't worth the complexity.
-- **No drift-defense `engram audit` job.** M2's audit story keyed on extractor drift across model versions; M4's tags are recomputable from raw text whenever the operator wants. The corresponding `stats` MCP tool ([M7]) surfaces current state, not drift.
+- **No drift-defense `engram audit` job.** M2's audit story keyed on extractor drift across model versions; M4's tags are recomputable from raw text whenever the operator wants. M6.0 shipped `engram stats` as a CLI subcommand for the operator-facing snapshot — current state, not drift.
 
 **The pre-M4 design (preserved here for history).** M2 shipped a `facts` table with `(subject, predicate, object, confidence, statement)` rows, a reflector cron, a confidence-band review queue, `correct_fact` MCP tool, and a `--rerun` flow with supersede-via-statement-or-triple-match dedup. M3 Phase D dogfood (commits `34ba756` → `2000059` on the m4-collapse-to-thoughts branch tell the full story) revealed that the (S, P, O) abstraction was generating most of the operator-visible failure modes (inverted comparatives, self-referential subjects, conditional-as-subject, predicate verbosity, polarity contradictions, triple-semantic drift). Statements were faithful; triples were brittle. **None of the M2-era drift-defense machinery was the wrong design for a fact store — it was the right design for the wrong abstraction.** M4 swapped the abstraction; the defensive machinery went with it.
 
 ## 11. Deployment & ops
 
-**Target hardware:** Phase 1 of the BOM — RTX 3090 (24 GB), Ryzen 7 9800X3D, 64 GB DDR5-6000, 2 TB PCIe 5.0 NVMe, Ubuntu 24.04 LTS, NVIDIA driver 560+, CUDA 12.6+. Postgres 16+ with `pgvector` ≥ 0.7 (HNSW required), `pg_trgm`, `pgcrypto`. Phase 2 (dual 3090) is fully supported by the same software stack with one config change (`CUDA_VISIBLE_DEVICES`).
+This section is the design-level operational shape. Operator-facing runbooks (first-time setup, configuration reference, per-subcommand examples) live in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 
 **Components:**
 
-- `engram` — the single Rust binary. M1 supports `serve` and `migrate` subcommands; `worker` and `embed-backfill` join at M2; `bench` joins at M3; `tag` joins at M4 (replacing M2's `reflect`).
-- Postgres 16 with `pgvector` ≥ 0.7, `pg_trgm`, `pgcrypto`. Connection is configured by URL (TOML or `DATABASE_URL` env). Local Unix socket is the simplest deployment; remote TCP — same Tailnet, separate NAS or DB host, or anywhere reachable — is fully supported. **Extensions must be installed on the Postgres server**, not the Engram host. At personal-scale data with HNSW indexes, network round-trip on a LAN adds negligible latency to queries.
-- `text-embeddings-inference` HTTP server for BGE-M3, sidecar pattern. **CPU build by default** for v0; swap to CUDA build by changing the systemd unit's container image (no Engram code or config change needed). Required from M1. From M3 onward, TEI also serves the cross-encoder reranker (separate model on the same HTTP shape).
-- vLLM serving an instruct model — required from M4 onward when the tagger is configured (no tagger backend in M1). **Operated independently of Engram.** Engram is a client; the operator manages vLLM's lifecycle, model choice, and serving config. Engram only requires the OpenAI-compatible endpoint to be reachable.
+- `engram` — the single Rust binary; subcommands cover the server, the drainer worker, and operator utilities (current set in `DEVELOPMENT.md`).
+- Postgres 16+ with `pgvector` ≥ 0.7, `pg_trgm`, `pgcrypto`. Connection is configured by URL (TOML or `DATABASE_URL` env). Local Unix socket is the simplest deployment; remote TCP — same Tailnet, separate NAS or DB host, or anywhere reachable — is fully supported. **Extensions must be installed on the Postgres server**, not the Engram host.
+- `text-embeddings-inference` HTTP server for the embedder, sidecar pattern. CPU and CUDA builds expose the same HTTP shape; choice is a deployment-time decision (no Engram code or config change). From M3 onward, TEI also serves the cross-encoder reranker on the same HTTP shape (separate model).
+- vLLM (or any OpenAI-compatible chat-completions endpoint) serving an instruct model — required from M4 onward when the tagger is configured. **Operated independently of Engram.** Engram is a client; the operator manages vLLM's lifecycle, model choice, and serving config.
 
-**Process model:** systemd units. `engram-server.service` exists from M1. `engram-tei.service` (the embeddings sidecar; CPU build by default — see §9) is required from M1. `engram-worker.service` joins at M2 and from M4 onward runs *two* drainer tasks inside one process: the embed drainer (always on, pulls jobs off `pending_embeddings`) and the tag drainer (M4; pulls off `pending_tags` when `[tagger].provider` is non-empty). vLLM and Postgres run as their own units, managed independently.
+**Process model:** systemd units. `engram-server.service` runs the MCP server; `engram-worker.service` runs the drainer process and from M4 onward runs *two* drainer tasks inside one process: the embed drainer (always on, pulls jobs off `pending_embeddings`) and the tag drainer (M4; pulls off `pending_tags` when `[tagger].provider` is non-empty). The embedder sidecar and vLLM run as their own units, managed independently.
 
 **Why two drainers, no cron** [M4+]. The M2 reflector ran on a cron schedule (default `0 0 3 * * *`) to batch fact extraction overnight and avoid contending with the operator's daytime agent loads. M4's tagger is a single chat-completion per thought, runs in the 1–2 s range, and produces 100–300 output tokens — small enough that ticking through `pending_tags` continuously alongside the embed drainer is cheap. No nightly scheduled run, no missed-cron catch-up logic, no time-of-day contention question.
 
@@ -652,7 +619,7 @@ Three relevant tiers. They map to milestones, not to deployment options offered 
 |---|---|---|---|---|
 | **0 — Localhost** | `127.0.0.1` only | None | M1 | First-run validation; the development default. |
 | **1 — Mesh** | Tailscale / WireGuard | None (mesh = auth) | M1 (config change) | Personal devices already on the Tailnet. The ops-recommended endpoint for single-user deployment. |
-| **2 — Tunnel** | Cloudflare Tunnel / Caddy + LE | Bearer token | M6 | Non-Tailnet clients (Claude Desktop, ChatGPT) that need a public HTTPS MCP URL. |
+| **2 — Tunnel** | Cloudflare Tunnel / Caddy + LE | Bearer token | M7 | Non-Tailnet clients (Claude Desktop, ChatGPT) that need a public HTTPS MCP URL. |
 
 A "Tier 3 — public + multi-user" option exists in principle but is **explicitly out of scope** for the current roadmap. It would require OAuth2, per-client tokens, and audit log; implementable later if the system is genuinely shared with another person, which is not a current requirement.
 
@@ -676,10 +643,9 @@ Eval runs end-to-end in `engram eval --suite <name>` and dumps a JSON report.
 
 Resolved during the milestone-roadmap planning conversation (see Revision history):
 
-1. ~~**Inference box specs.**~~ Resolved: Phase 1 RTX 3090 / 9800X3D / 64 GB; Phase 2 adds a second 3090.
-2. ~~**v0 scope.**~~ Resolved: see §3.5 milestone roadmap. M1 = capture + hybrid search + MCP. M2 added the facts pipeline; M4 retired it in favor of a tagging sidecar after M3 dogfood demonstrated the (S, P, O) abstraction wasn't earning its complexity.
-3. ~~**Search architecture.**~~ Resolved: hybrid (vector ∪ trigram, RRF) at M1; reranker at M3.
-4. ~~**Active-embedder mechanism.**~~ Resolved: config-driven `model_id`, one HNSW partial index per model.
+1. ~~**v0 scope.**~~ Resolved: see §3.5 milestone roadmap. M1 = capture + hybrid search + MCP. M2 added the facts pipeline; M4 retired it in favor of a tagging sidecar after M3 dogfood demonstrated the (S, P, O) abstraction wasn't earning its complexity.
+2. ~~**Search architecture.**~~ Resolved: hybrid (vector ∪ trigram, RRF) at M1; reranker at M3.
+3. ~~**Active-embedder mechanism.**~~ Resolved: config-driven `model_id`, one HNSW partial index per model.
 
 Carrying forward:
 
@@ -687,8 +653,8 @@ Carrying forward:
 6. **Sync.** Do we ever want multi-machine replication? Logical replication on Postgres is straightforward, but only worth doing if you'll actually use it. Defer.
 7. **Capture UX.** OB1's Slack capture is clever. Equivalents: a Telegram bot, a CLI `engram capture`, a Raycast/Alfred extension, a browser extension. Out of scope until at least M6.
 8. **Embedding model default.** v0 commits to BGE-M3 (well-established, multilingual, runs in ~1.5 GB, supports rerank). A future milestone should bake off Qwen3-Embedding-4B and Qwen3-Embedding-8B against our own eval fixture before any production-scope re-embed. The embeddings table design (§5) makes this a routine swap rather than a migration.
-9. **Are we storing agent transcripts?** Currently artifacts can hold them (M5+); we haven't decided whether agents auto-capture session transcripts on close or whether that's an explicit flush.
-10. **Tagger model: dense vs. MoE.** Phase 2 unlocks Qwen3-30B-A3B (MoE, 3B active) as an alternative to Qwen2.5-32B (dense). The MoE option likely wins on throughput; quality on tagger output is unmeasured against M4's v1 prompt. Decide via the eval suite (M6).
+9. **Are we storing agent transcripts?** Open. The original M5/M6 artifacts plan would have held them as long-form content; that plan was dropped in the M6 reshape (transcripts dilute the high-signal-density sweet spot per §3.5). The remaining options are explicit per-message capture, scope-prefixed session transcripts, or letting agents decide. No decision yet.
+10. **Tagger model: dense vs. MoE.** Dense (Qwen2.5-32B class) is the v0 default. MoE alternatives (Qwen3-30B-A3B style, ~3B active) likely win on throughput; quality on tagger output is unmeasured against the current prompt. Decide via the M7 eval suite.
 
 ## 15. Out of scope (for the foreseeable future)
 
@@ -723,6 +689,8 @@ Carrying forward:
 - **2026-05-18** — **v8 entities adjectival regression: accept + document (no prompt iteration).** The four-iteration prompt arc on entities (v3 negative-example list → v4 NAME-vs-DESCRIBE structural test → v6 pattern descriptions → v7 pure structural framing, zero phrase hints) hit diminishing returns on `047d0ce8`: at `tags_extractor_version: 7` the thought still emits entities `["agent memory protocol", "embedding-based", "lexical signals"]`. Diagnosis: the NAME-vs-DESCRIBE test asks the model to verify a fact it can't reliably verify — "does this phrase NAME a specific thing that has its own canonical identity outside this thought" requires world-knowledge the 30B model lacks reliable access to. When uncertain, the model defaults to "include," producing over-extraction on technical-prose noun phrases. Three reinforcing model-level biases compound this: (a) surface-pattern over-generalization from pre-training on entity-extraction tasks where multi-word noun phrases were correctly extracted; (b) definite-article-as-name signal ("The X provides..." reads as a definition); (c) coordination spillover (once one of `embedding-based` or `lexical signals` is included, the other follows by parallel structure). Lowering `entities.maxItems` (3→2) was rejected — drops legitimate 3-entity cases as collateral. v8 ships zero prompt changes and zero code changes; instead it documents the structural ceiling and ratifies operator-correction as the design intent. Engram's M5+ machinery (soft-delete on `thought_links`, `link_source` discriminator on `get_related_thoughts` responses, `unlink_thoughts` MCP tool) was designed for operator correction of tagger output — the imperfect tagger feeding into that correction layer is by design, not a bug. **Methodology lesson** (worth keeping for future prompt iterations on any closed-vocabulary or surface-discrimination LLM task): when prompt-engineering hits a structural ceiling — i.e., the prompt asks the model to verify a fact (world existence, factuality, ground truth) the model can't reliably check — further prompt iterations have diminishing returns. The next lever is architectural: closed vocabulary (model becomes classifier over a known set rather than free-form extractor), two-pass verification (verify pass after emission), or model swap (larger or specialized model with better world-knowledge or instruction-following). If continued dogfood reveals the residual entities imperfection is intolerable, escalate to closed-vocabulary mode (the `tagger.scope_vocab` already exists as tie-breaker; promote to gate) or model swap. `BUNDLED_TAGGER_VERSION` stays at 7 — no prompt change, no re-tag needed.
 
 - **2026-05-18** — **Rename + relocate.** The design doc moved from `docs/engram-design-v0.md` to `DESIGN.md` at the project root, joining `README.md` / `DEVELOPMENT.md` / `AGENTS.md` / `CLAUDE.md` as a top-level operator-facing document. The `v0` filename had outlived its purpose — this document is the canonical record of the design as it stands now, with the revision history below capturing past architectural decisions. Cross-references in `README.md`, `DEVELOPMENT.md`, `CLAUDE.md`, `docker-compose.yml`, `migrations/0001_initial.sql`, `crates/engram-extract/src/openai_compatible.rs`, and the milestone docs in `docs/milestones/` were updated; the doc body itself is unchanged from the consistency pass below.
+
+- **2026-05-18** — **Hardware excision + small drift fixes.** Front-matter `Last updated` advanced 2026-05-16 → 2026-05-18 to reflect today's editing. §3.5 M7 description: dropped the `The stats MCP tool.` bullet — `engram stats` shipped as CLI-only at M6.0 and no MCP `stats` tool is planned. §4 architecture diagram: `RTX 3090(s)` → generic `Inference GPU(s)`. §9: removed the misplaced "Hardware sizing — concrete on the Phase 1 / Phase 2 BOM, single-user." subsection (Phase 1 / Phase 2 VRAM table, Coder-32B rationale, tagger cost arithmetic, system-RAM-and-storage notes); kept a one-line note in §9 that CPU-vs-CUDA TEI build is a deployment-time choice with no code/config impact. §10: rewrote the "no drift-defense `engram audit` job" bullet to point at the M6.0 `engram stats` CLI rather than an "M7 stats MCP tool" that's no longer planned. §11: deleted the "Target hardware: Phase 1 of the BOM — RTX 3090..." paragraph entirely; rewrote the "Components" list to drop per-milestone CLI subcommand timelines (those belong in DEVELOPMENT.md), kept the design-level four-component summary (engram binary, Postgres+extensions, embedder sidecar, vLLM tagger); kept "Process model", "Why two drainers, no cron", "Backups", "Migrations", "Observability [M7]" intact since those are design content; added a forward-pointer to DEVELOPMENT.md at the top of §11. §12 Tier 2 row: `M6` → `M7` (aligns with §3.5 M7 description and the §12 prose at "Auth at Tier 2 [M7]"). §14 Open questions: dropped the resolved "Inference box specs" item (the hardware decisions are no longer part of the design surface); rewrote question 9 to remove the stale "artifacts can hold them (M5+)" claim (artifacts plan dropped); rewrote question 10 to strip Phase 2 / specific-model hardware framing and corrected the eval-suite milestone reference M6 → M7. Front-matter "Working name: Engram (placeholder; trivial to rename)" intentionally retained — name decision deferred to a separate conversation after research surfaced 8+ live AI-memory / MCP-named "Engram" projects (Gentleman-Programming/engram, lamb356/engram, engram.so / engram-ai.dev / engram.tools / engram.to commercial sites, EvolvingLMMs-Lab/engram, wyckit/mcp-engram-memory, edg-l/engram-mcp). No code changes, no migrations.
 
 - **2026-05-18** — **Doc-only consistency pass.** Section bodies were brought back into alignment with the M5.2/M6.1/v9 reality. §3.5 line 48: clarified that the `artifacts` / `artifact_chunks` tables remain on disk but are inert pending a future drop migration (M6 reshape dropped the artifacts plan). §3.5 "Order rationale" tail: removed the obsolete "M6 = artifacts" framing. §5 schema block: dropped the `artifacts` / `artifact_chunks` `CREATE TABLE` snippets in favour of a one-paragraph note about the inert tables — the doc represents the *design* as it stands today and points at the cleanup migration. §6.5: bumped "currently v3" to "currently v7"; added the `relations` field to the tagger JSON-schema example and a one-line note about the M6.1/v9 split into `TagOutput { tags, relations }`. §6.6: replaced the M5-era `thought_links` SQL with the current M5.2 schema (polymorphic `to_kind` + per-kind columns + generated `to_value` + `deleted_at` + partial unique index `WHERE deleted_at IS NULL`); rewrote the pipeline paragraph (three-way `UnlinkStatus`, polymorphic `link_thoughts`, `link_source` on every edge); reworked the worked example to span thought + URL targets and show the soft-delete lifecycle; deleted the redundant M5.2-summary paragraph (now woven into the body); pruned the out-of-scope list (tagger-extracted relations moved to §6.7). New §6.7 "Tagger-extracted relations (M6.1)" — covers why the tagger writes graph rows, schema reuse, the drainer pipeline (`apply_tagger_relations` + `soft_delete_tagger_edges_for_thought`), why the JSONB persistence path was dropped in v9, and the agent-facing discriminator (`link_source`). §8: removed the `ingest_artifact` row (artifacts dropped) and the `stats` row (CLI-only at M6.0, no MCP tool); added an operator-only-surfaces note covering `engram stats` + `engram audit migrations`; expanded `get_related_thoughts` description to surface `link_source`. §9: trimmed the Rust data-shape struct snippets (`Tags`, `ScopeVocab`, `RelationKind`, `ThoughtLink`) — the SQL forms in §5 and §6.6 are now the contract, with one line pointing at `crates/engram-core`; updated the `Tagger` trait signature to return `TagOutput` with an inline note. §9 config TOML: bumped `[tagger].model_version` 1 → 7, added `scope_vocab_enabled` / `scope_vocab_size`, added `[server].allowed_hosts` with a one-line explainer pointing at §12. No code changes, no migrations.
 

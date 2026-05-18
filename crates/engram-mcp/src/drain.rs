@@ -267,11 +267,17 @@ async fn process_tag_job(
     };
 
     match tagger.tag(&thought.content, vocab.as_ref()).await {
-        Ok(tags) => {
+        Ok(output) => {
+            // `output` is a TagOutput { tags, relations }. The Tags portion
+            // is persisted to thoughts.tags JSONB; the relations portion is
+            // routed to thought_links via apply_tagger_relations. They are
+            // NOT mirrored — thought_links is the canonical store for the
+            // link graph; tags.relations is no longer persisted (migration
+            // 0011 dropped the field from existing rows).
             if let Err(e) = engram_storage::update_thought_tags(
                 pool,
                 job.thought_id,
-                &tags,
+                &output.tags,
                 tagger.model_id(),
                 tagger.version(),
             )
@@ -288,7 +294,7 @@ async fn process_tag_job(
             // Emit tagger-extracted relations (M6.1). Soft-delete prior
             // tagger edges first so re-tag cycles produce a clean replacement;
             // agent-supplied edges are untouched.
-            apply_tagger_relations(pool, job.thought_id, &tags.relations).await;
+            apply_tagger_relations(pool, job.thought_id, &output.relations).await;
             if let Err(e) = engram_storage::complete_tag_job(pool, job.thought_id).await {
                 tracing::warn!(
                     thought_id = %job.thought_id,
@@ -400,7 +406,8 @@ mod tests {
     use super::*;
     use crate::capture::{CaptureRequest, capture};
     use engram_core::{
-        EmbeddingModel, ExtractedTarget, LinkTarget, RelationKind, Scope, Source, TagKind, Tags,
+        EmbeddingModel, ExtractedTarget, LinkTarget, RelationKind, Scope, Source, TagKind,
+        TagOutput, Tags,
     };
     use engram_embed::{FakeBehavior, FakeEmbedder};
     use engram_extract::{FakeBehavior as TaggerFakeBehavior, FakeTagger};
@@ -744,18 +751,20 @@ mod tests {
 
     // -- M6.1: tagger-extracted relations ---------------------------------
 
-    fn tags_with_relations(rels: Vec<ExtractedRelation>) -> Tags {
-        Tags {
-            kind: Some(TagKind::Reference),
+    fn tag_output_with_relations(rels: Vec<ExtractedRelation>) -> TagOutput {
+        TagOutput {
+            tags: Tags {
+                kind: Some(TagKind::Reference),
+                ..Tags::default()
+            },
             relations: rels,
-            ..Tags::default()
         }
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn drain_tags_inserts_emitted_relations_with_source_tagger(pool: PgPool) {
         let id = capture_and_enqueue_tag(&pool, "thought citing https://example.com").await;
-        let canned = tags_with_relations(vec![
+        let canned = tag_output_with_relations(vec![
             ExtractedRelation {
                 relation: RelationKind::References,
                 target: ExtractedTarget::Url("https://example.com".into()),
@@ -767,7 +776,7 @@ mod tests {
                 note: None,
             },
         ]);
-        let tagger = FakeTagger::with_canned(canned);
+        let tagger = FakeTagger::with_canned_output(canned);
         let report = drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
         assert_eq!(report.completed, 1);
 
@@ -795,12 +804,12 @@ mod tests {
         let id = capture_and_enqueue_tag(&pool, "first pass").await;
 
         // First drain: emit one URL relation.
-        let first = tags_with_relations(vec![ExtractedRelation {
+        let first = tag_output_with_relations(vec![ExtractedRelation {
             relation: RelationKind::References,
             target: ExtractedTarget::Url("https://old.example".into()),
             note: None,
         }]);
-        let tagger = FakeTagger::with_canned(first);
+        let tagger = FakeTagger::with_canned_output(first);
         drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
 
         let after_first = engram_storage::fetch_related_thoughts(
@@ -822,12 +831,12 @@ mod tests {
         engram_storage::enqueue_tag_job(&pool, id, "fake/tagger")
             .await
             .unwrap();
-        let second = tags_with_relations(vec![ExtractedRelation {
+        let second = tag_output_with_relations(vec![ExtractedRelation {
             relation: RelationKind::References,
             target: ExtractedTarget::Url("https://new.example".into()),
             note: None,
         }]);
-        let tagger = FakeTagger::with_canned(second);
+        let tagger = FakeTagger::with_canned_output(second);
         drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
 
         let after_second = engram_storage::fetch_related_thoughts(
@@ -868,12 +877,12 @@ mod tests {
         .unwrap();
 
         // Tagger-supplied URL edge from a, then drain re-runs with different relations.
-        let canned = tags_with_relations(vec![ExtractedRelation {
+        let canned = tag_output_with_relations(vec![ExtractedRelation {
             relation: RelationKind::References,
             target: ExtractedTarget::Url("https://new.example".into()),
             note: None,
         }]);
-        let tagger = FakeTagger::with_canned(canned);
+        let tagger = FakeTagger::with_canned_output(canned);
         drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
 
         let related = engram_storage::fetch_related_thoughts(
@@ -896,7 +905,7 @@ mod tests {
         let id = capture_and_enqueue_tag(&pool, "thought with mixed-validity relations").await;
         // First emission has a non-http URL (DB + validate_target reject).
         // Second is well-formed; should still land.
-        let canned = tags_with_relations(vec![
+        let canned = tag_output_with_relations(vec![
             ExtractedRelation {
                 relation: RelationKind::References,
                 target: ExtractedTarget::Url("ftp://bad.example".into()),
@@ -908,7 +917,7 @@ mod tests {
                 note: None,
             },
         ]);
-        let tagger = FakeTagger::with_canned(canned);
+        let tagger = FakeTagger::with_canned_output(canned);
         let report = drain_pending_tags(&pool, &tagger, 10, None).await.unwrap();
         // Drain itself doesn't fail — the bad emission is logged & skipped.
         assert_eq!(report.completed, 1);

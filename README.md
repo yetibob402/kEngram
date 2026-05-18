@@ -49,13 +49,11 @@ The lifecycle, end to end:
   "action_items": ["fast-track migration #0042"],
   "topics": ["memory-systems", "release-process"],
   "dates_mentioned": ["Thursday"],
-  "kind": "task",
-  "relations": [
-    { "relation": "references", "to_kind": "url",
-      "to_value": "https://arxiv.org/abs/2004.04906", "note": "explicit citation" }
-  ]
+  "kind": "task"
 }
 ```
+
+Tagger-emitted relations (URL / entity / person targets) are NOT persisted into this `tags` JSONB — they land in `thought_links` rows with `source='tagger'`, queryable via `get_related_thoughts` like any agent-supplied edge. `thought_links` is the single canonical store for the link graph; the `tags` JSONB is metadata only. Migration `0011_drop_tags_relations` removed the legacy `tags.relations` key from existing rows.
 
 `entities` are canonical proper names the prose mentions by name — projects, products, libraries, tools, organizations. The v3/v4 prompts narrowed this to recognizable-from-outside-the-conversation named entities only; the v4 prompt defaults to `[]` and applies a structural NAME-vs-DESCRIBE test (does this phrase NAME a specific thing, or does the thought DESCRIBE an action using a noun phrase?), with `maxItems: 3` to force selectivity. Descriptive phrases like "agent memory protocol" or "cross-encoder" belong in topics if anywhere. `topics` are broader subject categories the thought falls under, capped at 3. Keeping entities and topics separate (added in M4.1) lets `tag_filter` distinguish "thoughts that mention engram by name" from "thoughts categorized under memory-systems." `kind` is one of `observation | task | idea | reference | person_note | session` (or `null` if the model is unsure); it's classified from the thought's intrinsic shape, deliberately isolated from the scope's typical content. Tags are **advisory metadata** — they don't gate storage, don't supersede each other, and a wrong tag is low-impact because retrieval still works against the raw content via vector + trigram. Expect modest kind drift across re-tag cycles for ambiguous-shape content; the closed enum gives a stable shape but the choice within it can be sensitive to model + corpus state.
 

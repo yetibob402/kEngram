@@ -738,11 +738,11 @@ async fn run_tag(
             _ => None,
         };
         match tagger.tag(&t.content, vocab.as_ref()).await {
-            Ok(tags) => {
+            Ok(output) => {
                 if let Err(err) = engram_storage::update_thought_tags(
                     &pool,
                     t.id,
-                    &tags,
+                    &output.tags,
                     &model_id,
                     tagger_version,
                 )
@@ -755,10 +755,13 @@ async fn run_tag(
                     );
                     failed += 1;
                 } else {
-                    // M6.1: apply tagger-extracted relations after tags
-                    // persist. Mirrors the worker drainer path so synchronous
+                    // Apply tagger-extracted relations after tags persist.
+                    // Mirrors the worker drainer path so synchronous
                     // `engram tag` and async drainer behave identically.
-                    engram_mcp::apply_tagger_relations(&pool, t.id, &tags.relations).await;
+                    // Relations go to thought_links via apply_tagger_relations,
+                    // NOT into tags.relations (migration 0011 removed the
+                    // JSONB key).
+                    engram_mcp::apply_tagger_relations(&pool, t.id, &output.relations).await;
                     tagged += 1;
                 }
             }

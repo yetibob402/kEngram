@@ -182,3 +182,36 @@ A 2026-05-18 dogfood pass after the v6+v7 ship confirmed the adjectival entities
 **Escalation path:** if continued dogfood reveals the residual imperfection is intolerable, the next levers in priority order are: (a) closed-vocabulary mode (promote `tagger.scope_vocab` from tie-breaker to gate; the model becomes a classifier over a known set rather than a free-form extractor); (b) model swap (larger model or specialized entity-extraction model). Each is a significant design surface and would get its own plan-mode conversation. Not committing today.
 
 **The v8 lesson recorded for posterity:** four prompt iterations in one milestone cycle isn't indecision; it's the prompt-engineering ceiling discovery process. Future similar problems (any closed-vocabulary or surface-discrimination LLM task where the prompt asks the model to verify a fact it can't reliably check) should run a similar arc with awareness of the ceiling, and architectural levers should be considered before the fifth prompt iteration.
+
+
+---
+
+# v9 decision: drop tags.relations from persisted JSONB; thought_links is canonical
+
+**Status:** shipped 2026-05-18. Tagger version unchanged (still 7).
+
+Dogfood thought `b533ebac` (captured 2026-05-18) raised the naming-collision concern: engram used the word "relations" for two distinct things. Investigation showed the M6.1 drainer was actually writing tagger emissions to **both** stores (tags.relations JSONB on each thought row AND thought_links rows with source='tagger'). The thought's claim that they were "orthogonal" was incorrect — the data was duplicated, with thought_links acting as the deduplicated queryable graph and tags.relations as a raw frozen emission record. Pure DRY violation.
+
+**Resolution:** drop tags.relations from the persisted JSONB. thought_links is the single canonical store; the JSONB copy is gone. The LLM still emits relations in its response (the schema is unchanged); Rust-side parsing splits the response into a transient `TagOutput { tags, relations }` shape, where Tags goes to the JSONB column and relations route to thought_links via `apply_tagger_relations`.
+
+**Why this matters for an OSS-future engram:** at single-operator scale the duplication is invisible. At OSS scale, future operators will encounter the wart: confused readers, duplicate-data-of-record questions, two ways to query "what does this thought relate to?" Cleaning it up before publication is the simpler engineering call.
+
+**What shipped:**
+- Migration `0011_drop_tags_relations.sql` — UPDATE removing the `relations` key from existing rows; 45 rows touched.
+- `engram-core/src/tagger.rs` — new `TagOutput { tags, relations }` struct; `ExtractedRelation` + `ExtractedTarget` relocated here from tags.rs; `Tagger::tag` returns `TagOutput`.
+- `engram-core/src/tags.rs` — `relations` field removed from `Tags`.
+- `engram-extract/src/openai_compatible.rs` — internal `TaggerResponseDoc` parses the LLM response and splits into TagOutput; LLM-side schema (`tags_response_format()`) unchanged.
+- `engram-extract/src/fake_tagger.rs` — `FakeTaggerOutput` now wraps `TagOutput`; `with_canned(tags)` keeps its convenience shape for Tags-only tests; new `with_canned_output(TagOutput)` for richer cases.
+- `engram-mcp/src/drain.rs` + `engram-cli/src/main.rs` — destructure TagOutput in drainer + CLI; `apply_tagger_relations` continues to consume `&[ExtractedRelation]` unchanged.
+- Test cleanup across crates: drop `relations: vec![]` from Tags initializers; `tags_with_relations` helper renamed to `tag_output_with_relations`.
+- AGENTS.md: clarify thought_links is the single canonical store; tagger-emitted edges are queryable like agent-supplied edges via `link_source: tagger`.
+- README.md: tag-shape JSON example drops `relations`.
+
+**What did NOT change:**
+- LLM prompt and schema (`tags_response_format()`). The model still emits relations as a top-level field in its JSON response — only persistence shape changes.
+- `BUNDLED_TAGGER_VERSION` (stays at 7). No re-tag needed; existing v7-tagged thoughts already have correct tag content under both versions.
+- `apply_tagger_relations` signature.
+- `thought_links` schema or `get_related_thoughts` behavior.
+- `link_source` discriminator (`tagger` vs `agent`) — unchanged; this is the operator-correction surface.
+
+The methodology lesson: dogfood findings that surface architectural duplication are worth acting on even when the immediate-cost framing says "accept it." DRY at the data layer pays compound interest over time.

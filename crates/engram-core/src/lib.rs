@@ -26,6 +26,6 @@ pub use relation::{
 pub use scope::{Scope, ScopeError};
 pub use search::{DEFAULT_RECENCY_HALF_LIFE_DAYS, DEFAULT_RRF_K, Hit, recency_boost, rrf_fuse};
 pub use source::{Source, SourceError};
-pub use tagger::{Tagger, TaggerError};
-pub use tags::{ExtractedRelation, ExtractedTarget, ScopeVocab, TagKind, Tags};
+pub use tagger::{ExtractedRelation, ExtractedTarget, TagOutput, Tagger, TaggerError};
+pub use tags::{ScopeVocab, TagKind, Tags};
 pub use thought::{Thought, ThoughtId};

@@ -8,8 +8,72 @@
 //! on the next tick, or to log and skip without retry.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
-use crate::{ScopeVocab, Tags};
+use crate::{LinkTarget, RelationKind, ScopeVocab, Tags};
+
+/// Result of a single `Tagger::tag()` call. Bundles two distinct outputs
+/// that the same LLM call produces:
+///
+/// - `tags` — metadata classifying the thought (people, entities, topics,
+///   kind, etc.). Persisted as JSONB on `thoughts.tags`.
+/// - `relations` — LLM-extracted edges to non-thought targets (entity /
+///   person / URL). Persisted into `thought_links` via the drainer's
+///   `apply_tagger_relations` helper with `source = 'tagger'`. NOT
+///   persisted back into the `tags` JSONB; `thought_links` is the
+///   canonical store for the link graph.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TagOutput {
+    pub tags: Tags,
+    pub relations: Vec<ExtractedRelation>,
+}
+
+/// One LLM-extracted edge attached to a thought. The drainer inserts these
+/// into `thought_links` with `source = 'tagger'`. v1 (M6.1) targets
+/// non-thoughts only — thought-target tagger relations are deferred until
+/// entity resolution lands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtractedRelation {
+    pub relation: RelationKind,
+    #[serde(flatten)]
+    pub target: ExtractedTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Non-thought target shape emitted by the tagger. Mirrors `LinkTarget`'s
+/// non-thought variants and matches the JSON shape `{to_kind, to_value}` on
+/// the wire (flattened into `ExtractedRelation`). Converts losslessly into
+/// the full `LinkTarget` for insertion via `engram_storage::insert_link`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "to_kind", content = "to_value", rename_all = "snake_case")]
+pub enum ExtractedTarget {
+    Entity(String),
+    Person(String),
+    Url(String),
+}
+
+impl ExtractedTarget {
+    /// Convert into the polymorphic `LinkTarget` used by the storage layer.
+    /// Lossless — `ExtractedTarget` is a strict subset of `LinkTarget`
+    /// (omits the `Thought` variant).
+    pub fn into_link_target(self) -> LinkTarget {
+        match self {
+            Self::Entity(name) => LinkTarget::Entity(name),
+            Self::Person(name) => LinkTarget::Person(name),
+            Self::Url(url) => LinkTarget::Url(url),
+        }
+    }
+
+    /// Stable discriminator string (mirrors `LinkTarget::kind_str`).
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Entity(_) => "entity",
+            Self::Person(_) => "person",
+            Self::Url(_) => "url",
+        }
+    }
+}
 
 #[async_trait]
 pub trait Tagger: Send + Sync {
@@ -31,13 +95,15 @@ pub trait Tagger: Send + Sync {
     /// unseen concepts. Passing `None` runs the tagger without any
     /// vocabulary guidance.
     ///
-    /// Returning a `Tags::default()` is a valid "no extractable tags here"
-    /// answer and is not a failure.
+    /// Returns a [`TagOutput`] bundling the persisted `Tags` and the
+    /// transient `Vec<ExtractedRelation>` that the drainer routes into
+    /// `thought_links`. An empty TagOutput is a valid "no extractable
+    /// metadata here" answer and is not a failure.
     async fn tag(
         &self,
         thought_content: &str,
         vocab: Option<&ScopeVocab>,
-    ) -> Result<Tags, TaggerError>;
+    ) -> Result<TagOutput, TaggerError>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -79,6 +145,66 @@ impl TaggerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracted_relation_serde_round_trip() {
+        let r = ExtractedRelation {
+            relation: RelationKind::References,
+            target: ExtractedTarget::Url("https://anthropic.com".into()),
+            note: Some("explicit citation".into()),
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["relation"], "references");
+        assert_eq!(json["to_kind"], "url");
+        assert_eq!(json["to_value"], "https://anthropic.com");
+        assert_eq!(json["note"], "explicit citation");
+
+        let parsed: ExtractedRelation = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, r);
+    }
+
+    #[test]
+    fn extracted_relation_note_optional() {
+        let r = ExtractedRelation {
+            relation: RelationKind::BelongsTo,
+            target: ExtractedTarget::Entity("Probe 2".into()),
+            note: None,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(
+            json.get("note").is_none(),
+            "note should be omitted when None"
+        );
+
+        let parsed: ExtractedRelation = serde_json::from_str(
+            r#"{"relation":"belongs_to","to_kind":"entity","to_value":"Probe 2"}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.note, None);
+    }
+
+    #[test]
+    fn extracted_target_into_link_target_preserves_kind_and_value() {
+        assert_eq!(
+            ExtractedTarget::Entity("foo".into()).into_link_target(),
+            LinkTarget::Entity("foo".into())
+        );
+        assert_eq!(
+            ExtractedTarget::Person("Ron".into()).into_link_target(),
+            LinkTarget::Person("Ron".into())
+        );
+        assert_eq!(
+            ExtractedTarget::Url("https://x.io".into()).into_link_target(),
+            LinkTarget::Url("https://x.io".into())
+        );
+    }
+
+    #[test]
+    fn tag_output_default_is_empty() {
+        let o = TagOutput::default();
+        assert_eq!(o.tags, Tags::default());
+        assert!(o.relations.is_empty());
+    }
 
     #[test]
     fn unreachable_is_transient() {

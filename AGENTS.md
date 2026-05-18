@@ -32,7 +32,7 @@ Set `source` on capture to identify yourself: `agent:claude-code`, `agent:claude
 
 The LLM-extracted `tags` fields (especially `entities`) are best-effort, not strict claims. The v7 prompt's structural NAME-vs-DESCRIBE test has a known ceiling — see the design-v0 revision history for the four-iteration arc and structural diagnosis. In practice the `entities` field may include adjectival or descriptive phrases (e.g. `embedding-based`) alongside legitimate names (e.g. `engram`). Treat `tag_filter: {"entities": [...]}` as a positive signal — "thoughts the tagger associated with this term" — not a strict membership claim.
 
-When a tagger-emitted edge in `get_related_thoughts` targets a clearly-wrong entity, `unlink_thoughts(from, relation, {to_entity|to_person|to_url})` soft-deletes it (audit trail preserved). The entities field on the thought itself is corrected by re-tag cycles or direct psql edit — both operator-initiated, neither blocking your normal flow.
+The tagger also emits relations from prose (URL / entity / person targets, closed relation vocabulary). Those emissions are written **only** to `thought_links` with `link_source: "tagger"` — they are queryable via `get_related_thoughts` like any agent-supplied edge. They are NOT persisted into the `tags` JSONB; `thought_links` is the single canonical store for the link graph. When a tagger-emitted edge is wrong, `unlink_thoughts(from, relation, {to_entity|to_person|to_url})` soft-deletes it (audit trail preserved). The entities field on the thought itself is corrected by re-tag cycles or direct psql edit — both operator-initiated, neither blocking your normal flow.
 
 ## Honesty
 

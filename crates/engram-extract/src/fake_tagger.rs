@@ -1,14 +1,14 @@
 //! `FakeTagger` — deterministic, in-memory `Tagger` for tests.
 //!
 //! Configurable via [`FakeBehavior`] (always-succeed vs always-fail-with-X)
-//! and [`FakeTaggerOutput`] (what `Tags` to return when succeeding). Records
-//! the most recent call's content as a [`RecordedTag`] so tests can assert
-//! the drainer passed the correct thought content.
+//! and [`FakeTaggerOutput`] (what [`TagOutput`] to return when succeeding).
+//! Records the most recent call's content as a [`RecordedTag`] so tests can
+//! assert the drainer passed the correct thought content.
 //!
 //! Mirrors `engram-embed::FakeEmbedder` in shape.
 
 use async_trait::async_trait;
-use engram_core::{ScopeVocab, Tagger, TaggerError, Tags};
+use engram_core::{ScopeVocab, TagOutput, Tagger, TaggerError, Tags};
 use std::sync::{Arc, Mutex};
 
 /// Failure-mode selector. `Deterministic` succeeds and returns whatever
@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 /// corresponding `TaggerError` variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FakeBehavior {
-    /// Return `Tags` per the configured `FakeTaggerOutput`.
+    /// Return `TagOutput` per the configured `FakeTaggerOutput`.
     Deterministic,
     /// Always fail with `TaggerError::Timeout`.
     Timeout,
@@ -31,14 +31,14 @@ pub enum FakeBehavior {
 /// responses for test fixtures.
 #[derive(Debug, Clone)]
 pub enum FakeTaggerOutput {
-    /// Always return `Tags::default()` (every field empty / `None`).
+    /// Always return `TagOutput::default()` (empty tags + empty relations).
     Empty,
-    /// Always return the given `Tags`, regardless of input content.
-    Canned(Tags),
+    /// Always return the given `TagOutput`, regardless of input content.
+    Canned(TagOutput),
     /// If the input content contains any of the substrings (case-sensitive),
-    /// return the corresponding `Tags`. First match wins. Falls back to
-    /// `Tags::default()` when no substring matches.
-    Substring(Vec<(String, Tags)>),
+    /// return the corresponding `TagOutput`. First match wins. Falls back to
+    /// `TagOutput::default()` when no substring matches.
+    Substring(Vec<(String, TagOutput)>),
 }
 
 /// One observed call to `tag()` — content and optional scope vocabulary the
@@ -84,17 +84,29 @@ impl FakeTagger {
         }
     }
 
-    /// Build a deterministic tagger that always returns the given `Tags`.
+    /// Build a deterministic tagger that always returns the given `Tags`
+    /// (with empty relations). Convenience shorthand for the common case
+    /// where the test only cares about the persisted Tags shape.
     pub fn with_canned(tags: Tags) -> Self {
+        Self::with_canned_output(TagOutput {
+            tags,
+            relations: vec![],
+        })
+    }
+
+    /// Build a deterministic tagger that always returns the given
+    /// `TagOutput`. Use this when the test needs to specify both Tags and
+    /// tagger-emitted relations.
+    pub fn with_canned_output(output: TagOutput) -> Self {
         Self {
-            output: FakeTaggerOutput::Canned(tags),
+            output: FakeTaggerOutput::Canned(output),
             ..Self::new()
         }
     }
 
     /// Build a deterministic tagger driven by substring matching against the
-    /// thought content.
-    pub fn with_substring(rules: Vec<(String, Tags)>) -> Self {
+    /// thought content. Each rule maps a substring to a full `TagOutput`.
+    pub fn with_substring(rules: Vec<(String, TagOutput)>) -> Self {
         Self {
             output: FakeTaggerOutput::Substring(rules),
             ..Self::new()
@@ -138,7 +150,7 @@ impl Tagger for FakeTagger {
         &self,
         thought_content: &str,
         vocab: Option<&ScopeVocab>,
-    ) -> Result<Tags, TaggerError> {
+    ) -> Result<TagOutput, TaggerError> {
         *self.last_call.lock().expect("last_call mutex poisoned") = Some(RecordedTag {
             content: thought_content.to_string(),
             vocab: vocab.cloned(),
@@ -152,12 +164,12 @@ impl Tagger for FakeTagger {
                 "fake tagger configured to fail".into(),
             )),
             FakeBehavior::Deterministic => Ok(match &self.output {
-                FakeTaggerOutput::Empty => Tags::default(),
-                FakeTaggerOutput::Canned(t) => t.clone(),
+                FakeTaggerOutput::Empty => TagOutput::default(),
+                FakeTaggerOutput::Canned(o) => o.clone(),
                 FakeTaggerOutput::Substring(rules) => rules
                     .iter()
                     .find(|(key, _)| thought_content.contains(key))
-                    .map(|(_, tags)| tags.clone())
+                    .map(|(_, output)| output.clone())
                     .unwrap_or_default(),
             }),
         }
@@ -167,7 +179,7 @@ impl Tagger for FakeTagger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engram_core::TagKind;
+    use engram_core::{ExtractedRelation, ExtractedTarget, RelationKind, TagKind};
 
     fn sample_tags() -> Tags {
         Tags {
@@ -177,22 +189,40 @@ mod tests {
             topics: vec!["rust".to_string()],
             dates_mentioned: vec!["next Thursday".to_string()],
             kind: Some(TagKind::Task),
-            relations: vec![],
+        }
+    }
+
+    fn sample_output_with_relations() -> TagOutput {
+        TagOutput {
+            tags: sample_tags(),
+            relations: vec![ExtractedRelation {
+                relation: RelationKind::References,
+                target: ExtractedTarget::Url("https://anthropic.com".into()),
+                note: None,
+            }],
         }
     }
 
     #[tokio::test]
-    async fn fake_tagger_empty_returns_default_tags() {
+    async fn fake_tagger_empty_returns_default_tag_output() {
         let t = FakeTagger::new();
-        let tags = t.tag("anything", None).await.unwrap();
-        assert_eq!(tags, Tags::default());
+        let out = t.tag("anything", None).await.unwrap();
+        assert_eq!(out, TagOutput::default());
     }
 
     #[tokio::test]
-    async fn fake_tagger_canned_returns_given_tags() {
+    async fn fake_tagger_canned_tags_returns_them_with_empty_relations() {
         let t = FakeTagger::with_canned(sample_tags());
-        let tags = t.tag("any content goes here", None).await.unwrap();
-        assert_eq!(tags, sample_tags());
+        let out = t.tag("any content goes here", None).await.unwrap();
+        assert_eq!(out.tags, sample_tags());
+        assert!(out.relations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fake_tagger_canned_output_returns_both_tags_and_relations() {
+        let t = FakeTagger::with_canned_output(sample_output_with_relations());
+        let out = t.tag("any content", None).await.unwrap();
+        assert_eq!(out, sample_output_with_relations());
     }
 
     #[tokio::test]
@@ -200,31 +230,37 @@ mod tests {
         let rules = vec![
             (
                 "Sarah".to_string(),
-                Tags {
-                    people: vec!["Sarah".to_string()],
-                    ..Tags::default()
+                TagOutput {
+                    tags: Tags {
+                        people: vec!["Sarah".to_string()],
+                        ..Tags::default()
+                    },
+                    relations: vec![],
                 },
             ),
             (
                 "rust".to_string(),
-                Tags {
-                    topics: vec!["rust".to_string()],
-                    ..Tags::default()
+                TagOutput {
+                    tags: Tags {
+                        topics: vec!["rust".to_string()],
+                        ..Tags::default()
+                    },
+                    relations: vec![],
                 },
             ),
         ];
         let t = FakeTagger::with_substring(rules);
 
         let hit_sarah = t.tag("Met with Sarah yesterday", None).await.unwrap();
-        assert_eq!(hit_sarah.people, vec!["Sarah".to_string()]);
-        assert!(hit_sarah.topics.is_empty());
+        assert_eq!(hit_sarah.tags.people, vec!["Sarah".to_string()]);
+        assert!(hit_sarah.tags.topics.is_empty());
 
         let hit_rust = t.tag("learning rust ownership", None).await.unwrap();
-        assert_eq!(hit_rust.topics, vec!["rust".to_string()]);
-        assert!(hit_rust.people.is_empty());
+        assert_eq!(hit_rust.tags.topics, vec!["rust".to_string()]);
+        assert!(hit_rust.tags.people.is_empty());
 
         let no_match = t.tag("nothing here", None).await.unwrap();
-        assert_eq!(no_match, Tags::default());
+        assert_eq!(no_match, TagOutput::default());
     }
 
     #[tokio::test]

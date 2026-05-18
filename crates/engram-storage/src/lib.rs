@@ -2232,7 +2232,6 @@ mod tests {
             topics: vec!["meetings".into()],
             dates_mentioned: vec!["Thursday".into()],
             kind: Some(TagKind::Task),
-            relations: vec![],
         };
         update_thought_tags(&pool, id, &tags, "vllm/qwen2.5-7b-instruct", 1)
             .await

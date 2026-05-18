@@ -8,7 +8,7 @@
 //! `http://localhost:8000/v1`.
 
 use async_trait::async_trait;
-use engram_core::{ScopeVocab, Tagger, TaggerError, Tags};
+use engram_core::{ExtractedRelation, ScopeVocab, TagOutput, Tagger, TaggerError, Tags};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -339,7 +339,7 @@ impl Tagger for OpenAICompatibleTagger {
         &self,
         thought_content: &str,
         vocab: Option<&ScopeVocab>,
-    ) -> Result<Tags, TaggerError> {
+    ) -> Result<TagOutput, TaggerError> {
         let url = format!("{}/chat/completions", self.endpoint.trim_end_matches('/'));
 
         let system_content = {
@@ -399,14 +399,33 @@ impl Tagger for OpenAICompatibleTagger {
             .message
             .content;
 
-        let tags: Tags = serde_json::from_str(&content).map_err(|e| {
+        // Parse the LLM response into a transient document with both
+        // Tags fields AND relations. Split into TagOutput; the Tags
+        // portion gets persisted to thoughts.tags JSONB, the relations
+        // portion gets routed to thought_links by the drainer.
+        let doc: TaggerResponseDoc = serde_json::from_str(&content).map_err(|e| {
             TaggerError::MalformedResponse(format!(
                 "decoding tags payload (content={content:?}): {e}"
             ))
         })?;
 
-        Ok(tags)
+        Ok(TagOutput {
+            tags: doc.tags,
+            relations: doc.relations,
+        })
     }
+}
+
+/// Wire shape of the LLM response: the same `tags_response_format()` JSON
+/// schema the prompt enforces. Parsed transiently before splitting into
+/// the persisted `Tags` (JSONB column) and the transient
+/// `Vec<ExtractedRelation>` (routed to `thought_links` by the drainer).
+#[derive(Debug, Deserialize)]
+struct TaggerResponseDoc {
+    #[serde(flatten)]
+    tags: Tags,
+    #[serde(default)]
+    relations: Vec<ExtractedRelation>,
 }
 
 /// The `response_format` JSON object sent to the chat completions API. The
@@ -548,24 +567,33 @@ mod tests {
 
         let t =
             OpenAICompatibleTagger::new(config_for(format!("{}/v1", server.uri()), None)).unwrap();
-        let tags = t.tag("anything", None).await.unwrap();
-        assert_eq!(tags.people, vec!["Sarah".to_string(), "Ron".to_string()]);
+        let output = t.tag("anything", None).await.unwrap();
         assert_eq!(
-            tags.entities,
+            output.tags.people,
+            vec!["Sarah".to_string(), "Ron".to_string()]
+        );
+        assert_eq!(
+            output.tags.entities,
             vec!["engram".to_string(), "pgvector".to_string()]
         );
-        assert_eq!(tags.action_items, vec!["fix the login bug".to_string()]);
         assert_eq!(
-            tags.topics,
+            output.tags.action_items,
+            vec!["fix the login bug".to_string()]
+        );
+        assert_eq!(
+            output.tags.topics,
             vec!["rust".to_string(), "build-systems".to_string()]
         );
-        assert_eq!(tags.dates_mentioned, vec!["next Thursday".to_string()]);
-        assert_eq!(tags.kind, Some(TagKind::Task));
-        assert!(tags.relations.is_empty());
+        assert_eq!(
+            output.tags.dates_mentioned,
+            vec!["next Thursday".to_string()]
+        );
+        assert_eq!(output.tags.kind, Some(TagKind::Task));
+        assert!(output.relations.is_empty());
     }
 
     #[tokio::test]
-    async fn valid_response_with_relations_parses_to_tags() {
+    async fn valid_response_with_relations_parses_to_tag_output() {
         use engram_core::{ExtractedTarget, RelationKind};
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -599,20 +627,28 @@ mod tests {
 
         let t =
             OpenAICompatibleTagger::new(config_for(format!("{}/v1", server.uri()), None)).unwrap();
-        let tags = t.tag("anything", None).await.unwrap();
-        assert_eq!(tags.relations.len(), 2);
-        assert_eq!(tags.relations[0].relation, RelationKind::References);
+        let output = t.tag("anything", None).await.unwrap();
+        // Relations land in the transient TagOutput.relations vec, NOT in
+        // the persisted Tags struct (the tags JSONB column never sees them
+        // post-M6.x).
+        assert_eq!(output.relations.len(), 2);
+        assert_eq!(output.relations[0].relation, RelationKind::References);
         assert_eq!(
-            tags.relations[0].target,
+            output.relations[0].target,
             ExtractedTarget::Url("https://arxiv.org/abs/2004.04906".into())
         );
-        assert_eq!(tags.relations[0].note.as_deref(), Some("explicit citation"));
-        assert_eq!(tags.relations[1].relation, RelationKind::BelongsTo);
         assert_eq!(
-            tags.relations[1].target,
+            output.relations[0].note.as_deref(),
+            Some("explicit citation")
+        );
+        assert_eq!(output.relations[1].relation, RelationKind::BelongsTo);
+        assert_eq!(
+            output.relations[1].target,
             ExtractedTarget::Entity("Probe 2 experiment".into())
         );
-        assert_eq!(tags.relations[1].note, None);
+        assert_eq!(output.relations[1].note, None);
+        // Tags structure still has its 6 named fields; relations is not one of them.
+        assert_eq!(output.tags.entities, vec!["engram".to_string()]);
     }
 
     #[test]

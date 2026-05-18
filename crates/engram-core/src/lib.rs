@@ -20,7 +20,7 @@ pub use embedding::{Embedding, EmbeddingError, EmbeddingModel, EmbeddingStatus};
 pub use metadata::Metadata;
 pub use metrics::{ndcg_at_k, reciprocal_rank};
 pub use relation::{
-    LinkDirection, LinkId, LinkSource, RelationKind, ThoughtLink, UnknownLinkDirection,
+    LinkDirection, LinkId, LinkSource, LinkTarget, RelationKind, ThoughtLink, UnknownLinkDirection,
     UnknownLinkSource, UnknownRelationKind,
 };
 pub use scope::{Scope, ScopeError};

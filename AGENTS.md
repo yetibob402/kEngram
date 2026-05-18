@@ -14,7 +14,7 @@ Search engram opportunistically by judgment — not every turn, not never. Searc
 
 Capture autonomously when something is worth keeping — findings, decisions, refined understandings, characterized failure modes. Bar: "future-me would find this useful," not "this moment is interesting." **Always report the thought_id in your response.** Skip trivial restatements, conversation chatter, and near-duplicates (search first to check).
 
-Link autonomously when the relational structure is obvious (you captured a refinement of a thought you found; a finding that confirms a prior claim). Report the link. **Don't link speculatively** — adjacency isn't a relation.
+Link autonomously when the relational structure is obvious (you captured a refinement of a thought you found; a finding that confirms a prior claim). Report the link. **Don't link speculatively** — adjacency isn't a relation. When the natural target of a relation isn't itself a thought (an experiment, a project, a person, a URL), use the typed target fields on `link_thoughts` — `to_entity`, `to_person`, `to_url` — rather than capturing a placeholder thought.
 
 Thoughts are immutable. If I tell you a thought is wrong, retract it; don't try to modify.
 

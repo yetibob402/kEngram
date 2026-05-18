@@ -276,3 +276,57 @@ Tracked as an M5.x cleanup item; not urgent.
 The dogfood ran the refinement chain in the wild: `82256109` (silent-edge-removal finding) and `8751f1aa` (supports-semantic finding) both `references` the M5 milestone thought `74eb781c`; `8751f1aa` then `refines` `618f5a6b` (the original references-ambiguity finding from earlier in the dogfood). The dialectical chain is first-class: references-ambiguity → `supports` lands → refined finding on `supports` semantics. Walkable via `get_related_thoughts(618f5a6b, relations: ["refines"])` from the inbound direction.
 
 This is the citation-chain pattern the M5 milestone was motivated by, now visible in the live graph and queryable by relation type — the M4.1 dogfood's implicit-in-prose chain made explicit at M5+.
+
+---
+
+# M5.2 — Heterogeneous targets + audit + CLI scope-prefix
+
+**Status:** shipped 2026-05-17 as the M5 close-out iteration. Bundles three M5.x backlog items that emerged from M5 / M5.1 / M5.1.1 dogfood.
+
+## Scope
+
+1. **Heterogeneous link targets.** The `from` side of a `thought_links` row stays anchored on a thought; the `to` side gains three new shapes — entity (free-text), person (free-text), URL (`http(s)://...`). Discriminator column `to_kind` + three per-kind columns + a generated `to_value` column anchoring the unique-edge constraint.
+
+2. **Soft-delete + three-way unlink status.** `thought_links.deleted_at TIMESTAMPTZ NULL`. `delete_link` becomes UPDATE-with-RETURNING. `unlink_thoughts` returns a three-way status enum: `deleted_now` / `already_deleted` / `never_existed`. The partial unique index ignores soft-deleted rows, so re-creating a previously-removed edge inserts a fresh live row.
+
+3. **Migration audit table + CLI subcommand.** `migration_audit (id, migration, ran_at, rows_touched, notes)` populated by per-migration `INSERT` statements (process discipline; migration 0010 seeds the table with rows for 0009 + 0010). `engram audit migrations [--since X] [--limit N]` prints the log most-recent-first.
+
+4. **CLI scope-prefix flags.** `engram tag` and `engram embed-backfill` gain `--scope-prefix` (mutually exclusive with `--scope` via clap `conflicts_with`), threaded through to the corresponding storage helpers.
+
+5. **MCP surface deltas.** `link_thoughts` / `unlink_thoughts` args gain `to_entity` / `to_person` / `to_url` alongside `to_thought_id` (mutex; exactly-one validated server-side). `get_related_thoughts` args gain `target_kinds`; response gains `to_kind` / `to_value`, with thought-target hits retaining the existing scope / content_preview / retracted fields and non-thought hits leaving them null. SERVER_INSTRUCTIONS updated with the polymorphic-target surface; regression test extended to pin the four target-kind fields and the three-way unlink status enum.
+
+## Schema deltas
+
+- **Migration 0009** — heterogeneous targets. Adds `to_kind` (CHECK enum), `to_entity` / `to_person` / `to_url` (nullable), `to_value` (generated, COALESCE). Replaces `thought_links_unique_edge` (table-level UNIQUE) and `thought_links_no_self_reference`. Adds `thought_links_target_valid` (exactly-one-per-kind CHECK) and `thought_links_url_format` (http(s):// CHECK). New index `thought_links_from_kind_idx`. Non-destructive; existing rows default to `to_kind = 'thought'`.
+
+- **Migration 0010** — soft-delete + audit. Adds `thought_links.deleted_at`. Drops the table-level `thought_links_unique_edge` constraint added in 0009 and recreates it as a partial unique index (`WHERE deleted_at IS NULL`). Adds `thought_links_deleted_at_idx` partial index. Creates `migration_audit` table with `ran_at` index. Seeds audit rows for 0009 and 0010.
+
+## Decision log
+
+- **Discriminator-column over separate-tables (heterogeneous targets).** Postgres handles polymorphic targets fine via a discriminator + per-kind columns; the alternative (`thought_to_entity_links`, `thought_to_url_links`, etc.) fans out queries across tables and complicates traversal. The `to_value` generated column anchors a single unique-edge constraint covering all kinds — cleaner than per-kind unique indexes.
+
+- **Partial unique index for soft-delete idempotency.** `CREATE UNIQUE INDEX ... WHERE deleted_at IS NULL` lets a previously-soft-deleted edge sit inert while a fresh insert with the same triple succeeds. ON CONFLICT can target a partial unique index by `ON CONFLICT (cols) WHERE predicate` — works as expected; verified in `insert_after_soft_delete_creates_fresh_live_row` integration test.
+
+- **Free-text entities and persons (no first-class table).** Entities and persons are stored as strings on `thought_links.to_entity` / `to_person` rather than as FKs to dedicated tables. Engram has no entity-resolution layer in v0; first-class entity tables would precede tagger-extracted relations (still M5.x), and over-engineering them now would block M5.2 ship. Free-text is consistent with how the tagger already represents entities (in the `tags.entities[]` array — free-form strings).
+
+- **Three-way unlink status, not boolean discriminator.** `{ existed: bool, previously_removed: bool }` would work but composes awkwardly with future states (e.g., a `restored` status if `restore_link` ever ships). A tagged enum (`status`) leaves room for that without breaking the response shape further.
+
+- **`migration_audit` as a schema artifact + CLI surface, not a code helper.** Every future row-touching migration ends with an `INSERT INTO migration_audit` statement by convention (DEVELOPMENT.md note). A code-side `migration_audit_record!` helper would be over-engineered for one-line-per-migration usage. The CLI subcommand prints the log; no MCP-side surface for v1.
+
+- **`engram audit migrations` resource-as-positional, not `engram audit-migrations`.** Future audit resources (`engram audit links`, `engram audit thoughts`) compose under `engram audit <resource>`; a flat subcommand would have to add new top-level subcommands per resource.
+
+- **Schema breaking change accepted on `unlink_thoughts` response.** The shape moves from `{ existed: bool }` to `{ status: enum }`. Acceptable in single-operator dogfood; called out here so a future operator-facing changelog can pick it up.
+
+## Tests added
+
+Eleven new integration tests in engram-storage (heterogeneous-target writes, URL format CHECK, unique-edge across kinds, soft-delete + lookup_link_status three-way + fresh-row-after-soft-delete, target_kinds filter, migration_audit presence + ordering), seven new in engram-mcp (entity / URL / non-http rejection writes via the orchestrator, empty-name rejection, three-way unlink status, link-after-unlink, heterogeneous outbound retrieval, target_kinds filter), one CLI regression-shape extension. 317 total tests passing post-M5.2.
+
+## Out of scope (deferred)
+
+- Indexed search of `to_entity` / `to_person` / `to_url` columns. No GIN/B-tree on these in v1.
+- Entity/person resolution (would precede tagger-extracted relations).
+- Reverse traversal from non-thought targets ("what thoughts link to this URL?").
+- A `restore_link` tool. Operator can re-link via `link_thoughts` (fresh row) or UPDATE via psql.
+- Hard-purge / retention policy for soft-deleted edges.
+- Backfilling `migration_audit` for migrations 0001-0008.
+- `engram audit links`, `engram audit thoughts`, etc. — only `migrations` ships in M5.2.

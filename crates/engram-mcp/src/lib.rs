@@ -24,12 +24,12 @@ pub use drain::{
     drain_pending_tags,
 };
 pub use link::{
-    LinkError, LinkThoughtsRequest, LinkThoughtsResponse, MAX_LINK_NOTE_LEN,
-    UnlinkThoughtsResponse, link_thoughts, unlink_thoughts,
+    LinkError, LinkThoughtsRequest, LinkThoughtsResponse, MAX_LINK_NOTE_LEN, MAX_TARGET_NAME_LEN,
+    MAX_TARGET_URL_LEN, UnlinkStatus, UnlinkThoughtsResponse, link_thoughts, unlink_thoughts,
 };
 pub use relate::{
     GetRelatedThoughtsRequest, GetRelatedThoughtsResponse, RELATED_CONTENT_PREVIEW_LEN,
-    RelateError, RelatedThoughtHit, get_related_thoughts,
+    RelateError, RelatedTargetHit, get_related_thoughts,
 };
 pub use retract::{RetractError, RetractThoughtRequest, RetractThoughtResponse, retract_thought};
 pub use search::{

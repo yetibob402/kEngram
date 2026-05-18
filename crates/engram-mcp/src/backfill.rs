@@ -47,10 +47,13 @@ pub async fn embed_backfill(
     pool: &PgPool,
     embedder: &dyn Embedder,
     scope: Option<&str>,
+    scope_prefix: Option<&str>,
     limit: i64,
 ) -> Result<BackfillReport, BackfillError> {
     let model_id = &embedder.model().id;
-    let healed = engram_storage::enqueue_unembedded_thoughts(pool, model_id, scope, limit).await?;
+    let healed =
+        engram_storage::enqueue_unembedded_thoughts(pool, model_id, scope, scope_prefix, limit)
+            .await?;
 
     const BATCH: i64 = 16;
     let mut report = BackfillReport {
@@ -137,7 +140,7 @@ mod tests {
         assert_eq!(engram_storage::count_pending(&pool).await.unwrap(), 2);
 
         let good = FakeEmbedder::new();
-        let report = embed_backfill(&pool, &good, None, 100).await.unwrap();
+        let report = embed_backfill(&pool, &good, None, None, 100).await.unwrap();
         assert_eq!(report.healed, 0, "both thoughts were already queued");
         assert_eq!(report.embedded, 2);
         assert_eq!(report.failed, 0);
@@ -163,7 +166,7 @@ mod tests {
         assert_eq!(engram_storage::count_pending(&pool).await.unwrap(), 0);
 
         let good = FakeEmbedder::new();
-        let report = embed_backfill(&pool, &good, None, 100).await.unwrap();
+        let report = embed_backfill(&pool, &good, None, None, 100).await.unwrap();
         assert_eq!(report.healed, 1);
         assert_eq!(report.embedded, 1);
         assert!(
@@ -177,10 +180,10 @@ mod tests {
     async fn skips_already_embedded(pool: PgPool) {
         let id = cap(&pool, "already done", "global").await;
         let good = FakeEmbedder::new();
-        let first = embed_backfill(&pool, &good, None, 100).await.unwrap();
+        let first = embed_backfill(&pool, &good, None, None, 100).await.unwrap();
         assert_eq!(first.embedded, 1);
 
-        let second = embed_backfill(&pool, &good, None, 100).await.unwrap();
+        let second = embed_backfill(&pool, &good, None, None, 100).await.unwrap();
         assert_eq!(second.healed, 0);
         assert_eq!(second.embedded, 0);
         assert_eq!(second.failed, 0);
@@ -203,7 +206,7 @@ mod tests {
             .unwrap();
 
         let good = FakeEmbedder::new();
-        let report = embed_backfill(&pool, &good, Some("work"), 100)
+        let report = embed_backfill(&pool, &good, Some("work"), None, 100)
             .await
             .unwrap();
         assert_eq!(report.healed, 2);
@@ -232,7 +235,7 @@ mod tests {
             cap(&pool, &format!("t-{i}"), "global").await;
         }
         let good = FakeEmbedder::new();
-        let report = embed_backfill(&pool, &good, None, 2).await.unwrap();
+        let report = embed_backfill(&pool, &good, None, None, 2).await.unwrap();
         assert!(
             report.embedded <= 2,
             "must not exceed limit; got {}",
@@ -248,7 +251,9 @@ mod tests {
 
         let still_bad =
             FakeEmbedder::always_failing(EmbeddingModel::bge_m3(), FakeBehavior::Timeout);
-        let report = embed_backfill(&pool, &still_bad, None, 100).await.unwrap();
+        let report = embed_backfill(&pool, &still_bad, None, None, 100)
+            .await
+            .unwrap();
         assert_eq!(report.embedded, 0);
         assert_eq!(report.failed, 1);
         assert_eq!(engram_storage::count_pending(&pool).await.unwrap(), 1);

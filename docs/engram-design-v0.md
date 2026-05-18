@@ -75,9 +75,15 @@ The system is built in six capability milestones, preceded by a small environmen
 - Tagger version bumps 1→2; operator runs `engram tag --rerun --since 1970-01-01T00:00:00Z` to backfill existing rows.
 
 **M5 — Selective relations.**
-- Thought-to-thought graph layer on top of the M4 substrate. Closed relation vocabulary (initially `replaces`, `requires`, `references`, `belongs_to`, `decided_by`, `refines`; M5.1 added `supports` after day-one dogfood); thought-to-thought edges only at M5 (heterogeneous targets and tagger-extracted edges deferred to M5.2 and M5.x respectively).
+- Thought-to-thought graph layer on top of the M4 substrate. Closed relation vocabulary (initially `replaces`, `requires`, `references`, `belongs_to`, `decided_by`, `refines`; M5.1 added `supports` after day-one dogfood). Thought-to-thought edges at M5.
 - New `thought_links` table; new MCP tools `link_thoughts`, `unlink_thoughts`, `get_related_thoughts`.
 - Captures the relational structure that actually shows up in conversation memory (decisions, references, dependencies, refinements, evidential support) without trying to be a general knowledge graph.
+
+**M5.2 — Heterogeneous targets + audit + CLI scope-prefix (close-the-M5-loop).**
+- Polymorphic targets on `thought_links`: the `to` side can be a thought, an entity (free-text), a person (free-text), or a URL. Migration 0009 adds discriminator + per-kind columns + generated `to_value`.
+- Soft-delete on `thought_links` (`deleted_at`); `unlink_thoughts` returns three-way status (`deleted_now` / `already_deleted` / `never_existed`). Partial unique index makes re-creating a previously-removed edge succeed cleanly.
+- `migration_audit` table + `engram audit migrations` CLI subcommand for operator-visible diagnostics on per-migration row impact.
+- `engram tag` and `engram embed-backfill` gain `--scope-prefix` (mutex with `--scope`), completing the M5.x retrieval-side scope_prefix work.
 
 **M6 — Artifacts.**
 - Long-form ingestion: `artifacts` and `artifact_chunks` populated. Chunking strategy lands here.
@@ -363,7 +369,9 @@ link_thoughts(6d2ef58e, "refines", 8a533e15, "first refinement")
 
 `get_related_thoughts(8a533e15, direction: "inbound")` returns the inbound `refines` edge from `6d2ef58e`. `get_related_thoughts(6d2ef58e, direction: "both")` returns both the outbound `refines→8a533e15` and the inbound `refines←137dba1d`. The implicit-in-prose citation chain is now first-class.
 
-**M5 out of scope.** Tagger-extracted relations (LLM finds the edge from prose; the breakthrough capability, deferred to M5.x because it requires entity resolution and its own dogfood loop). Heterogeneous targets (to-entity, to-person, to-URL — deferred because the polymorphic schema is real future work). Bulk-link MCP tooling, multi-hop traversal (`get_thoughts_n_hops_away`), and `engram link` CLI — deferred per usage demand.
+**M5.2 — polymorphic targets, soft-delete, migration audit.** M5.2 closes the M5 loop. (a) The `to` side of `thought_links` becomes polymorphic: a thought UUID, a free-text entity name, a free-text person name, or a URL. Migration 0009 adds a `to_kind` discriminator + per-kind columns + a generated `to_value` column that anchors the unique-edge constraint across all kinds. `link_thoughts` accepts one of `{to_thought_id, to_entity, to_person, to_url}` (mutex; exactly-one validated server-side); `get_related_thoughts` returns hits with `to_kind` / `to_value`, plus thought-only fields (`scope`, `content_preview`, `retracted`) populated only when `to_kind = 'thought'`. (b) Soft-delete on `thought_links` (`deleted_at TIMESTAMPTZ`); migration 0010 replaces the table-level unique constraint with a partial unique index (`WHERE deleted_at IS NULL`). `unlink_thoughts` returns a three-way status (`deleted_now` / `already_deleted` / `never_existed`), distinguishing operator-self-removed from never-existed. (c) `migration_audit` table seeded by migration 0010 with rows for 0009 + 0010; future row-touching migrations populate it by convention; `engram audit migrations` CLI surfaces the log.
+
+**M5.2 out of scope.** Tagger-extracted relations (LLM finds the edge from prose; the breakthrough capability, still M5.x because it requires entity resolution and its own dogfood loop). First-class entity / person tables (entities and persons are free-text strings on `thought_links` until tagger-extracted relations land). Reverse traversal from non-thought targets, restore-link tool, hard-purge of soft-deleted edges, `engram audit links` / `engram audit thoughts` sibling resources, bulk-link tooling, multi-hop traversal (`get_thoughts_n_hops_away`), `engram link` CLI shortcut — deferred per usage demand.
 
 ## 7. Retrieval path
 
@@ -408,9 +416,10 @@ Tools and the milestone in which each ships. Names and signatures are part of th
 | `recent_thoughts` | M1 | Browse by recency in a scope. Excludes retracted thoughts. |
 | `get_thought` | M1 (M3 retraction; M4 tags) | Full thought + provenance (`embedding_status`, `embedded_at`, `tags`, `tags_extractor_model`, `tags_extractor_version`, `tags_extracted_at`, `retracted_at`, `retracted_reason`). Direct lookup returns the row even if retracted — this is the audit path. |
 | `retract_thought` | M3 | Mark a thought as untrusted. Sets `thoughts.retracted_at`; the row is excluded from retrieval but stays in the DB for audit. |
-| `link_thoughts` | M5 | Create a thought-to-thought edge with one of seven closed-vocabulary relations (`replaces`, `requires`, `references`, `supports`, `belongs_to`, `decided_by`, `refines`). Idempotent on `(from, relation, to)`. |
-| `unlink_thoughts` | M5 | Delete a thought-to-thought edge by `(from, relation, to)`. Idempotent on already-deleted. |
-| `get_related_thoughts` | M5 | Walk the thought graph. Returns grouped `outbound` + `inbound` arrays; each entry carries the related thought's content_preview, retraction state, and edge metadata. Optional filters by relation type and direction. |
+| `list_scopes` | M5.x | Enumerate scopes currently in use with `thought_count` / `first_activity_at` / `last_activity_at`. Optional `prefix` filter. Sorted most-recently-used first. |
+| `link_thoughts` | M5 (M5.2 polymorphic targets) | Create a link from a thought to a polymorphic target — another thought (`to_thought_id`), entity name (`to_entity`), person name (`to_person`), or URL (`to_url`). Exactly one of the four target fields. Seven closed-vocabulary relations (`replaces`, `requires`, `references`, `supports`, `belongs_to`, `decided_by`, `refines`). Idempotent on `(from, relation, to_kind, to_value)`. |
+| `unlink_thoughts` | M5 (M5.2 soft-delete + three-way status) | Soft-delete a link by its `(from, relation, target)` triple. Returns `status: deleted_now | already_deleted | never_existed`. Re-creating a soft-deleted edge succeeds. |
+| `get_related_thoughts` | M5 (M5.2 polymorphic) | Walk the link graph. Returns grouped `outbound` + `inbound` arrays. Each hit carries `to_kind` / `to_value`; thought-target hits additionally surface the target's content_preview, scope, retraction state. Optional filters: `relations`, `target_kinds` (outbound only), `direction`. |
 | `ingest_artifact` | M6 | Async ingest of a longer document. |
 | `stats` | M7 | Per-scope counts, last activity, embedding model version, tagger model version. |
 

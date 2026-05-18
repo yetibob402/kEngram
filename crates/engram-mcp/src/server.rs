@@ -9,7 +9,9 @@
 //! `capture`, `search_thoughts`, `recent_thoughts`, `get_thought`,
 //! `retract_thought`. Tag drainage lives in the worker, not here.
 
-use engram_core::{Embedder, LinkDirection, Metadata, RelationKind, Scope, Source, ThoughtId};
+use engram_core::{
+    Embedder, LinkDirection, LinkTarget, Metadata, RelationKind, Scope, Source, ThoughtId,
+};
 use engram_embed::Reranker;
 use rmcp::{
     ServerHandler,
@@ -138,12 +140,29 @@ pub struct LinkThoughtsArgs {
     pub from_thought_id: String,
 
     #[schemars(
-        description = "Relation type. Must be one of the closed vocabulary: 'replaces' (this thought replaces an earlier one — most recent supersedes), 'requires' (this thought depends on another), 'references' (this thought points at another for context, like a citation — passive mention), 'supports' (this thought makes a claim that ACTIVELY CONFIRMS a claim made in another — experimental evidence, corroborating data, logical support; direction is FROM=confirmer, TO=claim-maker; ask 'does the FROM thought itself make a confirming claim?' — if it's just adjacent or topical, use `references` instead), 'belongs_to' (this thought is a member/sub-element of another, e.g. a finding under a parent thread), 'decided_by' (this thought is a decision attributed to another, e.g. a person-note or session-anchor), 'refines' (this thought is a refinement/iteration of an earlier one — both stand, but the newer thought represents updated thinking).\n\nCommon mistakes to avoid:\n- DO NOT use `refines` for citation or evidence. `refines` means the newer thought represents updated thinking on the SAME proposition — not 'the newer thought cites the older one for context.' Use `references` (or `supports` if the newer thought makes a confirming claim) instead.\n- DO NOT use `belongs_to` when the target is a peer or sibling — the v1 vocabulary lacks a sibling/peer-grouping relation. Model the parent (e.g., the experiment, the session) explicitly as its own thought and use `belongs_to` against that. If the parent isn't naturally a thought, capture one for it (one-line description is fine).\n- DO NOT use `decided_by` unless there is a clear decision-maker attribution. 'The team converged on X' is `decided_by` Team; 'the research suggests X' is `supports`, not `decided_by`.\n- DO NOT use `replaces` for refinement. `replaces` means the older thought is no longer the current thinking; use `refines` when both stand and the newer one just represents updated thinking.\n- DO NOT use `supports` for passive citation or summarization. `supports` requires the FROM thought to itself make a claim that confirms TO's claim. Summary/aggregation edges (FROM summarizes data points TO) are `references`, not `supports`. Passive prose mentions (FROM cites TO without endorsing) are `references`, not `supports`."
+        description = "Relation type. Must be one of the closed vocabulary: 'replaces' (this thought replaces an earlier one — most recent supersedes), 'requires' (this thought depends on another), 'references' (this thought points at another for context, like a citation — passive mention), 'supports' (this thought makes a claim that ACTIVELY CONFIRMS a claim made in another — experimental evidence, corroborating data, logical support; direction is FROM=confirmer, TO=claim-maker; ask 'does the FROM thought itself make a confirming claim?' — if it's just adjacent or topical, use `references` instead), 'belongs_to' (this thought is a member/sub-element of another, e.g. a finding under a parent thread), 'decided_by' (this thought is a decision attributed to another, e.g. a person-note or session-anchor), 'refines' (this thought is a refinement/iteration of an earlier one — both stand, but the newer thought represents updated thinking).\n\nCommon mistakes to avoid:\n- DO NOT use `refines` for citation or evidence. `refines` means the newer thought represents updated thinking on the SAME proposition — not 'the newer thought cites the older one for context.' Use `references` (or `supports` if the newer thought makes a confirming claim) instead.\n- DO NOT use `belongs_to` when the target is a peer or sibling — the v1 vocabulary lacks a sibling/peer-grouping relation. Model the parent (e.g., the experiment, the session) explicitly as its own thought (or, if it's not a thought at all, pass it as `to_entity`) and use `belongs_to` against that.\n- DO NOT use `decided_by` unless there is a clear decision-maker attribution. 'The team converged on X' is `decided_by` Team; 'the research suggests X' is `supports`, not `decided_by`.\n- DO NOT use `replaces` for refinement. `replaces` means the older thought is no longer the current thinking; use `refines` when both stand and the newer one just represents updated thinking.\n- DO NOT use `supports` for passive citation or summarization. `supports` requires the FROM thought to itself make a claim that confirms TO's claim. Summary/aggregation edges (FROM summarizes data points TO) are `references`, not `supports`. Passive prose mentions (FROM cites TO without endorsing) are `references`, not `supports`."
     )]
     pub relation: String,
 
-    #[schemars(description = "Target thought ID (the 'to' side of the relation). UUID string.")]
-    pub to_thought_id: String,
+    #[schemars(
+        description = "Target thought ID (UUID string) when linking to another thought. Mutually exclusive with `to_entity`, `to_person`, `to_url` — supply exactly one of the four target fields."
+    )]
+    pub to_thought_id: Option<String>,
+
+    #[schemars(
+        description = "Target entity name (free-text string, up to 200 chars) when the natural target of the relation isn't a thought — e.g. an experiment, a project, a session. Mutually exclusive with `to_thought_id`, `to_person`, `to_url`."
+    )]
+    pub to_entity: Option<String>,
+
+    #[schemars(
+        description = "Target person name (free-text string, up to 200 chars) when attributing a thought to a person (e.g. `decided_by` Ron). Mutually exclusive with `to_thought_id`, `to_entity`, `to_url`."
+    )]
+    pub to_person: Option<String>,
+
+    #[schemars(
+        description = "Target URL (must start with http:// or https://, up to 2048 chars) when referencing an external resource. Mutually exclusive with `to_thought_id`, `to_entity`, `to_person`."
+    )]
+    pub to_url: Option<String>,
 
     #[schemars(
         description = "Optional free-text annotation explaining the link (e.g. 'refines after probe 2B dogfood'). Stored on thought_links.note; max 1000 chars."
@@ -161,8 +180,25 @@ pub struct UnlinkThoughtsArgs {
     )]
     pub relation: String,
 
-    #[schemars(description = "Target thought ID (the 'to' side). UUID string.")]
-    pub to_thought_id: String,
+    #[schemars(
+        description = "Target thought ID (UUID string) when the edge being removed targeted a thought. Mutually exclusive with `to_entity`, `to_person`, `to_url`."
+    )]
+    pub to_thought_id: Option<String>,
+
+    #[schemars(
+        description = "Target entity name when the edge being removed targeted an entity. Mutually exclusive with `to_thought_id`, `to_person`, `to_url`."
+    )]
+    pub to_entity: Option<String>,
+
+    #[schemars(
+        description = "Target person name when the edge being removed targeted a person. Mutually exclusive with `to_thought_id`, `to_entity`, `to_url`."
+    )]
+    pub to_person: Option<String>,
+
+    #[schemars(
+        description = "Target URL when the edge being removed targeted a URL. Mutually exclusive with `to_thought_id`, `to_entity`, `to_person`."
+    )]
+    pub to_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -174,6 +210,11 @@ pub struct GetRelatedThoughtsArgs {
         description = "Optional filter to a subset of relation types (e.g. ['refines','replaces']). Each item must be in the closed vocabulary: replaces, requires, references, supports, belongs_to, decided_by, refines. Omit to return edges of every type."
     )]
     pub relations: Option<Vec<String>>,
+
+    #[schemars(
+        description = "Optional filter to a subset of target kinds (e.g. ['thought','url']). Each item must be one of: thought, entity, person, url. Applies to outbound edges only — inbound edges are always thought→thought by schema. Omit to return every kind."
+    )]
+    pub target_kinds: Option<Vec<String>>,
 
     #[schemars(
         description = "Traversal direction: 'outbound' (edges where the queried thought is the source — 'this refines X'), 'inbound' (edges where it is the target — 'X refines this'), or 'both' (default). Response always groups results into separate `outbound` and `inbound` arrays regardless."
@@ -392,7 +433,7 @@ impl EngramServer {
     }
 
     #[tool(
-        description = "Create a thought-to-thought relation in the M5 graph layer. Asserts an edge with one of seven closed-vocabulary relations: replaces, requires, references, supports, belongs_to, decided_by, refines. Idempotent on the (from, relation, to) triple — re-asserting the same edge returns is_new=false and the existing link_id. Validates that both endpoints exist and that from != to; returns clear error strings otherwise. Use this to link a thought to one it refines, replaces, references, supports (confirms a claim made by), depends on, belongs under, or that decided it. Heterogeneous targets (to-entity, to-person, to-URL) and tagger-extracted relations are not in M5 — model those agent-side in your own structure, or capture an intermediate thought (e.g. for an experiment, session, or external resource) and link to that thought instead."
+        description = "Create a relation from a thought to a polymorphic target in the engram graph layer. Asserts an edge with one of seven closed-vocabulary relations: replaces, requires, references, supports, belongs_to, decided_by, refines. The target side can be: another thought (`to_thought_id`), a free-text entity name (`to_entity` — for experiments, projects, sessions, abstract concepts), a person name (`to_person` — for attribution like `decided_by`), or a URL (`to_url` — for external resources). Supply exactly one of the four target fields. Idempotent on the (from, relation, to_kind, to_value) quadruple — re-asserting the same live edge returns is_new=false and the existing link_id. If the edge was previously soft-deleted via `unlink_thoughts`, a fresh live row is inserted and is_new=true. Validates that thought endpoints exist (from + to_thought_id), that from != to_thought_id when targeting a thought, that to_url starts with http:// or https://, and that to_entity/to_person aren't empty; returns clear error strings otherwise."
     )]
     async fn link_thoughts(
         &self,
@@ -400,19 +441,23 @@ impl EngramServer {
     ) -> Result<String, String> {
         let from = ThoughtId::from_str(&args.from_thought_id)
             .map_err(|e| format!("invalid from_thought_id: {e}"))?;
-        let to = ThoughtId::from_str(&args.to_thought_id)
-            .map_err(|e| format!("invalid to_thought_id: {e}"))?;
         let relation: RelationKind = args
             .relation
             .parse()
             .map_err(|e: engram_core::UnknownRelationKind| e.to_string())?;
+        let target = parse_link_target(
+            args.to_thought_id.as_deref(),
+            args.to_entity,
+            args.to_person,
+            args.to_url,
+        )?;
 
         let resp = link::link_thoughts(
             &self.pool,
             LinkThoughtsRequest {
                 from_thought_id: from,
                 relation,
-                to_thought_id: to,
+                target,
                 note: args.note,
             },
         )
@@ -423,14 +468,15 @@ impl EngramServer {
             "link_id": resp.link_id.to_string(),
             "from_thought_id": resp.from_thought_id.to_string(),
             "relation": resp.relation.as_str(),
-            "to_thought_id": resp.to_thought_id.to_string(),
+            "to_kind": resp.target.kind_str(),
+            "to_value": resp.target.value_str(),
             "is_new": resp.is_new,
         });
         serde_json::to_string(&body).map_err(|e| format!("response serialization error: {e}"))
     }
 
     #[tool(
-        description = "Delete a thought-to-thought edge by its (from, relation, to) triple. Idempotent — deleting an already-missing edge returns existed=false and is not an error. Mirrors `link_thoughts`'s argument shape (without `note`)."
+        description = "Soft-delete a link by its (from, relation, target) triple. Returns a three-way status discriminator: `deleted_now` (the edge was live and was just removed), `already_deleted` (the edge previously existed but had already been soft-deleted), or `never_existed` (no edge with this triple ever existed). Soft-deleted edges sit inert in the table — re-creating the same edge via `link_thoughts` succeeds (fresh row). Supply the target the same way as `link_thoughts` (exactly one of `to_thought_id`, `to_entity`, `to_person`, `to_url`)."
     )]
     async fn unlink_thoughts(
         &self,
@@ -438,25 +484,29 @@ impl EngramServer {
     ) -> Result<String, String> {
         let from = ThoughtId::from_str(&args.from_thought_id)
             .map_err(|e| format!("invalid from_thought_id: {e}"))?;
-        let to = ThoughtId::from_str(&args.to_thought_id)
-            .map_err(|e| format!("invalid to_thought_id: {e}"))?;
         let relation: RelationKind = args
             .relation
             .parse()
             .map_err(|e: engram_core::UnknownRelationKind| e.to_string())?;
+        let target = parse_link_target(
+            args.to_thought_id.as_deref(),
+            args.to_entity,
+            args.to_person,
+            args.to_url,
+        )?;
 
-        let resp = link::unlink_thoughts(&self.pool, from, relation, to)
+        let resp = link::unlink_thoughts(&self.pool, from, relation, &target)
             .await
             .map_err(map_link_error)?;
 
         let body = serde_json::json!({
-            "existed": resp.existed,
+            "status": resp.status.as_str(),
         });
         serde_json::to_string(&body).map_err(|e| format!("response serialization error: {e}"))
     }
 
     #[tool(
-        description = "Walk the M5 thought-to-thought graph from a single thought. Returns grouped `outbound` (edges where this thought is `from`) and `inbound` (edges where it's `to`) arrays. Each entry carries the related thought's id, scope, content_preview (first 400 chars), retracted-state flag, the edge's relation/note/source, and timestamps. Optional `relations` array restricts to specific relation types; optional `direction` ('outbound' | 'inbound' | 'both') is the traversal scope (default 'both'). Retracted thoughts on either side are included with `retracted: true` — the caller decides whether to show, dim, or hide them. Edges are agent-supplied via `link_thoughts(from, relation, to, note?)` and removed via `unlink_thoughts(from, relation, to)` — both idempotent on the (from, relation, to) triple. If the response is empty, no edges have been linked from/to this thought yet — `link_thoughts` is how the graph gets built."
+        description = "Walk the engram link graph from a single thought. Returns grouped `outbound` (edges where this thought is `from`) and `inbound` (edges where it's `to`) arrays. Each entry carries the edge's `link_id`, `relation`, `to_kind` (`thought` | `entity` | `person` | `url`), `to_value` (the target's UUID/name/URL string), the edge's `link_created_at`/`link_source`/`note`, plus — when `to_kind = thought` — the target thought's `thought_id`, `scope`, `content_preview` (first 400 chars), `content_truncated`, `thought_created_at`, and `retracted` flag. For non-thought targets those thought-specific fields are null. Optional `relations` array restricts to specific relation types; optional `target_kinds` array restricts outbound to specific target kinds (no effect on inbound, which is always thought→thought by schema); optional `direction` ('outbound' | 'inbound' | 'both') is the traversal scope (default 'both'). Retracted thoughts on either side are surfaced with `retracted: true` — the caller decides whether to show, dim, or hide them. Soft-deleted edges are excluded. Edges are agent-supplied via `link_thoughts` and removed via `unlink_thoughts`. If the response is empty, no live edges connect to this thought yet."
     )]
     async fn get_related_thoughts(
         &self,
@@ -491,6 +541,7 @@ impl EngramServer {
             GetRelatedThoughtsRequest {
                 thought_id,
                 relations,
+                target_kinds: args.target_kinds,
                 direction,
             },
         )
@@ -499,6 +550,50 @@ impl EngramServer {
 
         let body = related_thoughts_response_json(&resp);
         serde_json::to_string(&body).map_err(|e| format!("response serialization error: {e}"))
+    }
+}
+
+/// Parse the four optional target args into a `LinkTarget`. Returns an
+/// error string when zero or more-than-one is supplied. Also validates
+/// the inner string formats (UUID for thought, http(s):// for URL — though
+/// the URL prefix check is also enforced in `link::validate_target` and
+/// at the DB CHECK).
+fn parse_link_target(
+    to_thought_id: Option<&str>,
+    to_entity: Option<String>,
+    to_person: Option<String>,
+    to_url: Option<String>,
+) -> Result<LinkTarget, String> {
+    let count = [
+        to_thought_id.is_some(),
+        to_entity.is_some(),
+        to_person.is_some(),
+        to_url.is_some(),
+    ]
+    .into_iter()
+    .filter(|b| *b)
+    .count();
+    if count == 0 {
+        return Err(
+            "exactly one of to_thought_id, to_entity, to_person, to_url must be supplied".into(),
+        );
+    }
+    if count > 1 {
+        return Err(
+            "to_thought_id, to_entity, to_person, and to_url are mutually exclusive — supply exactly one".into(),
+        );
+    }
+    if let Some(id) = to_thought_id {
+        let parsed = ThoughtId::from_str(id).map_err(|e| format!("invalid to_thought_id: {e}"))?;
+        Ok(LinkTarget::Thought(parsed))
+    } else if let Some(name) = to_entity {
+        Ok(LinkTarget::Entity(name))
+    } else if let Some(name) = to_person {
+        Ok(LinkTarget::Person(name))
+    } else if let Some(url) = to_url {
+        Ok(LinkTarget::Url(url))
+    } else {
+        unreachable!("count check above guarantees exactly one is Some")
     }
 }
 
@@ -555,6 +650,16 @@ fn map_link_error(err: LinkError) -> String {
         LinkError::NoteTooLong { got, max } => {
             format!("note too long: {got} bytes (max {max} = {MAX_LINK_NOTE_LEN})")
         }
+        LinkError::EmptyTargetName => {
+            "to_entity / to_person target must not be empty or whitespace-only".to_string()
+        }
+        LinkError::TargetNameTooLong { got, max } => {
+            format!("to_entity / to_person target too long: {got} bytes (max {max})")
+        }
+        LinkError::TargetUrlTooLong { got, max } => {
+            format!("to_url target too long: {got} bytes (max {max})")
+        }
+        LinkError::InvalidUrl => "to_url must start with http:// or https://".to_string(),
         LinkError::Storage(e) => {
             tracing::error!(error = %e, "link/unlink storage error");
             "internal database error".to_string()
@@ -565,6 +670,9 @@ fn map_link_error(err: LinkError) -> String {
 fn map_relate_error(err: RelateError) -> String {
     match err {
         RelateError::ThoughtNotFound(id) => format!("thought not found: {id}"),
+        RelateError::UnknownTargetKind(s) => {
+            format!("unknown target_kind {s:?} (expected one of: thought, entity, person, url)")
+        }
         RelateError::Storage(e) => {
             tracing::error!(error = %e, "get_related_thoughts storage error");
             "internal database error".to_string()
@@ -575,17 +683,26 @@ fn map_relate_error(err: RelateError) -> String {
 fn related_thoughts_response_json(
     resp: &crate::relate::GetRelatedThoughtsResponse,
 ) -> serde_json::Value {
-    fn hit_to_json(h: &crate::relate::RelatedThoughtHit) -> serde_json::Value {
+    fn hit_to_json(h: &crate::relate::RelatedTargetHit) -> serde_json::Value {
+        // Thought-target hits carry thought_id + scope + content_preview +
+        // thought_created_at + retracted; non-thought hits leave those null.
+        let thought_id = match &h.target {
+            LinkTarget::Thought(id) => Some(id.to_string()),
+            _ => None,
+        };
         serde_json::json!({
             "link_id": h.link_id.to_string(),
             "relation": h.relation.as_str(),
-            "thought_id": h.thought_id.to_string(),
-            "scope": h.scope.as_str(),
+            "to_kind": h.target.kind_str(),
+            "to_value": h.target.value_str(),
+            "thought_id": thought_id,
+            "scope": h.scope.as_ref().map(|s| s.as_str()),
             "content_preview": h.content_preview,
             "content_truncated": h.content_truncated,
-            "thought_created_at": h.thought_created_at
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_default(),
+            "thought_created_at": h.thought_created_at.map(|t| {
+                t.format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default()
+            }),
             "link_created_at": h.link_created_at
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap_or_default(),
@@ -731,15 +848,15 @@ Top-level keys AND together; array values match by subset containment.
 
 `capture` is idempotent on content via SHA-256 fingerprint: same content captured twice returns the existing `thought_id` with `is_duplicate: true` and no new embedding/tag jobs enqueue.
 
-Relations (M5+): thoughts can be linked with a closed-vocabulary `(from, relation, to)` edge. Seven relations (M5 shipped 6; M5.1 added `supports` after dogfood):
+Relations (M5+): thoughts can be linked with a closed-vocabulary `(from, relation, target)` edge. Seven relations (M5 shipped 6; M5.1 added `supports` after dogfood):
   replaces, requires, references, supports, belongs_to, decided_by, refines
-Distinguish `references` (prose-level citation / contextual mention) from `supports` (evidential / corroborative — the newer thought confirms a claim made in the older one). Endpoints are thought_ids only — heterogeneous targets (entities, people, URLs) and tagger-extracted relations are not in M5. Use:
-  - `link_thoughts(from_thought_id, relation, to_thought_id, note?)` → idempotent on the (from, relation, to) triple; returns `is_new` + the link_id.
-  - `unlink_thoughts(from_thought_id, relation, to_thought_id)` → idempotent on already-deleted.
-  - `get_related_thoughts(thought_id, relations?, direction?)` → grouped `outbound` + `inbound` arrays with full edge metadata and a content_preview for each related thought.
+Distinguish `references` (prose-level citation / contextual mention) from `supports` (evidential / corroborative — the newer thought confirms a claim made in the older one). The `from` side is always a thought; the `to` side can be a thought, an entity name, a person name, or a URL (M5.2). Use:
+  - `link_thoughts(from_thought_id, relation, {to_thought_id | to_entity | to_person | to_url}, note?)` → supply exactly one of the four target fields. Idempotent on the (from, relation, to_kind, to_value) quadruple; returns `is_new` + the `link_id` + the `to_kind`/`to_value` discriminator.
+  - `unlink_thoughts(from_thought_id, relation, {one-of-four-targets})` → soft-delete; returns a three-way `status`: `deleted_now`, `already_deleted`, or `never_existed`.
+  - `get_related_thoughts(thought_id, relations?, target_kinds?, direction?)` → grouped `outbound` + `inbound` arrays. Each hit carries `to_kind`/`to_value`; thought-target hits also include `thought_id`, `scope`, `content_preview`, and `retracted`. Non-thought-target hits leave those fields null.
 Edges survive thought retraction (retracted thoughts surface with `retracted: true`); to fully sever a link, use `unlink_thoughts`.
 
-Workflow shape: after capturing a thought, use `link_thoughts` to express structural relationships — these are queryable via `get_related_thoughts` and not encodable in `metadata`. After a search, follow up with `get_related_thoughts(thought_id)` on a hit to walk the graph from there. Before capturing, call `list_scopes(prefix?)` to discover what scopes are in use — don't invent new scope names silently. Pass the same prefix to `search_thoughts(scope_prefix=...)` or `recent_thoughts(scope_prefix=...)` to query across a namespace of related scopes (exact-match `scope` and prefix-match `scope_prefix` are mutually exclusive).
+Workflow shape: after capturing a thought, use `link_thoughts` to express structural relationships — these are queryable via `get_related_thoughts` and not encodable in `metadata`. After a search, follow up with `get_related_thoughts(thought_id)` on a hit to walk the graph from there. When the natural target of a relation isn't a thought, prefer the typed `to_entity`/`to_person`/`to_url` over capturing a placeholder thought. Before capturing, call `list_scopes(prefix?)` to discover what scopes are in use — don't invent new scope names silently. Pass the same prefix to `search_thoughts(scope_prefix=...)` or `recent_thoughts(scope_prefix=...)` to query across a namespace of related scopes (exact-match `scope` and prefix-match `scope_prefix` are mutually exclusive).
 
 Tools: `capture`, `search_thoughts`, `recent_thoughts`, `list_scopes`, `get_thought`, `retract_thought`, `link_thoughts`, `unlink_thoughts`, `get_related_thoughts`.";
 
@@ -829,6 +946,22 @@ mod tests {
             assert!(
                 s.contains(tool),
                 "instructions should advertise tool `{tool}`"
+            );
+        }
+        // M5.2: the polymorphic target-kind enum is the load-bearing new
+        // surface; every kind must appear so agents know they can target
+        // non-thoughts. The three-way unlink status enum is also pinned —
+        // it's the operator-facing semantic upgrade from the old boolean.
+        for kind in ["to_thought_id", "to_entity", "to_person", "to_url"] {
+            assert!(
+                s.contains(kind),
+                "instructions should advertise target field `{kind}`",
+            );
+        }
+        for status in ["deleted_now", "already_deleted", "never_existed"] {
+            assert!(
+                s.contains(status),
+                "instructions should advertise unlink status `{status}`",
             );
         }
     }

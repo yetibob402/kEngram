@@ -54,9 +54,15 @@ enum Command {
     /// Embed thoughts that don't yet have an embedding row for the active
     /// embedder model. M4 thoughts-only (the `--target` flag is gone).
     EmbedBackfill {
-        /// Restrict to a single scope.
-        #[arg(long)]
+        /// Restrict to a single scope (exact match). Mutually exclusive
+        /// with `--scope-prefix`.
+        #[arg(long, conflicts_with = "scope_prefix")]
         scope: Option<String>,
+        /// Restrict to scopes starting with this prefix (e.g. `engram.`
+        /// matches `engram.dogfood`, `engram.test`, etc.). Mutually
+        /// exclusive with `--scope`.
+        #[arg(long, conflicts_with = "scope")]
+        scope_prefix: Option<String>,
         /// Maximum number of thoughts to embed in this run.
         #[arg(long, default_value_t = 1000)]
         limit: i64,
@@ -67,9 +73,14 @@ enum Command {
     /// (the tagger prompt has been bumped) — useful after upgrading the
     /// tagger model or prompt.
     Tag {
-        /// Restrict to a single scope (exact match).
-        #[arg(long)]
+        /// Restrict to a single scope (exact match). Mutually exclusive
+        /// with `--scope-prefix`.
+        #[arg(long, conflicts_with = "scope_prefix")]
         scope: Option<String>,
+        /// Restrict to scopes starting with this prefix. Mutually
+        /// exclusive with `--scope`.
+        #[arg(long, conflicts_with = "scope")]
+        scope_prefix: Option<String>,
         /// Max thoughts to process this run. Defaults to 200.
         #[arg(long, default_value_t = 200)]
         limit: i64,
@@ -90,6 +101,28 @@ enum Command {
     Bench {
         #[command(subcommand)]
         action: BenchAction,
+    },
+    /// Operator-diagnostics queries — surface state that's normally only
+    /// visible via psql. Subcommand-action shape leaves room for more
+    /// audit resources without flattening the CLI.
+    Audit {
+        #[command(subcommand)]
+        resource: AuditResource,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AuditResource {
+    /// Print the `migration_audit` log: per-migration ran_at, rows_touched,
+    /// notes. Most recent first.
+    Migrations {
+        /// Optional RFC-3339 lower bound on `ran_at`. Restrict the log to
+        /// recent entries.
+        #[arg(long)]
+        since: Option<String>,
+        /// Maximum rows to print. Defaults to 50.
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
     },
 }
 
@@ -550,6 +583,7 @@ async fn tag_drainer_loop(
 async fn run_embed_backfill(
     config: Config,
     scope: Option<String>,
+    scope_prefix: Option<String>,
     limit: i64,
 ) -> anyhow::Result<()> {
     let pool = PgPoolOptions::new()
@@ -560,13 +594,19 @@ async fn run_embed_backfill(
 
     let embedder = build_embedder(&config.embedder)?;
 
-    // Treat `--scope ""` as "no filter" (same empty-string normalisation
-    // applied elsewhere on the config side).
+    // Treat `--scope ""` / `--scope-prefix ""` as "no filter" (same
+    // empty-string normalisation applied elsewhere on the config side).
     let scope_filter = scope.filter(|s| !s.is_empty());
+    let scope_prefix_filter = scope_prefix.filter(|s| !s.is_empty());
 
-    let report =
-        engram_mcp::embed_backfill(&pool, embedder.as_ref(), scope_filter.as_deref(), limit)
-            .await?;
+    let report = engram_mcp::embed_backfill(
+        &pool,
+        embedder.as_ref(),
+        scope_filter.as_deref(),
+        scope_prefix_filter.as_deref(),
+        limit,
+    )
+    .await?;
 
     tracing::info!(
         healed = report.healed,
@@ -596,6 +636,7 @@ async fn run_embed_backfill(
 async fn run_tag(
     config: Config,
     scope: Option<String>,
+    scope_prefix: Option<String>,
     limit: i64,
     rerun: bool,
     since: Option<String>,
@@ -631,12 +672,14 @@ async fn run_tag(
             None
         };
 
-    // Treat `--scope ""` as "no filter" (matches the empty-string-as-None
-    // normalisation applied elsewhere).
+    // Treat `--scope ""` / `--scope-prefix ""` as "no filter" (matches the
+    // empty-string-as-None normalisation applied elsewhere).
     let scope_filter = scope.filter(|s| !s.is_empty());
+    let scope_prefix_filter = scope_prefix.filter(|s| !s.is_empty());
 
     tracing::info!(
         scope = ?scope_filter,
+        scope_prefix = ?scope_prefix_filter,
         limit,
         rerun,
         since = ?parsed_since,
@@ -650,6 +693,7 @@ async fn run_tag(
         tagger_version,
         rerun,
         scope_filter.as_deref(),
+        scope_prefix_filter.as_deref(),
         parsed_since,
         limit,
     )
@@ -734,17 +778,75 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve => run_serve(config).await,
         Command::Migrate => run_migrate(config).await,
         Command::Worker => run_worker(config).await,
-        Command::EmbedBackfill { scope, limit } => run_embed_backfill(config, scope, limit).await,
+        Command::EmbedBackfill {
+            scope,
+            scope_prefix,
+            limit,
+        } => run_embed_backfill(config, scope, scope_prefix, limit).await,
         Command::Tag {
             scope,
+            scope_prefix,
             limit,
             rerun,
             since,
-        } => run_tag(config, scope, limit, rerun, since).await,
+        } => run_tag(config, scope, scope_prefix, limit, rerun, since).await,
         Command::Bench { action } => match action {
             BenchAction::Rerank { corpus } => run_bench_rerank(config, corpus).await,
         },
+        Command::Audit { resource } => match resource {
+            AuditResource::Migrations { since, limit } => {
+                run_audit_migrations(config, since, limit).await
+            }
+        },
     }
+}
+
+async fn run_audit_migrations(
+    config: Config,
+    since: Option<String>,
+    limit: i64,
+) -> anyhow::Result<()> {
+    let parsed_since = match since {
+        Some(s) => Some(
+            time::OffsetDateTime::parse(&s, &time::format_description::well_known::Rfc3339)
+                .with_context(|| format!("parsing --since={s:?} as RFC-3339"))?,
+        ),
+        None => None,
+    };
+
+    let pool = PgPoolOptions::new()
+        .max_connections(config.database.max_connections)
+        .connect(&config.database.url)
+        .await
+        .with_context(|| format!("connecting to {}", config.database.url))?;
+
+    let rows = engram_storage::query_migration_audit(&pool, parsed_since, limit)
+        .await
+        .context("querying migration_audit")?;
+
+    if rows.is_empty() {
+        println!("(no migration_audit rows)");
+        return Ok(());
+    }
+
+    // Two-line-per-row "header + notes" rendering. Migration names are
+    // long; a column-table would either truncate them or fan out wide.
+    for r in rows {
+        let ran_at = r
+            .ran_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| r.ran_at.to_string());
+        println!(
+            "{ran_at}  rows_touched={rows}  {name}",
+            ran_at = ran_at,
+            rows = r.rows_touched,
+            name = r.migration,
+        );
+        if let Some(notes) = r.notes {
+            println!("    {notes}");
+        }
+    }
+    Ok(())
 }
 
 async fn run_bench_rerank(config: Config, corpus: PathBuf) -> anyhow::Result<()> {

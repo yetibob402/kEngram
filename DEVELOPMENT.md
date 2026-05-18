@@ -87,6 +87,8 @@ sqlx migrate run
 
 The migration creates the three required extensions in the `engram` database and ships the schema described in `docs/engram-design-v0.md` §5.
 
+**Migration audit (M5.2+).** The `migration_audit` table (introduced in 0010) records what each migration did — `migration`, `ran_at`, `rows_touched`, optional `notes`. Convention going forward: any row-touching migration ends with an `INSERT INTO migration_audit (...)` statement so the operator can verify per-migration impact via `engram audit migrations` rather than psql. Schema-only migrations should still insert an audit row with `rows_touched = 0` and a one-line `notes` summary.
+
 ### 5. Build, test, run
 
 ```bash

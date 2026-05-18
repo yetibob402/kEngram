@@ -1,10 +1,13 @@
 //! Relation types — the M5 thought-to-thought graph layer.
 //!
-//! Edges live in `thought_links` (migration 0007). M5 commits to a small
-//! closed relation vocabulary (`replaces`, `requires`, `references`,
-//! `belongs_to`, `decided_by`, `refines`) and to thought-to-thought edges
-//! only — heterogeneous targets (to-entity, to-person, to-URL) and
-//! tagger-extracted relations are M5.x.
+//! Edges live in `thought_links` (migration 0007). The closed relation
+//! vocabulary is `replaces`, `requires`, `references`, `supports`,
+//! `belongs_to`, `decided_by`, `refines` (M5 shipped six; M5.1 added
+//! `supports`).
+//!
+//! M5.2 added heterogeneous targets — a link's `to` side can be a thought,
+//! an entity, a person, or a URL (see [`LinkTarget`]) — and soft-delete on
+//! the edge row (`deleted_at`). Tagger-extracted relations remain M5.x.
 
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
@@ -161,6 +164,88 @@ impl FromStr for LinkDirection {
 #[error("unknown link direction: {0:?} (expected 'outbound', 'inbound', or 'both')")]
 pub struct UnknownLinkDirection(pub String);
 
+/// Polymorphic target of a link (M5.2). The `from` side of a link is
+/// always a thought; the `to` side can be a thought, a free-text entity
+/// name, a free-text person name, or a URL.
+///
+/// Wire shape uses `{"kind": "<variant>", "value": "<string>"}` —
+/// matches the `to_kind` / `to_value` columns on `thought_links` and the
+/// flattened shape used by the MCP layer (`to_thought_id` / `to_entity` /
+/// `to_person` / `to_url` args on `link_thoughts`).
+///
+/// Entity and person targets are free-text strings; engram has no
+/// first-class entity or person table in v1. URL targets must start with
+/// `http://` or `https://` (DB-side CHECK).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum LinkTarget {
+    Thought(ThoughtId),
+    Entity(String),
+    Person(String),
+    Url(String),
+}
+
+impl LinkTarget {
+    /// Stable discriminator string matching the `thought_links.to_kind`
+    /// CHECK constraint values.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Thought(_) => "thought",
+            Self::Entity(_) => "entity",
+            Self::Person(_) => "person",
+            Self::Url(_) => "url",
+        }
+    }
+
+    /// Stable string form of the target value matching the
+    /// `thought_links.to_value` generated column. Thought targets
+    /// stringify the UUID; other kinds return the underlying string.
+    pub fn value_str(&self) -> String {
+        match self {
+            Self::Thought(id) => id.as_uuid().to_string(),
+            Self::Entity(name) | Self::Person(name) => name.clone(),
+            Self::Url(url) => url.clone(),
+        }
+    }
+
+    /// Extracts the thought id when the target is a thought; `None` otherwise.
+    /// Convenient for storage-layer code writing the four typed columns.
+    pub fn as_thought_id(&self) -> Option<&ThoughtId> {
+        if let Self::Thought(id) = self {
+            Some(id)
+        } else {
+            None
+        }
+    }
+
+    /// Extracts the entity name when the target is an entity; `None` otherwise.
+    pub fn as_entity(&self) -> Option<&str> {
+        if let Self::Entity(name) = self {
+            Some(name.as_str())
+        } else {
+            None
+        }
+    }
+
+    /// Extracts the person name when the target is a person; `None` otherwise.
+    pub fn as_person(&self) -> Option<&str> {
+        if let Self::Person(name) = self {
+            Some(name.as_str())
+        } else {
+            None
+        }
+    }
+
+    /// Extracts the URL when the target is a URL; `None` otherwise.
+    pub fn as_url(&self) -> Option<&str> {
+        if let Self::Url(url) = self {
+            Some(url.as_str())
+        } else {
+            None
+        }
+    }
+}
+
 /// Stable identity for a row in `thought_links`. Wraps a UUID so the type
 /// system can distinguish a link id from a thought id (mirrors `ThoughtId`'s
 /// shape).
@@ -208,15 +293,20 @@ impl FromStr for LinkId {
 }
 
 /// The full row-shape of a `thought_links` edge.
+///
+/// M5.2 generalized the target from `to_thought_id: ThoughtId` to a
+/// polymorphic `target: LinkTarget` and added the `deleted_at` soft-delete
+/// marker. Live (non-soft-deleted) rows have `deleted_at = None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThoughtLink {
     pub id: LinkId,
     pub from_thought_id: ThoughtId,
     pub relation: RelationKind,
-    pub to_thought_id: ThoughtId,
+    pub target: LinkTarget,
     pub source: LinkSource,
     pub note: Option<String>,
     pub created_at: OffsetDateTime,
+    pub deleted_at: Option<OffsetDateTime>,
 }
 
 #[cfg(test)]
@@ -308,5 +398,75 @@ mod tests {
         let s = id.to_string();
         let parsed: LinkId = s.parse().unwrap();
         assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn link_target_kind_str_matches_variant() {
+        let tid = ThoughtId::new();
+        assert_eq!(LinkTarget::Thought(tid).kind_str(), "thought");
+        assert_eq!(LinkTarget::Entity("foo".into()).kind_str(), "entity");
+        assert_eq!(LinkTarget::Person("alice".into()).kind_str(), "person");
+        assert_eq!(
+            LinkTarget::Url("https://example.com".into()).kind_str(),
+            "url"
+        );
+    }
+
+    #[test]
+    fn link_target_value_str_round_trips() {
+        let tid = ThoughtId::new();
+        assert_eq!(
+            LinkTarget::Thought(tid).value_str(),
+            tid.as_uuid().to_string()
+        );
+        assert_eq!(
+            LinkTarget::Entity("acme corp".into()).value_str(),
+            "acme corp"
+        );
+        assert_eq!(LinkTarget::Person("Ron".into()).value_str(), "Ron");
+        assert_eq!(
+            LinkTarget::Url("https://anthropic.com".into()).value_str(),
+            "https://anthropic.com"
+        );
+    }
+
+    #[test]
+    fn link_target_accessors_return_some_only_for_matching_variant() {
+        let tid = ThoughtId::new();
+        let t = LinkTarget::Thought(tid);
+        assert_eq!(t.as_thought_id(), Some(&tid));
+        assert_eq!(t.as_entity(), None);
+        assert_eq!(t.as_person(), None);
+        assert_eq!(t.as_url(), None);
+
+        let e = LinkTarget::Entity("foo".into());
+        assert_eq!(e.as_thought_id(), None);
+        assert_eq!(e.as_entity(), Some("foo"));
+        assert_eq!(e.as_person(), None);
+        assert_eq!(e.as_url(), None);
+    }
+
+    #[test]
+    fn link_target_serializes_as_kind_value_tagged() {
+        let tid = ThoughtId::new();
+        let json = serde_json::to_value(LinkTarget::Thought(tid)).unwrap();
+        assert_eq!(json["kind"], "thought");
+        assert_eq!(json["value"], tid.as_uuid().to_string());
+
+        let json = serde_json::to_value(LinkTarget::Url("https://x.io".into())).unwrap();
+        assert_eq!(json["kind"], "url");
+        assert_eq!(json["value"], "https://x.io");
+    }
+
+    #[test]
+    fn link_target_deserializes_from_kind_value_tagged() {
+        let tid = ThoughtId::new();
+        let s = format!(r#"{{"kind": "thought", "value": "{}"}}"#, tid.as_uuid());
+        let parsed: LinkTarget = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed, LinkTarget::Thought(tid));
+
+        let parsed: LinkTarget =
+            serde_json::from_str(r#"{"kind": "entity", "value": "acme"}"#).unwrap();
+        assert_eq!(parsed, LinkTarget::Entity("acme".into()));
     }
 }

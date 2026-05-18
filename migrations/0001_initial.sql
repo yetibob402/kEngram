@@ -1,5 +1,5 @@
 -- Engram initial schema.
--- Mirrors design doc §5 (docs/engram-design-v0.md). Future migrations add
+-- Mirrors design doc §5 (DESIGN.md). Future migrations add
 -- per-model HNSW partial indexes when new embedders are introduced.
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;

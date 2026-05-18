@@ -163,7 +163,7 @@ End state: three-band confidence routing live with `flagged` surfacing in MCP re
 - [x] Write the closing `m3-progress.md` History entry. *(2026-05-16 entry above.)*
 - [x] Mark M3 ✅ in `README.md`. *(Done in the M4 Wave 5b documentation pass.)*
 
-The 7 dogfood rounds produced negative knowledge: *the extraction-side abstraction was wrong for the use case.* Statements were faithful; triples were brittle in ways no v4 prompt iteration could consistently fix. Rather than ship M3 with a known-broken extraction surface and try to fix it in a follow-on prompt-engineering loop, the operator and architect agreed to collapse the schema (M4, [Path B-OB1](../engram-design-v0.md#10-operational-shape--what-makes-the-store-honest)) and retire the facts pipeline entirely. The M3 retrieval improvements (hybrid + reranker + A/B harness) all survive the collapse and operate on the simpler thoughts-only schema.
+The 7 dogfood rounds produced negative knowledge: *the extraction-side abstraction was wrong for the use case.* Statements were faithful; triples were brittle in ways no v4 prompt iteration could consistently fix. Rather than ship M3 with a known-broken extraction surface and try to fix it in a follow-on prompt-engineering loop, the operator and architect agreed to collapse the schema (M4, [Path B-OB1](../../DESIGN.md#10-operational-shape--what-makes-the-store-honest)) and retire the facts pipeline entirely. The M3 retrieval improvements (hybrid + reranker + A/B harness) all survive the collapse and operate on the simpler thoughts-only schema.
 
 ## History
 

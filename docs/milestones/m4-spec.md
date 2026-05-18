@@ -496,7 +496,7 @@ Total estimated deletions: ~110 tests. Net target with new tagger/fingerprint/ta
 | `tests/fixtures/bench-rerank.example.json` | 5a (CLI) | Drop `target` field |
 | `README.md` | 5b (DOCS) | Major rewrite of extraction sections |
 | `DEVELOPMENT.md` | 5b (DOCS) | Drop reflect/extractor, add tag/tagger |
-| `docs/engram-design-v0.md` | 5b (DOCS) | Major revision §6 + §10 |
+| `DESIGN.md` | 5b (DOCS) | Major revision §6 + §10 |
 | `docs/milestones/m3-progress.md` | 5b (DOCS) | Final close-out entry |
 | `docs/milestones/m3-search-quality.md` | 5b (DOCS) | Status ✅ on retrieval items |
 | `docs/milestones/m4-collapse-to-thoughts.md` | 5b (DOCS) | Add Progress section |

@@ -1,5 +1,5 @@
 # Dev-only Postgres + TEI reranker for Engram. Production deployment uses
-# systemd-managed services (see docs/engram-design-v0.md §11), not this file.
+# systemd-managed services (see DESIGN.md §11), not this file.
 #
 # The pgvector/pgvector:pg16 image bundles the `vector`, `pg_trgm`, and
 # `pgcrypto` extensions — i.e. everything the M1 migration's CREATE EXTENSION

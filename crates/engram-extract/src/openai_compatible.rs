@@ -192,7 +192,7 @@ impl OpenAICompatibleTagger {
 /// shouldn't be considered comparable; `engram tag --rerun` then re-tags
 /// under the new version. If you override this via
 /// `OpenAICompatibleConfig::system_prompt`, you are responsible for also
-/// bumping the version — see `docs/engram-design-v0.md` §6 / §10.
+/// bumping the version — see `DESIGN.md` §6 / §10.
 pub const BUNDLED_TAGGER_PROMPT: &str = "\
 You are a tagging assistant. Given a single thought from a memory service, return its metadata tags as JSON.
 

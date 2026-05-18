@@ -4,12 +4,12 @@
 
 Engram is a self-hosted, MCP-native AI memory service. It stores agent "thoughts" and extracted facts in Postgres + pgvector, and exposes a small set of MCP tools (capture, search, etc.) so any MCP-capable client — Claude Code, opencode, Claude Desktop, ChatGPT — reads and writes the same persistent backing store.
 
-The system is built across five milestones (M1 → M5). At any given moment, only one milestone is the "current focus" and only its features are expected to be implemented. The terminal-state design lives in `docs/engram-design-v0.md`; per-milestone scope and success criteria live in `docs/milestones/`.
+The system is being built across seven capability milestones (M1 → M7), preceded by an environment milestone (M0). All milestones through M6.1 are shipped as of 2026-05-18; M7 (operational maturity) is the next focus. The terminal-state design lives in `DESIGN.md`; per-milestone scope and success criteria live in `docs/milestones/`.
 
 ## Documents
 
-- **`docs/engram-design-v0.md`** — design doc. Describes the M5-complete terminal system. Inline milestone callouts (`[M1]`, `[M2+]`, etc.) flag features by milestone. **Read it before starting any non-trivial work.**
-- **`docs/milestones/m{N}-*.md`** — one document per milestone (M0–M5). Scope, success criteria, schema/MCP/crate deltas, dependencies, open questions. The current-focus milestone document is the unit of work for the next planning conversation.
+- **`DESIGN.md`** — design doc. Describes the M5-complete terminal system. Inline milestone callouts (`[M1]`, `[M2+]`, etc.) flag features by milestone. **Read it before starting any non-trivial work.**
+- **`docs/milestones/m{N}-*.md`** — one document per milestone (M0–M7). Scope, success criteria, schema/MCP/crate deltas, dependencies, open questions. The current-focus milestone document is the unit of work for the next planning conversation.
 - **`docs/milestones/m{N}-progress.md`** — paired progress doc for the current-focus milestone. Phased checklist + dated History notes. Updated as work lands.
 - **`DEVELOPMENT.md`** — first-time setup runbook (Docker Postgres, Ollama, `DATABASE_URL`).
 
@@ -40,9 +40,11 @@ If you find yourself reasoning about a design choice that the design doc already
 .
 ├── Cargo.toml              # workspace manifest, [workspace.dependencies] block
 ├── CLAUDE.md               # this file
+├── DESIGN.md               # the design doc (terminal state)
 ├── README.md
+├── DEVELOPMENT.md          # operator setup + configuration reference
+├── AGENTS.md               # agent-facing usage preferences
 ├── docs/
-│   ├── engram-design-v0.md # the design doc (terminal state)
 │   └── milestones/         # one doc per milestone
 ├── crates/
 │   ├── engram-core/        # domain types, Embedder trait, retrieval fusion (pure)
@@ -103,7 +105,7 @@ cargo test --workspace --features integration  # requires running Postgres + TEI
 
 ## Current state
 
-- ✅ Design doc revised (v0.1) after milestone-roadmap brainstorm. See `docs/engram-design-v0.md`.
+- ✅ Design doc revised (v0.1) after milestone-roadmap brainstorm. See `DESIGN.md`.
 - ✅ Per-milestone documents drafted at `docs/milestones/m{0..5}-*.md`.
 - ✅ **M0 dev environment shipped.** `docker-compose.yml` at repo root for Postgres 16 + pgvector + pg_trgm + pgcrypto. `DEVELOPMENT.md` documents first-time setup. Dev-mode embedder is Ollama at `http://localhost:11434/v1/embeddings` (model `bge-m3`).
 - ⏳ **Current focus: M1 design.** Workspace, migration, capture/search, and MCP surface are all yet to be designed in detail.

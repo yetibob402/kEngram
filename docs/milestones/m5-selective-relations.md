@@ -102,7 +102,7 @@ No new subcommands. Linking is MCP-only — operators link via Claude Code/Deskt
 - `crates/engram-mcp/src/server.rs` — three `#[tool]` methods, SERVER_INSTRUCTIONS, regression test
 - `crates/engram-mcp/src/lib.rs` — module declarations + re-exports
 - `README.md` — roadmap table (M5/M6/M7); MCP tool surface table; new "How relations work" section
-- `docs/engram-design-v0.md` — §3.5 roadmap renumbered; §6.6 selective relations sidecar added; §8 MCP surface table updated; §9 type listing; revision history
+- `DESIGN.md` — §3.5 roadmap renumbered; §6.6 selective relations sidecar added; §8 MCP surface table updated; §9 type listing; revision history
 
 **Renamed (via `git mv`):**
 - `docs/milestones/m5-artifacts.md` → `m6-artifacts.md`
@@ -207,7 +207,7 @@ Migration 0008 is a pure CHECK constraint relax — drops the old `thought_links
 - `crates/engram-core/src/relation.rs` — added `Supports` variant to `RelationKind` enum; `as_str`, `FromStr`, `ALL`, error message text all updated. `ALL` is now `[RelationKind; 7]`.
 - `migrations/0008_relation_supports.sql` — CHECK constraint extension.
 - `crates/engram-mcp/src/server.rs` — `LinkThoughtsArgs.relation` description gains the `supports` entry + "Common mistakes" block; `UnlinkThoughtsArgs.relation` and `GetRelatedThoughtsArgs.relations` descriptions mention `supports`; `SERVER_INSTRUCTIONS` lists all seven relations + the `references`/`supports` distinction; regression test `server_instructions_advertise_*` pins `supports`.
-- `README.md`, `docs/engram-design-v0.md` — vocabulary table / §6.6 / §9 / revision history updated.
+- `README.md`, `DESIGN.md` — vocabulary table / §6.6 / §9 / revision history updated.
 
 ### Dogfood plan (post-merge)
 

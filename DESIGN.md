@@ -45,7 +45,7 @@ The system is built in six capability milestones, preceded by a small environmen
 - `DEVELOPMENT.md` runbook for first-time setup. No code is written; M0 only ensures M1's code has somewhere to run.
 
 **M1 — Capture and search.** *The floor.*
-- Schema ships with `thoughts`, `embeddings`, `artifacts`, `artifact_chunks` (artifact tables are reserved for M5 and stay empty). Future-milestone tables exist now so later migrations don't touch live data.
+- Schema ships with `thoughts` and `embeddings`. Migration 0001 also ships `artifacts` / `artifact_chunks` tables for what was then a planned long-form-ingestion milestone; the artifacts plan was dropped in the M6 reshape (see revision history 2026-05-17), and those two tables remain inert pending a future drop migration.
 - Sync embedding on `capture` via TEI sidecar (BGE-M3, 1024-dim).
 - Hybrid retrieval: vector kNN ∪ trigram lexical search, fused via reciprocal rank fusion (RRF). No reranker.
 - Four MCP tools: `capture`, `search_thoughts`, `recent_thoughts`, `get_thought`.
@@ -97,7 +97,7 @@ The system is built in six capability milestones, preceded by a small environmen
 - Eval suite (capture-recall, cross-model retrieval consistency, LongMemEval-style).
 - The `stats` MCP tool.
 
-**Order rationale.** M1 is the floor: nothing else makes sense without capture and retrieval. M2 (facts) before M3 (rerank) because at the time facts added capability and rerank improved quality, and quality without capability felt unmotivated. M3 dogfood produced negative knowledge that motivated M4 (collapse to thoughts-only) — the facts pipeline didn't earn its complexity for the operator's actual queries. M5 (selective relations) comes after M4 because the citation-chain pattern that emerged from the M4.1 dogfood (thoughts referencing and refining each other in prose) was the strongest signal for the next architectural addition — making implicit graph structure first-class. M6 (artifacts) before M7 (operational) because ingesting existing notes/transcripts earns its keep faster than auth/eval ceremony for a single-operator tool.
+**Order rationale.** M1 is the floor: nothing else makes sense without capture and retrieval. M2 (facts) before M3 (rerank) because at the time facts added capability and rerank improved quality, and quality without capability felt unmotivated. M3 dogfood produced negative knowledge that motivated M4 (collapse to thoughts-only) — the facts pipeline didn't earn its complexity for the operator's actual queries. M5 (selective relations) comes after M4 because the citation-chain pattern that emerged from the M4.1 dogfood (thoughts referencing and refining each other in prose) was the strongest signal for the next architectural addition — making implicit graph structure first-class. M6's original "artifacts/long-form ingestion" plan was dropped after a live-corpus measurement showed engram occupies a high-signal-density sweet spot that long-form ingestion would dilute; the reshaped M6 ships `engram stats` and tagger-extracted relations instead (see revision history 2026-05-17). M7 (operational maturity) closes out the v0 plan.
 
 ## 4. High-level architecture
 
@@ -179,25 +179,13 @@ CREATE INDEX thoughts_content_trgm_idx
 CREATE INDEX thoughts_tags_gin
     ON thoughts USING gin (tags);            -- JSONB containment for tag_filter
 
--- Long-form content. Reserved for M4.
-CREATE TABLE artifacts (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    scope           TEXT NOT NULL DEFAULT 'global',
-    kind            TEXT NOT NULL,           -- 'document'|'transcript'|'code'|'web'|...
-    title           TEXT,
-    content_uri     TEXT,                    -- file:// or s3:// for blobs
-    content_text    TEXT,                    -- inline if small
-    metadata        JSONB NOT NULL DEFAULT '{}',
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE artifact_chunks (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    artifact_id     UUID NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
-    chunk_index     INT NOT NULL,
-    content         TEXT NOT NULL,
-    UNIQUE (artifact_id, chunk_index)
-);
+-- Migration 0001 also ships `artifacts` and `artifact_chunks` tables for
+-- what was then a planned long-form-ingestion milestone. That plan was
+-- dropped in the M6 reshape (2026-05-17) after a live-corpus measurement
+-- showed engram occupies a high-signal-density sweet spot that long-form
+-- ingestion would dilute. Those two tables are inert and slated for
+-- removal by a future drop migration; they are intentionally omitted
+-- from the schema block above.
 
 -- Embeddings are first-class. Multiple per target during model migration.
 CREATE TABLE embeddings (
@@ -264,15 +252,15 @@ CREATE TABLE pending_tags (
 
 ## 6. Ingest path
 
-There are two write paths. Both terminate in the same `thoughts` row plus an embedding plus (when the tagger is configured) a tags JSONB sidecar.
+There is one write path. It terminates in a `thoughts` row plus an embedding plus (when the tagger is configured) a tags JSONB sidecar.
 
-1. **Direct capture.** [M1 + M4 dedup] Agent calls `capture(content, scope?, source?, metadata?)`. The handler computes `content_fingerprint = sha256(content)` and runs `INSERT INTO thoughts (..., content_fingerprint, tags) VALUES (..., $fp, '{}') ON CONFLICT (content_fingerprint) DO NOTHING RETURNING id`. On insert: enqueue an embedding job and (if `[tagger]` is configured) a tag job; return `{thought_id, embedding_status: "pending", is_duplicate: false}`. On conflict: SELECT the existing `thought_id` by fingerprint and return `{thought_id, embedding_status: <existing state>, is_duplicate: true}` — no new jobs enqueued.
+**Direct capture.** [M1 + M4 dedup] Agent calls `capture(content, scope?, source?, metadata?)`. The handler computes `content_fingerprint = sha256(content)` and runs `INSERT INTO thoughts (..., content_fingerprint, tags) VALUES (..., $fp, '{}') ON CONFLICT (content_fingerprint) DO NOTHING RETURNING id`. On insert: enqueue an embedding job and (if `[tagger]` is configured) a tag job; return `{thought_id, embedding_status: "pending", is_duplicate: false}`. On conflict: SELECT the existing `thought_id` by fingerprint and return `{thought_id, embedding_status: <existing state>, is_duplicate: true}` — no new jobs enqueued.
 
-2. **Artifact ingestion.** [M6] Agent calls `ingest_artifact(uri, kind, scope?)`. The handler inserts the artifact row and hands off to the worker, which fetches, chunks, embeds, and writes `artifact_chunks` plus their embeddings.
+(An artifact-ingestion write path was on the original M6 surface; M6 was reshaped and the artifacts plan was dropped — see revision history 2026-05-17.)
 
 **Designed-in seam for async embedding.** [M2+] In M1 the capture handler called `Embedder::embed(...)` directly. From M2, the worker process exists, and the capture handler enqueues a row in `pending_embeddings`; the worker drains the queue. The MCP contract is identical to M1; the embedding row becomes available shortly after capture returns (with a brief window during which `search_thoughts` may not surface the brand-new thought via vector — trigram still finds it).
 
-**Tagging sidecar.** [M4+] The same worker process runs a second drainer task against `pending_tags`. The tag drainer pulls batches the same way the embed drainer does, calls `Tagger::tag(content)` → `Tags`, and writes `thoughts.tags` plus the three provenance columns (`tags_extractor_model`, `tags_extractor_version`, `tags_extracted_at`). Both drainers share the `[worker]` knobs (`tick_interval_seconds`, `batch_size`); tagging is opt-in via `[tagger].provider` non-empty. The tagging-sidecar shape is the subject of §6.5; §10 covers the operational shape and the rationale for *not* having drift-defense machinery.
+**Tagging sidecar.** [M4+] The same worker process runs a second drainer task against `pending_tags`. The tag drainer pulls batches the same way the embed drainer does, calls `Tagger::tag(content, vocab)`, and writes the persisted `Tags` half into `thoughts.tags` plus the three provenance columns (`tags_extractor_model`, `tags_extractor_version`, `tags_extracted_at`). From M6.1, the same tagger call also returns `relations` — closed-vocabulary edges from prose that the drainer routes into `thought_links` with `source='tagger'` (see §6.7). Both drainers share the `[worker]` knobs (`tick_interval_seconds`, `batch_size`); tagging is opt-in via `[tagger].provider` non-empty. The tagging-sidecar shape is the subject of §6.5; §10 covers the operational shape and the rationale for *not* having drift-defense machinery.
 
 ## 6.5 Tagging sidecar
 
@@ -284,24 +272,35 @@ There are two write paths. Both terminate in the same `thoughts` row plus an emb
 
 1. **Drain.** `SELECT thought_id, tagger_model_id FROM pending_tags ORDER BY enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT $batch_size`. Fetched in the same idempotent style as `pending_embeddings`.
 
-2. **Tag.** Call `Tagger::tag(content, vocab)`. The default impl (`OpenAICompatibleTagger`) POSTs to `/v1/chat/completions` with the bundled prompt (currently v3) + `response_format: { type: "json_schema", strict: true, schema: { ... } }`. Schema (live in `crates/engram-extract/src/openai_compatible.rs`):
+2. **Tag.** Call `Tagger::tag(content, vocab)`. The default impl (`OpenAICompatibleTagger`) POSTs to `/v1/chat/completions` with the bundled prompt (currently v7) + `response_format: { type: "json_schema", strict: true, schema: { ... } }`. Schema (live in `crates/engram-extract/src/openai_compatible.rs`):
 
     ```json
     {
       "type": "object",
       "additionalProperties": false,
-      "required": ["people", "entities", "action_items", "topics", "dates_mentioned", "kind"],
+      "required": ["people", "entities", "action_items", "topics", "dates_mentioned", "kind", "relations"],
       "properties": {
         "people":          { "type": "array", "items": { "type": "string" } },
-        "entities":        { "type": "array", "items": { "type": "string" }, "maxItems": 5 },
+        "entities":        { "type": "array", "items": { "type": "string" }, "maxItems": 3 },
         "action_items":    { "type": "array", "items": { "type": "string" } },
         "topics":          { "type": "array", "items": { "type": "string" }, "maxItems": 3 },
         "dates_mentioned": { "type": "array", "items": { "type": "string" } },
         "kind":            { "type": ["string", "null"],
-                             "enum": ["observation","task","idea","reference","person_note","session", null] }
+                             "enum": ["observation","task","idea","reference","person_note","session", null] },
+        "relations":       { "type": "array", "maxItems": 5,
+                             "items": { "type": "object",
+                                        "required": ["relation","to_kind","to_value","note"],
+                                        "properties": {
+                                          "relation": { "type": "string",
+                                                        "enum": ["replaces","requires","references","supports","belongs_to","decided_by","refines"] },
+                                          "to_kind":  { "type": "string", "enum": ["entity","person","url"] },
+                                          "to_value": { "type": "string" },
+                                          "note":     { "type": ["string","null"] } } } }
       }
     }
     ```
+
+    [M6.1+] The LLM emits both `tags` fields (persisted to `thoughts.tags` JSONB) and `relations` (routed to `thought_links` with `source='tagger'`, not persisted into the JSONB — see §6.7). `Tagger::tag` returns `TagOutput { tags, relations }`; the drainer destructures and writes the two halves through separate code paths.
 
     [M4.1+] Before the tagger call, the drainer optionally pre-fetches the top-N most-frequent topic and entity terms from the thought's scope (via `engram_storage::fetch_scope_vocab`) and passes them to `Tagger::tag(content, Some(&vocab))`. The default `OpenAICompatibleTagger` renders the vocab into a "controlled vocabulary" section appended to the system prompt — the model is told to prefer established terms when they fit and coin new ones only for genuinely unseen concepts. This produces consistent topic vocabulary at the corpus level: the same author writing about the same subject in different prose now lands in overlapping topic terms, addressing v1's phrase-driven divergence. Controlled by `[tagger].scope_vocab_enabled` (default `true`) and `[tagger].scope_vocab_size` (default `50`).
 
@@ -330,50 +329,93 @@ The blob lands in `thoughts.tags` via the drainer. A subsequent `search_thoughts
 
 ## 6.6 Selective relations (graph layer)
 
-[M5+] On top of the tagging sidecar, M5 adds a graph layer of thought-to-thought edges in a small closed vocabulary. M5 shipped six relations; M5.1 added a seventh after day-one dogfood (see Revision history): `replaces`, `requires`, `references`, `supports`, `belongs_to`, `decided_by`, `refines`. `supports` separates evidential / corroborative relationships ("this confirms a claim made there") from `references` (prose-level citation). Edges live in `thought_links` (migration 0007) keyed by `(from_thought_id, relation, to_thought_id)` with a UNIQUE constraint enforcing idempotency on the triple.
+[M5+] On top of the tagging sidecar, M5 adds a graph layer of edges over thoughts in a small closed vocabulary. M5 shipped six relations; M5.1 added a seventh after day-one dogfood (see Revision history): `replaces`, `requires`, `references`, `supports`, `belongs_to`, `decided_by`, `refines`. `supports` separates evidential / corroborative relationships ("this confirms a claim made there") from `references` (prose-level citation). M5 launched thought-to-thought only; M5.2 generalized the target to a polymorphic shape — an edge can now point at another thought, a free-text entity name, a free-text person name, or a URL — and added soft-delete so a removed edge can be re-created cleanly.
 
 **Why selective, not general.** The M3 facts pipeline tried full open-vocabulary `(subject, predicate, object)` extraction and the dogfood (see Revision history 2026-05-16 entries) showed the predicate slot broke under small-model limitations. M5's closed vocabulary trades coverage for tractability — seven relations the operator can predict (six at M5 launch; `supports` added in M5.1), queries that always have a fixed-cardinality dispatch, and no extraction prompt to break under load. The vocabulary was picked from observation of the M4.1 dogfood corpus: the citation chain `137dba1d → 6d2ef58e → 8a533e15` is exactly the `refines`-style structure operators kept building in prose.
 
-**Schema.**
+**Schema.** Migration 0007 introduces the table; 0009 generalizes the target shape; 0010 adds soft-delete + the partial unique index.
 
 ```sql
 CREATE TABLE thought_links (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     from_thought_id UUID NOT NULL REFERENCES thoughts(id) ON DELETE CASCADE,
-    relation TEXT NOT NULL,
-    to_thought_id UUID NOT NULL REFERENCES thoughts(id) ON DELETE CASCADE,
-    source TEXT NOT NULL DEFAULT 'agent',
-    note TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    relation        TEXT NOT NULL,
+    -- Polymorphic target [M5.2]: exactly one of the four columns is populated;
+    -- to_kind is the discriminator; to_value is a generated convenience column
+    -- (canonical string form of whichever target column is non-null).
+    to_kind         TEXT NOT NULL,                          -- 'thought'|'entity'|'person'|'url'
+    to_thought_id   UUID REFERENCES thoughts(id) ON DELETE CASCADE,
+    to_entity       TEXT,
+    to_person       TEXT,
+    to_url          TEXT,
+    to_value        TEXT GENERATED ALWAYS AS (
+                        COALESCE(to_thought_id::text, to_entity, to_person, to_url)
+                    ) STORED,
+    source          TEXT NOT NULL DEFAULT 'agent',
+    note            TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted_at      TIMESTAMPTZ,                            -- soft-delete [M5.2]
     CHECK (relation IN ('replaces','requires','references','supports','belongs_to','decided_by','refines')),
     CHECK (source IN ('agent','tagger')),
-    CHECK (from_thought_id <> to_thought_id),
-    UNIQUE (from_thought_id, relation, to_thought_id)
+    CHECK (to_kind IN ('thought','entity','person','url')),
+    -- Exactly-one-target invariant.
+    CHECK (
+        (to_kind = 'thought' AND to_thought_id IS NOT NULL AND to_entity IS NULL AND to_person IS NULL AND to_url IS NULL) OR
+        (to_kind = 'entity'  AND to_entity     IS NOT NULL AND to_thought_id IS NULL AND to_person IS NULL AND to_url IS NULL) OR
+        (to_kind = 'person'  AND to_person     IS NOT NULL AND to_thought_id IS NULL AND to_entity IS NULL AND to_url IS NULL) OR
+        (to_kind = 'url'     AND to_url        IS NOT NULL AND to_thought_id IS NULL AND to_entity IS NULL AND to_person IS NULL)
+    ),
+    -- No self-links for thought targets.
+    CHECK (NOT (to_kind = 'thought' AND from_thought_id = to_thought_id))
 );
+
+-- Idempotency on the live (non-deleted) triple. Soft-deleted rows don't
+-- conflict, so re-creating a previously-removed edge succeeds.
+CREATE UNIQUE INDEX thought_links_live_uq
+    ON thought_links (from_thought_id, relation, to_kind, to_value)
+    WHERE deleted_at IS NULL;
 ```
 
-`source` distinguishes agent-supplied (M5) from tagger-extracted (M5.x). `note` is an optional free-text annotation (max 1000 chars enforced at the MCP layer). `ON DELETE CASCADE` is safe because retraction is soft — edges resolve against retracted thoughts and just surface the `retracted: true` flag rather than disappear.
+`source` distinguishes agent-supplied (M5) from tagger-extracted (M6.1). `note` is an optional free-text annotation (max 1000 chars enforced at the MCP layer). `ON DELETE CASCADE` is safe because retraction is soft — edges resolve against retracted thoughts and just surface the `retracted: true` flag rather than disappear. Soft-delete on the edge itself (the `deleted_at` column) preserves an audit trail of removed edges while making re-creation idempotent.
 
-**Pipeline.** No background drainer at M5 — edges are agent-supplied via MCP, not extracted from prose:
+**Pipeline.** Two write paths land in this table — agent-supplied via MCP and tagger-extracted via the M6.1 drainer (covered in §6.7). Read path is shared.
 
-1. **`link_thoughts(from, relation, to, note?)`** validates self-link, note length, and both-endpoint existence, then calls `engram_storage::insert_link` with ON CONFLICT idempotency. Returns `is_new: bool` (mirrors `capture`'s `is_duplicate` polarity) plus the `link_id`.
-2. **`unlink_thoughts(from, relation, to)`** is the inverse — DELETE on the triple, idempotent on already-missing. Returns `existed: bool`.
-3. **`get_related_thoughts(thought_id, relations?, direction?)`** walks the graph from a single thought. Returns grouped `outbound` (edges where this thought is `from`) and `inbound` (edges where it's `to`) arrays. Each entry carries enough enrichment (related thought's content_preview, scope, retraction state, edge metadata) to render without a follow-up `get_thought`.
+1. **`link_thoughts(from, relation, to, note?)`** [M5+, M5.2 polymorphic] takes exactly one of `to_thought_id` / `to_entity` / `to_person` / `to_url`. Validates self-link (for thought targets), note length, and endpoint existence (for thought targets), then calls `engram_storage::insert_link` with ON CONFLICT idempotency against the live unique index. Returns `is_new: bool` (mirrors `capture`'s `is_duplicate` polarity) plus the `link_id`.
+2. **`unlink_thoughts(from, relation, to)`** [M5+, M5.2 three-way status] soft-deletes by stamping `deleted_at`. Returns a three-way `status: deleted_now | already_deleted | never_existed` so the caller can distinguish a no-op-because-already-gone from a no-op-because-never-there. A subsequent `link_thoughts` of the same triple succeeds cleanly.
+3. **`get_related_thoughts(thought_id, relations?, target_kinds?, direction?)`** walks the graph from a single thought. Returns grouped `outbound` (edges where this thought is `from`) and `inbound` (edges where it's `to`, thought-target rows only). Each edge carries `to_kind`, `to_value`, `link_source` (`agent` | `tagger`), and `note`. Thought-target hits additionally surface the related thought's content_preview, scope, and retraction state. Filters: `relations` (closed-vocab subset), `target_kinds` (outbound only — restrict to specific `to_kind` values), `direction` (`outbound` | `inbound` | `both`).
 
-**Concrete example.** Three thoughts in the citation chain: `8a533e15` (original observation), `6d2ef58e` (a refinement), `137dba1d` (a further refinement of `6d2ef58e`). Agent links them:
+**Concrete example.** Three thoughts in a citation chain plus a URL citation:
 
 ```text
-link_thoughts(137dba1d, "refines", 6d2ef58e, "post-Probe-2 refinement")
-link_thoughts(6d2ef58e, "refines", 8a533e15, "first refinement")
+link_thoughts(137dba1d, "refines",    to_thought_id: 6d2ef58e, note: "post-Probe-2 refinement")
+link_thoughts(6d2ef58e, "refines",    to_thought_id: 8a533e15, note: "first refinement")
+link_thoughts(137dba1d, "references", to_url: "https://example.org/probe-2", note: "source")
 ```
 
-`get_related_thoughts(8a533e15, direction: "inbound")` returns the inbound `refines` edge from `6d2ef58e`. `get_related_thoughts(6d2ef58e, direction: "both")` returns both the outbound `refines→8a533e15` and the inbound `refines←137dba1d`. The implicit-in-prose citation chain is now first-class.
+`get_related_thoughts(8a533e15, direction: "inbound")` returns the inbound `refines` edge from `6d2ef58e`. `get_related_thoughts(137dba1d, direction: "outbound")` returns the `refines→6d2ef58e` (a thought hit, with content_preview) and the `references→<url>` (a URL hit). `unlink_thoughts(137dba1d, "references", to_url: "...")` returns `deleted_now`; a re-issued `unlink_thoughts` on the same triple returns `already_deleted`; a third `link_thoughts` on the same triple succeeds because the soft-deleted row is excluded from the live unique index.
 
-**M6.1 — tagger-extracted relations (v1, non-thought targets).** v5 tagger prompt emits relations from prose; the drainer inserts them into `thought_links` with `source = 'tagger'`. v1 ships URL / entity / person targets only (no thought-to-thought; entity resolution is the deferred sub-problem). The `source` discriminator on `thought_links` (always supported, finally exercised by something other than `agent`) lets `get_related_thoughts` consumers distinguish agent-supplied from tagger-emitted edges via the `link_source` response field. Re-tag soft-deletes prior tagger emissions before re-inserting fresh ones — agent edges untouched. Bypass-on-error in the drainer: a malformed individual emission is logged and skipped, never fails the whole tag job.
+**Migration audit (M5.2 ancillary).** Migration 0010 also introduces a `migration_audit` table that any row-touching migration populates by convention. `engram audit migrations` surfaces the log so an operator can answer "what did each migration actually touch on my corpus" without psql. Currently populated by 0009, 0010, and 0011.
 
-**M5.2 — polymorphic targets, soft-delete, migration audit.** M5.2 closes the M5 loop. (a) The `to` side of `thought_links` becomes polymorphic: a thought UUID, a free-text entity name, a free-text person name, or a URL. Migration 0009 adds a `to_kind` discriminator + per-kind columns + a generated `to_value` column that anchors the unique-edge constraint across all kinds. `link_thoughts` accepts one of `{to_thought_id, to_entity, to_person, to_url}` (mutex; exactly-one validated server-side); `get_related_thoughts` returns hits with `to_kind` / `to_value`, plus thought-only fields (`scope`, `content_preview`, `retracted`) populated only when `to_kind = 'thought'`. (b) Soft-delete on `thought_links` (`deleted_at TIMESTAMPTZ`); migration 0010 replaces the table-level unique constraint with a partial unique index (`WHERE deleted_at IS NULL`). `unlink_thoughts` returns a three-way status (`deleted_now` / `already_deleted` / `never_existed`), distinguishing operator-self-removed from never-existed. (c) `migration_audit` table seeded by migration 0010 with rows for 0009 + 0010; future row-touching migrations populate it by convention; `engram audit migrations` CLI surfaces the log.
+**Out of scope at v0.** First-class `entities` / `persons` tables (the free-text columns on `thought_links` are the v0 representation; entity resolution is its own multi-conversation problem). Reverse traversal from non-thought targets, restore-link tool, hard-purge of soft-deleted edges, sibling `engram audit links` / `engram audit thoughts` resources, bulk-link tooling, multi-hop traversal (`get_thoughts_n_hops_away`), an `engram link` CLI shortcut — deferred per usage demand.
 
-**M5.2 out of scope.** Tagger-extracted relations (LLM finds the edge from prose; the breakthrough capability, still M5.x because it requires entity resolution and its own dogfood loop). First-class entity / person tables (entities and persons are free-text strings on `thought_links` until tagger-extracted relations land). Reverse traversal from non-thought targets, restore-link tool, hard-purge of soft-deleted edges, `engram audit links` / `engram audit thoughts` sibling resources, bulk-link tooling, multi-hop traversal (`get_thoughts_n_hops_away`), `engram link` CLI shortcut — deferred per usage demand.
+## 6.7 Tagger-extracted relations (M6.1)
+
+[M6.1+] The graph layer in §6.6 was agent-supplied at M5 launch. M6.1 adds a second writer: the tagger emits relations from prose, and the drainer routes them into the same `thought_links` table with `source = 'tagger'`.
+
+**Why the tagger writes graph rows.** Some relational structure is observable in the surface form of the thought itself ("This finding supports earlier observation X"; "Decision per Ron"; "See arxiv.org/abs/..."). When the LLM can spot it during the existing tagging pass, there is no reason to make the agent re-derive the same edge at capture time. The closed seven-relation vocabulary already trained on §6.6 carries over; only the target shape narrows (no thought-to-thought tagger relations until entity resolution lands — the tagger can read prose but cannot reliably resolve "the earlier Probe 2 finding" to a specific UUID).
+
+**Schema reuse.** No schema changes for M6.1. M5.2's polymorphic targets (`to_kind ∈ {entity, person, url}`), `LinkSource::Tagger` discriminator, and soft-delete machinery were the exact substrate this milestone needed.
+
+**Pipeline.** The tag drainer (§6.5 step 2) already calls `Tagger::tag(content, vocab)`. Post-M6.1 that call returns `TagOutput { tags, relations }`. The drainer destructures:
+
+1. **Write tags** (unchanged from §6.5): `update_thought_tags` writes `tags` into `thoughts.tags` JSONB.
+2. **Apply relations** ([M6.1]): `engram_mcp::apply_tagger_relations(thought_id, &output.relations, pool)` first calls `soft_delete_tagger_edges_for_thought(thought_id)` — every existing `source='tagger'` edge from the thought is stamped with `deleted_at = NOW()`. Then each emission in `output.relations` is validated (`link::validate_target` — URL must be `http(s)://`, names ≤200 chars) and inserted via the standard `insert_link` path with `source = 'tagger'`. Bypass-on-error: a single malformed emission is logged and skipped; the rest of the batch still lands; the tag job is never failed by a bad relation.
+
+Re-tag cycles (operator-initiated via `engram tag --rerun`) replay step 2: prior tagger edges are soft-deleted and fresh ones inserted. Agent-supplied edges (`source = 'agent'`) are untouched — only the tagger-owned subset churns.
+
+**Why not persist into the `tags` JSONB.** v5/M6.1 originally wrote tagger emissions into BOTH `thoughts.tags.relations` (raw frozen JSONB) AND `thought_links` rows. The live-corpus dogfood revealed every persisted JSONB entry had a corresponding `thought_links` row — pure DRY violation. v9 (2026-05-18, migration 0011) dropped the `tags.relations` JSONB field; `thought_links` is now the single canonical store. The LLM-side response schema (§6.5) still asks for a top-level `relations` array — `OpenAICompatibleTagger` parses it into the transient `TagOutput.relations` field; only the persistence shape changed.
+
+**Consumer-side discriminator.** `get_related_thoughts` exposes `link_source` on every edge so agents downstream can treat tagger-emitted edges as advisory (re-tag may add or remove them) versus agent-supplied edges as deliberate. `unlink_thoughts` (M5.2 soft-delete) is the operator-correction tool for a wrong tagger edge; the next re-tag cycle may re-emit it, which is the signal that the prompt or the source thought needs work (operator's call, not the agent's).
 
 ## 7. Retrieval path
 
@@ -421,9 +463,9 @@ Tools and the milestone in which each ships. Names and signatures are part of th
 | `list_scopes` | M5.x | Enumerate scopes currently in use with `thought_count` / `first_activity_at` / `last_activity_at`. Optional `prefix` filter. Sorted most-recently-used first. |
 | `link_thoughts` | M5 (M5.2 polymorphic targets) | Create a link from a thought to a polymorphic target — another thought (`to_thought_id`), entity name (`to_entity`), person name (`to_person`), or URL (`to_url`). Exactly one of the four target fields. Seven closed-vocabulary relations (`replaces`, `requires`, `references`, `supports`, `belongs_to`, `decided_by`, `refines`). Idempotent on `(from, relation, to_kind, to_value)`. |
 | `unlink_thoughts` | M5 (M5.2 soft-delete + three-way status) | Soft-delete a link by its `(from, relation, target)` triple. Returns `status: deleted_now | already_deleted | never_existed`. Re-creating a soft-deleted edge succeeds. |
-| `get_related_thoughts` | M5 (M5.2 polymorphic) | Walk the link graph. Returns grouped `outbound` + `inbound` arrays. Each hit carries `to_kind` / `to_value`; thought-target hits additionally surface the target's content_preview, scope, retraction state. Optional filters: `relations`, `target_kinds` (outbound only), `direction`. |
-| `ingest_artifact` | M6 | Async ingest of a longer document. |
-| `stats` | M7 | Per-scope counts, last activity, embedding model version, tagger model version. |
+| `get_related_thoughts` | M5 (M5.2 polymorphic) | Walk the link graph. Returns grouped `outbound` + `inbound` arrays. Each hit carries `to_kind` / `to_value` / `link_source`; thought-target hits additionally surface the target's content_preview, scope, retraction state. Optional filters: `relations`, `target_kinds` (outbound only), `direction`. |
+
+Operator-only surfaces (not exposed as MCP tools): `engram stats` (corpus + storage telemetry, shipped at M6.0) and `engram audit migrations` (per-migration row impact log, shipped at M5.2) are CLI subcommands; an MCP `stats` tool is deferred to M7+. `ingest_artifact` was on the original M6 surface and was dropped when M6 was reshaped (see revision history 2026-05-17).
 
 `search_facts` and `correct_fact` shipped in M2 and were removed in M4 when the facts pipeline was retired. Operators correcting a wrong claim now `retract_thought` and capture a corrected one; tags are advisory and re-derivable, so per-tag operator correction was unnecessary.
 
@@ -454,45 +496,14 @@ pub trait Tagger: Send + Sync {
     fn version(&self) -> i32;                    // bumped when tagger prompt/schema changes
     // [M4.1] vocab is the top-N established topic + entity terms in the
     // thought's scope; rendered into the prompt as a controlled-vocabulary hint.
-    async fn tag(&self, thought_content: &str, vocab: Option<&ScopeVocab>) -> Result<Tags, TaggerError>;
-}
-
-pub struct ScopeVocab {              // [M4.1] — controlled-vocabulary hint per scope
-    pub topics: Vec<String>,
-    pub entities: Vec<String>,
-}
-
-pub struct Tags {                   // [M4] — tagger output, written to thoughts.tags
-    pub people: Vec<String>,
-    pub entities: Vec<String>,           // [M4.1] proper-noun-style identifiers mentioned by name
-    pub action_items: Vec<String>,
-    pub topics: Vec<String>,             // 1-3 short lowercase subject categories
-    pub dates_mentioned: Vec<String>,    // free-text dates as the LLM emits them
-    pub kind: Option<TagKind>,           // observation | task | idea | reference | person_note | session
-}
-
-pub enum RelationKind {              // [M5] — closed thought-to-thought vocabulary
-    Replaces,
-    Requires,
-    References,
-    Supports,                        // [M5.1] — added after day-one dogfood
-    BelongsTo,
-    DecidedBy,
-    Refines,
-}
-
-pub struct ThoughtLink {             // [M5] — row-shape of `thought_links`
-    pub id: LinkId,
-    pub from_thought_id: ThoughtId,
-    pub relation: RelationKind,
-    pub to_thought_id: ThoughtId,
-    pub source: LinkSource,          // Agent | Tagger (Tagger reserved for M5.x)
-    pub note: Option<String>,
-    pub created_at: OffsetDateTime,
+    // [M6.1+] returns TagOutput { tags, relations }; the drainer writes tags
+    // to thoughts.tags JSONB and routes relations into thought_links with
+    // source='tagger' (see §6.7).
+    async fn tag(&self, thought_content: &str, vocab: Option<&ScopeVocab>) -> Result<TagOutput, TaggerError>;
 }
 ```
 
-All three error enums carry `is_transient(&self) -> bool` so capture/drain orchestrators can decide retry vs. mark-failed per call. `Timeout`, `Unreachable`, and `Backend { status: 500..=599, .. }` are transient; everything else is not.
+Data shapes (`Tags`, `ScopeVocab`, `TagOutput`, `ExtractedRelation`, `RelationKind`, `LinkTarget`, `LinkSource`, `ThoughtLink`) live in `crates/engram-core`; the SQL forms in §5 and §6.6 are the contract, and the Rust shapes follow them. All three trait error enums carry `is_transient(&self) -> bool` so capture/drain orchestrators can decide retry vs. mark-failed per call. `Timeout`, `Unreachable`, and `Backend { status: 500..=599, .. }` are transient; everything else is not.
 
 **Default implementations:**
 
@@ -516,6 +527,9 @@ max_connections = 10
 
 [server]                                        # [M1]
 bind = "127.0.0.1:8080"                         # Tier 0 default — see §12
+allowed_hosts = []                              # [M5.x] DNS-rebinding allowlist;
+                                                # empty = rmcp default (localhost/127.0.0.1/::1);
+                                                # non-empty REPLACES the default (Tier 1 mesh access)
 
 [embedder]                                      # [M1]
 provider     = "openai-compatible"
@@ -540,7 +554,9 @@ provider        = "openai-compatible"           # alternative: "openrouter"; "" 
 endpoint        = "http://localhost:8000/v1"    # vLLM default
 model_name      = "qwen2.5-7b-instruct"         # backend-side model name
 model_id        = "vllm/qwen2.5-7b-instruct"    # provenance label → thoughts.tags_extractor_model
-model_version   = 1                             # bump when prompt/schema changes
+model_version   = 7                             # tracks BUNDLED_TAGGER_VERSION; bump on prompt/schema change
+scope_vocab_enabled = true                      # [M4.1] controlled-vocabulary hint per scope
+scope_vocab_size    = 50                        # [M4.1] top-N established terms per scope
 timeout_seconds = 60
 temperature     = 0.2
 ```
@@ -705,5 +721,9 @@ Carrying forward:
 - **2026-05-17** — **v7 tagger prompt iteration + JSON schema concrete-type fix.** A second dogfood pass on the WIP v6 prompt (before commit) confirmed the entities section regressed on `047d0ce8`: `["agent memory protocol", "embedding-based", "lexical signals"]` — same shape as the v5 dogfood failure. Root cause: v6 had added a "Patterns that are NOT entities" block listing adjectival phrases as examples (e.g., `embedding-based` shown as an adjectival modifier failure), repeating the v3→v4 backfire — listing forbidden phrases reinforces them. v7 drops the entire NOT-entities block; the entities section now contains only the lead-with-empty framing (v4), the surface-only rule citing `pg_trgm` hallucination (v6), the NAME-vs-DESCRIBE structural test (v4), and the final-pass re-read verification (v6). Positive examples (`engram`, `pgvector`, ...) retained — they reinforce desired behavior. v7 also explicitly states topics-as-concept-mapping intent ("Topics map prose to canonical subject categories — they may be inferred from context when the subject is clear ... This is concept-mapping behavior, not surface-lexeme lifting"), which had been de-facto behavior since v4 vocab-softening but wasn't documented; four corpus findings (`6d2ef58e`, `74eb781c`, `137dba1d`, `ce83b7ba`) claim phrase-driven topics extraction with empirical support that is now empirically false (Probe 2 disjoint-vocab pair has 2/3 topic overlap). Operator action: retract-and-replace those four findings at leisure. **Bundled JSON-schema concrete-type fix:** the same dogfood pass surfaced that `tag_filter` and `metadata` were being stripped by claude.ai's MCP client before reaching engram. Root cause: both fields were typed `Option<serde_json::Value>` in the rmcp tool-args structs, which schemars renders without a concrete `type` field in the published JSON schema. Strict client-side validators drop fields they cannot match to a declared type. Wire-tested with raw curl: orchestrator filters correctly when field arrives. Audited via claude.ai client: field never arrives. Fix: change Rust types to `Option<serde_json::Map<String, serde_json::Value>>` (semantically a tightening; both fields were always supposed to be objects) so schemars renders `type: ["object", "null"]`. Boundary conversion to `Value::Object` at the orchestrator call site keeps the inner API unchanged. New regression test `tool_args_object_fields_have_concrete_schema_type` (engram-mcp/src/server.rs) pins the schema shape — any regression to `Option<Value>` fails CI before ship. `BUNDLED_TAGGER_VERSION` bumps 6→7; `TaggerConfig::default().model_version` likewise. Operator workflow after pull: (a) restart `engram serve` to apply the schema fix; (b) `engram tag --rerun --since 1970-01-01T00:00:00Z` to refresh the WIP-v6-tagged corpus under v7; (c) re-audit `search_thoughts(tag_filter={"entities": ["embedding-based"]})` should return 0 results. The v3→v4 lesson is recorded twice in revision history now (v3→v4, and v6→v7); future tagger iterations should default to the v4/v7 pattern (structural questions only, zero phrase hints for what to exclude). The diagnostic doc `tag_filter-strip-diagnostic.md` (operator-supplied, not committed) is the canonical record of the schema-strip bracketing.
 
 - **2026-05-18** — **v8 entities adjectival regression: accept + document (no prompt iteration).** The four-iteration prompt arc on entities (v3 negative-example list → v4 NAME-vs-DESCRIBE structural test → v6 pattern descriptions → v7 pure structural framing, zero phrase hints) hit diminishing returns on `047d0ce8`: at `tags_extractor_version: 7` the thought still emits entities `["agent memory protocol", "embedding-based", "lexical signals"]`. Diagnosis: the NAME-vs-DESCRIBE test asks the model to verify a fact it can't reliably verify — "does this phrase NAME a specific thing that has its own canonical identity outside this thought" requires world-knowledge the 30B model lacks reliable access to. When uncertain, the model defaults to "include," producing over-extraction on technical-prose noun phrases. Three reinforcing model-level biases compound this: (a) surface-pattern over-generalization from pre-training on entity-extraction tasks where multi-word noun phrases were correctly extracted; (b) definite-article-as-name signal ("The X provides..." reads as a definition); (c) coordination spillover (once one of `embedding-based` or `lexical signals` is included, the other follows by parallel structure). Lowering `entities.maxItems` (3→2) was rejected — drops legitimate 3-entity cases as collateral. v8 ships zero prompt changes and zero code changes; instead it documents the structural ceiling and ratifies operator-correction as the design intent. Engram's M5+ machinery (soft-delete on `thought_links`, `link_source` discriminator on `get_related_thoughts` responses, `unlink_thoughts` MCP tool) was designed for operator correction of tagger output — the imperfect tagger feeding into that correction layer is by design, not a bug. **Methodology lesson** (worth keeping for future prompt iterations on any closed-vocabulary or surface-discrimination LLM task): when prompt-engineering hits a structural ceiling — i.e., the prompt asks the model to verify a fact (world existence, factuality, ground truth) the model can't reliably check — further prompt iterations have diminishing returns. The next lever is architectural: closed vocabulary (model becomes classifier over a known set rather than free-form extractor), two-pass verification (verify pass after emission), or model swap (larger or specialized model with better world-knowledge or instruction-following). If continued dogfood reveals the residual entities imperfection is intolerable, escalate to closed-vocabulary mode (the `tagger.scope_vocab` already exists as tie-breaker; promote to gate) or model swap. `BUNDLED_TAGGER_VERSION` stays at 7 — no prompt change, no re-tag needed.
+
+- **2026-05-18** — **Rename + relocate.** The design doc moved from `docs/engram-design-v0.md` to `DESIGN.md` at the project root, joining `README.md` / `DEVELOPMENT.md` / `AGENTS.md` / `CLAUDE.md` as a top-level operator-facing document. The `v0` filename had outlived its purpose — this document is the canonical record of the design as it stands now, with the revision history below capturing past architectural decisions. Cross-references in `README.md`, `DEVELOPMENT.md`, `CLAUDE.md`, `docker-compose.yml`, `migrations/0001_initial.sql`, `crates/engram-extract/src/openai_compatible.rs`, and the milestone docs in `docs/milestones/` were updated; the doc body itself is unchanged from the consistency pass below.
+
+- **2026-05-18** — **Doc-only consistency pass.** Section bodies were brought back into alignment with the M5.2/M6.1/v9 reality. §3.5 line 48: clarified that the `artifacts` / `artifact_chunks` tables remain on disk but are inert pending a future drop migration (M6 reshape dropped the artifacts plan). §3.5 "Order rationale" tail: removed the obsolete "M6 = artifacts" framing. §5 schema block: dropped the `artifacts` / `artifact_chunks` `CREATE TABLE` snippets in favour of a one-paragraph note about the inert tables — the doc represents the *design* as it stands today and points at the cleanup migration. §6.5: bumped "currently v3" to "currently v7"; added the `relations` field to the tagger JSON-schema example and a one-line note about the M6.1/v9 split into `TagOutput { tags, relations }`. §6.6: replaced the M5-era `thought_links` SQL with the current M5.2 schema (polymorphic `to_kind` + per-kind columns + generated `to_value` + `deleted_at` + partial unique index `WHERE deleted_at IS NULL`); rewrote the pipeline paragraph (three-way `UnlinkStatus`, polymorphic `link_thoughts`, `link_source` on every edge); reworked the worked example to span thought + URL targets and show the soft-delete lifecycle; deleted the redundant M5.2-summary paragraph (now woven into the body); pruned the out-of-scope list (tagger-extracted relations moved to §6.7). New §6.7 "Tagger-extracted relations (M6.1)" — covers why the tagger writes graph rows, schema reuse, the drainer pipeline (`apply_tagger_relations` + `soft_delete_tagger_edges_for_thought`), why the JSONB persistence path was dropped in v9, and the agent-facing discriminator (`link_source`). §8: removed the `ingest_artifact` row (artifacts dropped) and the `stats` row (CLI-only at M6.0, no MCP tool); added an operator-only-surfaces note covering `engram stats` + `engram audit migrations`; expanded `get_related_thoughts` description to surface `link_source`. §9: trimmed the Rust data-shape struct snippets (`Tags`, `ScopeVocab`, `RelationKind`, `ThoughtLink`) — the SQL forms in §5 and §6.6 are now the contract, with one line pointing at `crates/engram-core`; updated the `Tagger` trait signature to return `TagOutput` with an inline note. §9 config TOML: bumped `[tagger].model_version` 1 → 7, added `scope_vocab_enabled` / `scope_vocab_size`, added `[server].allowed_hosts` with a one-line explainer pointing at §12. No code changes, no migrations.
 
 - **2026-05-18** — **Drop `tags.relations` from persisted JSONB; thought_links becomes the single canonical store for the link graph.** Dogfood thought `b533ebac` raised a naming-collision concern: engram used the word "relations" for two distinct things — the link graph (`thought_links`, `link_thoughts`, `get_related_thoughts`) and the tagger's `tags.relations` JSONB field. Investigation against the live corpus confirmed that the M6.1 drainer (`apply_tagger_relations`) was writing tagger emissions to BOTH stores: thoughts.tags.relations (raw frozen emission JSONB, preserving duplicates) AND thought_links rows with source='tagger' (deduplicated queryable graph). Live evidence: thought `15533025` had 3 entries in tags.relations and 3 corresponding thought_links rows; thought `b533ebac` had 2 duplicate entries in tags.relations and 1 thought_links row (deduped by the partial unique index). The duplication was pure DRY violation — every persisted tags.relations entry had a corresponding thought_links row. Operator pushback against "accept-the-duplication-because-low-scale": engram is planned OSS, larger-scale operators will hit this, and the duplication doesn't provide better data. **Resolution:** drop `tags.relations` from the persisted JSONB; thought_links is the single canonical store. Engineering changes (all in one ship): (a) Move `ExtractedRelation` + `ExtractedTarget` from engram-core/tags.rs to engram-core/tagger.rs (they're tagger-output shape, not Tags shape). (b) Add `TagOutput { tags: Tags, relations: Vec<ExtractedRelation> }` to engram-core/tagger.rs; `Tagger::tag` returns `TagOutput`. (c) `Tags` struct loses the `relations` field; the `tags` JSONB column written by `update_thought_tags` is automatically narrower. (d) `OpenAICompatibleTagger::tag` parses the LLM response into a transient `TaggerResponseDoc` struct via serde flatten, splitting into the TagOutput shape. The LLM-side `tags_response_format()` schema is **unchanged** — the LLM still emits a top-level `relations` field; only the Rust-side persistence shape changes. (e) Drainer + CLI destructure TagOutput: `update_thought_tags(&output.tags, ...)` then `apply_tagger_relations(&output.relations, ...)`. (f) `FakeTagger::with_canned` keeps its `(tags: Tags)` shape (convenience for the common case); new `with_canned_output(output: TagOutput)` for tests needing both. **Migration `0011_drop_tags_relations.sql`** removes the JSONB key from existing rows: `UPDATE thoughts SET tags = tags - 'relations' WHERE tags ? 'relations'`; CTE captures the rows_touched count for the audit row. Applied 2026-05-18 against the live corpus; 45 rows touched. No tagger version bump — the LLM emission content is unchanged, only the Rust-side persistence path changes. The naming collision is resolved entirely: only `thought_links` / `link_thoughts` / `get_related_thoughts` exist for relations; the `tags` JSONB is metadata-only. AGENTS.md updated to reflect the new mental model. The methodology lesson: when two persistence paths exist for the same data, the DRY violation is the load-bearing concern even at small scale — the cost-now framing ignores the OSS-future + reader-confusion costs that matter long-term.

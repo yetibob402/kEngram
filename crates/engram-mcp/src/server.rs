@@ -51,7 +51,12 @@ pub struct CaptureArgs {
     #[schemars(
         description = "Optional free-form metadata object. Recommended keys: client_name, session_id, tool_name, agent_role, for_audience. DO NOT use this field to encode references to other thoughts (refines, replaces, etc.) — metadata is opaque to retrieval and graph traversal. For cross-thought structure, use `link_thoughts` after capture."
     )]
-    pub metadata: Option<serde_json::Value>,
+    // Map<String, Value> rather than Value: ensures the JSON schema renders
+    // with a concrete `type: "object"` instead of (no type). claude.ai's MCP
+    // client strips fields without concrete types from outbound tool calls;
+    // typing this as Map<...> keeps it forwarded. Semantically a strict
+    // tightening — metadata was always supposed to be an object.
+    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -90,7 +95,13 @@ pub struct SearchThoughtsArgs {
     #[schemars(
         description = "Optional JSONB-containment filter applied to each thought's `tags` field. Tags are LLM-extracted metadata with shape: { people: string[], entities: string[] (named proper-noun-style identifiers — projects, products, libraries, tools, e.g. \"engram\", \"pgvector\"), action_items: string[], topics: string[] (1-3 short lowercase subject categories — e.g. \"rust\", \"memory-systems\"), dates_mentioned: string[], kind: 'observation' | 'task' | 'idea' | 'reference' | 'person_note' | 'session' | null }. Distinguish `entities` (specific named things mentioned by name) from `topics` (broader subject categories the thought falls under). The `kind` enum is closed at the values listed; the array fields are open-vocabulary strings. Examples: {\"kind\": \"task\"} returns only thoughts the tagger classified as tasks; {\"people\": [\"Sarah\"]} returns thoughts whose people-tag contains Sarah; {\"entities\": [\"engram\"]} returns thoughts mentioning engram by name; {\"topics\": [\"rust\"], \"kind\": \"idea\"} combines both (top-level keys AND together; array values are subset-match). Empty object {} is a no-op. Filters compose with `scope` (or `scope_prefix`, whichever is set) via AND."
     )]
-    pub tag_filter: Option<serde_json::Value>,
+    // Map<String, Value> rather than Value: ensures the JSON schema renders
+    // with a concrete `type: "object"` instead of (no type). claude.ai's MCP
+    // client strips fields without concrete types from outbound tool calls
+    // — empirically reproduced 2026-05-18 against the live engram server.
+    // Tightening to Map is semantically correct (the filter must be an
+    // object for JSONB-containment to make sense).
+    pub tag_filter: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -281,7 +292,13 @@ impl EngramServer {
             None => None,
         };
 
-        let metadata = args.metadata.map(Metadata::from);
+        // Map<String, Value> → Value::Object → Metadata. The Map type on
+        // the args struct keeps the schema's `type: "object"` concrete so
+        // claude.ai's MCP client forwards the field intact.
+        let metadata = args
+            .metadata
+            .map(serde_json::Value::Object)
+            .map(Metadata::from);
 
         let request = CaptureRequest {
             content: args.content,
@@ -328,7 +345,11 @@ impl EngramServer {
             recency_half_life_days: args.recency_half_life_days,
             rerank: args.rerank,
             candidate_pool: args.candidate_pool,
-            tag_filter: args.tag_filter,
+            // Map<String, Value> on the wire → Value::Object for the
+            // orchestrator's filter logic. Keeps the schema concrete (so
+            // claude.ai forwards the field) without changing the
+            // SearchRequest API.
+            tag_filter: args.tag_filter.map(serde_json::Value::Object),
         };
 
         let resp = search::search_thoughts(
@@ -876,6 +897,58 @@ mod tests {
     /// fields without having to discover them by reading per-tool schemas.
     /// If the SERVER_INSTRUCTIONS text drifts and loses this orientation,
     /// agents lose their reliable mental model for `tag_filter` values.
+    /// Regression pin: the JSON schema for `search_thoughts.tag_filter` and
+    /// `capture.metadata` must declare a concrete `type` ("object" + "null"),
+    /// not just `description`. Without a concrete type, claude.ai's MCP
+    /// client silently strips the field from outbound tool calls
+    /// (empirically reproduced 2026-05-18). Pinning the schema shape here
+    /// catches a regression to `Option<serde_json::Value>` (no type) before
+    /// it ships.
+    #[test]
+    fn tool_args_object_fields_have_concrete_schema_type() {
+        let s = schemars::schema_for!(SearchThoughtsArgs);
+        let v = serde_json::to_value(&s).unwrap();
+        let tag_filter = v
+            .get("properties")
+            .and_then(|p| p.get("tag_filter"))
+            .expect("tag_filter property must exist in SearchThoughtsArgs schema");
+        let type_field = tag_filter
+            .get("type")
+            .expect("tag_filter must declare a concrete `type` (else clients strip it)");
+        // schemars renders `Option<Map<String, Value>>` as `type: ["object", "null"]`.
+        let types: Vec<&str> = type_field
+            .as_array()
+            .expect("type should be an array of strings")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            types.contains(&"object"),
+            "tag_filter type must include `object`; got {types:?}"
+        );
+        assert!(
+            types.contains(&"null"),
+            "tag_filter type must include `null` (it's optional); got {types:?}"
+        );
+
+        let s = schemars::schema_for!(CaptureArgs);
+        let v = serde_json::to_value(&s).unwrap();
+        let metadata = v
+            .get("properties")
+            .and_then(|p| p.get("metadata"))
+            .expect("metadata property must exist in CaptureArgs schema");
+        let types: Vec<&str> = metadata
+            .get("type")
+            .expect("metadata must declare a concrete `type`")
+            .as_array()
+            .expect("type should be an array of strings")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(types.contains(&"object"));
+        assert!(types.contains(&"null"));
+    }
+
     #[test]
     fn server_instructions_advertise_tags_shape_and_kind_enum() {
         let s = SERVER_INSTRUCTIONS;
@@ -1172,7 +1245,7 @@ mod tests {
                 recency_half_life_days: Some(0.0),
                 rerank: None,
                 candidate_pool: None,
-                tag_filter: Some(serde_json::json!({"kind": "task"})),
+                tag_filter: serde_json::json!({"kind": "task"}).as_object().cloned(),
             }))
             .await
             .unwrap();

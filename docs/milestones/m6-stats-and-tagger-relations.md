@@ -87,3 +87,79 @@ No migrations. M5.2 already shipped:
 - **Tagger prompt v5 quality is empirical.** The wiring is straightforward; whether the prompt produces useful relations vs. noisy ones is a dogfood question. Same pattern as M4.1's v2→v3→v4 prompt iteration — ship a deliberately selective starting point, iterate.
 - **Tagger latency increase.** Adding a `relations` field to the LLM response is a minor extension of the same JSON call. Should be small; the schema-constrained mode keeps inference bounded.
 - **Re-tag churn rows.** Each `--rerun` soft-deletes the prior tagger edges and inserts fresh ones. At single-operator scale this is trivial; flagged for M7 if storage growth becomes operationally interesting.
+
+---
+
+# v6 + v7 — Post-M6.1 dogfood iterations
+
+**Status:** shipped 2026-05-17 as a single bundled commit (v6 prompt + v7 entities-section fix + JSON schema concrete-type fix on `tag_filter` / `metadata`). v6 was the initial post-M6.1 dogfood iteration; v7 dropped a phrase-list backfire surfaced by a second dogfood pass on the WIP v6 prompt before commit.
+
+## What surfaced from the v5 dogfood
+
+A 2026-05-17 dogfood pass on the v5 tagger (post-M6.1 re-tag across `engram.m3.dogfood`, 17 thoughts) surfaced three regressions:
+
+1. **Kind classification collapsed to `observation`** — 17/17 thoughts came back as `observation`, including mission/charter statements that should be `task`, definitional thoughts that should be `reference`, and finding-shaped thoughts that should be `idea`. The closed 6-value enum was empirically reduced to 1 in practice.
+2. **Entity field regressed on world-knowledge hallucination** — thought `63ad01e0` (Probe 2A) extracted `pg_trgm` from prose containing only "trigram retrieval"; the model inferred the underlying Postgres extension from world-knowledge.
+3. **Entity field regressed on adjectival miscategorization** — thought `047d0ce8` (Probe 2B) extracted `embedding-based` and `lexical signals` as entities. Same class as the v3 regression v4 was supposed to close.
+4. **URL emissions failed 2/2** with "URL target must start with http:// or https://" — the model emitted partial URLs / bare domains in the new v5 `relations` field; app-side validation rejected at the gate.
+
+A separate finding in the dogfood report — `tag_filter` silently ignored — was investigated and proven a false positive (orchestrator filters correctly against the live corpus; tracing instrumentation in commit `8b8dc9a` makes future false claims diagnosable from server logs).
+
+## v6 prompt changes
+
+1. **Kind rebalanced as a 5-step decision tree** with `observation` as the explicit catchall (not the default). The model walks the tree in order; only the catchall step lands on `observation`. Anti-default framing inverts v5's degenerate bias. Each step has 1-2 worked examples in the prompt body.
+2. **Entity surface-only rule** with explicit "do NOT infer from world knowledge" and `pg_trgm` cited as the failure case. Final-pass "re-read and verify" instruction added.
+3. **Adjectival re-tightening** via pattern-based negative examples (adjectives, descriptive noun phrases, descriptively-used phrases) — the v3→v4 lesson preserved: structural patterns, not literal phrase lists.
+4. **URL emission tightening** — explicit "FULL `http://` or `https://` URL only" with the `arxiv.org/abs/...` partial-URL case as the failure example.
+5. **Structural tweaks**: kind reordered to sit next to entities (the two highest-signal classification fields adjacent); relations block shortened to free attention budget; closing "Before you emit" final-pass review section.
+
+`BUNDLED_TAGGER_VERSION: 5 → 6`. `TaggerConfig::default().model_version` likewise. Operator runs `engram tag --rerun --since 1970-01-01T00:00:00Z` to backfill the corpus under v6.
+
+Schema unchanged.
+
+## Diagnostic updates
+
+`kind_stability_diagnostic` and `kind_stability_diagnostic_with_vocab` (`crates/engram-extract/src/openai_compatible.rs`) gain:
+- A 7th fixture (`63ad01e0`) pinning the pg_trgm hallucination case.
+- Updated descriptors on `8a533e15` (kind=task target) and `047d0ce8` (no-adjectival-entity target).
+- Per-run entity capture + printed entity emissions section so the operator can visually verify surface-only behavior alongside kind stability.
+
+Per-fixture v6 pass criterion: dogfood failure cases emit the expected behavior in ≥7/10 runs. Imperfect stability is acceptable; the goal is bias-shift, not deterministic output.
+
+## Verification (operator-driven)
+
+1. `engram tag --rerun --since 1970-01-01T00:00:00Z` re-tags the corpus under v6.
+2. `engram stats` confirms kind diversity restored (not all `observation`).
+3. Sample 5-10 thoughts in dogfood scope: verify entity field is surface-only (no `pg_trgm`-class hallucination, no adjectival phrases).
+4. Sample relations: verify URLs that land start with `http(s)://`; verify the model isn't refusing to emit (zero relations everywhere would signal over-conservatism).
+5. Optional, Ollama-gated: `cargo test -p engram-extract --features integration --release -- kind_stability_diagnostic --nocapture --ignored` runs the extended diagnostic against the 7 fixtures.
+
+## Risk notes
+
+- **Long-prompt attention budget.** v6 grows the prompt (decision tree + worked examples + final-pass review). The relations block was shortened to compensate. If v7 dogfood shows attention-budget degradation, the relations section can shrink further (the anti-pattern documentation lives more naturally in the MCP `link_thoughts` tool description anyway).
+- **Over-conservative emission.** Tightening entity rules + narrowing observation may cause the model to under-emit. Verification step catches it; v6.1 can re-soften.
+- **The v3→v4 negative-example backfire** (acknowledged risk in the v6 plan; reproduced empirically; addressed in v7).
+
+## v7 amendment — drop the entities NOT-list
+
+A second dogfood pass on the WIP v6 prompt (against `engram.m3.dogfood`) confirmed the entities backfire reproduced: thought `047d0ce8`'s entities were `["agent memory protocol", "embedding-based", "lexical signals"]` — the same v5-era output. The v6 entities section's "Patterns that are NOT entities" block listed `embedding-based` and `lexical signals` explicitly as examples of adjectival / descriptive failures. Same v3→v4 lesson: listing the phrases (or even their structural suffix patterns) in the prompt reinforces them. Verified by Ron with `search_thoughts(tag_filter={"entities": ["embedding-based"]})` returning the offending thought.
+
+v7 drops the entire "Patterns that are NOT entities" block. The entities section now contains only:
+- The lead-with-empty framing (kept from v4).
+- A surface-only rule citing the `pg_trgm` hallucination case as a positive example of what NOT to do (the only acceptable negative example is one not in the actual corpus).
+- The NAME-vs-DESCRIBE structural test (kept from v4).
+- The final-pass re-read verification (new in v6, kept in v7).
+
+The positive examples list (`engram`, `pgvector`, `PostgreSQL`, ...) is retained — those reinforce desired behavior.
+
+## v7 also documents topics-as-concept-mapping explicitly
+
+The same dogfood surfaced the v4→v5 topics shift (phrase-driven → concept-mapping) had stayed undocumented. Five existing corpus findings claim "topics are phrase-driven" with empirical support — those claims are now empirically false on their own cited evidence (Probe 2 disjoint-vocab pair has 2/3 topic overlap). v7 adds an explicit statement to the topics section: "Topics map prose to canonical subject categories — they may be inferred when the subject is clear, even if the exact topic word doesn't appear. Two thoughts about the same subject may share topics even with disjoint surface vocabulary. This is concept-mapping behavior, not surface-lexeme lifting."
+
+This makes the long-standing v4 behavior explicit. The stale claims in `6d2ef58e`, `74eb781c`, `137dba1d`, `ce83b7ba` remain operator-action items (retract-and-replace).
+
+## JSON schema concrete-type fix on `tag_filter` and `metadata`
+
+Bundled into the v7 commit because it surfaced from the same dogfood: claude.ai's MCP client silently strips fields whose schema declarations lack a concrete `type`. Engram's `SearchThoughtsArgs.tag_filter: Option<serde_json::Value>` and `CaptureArgs.metadata: Option<serde_json::Value>` produced schemas with only `description` (no `type`). Wire-tested with raw curl: the orchestrator filters correctly when the field arrives. Audited with the claude.ai client: the field never arrives. Fix: change both Rust types to `Option<serde_json::Map<String, serde_json::Value>>` so schemars renders `type: ["object", "null"]`. New regression test `tool_args_object_fields_have_concrete_schema_type` pins the shape so a regression to `Option<Value>` fails CI before ship.
+
+The diagnostic that surfaced this is `tag_filter-strip-diagnostic.md` in the repo root (operator-supplied; not committed).

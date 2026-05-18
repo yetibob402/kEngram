@@ -40,7 +40,7 @@ The lifecycle, end to end:
 
 **2. Drain.** The `engram worker` process runs two drainers in parallel, both on the `[worker] tick_interval_seconds` cadence. The embed drainer calls the configured `[embedder]` and inserts vectors; the tag drainer calls the configured `[tagger]` and writes the JSONB `tags` column plus provenance (`tags_extractor_model`, `tags_extractor_version`, `tags_extracted_at`).
 
-**3. Tag shape.** The tagger speaks OpenAI's `/v1/chat/completions` with `response_format: { type: "json_schema", strict: true, ... }`. Guided decoding (vLLM's `xgrammar`, OpenRouter's structured-outputs) makes the response guaranteed-parseable. The schema and current prompt live in `crates/engram-extract/src/openai_compatible.rs` (constants `BUNDLED_TAGGER_PROMPT` and `BUNDLED_TAGGER_VERSION`; currently at v5 after M4.1's three iterations + M6.1's relations addition). The output shape:
+**3. Tag shape.** The tagger speaks OpenAI's `/v1/chat/completions` with `response_format: { type: "json_schema", strict: true, ... }`. Guided decoding (vLLM's `xgrammar`, OpenRouter's structured-outputs) makes the response guaranteed-parseable. The schema and current prompt live in `crates/engram-extract/src/openai_compatible.rs` (constants `BUNDLED_TAGGER_PROMPT` and `BUNDLED_TAGGER_VERSION`; currently at v7 after M4.1's three iterations + M6.1's relations addition + two post-M6.1 dogfood iterations: v6 rebalanced kind + added surface-only entities + tightened URLs, v7 dropped a phrase-list anti-pattern that re-triggered the v3→v4 backfire and stated topics-as-concept-mapping intent explicitly). The output shape:
 
 ```json
 {

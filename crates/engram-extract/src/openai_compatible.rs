@@ -96,12 +96,24 @@ impl OpenAICompatibleConfig {
 /// negative-example list backfired — the model emitted those exact phrases
 /// from `047d0ce8`), dropped entities maxItems 5→3, and softened the
 /// scope-vocabulary section from "vocab dominates" to "vocab tie-breaks"
-/// (precision over consistency); **v5 (M6.1) adds tagger-extracted
-/// relations** — the LLM emits closed-vocabulary `(relation, to_kind,
-/// to_value)` edges for explicit relational claims in prose. v1 ships
-/// non-thought targets only (entity / person / url); thought-target
-/// extraction requires entity resolution and is deferred.
-pub const BUNDLED_TAGGER_VERSION: i32 = 5;
+/// (precision over consistency); v5 (M6.1) added tagger-extracted
+/// relations — the LLM emits closed-vocabulary `(relation, to_kind,
+/// to_value)` edges for explicit relational claims in prose, non-thought
+/// targets only (entity / person / url); v6 (post-M6.1 dogfood pass 1)
+/// rebalanced kind classification + added an entity surface-only rule +
+/// tightened URL emission, but the entities section listed `embedding-based`
+/// and `lexical signals` as literal negative examples, which repeated the
+/// v3→v4 backfire pattern (the model emitted the listed phrases verbatim
+/// on `047d0ce8` again); **v7 (post-v6 dogfood pass 2)** drops the
+/// literal-phrase NOT-entities list and any suffix hints (e.g. `-based`),
+/// relying on the structural NAME-vs-DESCRIBE test, the surface-only
+/// rule, and the re-read verification alone — mirrors v4's clean-pattern
+/// fix and documents the v6 lesson explicitly so a v8 doesn't
+/// reintroduce phrase hints. v7 also adds an explicit topics
+/// concept-mapping intent statement (topics may be inferred when the
+/// subject is clear; surface lexemes are not required), which had been
+/// de-facto behavior since v4 vocab-softening but wasn't stated.
+pub const BUNDLED_TAGGER_VERSION: i32 = 7;
 
 #[derive(Debug, Clone)]
 pub struct OpenAICompatibleTagger {
@@ -185,48 +197,76 @@ pub const BUNDLED_TAGGER_PROMPT: &str = "\
 You are a tagging assistant. Given a single thought from a memory service, return its metadata tags as JSON.
 
 # Output shape
-{ \"people\": [...], \"entities\": [...], \"action_items\": [...], \"topics\": [...], \"dates_mentioned\": [...], \"kind\": \"...\", \"relations\": [...] }
+{ \"people\": [...], \"entities\": [...], \"kind\": \"...\", \"action_items\": [...], \"topics\": [...], \"dates_mentioned\": [...], \"relations\": [...] }
 
 # Field semantics
+
 - people: bare names of people mentioned. Empty array if none.
-- entities: default to []. Only add an item if the thought explicitly names a specific entity by its canonical name — a project, product, library, tool, technology, or organization that exists by that name outside this thought. Examples of valid entities: \"engram\", \"pgvector\", \"PostgreSQL\", \"MCP\", \"TCGplayer\", \"Cap'n Proto\", \"Rust\", \"Hummingbird\". Test before including any phrase: does this phrase NAME a specific thing that has its own canonical identity (yes → entity), or does the thought DESCRIBE an action or concept using a noun phrase (no → belongs in topics if anywhere)? Preserve the thought's casing, or use canonical casing if the thought is inconsistent. If you are unsure whether a phrase qualifies, omit it.
-- action_items: short imperative phrases describing tasks the thought commits to or implies (e.g., \"fix the login bug\", \"review the migration plan\"). Empty array if none.
-- topics: 1-3 short tag-like subject categories, lowercase, hyphen-separated, no punctuation. What broad SUBJECT AREA is this thought about? Examples: \"rust\", \"build-systems\", \"team-management\", \"memory-systems\". Distinct from entities: a topic is a category the thought falls under; an entity is a specific named thing the thought mentions. A thought naming \"engram\" and \"pgvector\" might have entities [\"engram\", \"pgvector\"] and topics [\"memory-systems\", \"databases\"].
+
+- entities: default to []. Only emit a name that the thought MENTIONS BY ITS SURFACE NAME — a specific named thing (project, product, library, tool, technology, organization) with its own canonical identity independent of this thought. Examples of valid entities: \"engram\", \"pgvector\", \"PostgreSQL\", \"MCP\", \"TCGplayer\", \"Cap'n Proto\", \"Rust\", \"Hummingbird\". Preserve the thought's casing, or use canonical casing if the thought is inconsistent.
+
+  Surface-only rule (load-bearing): entities must appear in the thought's prose. Do NOT infer entities from world knowledge. Example failure: if the thought says \"trigram retrieval\", do NOT emit `pg_trgm` even though pg_trgm is the Postgres extension that implements trigram retrieval — that is a world-knowledge inference, not surface evidence. The name (or a clearly-recognizable abbreviation that maps to it) must appear in the prose.
+
+  NAME-vs-DESCRIBE test (apply this to every candidate before including it): ask \"does this phrase NAME a specific thing that has its own canonical identity outside this thought, or does the thought DESCRIBE an action / concept / style using a noun phrase?\" Only names belong in entities. When in doubt, omit. If the same phrase could be a name elsewhere but is used descriptively here, omit.
+
+  Before you emit: re-read the thought. Verify each entity in your output appears (by name or close paraphrase) in the prose. Remove any that don't.
+
+- kind: a single closed-enum classification of what the thought DOES. Pick exactly one of: observation | task | idea | reference | person_note | session | null. Walk this decision tree in order and pick the FIRST kind that fits — do NOT default to observation:
+
+  1. Does the thought DEFINE or POINT AT a specific named thing (a project, paper, tool, term, organization)?
+     - Yes, and the named thing is a person → person_note. (\"Sarah prefers async meetings.\")
+     - Yes, otherwise → reference. (\"Hummingbird is our internal rollout coordinator.\" \"Cap'n Proto offers zero-copy reads.\")
+
+  2. Does the thought COMMIT TO or DESCRIBE an action to take?
+     - Yes → task. (\"Mission: test the engram MCP toolset for accuracy.\" \"Fix the login bug.\")
+
+  3. Does the thought PROPOSE, HYPOTHESIZE, or REPORT a finding/conclusion?
+     - Yes → idea. (\"We could use Bloom filters here.\" \"Probe 2 confirms that topics are phrase-driven.\" \"The reranker beat RRF-only by 7% on this fixture.\")
+
+  4. Is the thought NARRATING current-session activity (\"I just ran X\", \"the search returned Y\", \"this test passed\")?
+     - Yes → session. Session-shaped thoughts typically have otherwise-empty arrays.
+
+  5. Otherwise — a pure factual claim about the world with no commitment, no proposal, no definition, no narrative — observation. (\"Rust has stronger memory safety than C.\" \"JSON parsing benefits from SIMD on documents over 1 MB.\")
+
+  Anti-default: observation is the CATCHALL, not the default. When the thought arguably fits a more specific kind, prefer the more specific kind. A degenerate tagger that classifies every thought as observation is a failure mode v6 is designed to inverse.
+
+  Kind is classified from the thought's intrinsic shape only — never from the scope's typical content, never from controlled-vocabulary hints below. The vocabulary section informs topic and entity term choice; it does NOT influence kind.
+
+- action_items: short imperative phrases describing tasks the thought commits to or implies (e.g., \"fix the login bug\", \"review the migration plan\"). Empty array if none. Distinct from kind=task: action_items is the per-thought list of items; kind=task is the thought's overall classification.
+
+- topics: 1-3 short tag-like subject categories, lowercase, hyphen-separated, no punctuation. What broad SUBJECT AREA is this thought about? Examples: \"rust\", \"build-systems\", \"team-management\", \"memory-systems\". Topics map prose to canonical subject categories — they may be inferred from context when the subject is clear, even if the exact topic word doesn't appear in the thought. Two thoughts about the same subject (e.g. one mentioning \"trigram retrieval\", another mentioning \"vector similarity\") may share topics (\"information-retrieval\") even with disjoint surface vocabulary. This is concept-mapping behavior, not surface-lexeme lifting. Distinct from entities: a topic is a category the thought falls under; an entity is a specific named thing the thought mentions. A thought naming \"engram\" and \"pgvector\" might have entities [\"engram\", \"pgvector\"] and topics [\"memory-systems\", \"databases\"].
+
 - dates_mentioned: any dates or temporal references appearing in the prose (\"next Thursday\", \"Q3\", \"2026-05-15\", \"before the release\"). Free-form strings, copied roughly as they appear. Empty array if none.
-- kind: a single classification of the thought's intrinsic shape — not its subject area, and not influenced by what other thoughts in this scope tend to be classified as. Classify from the writing's structural form (factual claim → observation; imperative → task; proposal → idea; pointer to a resource → reference; statement about a person → person_note; transient narrative → session). Use null if genuinely ambiguous. Categories:
-  - observation: a factual claim about the world (\"Rust has stronger memory safety than C\").
-  - task: a thing the writer or someone else needs to do (\"fix the login bug\").
-  - idea: a proposal or hypothesis (\"we could use Bloom filters here\").
-  - reference: a pointer to an external resource (a URL, a paper, a tool, or a definition of a named thing).
-  - person_note: a fact about a specific person (\"Sarah prefers async meetings\").
-  - session: transient session/test narrative (\"the search returned 3 results\", \"I just ran the migration\"). These should also have otherwise-empty arrays.
-- relations: default to []. Closed-vocabulary edges from this thought to non-thought targets. Emit an entry ONLY when the prose makes an explicit relational claim — not when something is merely mentioned, adjacent, or vaguely alluded to. Each entry has three required fields: `relation` (closed vocabulary), `to_kind` (one of `entity`, `person`, `url`), and `to_value` (the canonical name / URL string). Optional `note` for a short rationale phrase.
-  - relation vocabulary (pick exactly one per edge):
-    - references: this thought cites or points at the target for context (passive mention). Use for prose-level citation: \"see [URL]\", \"per [Author]\", \"following [Project]'s convention\".
-    - supports: this thought makes a claim that ACTIVELY CONFIRMS the target. The prose must contain a confirming claim, not just a citation. Use for evidential / corroborative relationships: \"our results match [Paper]'s findings\", \"data confirms [Hypothesis]\". If the prose is just a citation without endorsement, use `references`.
-    - decided_by: this thought attributes a decision to the target. The target is the decision-maker. Use only with explicit attribution: \"the team decided X\" → decided_by team; \"per Ron, we'll do Y\" → decided_by Ron. Do not use for general influence (\"research suggests X\" is `supports`, not `decided_by`).
-    - belongs_to: this thought is a sub-element or member of the target. Use when the prose explicitly grounds this thought under a parent (e.g. \"a finding under Probe 2 experiment\" → belongs_to entity \"Probe 2\"; \"during the 2026-05-15 design session\" → belongs_to entity \"design session 2026-05-15\").
-    - requires: this thought depends on the target. Use for explicit prerequisites.
-    - refines: deprecated for non-thought targets in v1 (refines targets another thought, which v1 cannot resolve). Skip.
-    - replaces: deprecated for non-thought targets in v1 (replaces targets another thought). Skip.
-  - to_kind values:
-    - url: an http:// or https:// URL appearing in the prose. Copy the URL verbatim.
-    - entity: a named non-person thing the relation targets (a project, experiment, paper title, session anchor). Use the same canonical name you'd put in the `entities` array.
-    - person: a named individual. Same name shape as the `people` array.
-  - Selectivity guidance:
-    - Default to []. The relation surface is a high-precision low-recall signal; over-emission creates graph noise.
-    - Require an explicit relational verb or construction in the prose. \"X uses Y\" is not a relation by itself; \"X is built on Y\" or \"X refines Y's approach\" is.
-    - Emit at most 5 relations per thought. Pick the most load-bearing ones.
-    - Do not emit a `references` edge for a URL that's not explicitly cited (e.g., a URL that appears only in a code block as configuration). Cited URLs are URLs the prose surrounding them treats as a referent.
+
+- relations: default to []. Closed-vocabulary edges from this thought to non-thought targets. Emit ONLY when the prose makes an EXPLICIT relational claim — not on adjacency, mere mention, or vague allusion. Each entry: `relation` (closed vocab), `to_kind` ∈ {entity, person, url}, `to_value` (canonical name or full URL), optional `note`.
+
+  - Relation vocabulary:
+    - references: prose cites or points at the target for context (passive mention).
+    - supports: prose contains a claim that CONFIRMS the target. Distinct from references (which is a passive citation).
+    - decided_by: thought attributes a decision to the target. Requires explicit attribution (\"the team decided X\" → decided_by team).
+    - belongs_to: thought is a sub-element/member of the target (\"a finding under Probe 2\" → belongs_to entity \"Probe 2\").
+    - requires: thought depends on the target (explicit prerequisite).
+    - refines, replaces: skip — these target other thoughts; v1 cannot resolve thought targets.
+
+  - to_kind:
+    - url: a FULL `http://` or `https://` URL appearing verbatim in the prose. If the thought has only a bare domain (\"example.com\"), partial path (\"/docs/foo\"), or paper citation without scheme (\"arxiv.org/abs/2004.04906\" — no http(s):// prefix), do NOT emit a url relation; the schema validation will reject it. Prefer an entity target instead, or omit.
+    - entity: a named non-person thing.
+    - person: a named individual.
+
+  - Selectivity: maxItems 5. Require an explicit relational verb or construction in the prose; mere mention is not a relation.
 
 # Rules
-- Entities require explicit mention by name in the thought. Do not invent entities. Do not pad entities with descriptive phrases when no named entities are present — empty array is correct.
-- Topics may be inferred from prose context when the subject is clear, even if the exact topic word doesn't appear.
-- Kind is classified from the thought's intrinsic shape, not from the scope's typical content or any controlled-vocabulary hints below. The vocabulary section, when present, informs topic and entity term choice only.
-- Relations require an explicit relational claim — a verb or construction in the prose that asserts the relationship. Mere mention is not a relation.
-- Empty arrays are correct for any field that has no content.
-- One classification only; pick the most-load-bearing category. If genuinely ambiguous, return null.
-- This is a tagging pass, not a paraphrase or rewrite. Do not rephrase the thought's content; only emit metadata.";
+
+- Entities require explicit surface mention. Topics may be inferred from context. Kind is intrinsic-shape only.
+- Empty arrays are correct when there's no content. Empty arrays are NOT a tagger-failure signal; over-emission is.
+- One kind only; if genuinely ambiguous, return null.
+- This is a tagging pass, not a paraphrase. Do not rephrase content; only emit metadata.
+
+# Before you emit — final pass
+
+1. Kind: did you walk the 5-step decision tree, or did you default to observation? Walk it now if not.
+2. Entities: re-read the thought. Does each entity in your output appear (by name or close paraphrase) in the prose? Remove any that don't.
+3. Relations: does each emission correspond to an explicit relational claim in the prose? Remove speculative ones. For url-kind relations: does `to_value` start with `http://` or `https://`? If not, drop or convert to entity.";
 
 /// Render the optional controlled-vocabulary section appended to the system
 /// prompt when scope vocabulary is available. Returns an empty string when
@@ -772,11 +812,11 @@ mod tests {
     /// test) without regressing to the v3 negative-example list (which
     /// backfired in dogfood — the model emitted the listed phrases verbatim).
     #[test]
-    fn tagger_v5_prompt_contains_field_semantics_lead_with_empty_kind_isolation_and_relations() {
+    fn tagger_v7_prompt_kind_decision_tree_entity_surface_only_and_url_tightening() {
         let p = BUNDLED_TAGGER_PROMPT;
         assert!(
             p.contains("Field semantics"),
-            "v4 prompt must contain a 'Field semantics' section"
+            "v7 prompt must contain a 'Field semantics' section"
         );
         for field in [
             "people",
@@ -785,70 +825,102 @@ mod tests {
             "topics",
             "dates_mentioned",
             "kind",
+            "relations",
         ] {
-            assert!(p.contains(field), "v4 prompt must mention field {field}");
+            assert!(p.contains(field), "v7 prompt must mention field {field}");
         }
         // The entities/topics distinction must be explicit (kept from v2).
         assert!(
             p.contains("Distinct from entities"),
-            "v4 prompt must explicitly distinguish entities from topics"
+            "v7 prompt must explicitly distinguish entities from topics"
         );
-        // v4 entities lead-with-empty framing: the description must open
-        // with the default-empty case rather than burying it as a constraint.
+        // v4 entities lead-with-empty framing preserved.
         assert!(
             p.contains("entities: default to []"),
-            "v4 prompt must lead the entities description with the empty case"
+            "v7 prompt must lead the entities description with the empty case"
         );
-        // v4 structural NAME-vs-DESCRIBE test replaces the v3 negative-example
-        // list (which backfired — the model emitted listed phrases verbatim).
+        // v4 NAME-vs-DESCRIBE test preserved.
         assert!(
             p.contains("NAME a specific thing"),
-            "v4 prompt must include the structural NAME-vs-DESCRIBE entities test"
+            "v7 prompt must include the structural NAME-vs-DESCRIBE entities test"
         );
-        assert!(
-            p.contains("DESCRIBE an action"),
-            "v4 prompt must include the structural NAME-vs-DESCRIBE entities test"
-        );
-        // v3's negative-example list must be gone — its presence reinforced
-        // the very phrases it was trying to exclude (047d0ce8 dogfood case).
+        // v3 negative-example list still must NOT be present (its backfire
+        // was the v3→v4 lesson; v6 uses *patterns* not literal phrases).
         assert!(
             !p.contains("The following are NOT entities"),
-            "v4 prompt must NOT contain the v3 negative-example list lead-in"
+            "v7 prompt must NOT contain the v3 negative-example list lead-in"
         );
-        // v3 kind-isolation clause remains: kind framed as intrinsic-shape
-        // and the Rules section forbids vocab from influencing kind.
+        // v6 surface-only rule (load-bearing addition addressing the
+        // `pg_trgm` knowledge-based hallucination from v5 dogfood).
         assert!(
-            p.contains("intrinsic shape"),
-            "v4 prompt must frame kind as intrinsic-shape classification"
+            p.contains("Surface-only rule"),
+            "v7 prompt must contain the surface-only rule heading"
         );
         assert!(
-            p.contains("not from the scope's typical content"),
-            "v4 prompt must explicitly isolate kind from scope-typical content"
+            p.contains("pg_trgm"),
+            "v7 prompt must cite the pg_trgm hallucination case as the surface-only example"
         );
-        // Presets pinned to the bundled version (5 as of M6.1's tagger-extracted relations).
-        assert_eq!(BUNDLED_TAGGER_VERSION, 5);
-        let cfg = OpenAICompatibleConfig::vllm_local();
-        assert_eq!(cfg.model_version, BUNDLED_TAGGER_VERSION);
-        let cfg = OpenAICompatibleConfig::open_router("k".into(), "m".into());
-        assert_eq!(cfg.model_version, BUNDLED_TAGGER_VERSION);
-        // v5 adds the Relations section to the prompt body. Pin the
-        // load-bearing rules so a careless prompt edit doesn't silently
-        // open the relation vocabulary or relax the selectivity framing.
+        assert!(
+            p.contains("world-knowledge"),
+            "v7 prompt must explicitly forbid world-knowledge inference"
+        );
+        // v6 final-pass verification on entities.
+        assert!(
+            p.contains("re-read the thought"),
+            "v7 prompt must include a re-read verification on entities"
+        );
+
+        // v6 kind rebalance: 5-step decision tree + anti-default framing.
+        assert!(
+            p.contains("decision tree"),
+            "v7 prompt must frame kind as a decision tree"
+        );
+        assert!(
+            p.contains("Anti-default"),
+            "v7 prompt must include the Anti-default framing inverting v5's observation collapse"
+        );
+        assert!(
+            p.contains("CATCHALL"),
+            "v7 prompt must label observation as the CATCHALL (not the default)"
+        );
+        // v3 kind-isolation clause preserved.
+        assert!(
+            p.contains("intrinsic-shape only") || p.contains("intrinsic shape"),
+            "v7 prompt must keep the intrinsic-shape framing on kind"
+        );
+        assert!(
+            p.contains("not from the scope's typical content")
+                || p.contains("never from the scope's typical content"),
+            "v7 prompt must keep kind isolated from scope-typical content"
+        );
+        // All 6 non-null kind enum values + null mentioned.
+        for k in [
+            "observation",
+            "task",
+            "idea",
+            "reference",
+            "person_note",
+            "session",
+        ] {
+            assert!(p.contains(k), "v7 prompt must enumerate kind {k:?}");
+        }
+
+        // v5 Relations section preserved.
         assert!(
             p.contains("relations: default to []"),
-            "v5 prompt must lead the relations description with the empty case"
+            "v7 prompt must lead the relations description with the empty case"
         );
         assert!(
-            p.contains("explicit relational claim"),
-            "v5 prompt must require explicit relational claims (no over-emission)"
+            p.contains("EXPLICIT relational claim"),
+            "v7 prompt must require explicit relational claims (no over-emission)"
         );
         for kind in ["url", "entity", "person"] {
             assert!(
                 p.contains(kind),
-                "v5 prompt must enumerate target kind {kind:?}"
+                "v7 prompt must enumerate target kind {kind:?}"
             );
         }
-        // Relations vocabulary is closed — all 7 names must appear in the prompt.
+        // Closed relations vocabulary — all 7 must appear.
         for r in [
             "replaces",
             "requires",
@@ -858,12 +930,51 @@ mod tests {
             "decided_by",
             "refines",
         ] {
-            assert!(p.contains(r), "v5 prompt must enumerate relation `{r}`");
+            assert!(p.contains(r), "v7 prompt must enumerate relation `{r}`");
         }
+        // v6 URL tightening (addresses the 2/2 dogfood URL rejections).
+        assert!(
+            p.contains("FULL `http://` or `https://` URL"),
+            "v7 prompt must require full http(s):// URLs only"
+        );
+        assert!(
+            p.contains("bare domain"),
+            "v7 prompt must explicitly call out bare-domain rejection"
+        );
+
+        // v6 final-pass review section (retained in v7).
+        assert!(
+            p.contains("Before you emit"),
+            "v7 prompt must include a 'Before you emit' final-pass review section"
+        );
+
+        // v7-specific: the structural NAME-vs-DESCRIBE test must be present
+        // AND there must be no "Patterns that are NOT entities" block. The
+        // v6 attempt to list adjectival patterns triggered the v3→v4
+        // backfire again — the model emitted the listed phrases verbatim
+        // from `047d0ce8`. v7 drops the NOT-entities block; the structural
+        // test + surface-only rule + final-pass verify alone handle it.
+        assert!(
+            !p.contains("Patterns that are NOT entities"),
+            "v7 prompt must NOT contain a 'Patterns that are NOT entities' block (v6 backfire pattern)"
+        );
+        // v7 topics-as-concept-mapping intent (was de-facto since v4 vocab
+        // softening; now stated explicitly).
+        assert!(
+            p.contains("concept-mapping"),
+            "v7 prompt must explicitly document topics as concept-mapping behavior"
+        );
+
+        // Presets pinned to v7.
+        assert_eq!(BUNDLED_TAGGER_VERSION, 7);
+        let cfg = OpenAICompatibleConfig::vllm_local();
+        assert_eq!(cfg.model_version, BUNDLED_TAGGER_VERSION);
+        let cfg = OpenAICompatibleConfig::open_router("k".into(), "m".into());
+        assert_eq!(cfg.model_version, BUNDLED_TAGGER_VERSION);
     }
 
     #[test]
-    fn tags_response_format_pins_v5_shape() {
+    fn tags_response_format_pins_v7_shape() {
         let v = tags_response_format();
         let schema = &v["json_schema"]["schema"];
         let required = schema["required"].as_array().unwrap();
@@ -1022,8 +1133,10 @@ mod tests {
     }
 
     /// Common fixtures for both kind-stability diagnostics (vocab-off and
-    /// vocab-on). Six fixture thoughts pulled from the post-M4.1 corpus.
-    /// Format: (short_id, scope, current_v2_kind, descriptor, content).
+    /// vocab-on). Seven fixture thoughts pulled from the post-M4.1 corpus,
+    /// with `63ad01e0` added in v6 to pin the pg_trgm world-knowledge
+    /// hallucination regression. Format: (short_id, scope, current_stored_kind,
+    /// descriptor, content).
     #[cfg(feature = "integration")]
     fn diagnostic_fixtures() -> Vec<(
         &'static str,
@@ -1037,15 +1150,22 @@ mod tests {
                 "8a533e15",
                 "engram.m3.dogfood",
                 "observation",
-                "Mission/setup (drift candidate: was task in v1, observation in v2)",
+                "Mission/setup (drift candidate: was task in v1, observation in v2-v5; v6 target: task)",
                 "Mission for the engram.m3.dogfood scope: We are testing the Engram agent memory system via its MCP toolset. We are testing for accuracy, making sure that facts don't drift negatively, and that searches return expected information.\n\nWhen scope is a parameter, we will use \"engram.m3.dogfood\".\n\nFor any of our conversations, the agent will always consult the facts and thoughts in that scope, giving more weight to facts than thoughts. The agent will add any interesting thought that it or the operator comes up with during the conversation. If unsure, the agent will ask the operator whether it should be stored.",
             ),
             (
                 "047d0ce8",
                 "engram.m3.dogfood",
                 "observation",
-                "Probe 2B definitional (drift candidate: was reference in v1, observation in v2)",
+                "Probe 2B definitional (v5 dogfood: emitted adjectival entities `embedding-based`, `lexical signals`; v6 target: NEITHER in entities)",
                 "The agent memory protocol provides five operations: writing notes, querying them by similarity or recency, fetching by id, and marking notes untrusted. Querying combines embedding-based and lexical signals, optionally re-scored by a cross-encoder.",
+            ),
+            (
+                "63ad01e0",
+                "engram.m3.dogfood",
+                "observation",
+                "Probe 2A surface-check (v5 dogfood: hallucinated `pg_trgm` from \"trigram retrieval\"; v6 target: `pg_trgm` NOT in entities)",
+                "engram's MCP tool surface exposes capture, search_thoughts, get_thought, recent_thoughts, and retract_thought. Search supports hybrid vector + trigram retrieval with optional cross-encoder rerank.",
             ),
             (
                 "22bccb3a",
@@ -1218,20 +1338,28 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn kind_stability_diagnostic() {
-        // Six fixture thoughts pulled from the post-M4.1 corpus. Format:
-        // (short_id, current_v2_kind, descriptor, content).
+        // Seven fixture thoughts pulled from the post-M4.1 corpus. Format:
+        // (short_id, current_stored_kind, descriptor, content). `63ad01e0`
+        // added in v6 to pin the pg_trgm world-knowledge hallucination
+        // regression observed in v5 dogfood.
         let fixtures: Vec<(&str, &str, &str, &str)> = vec![
             (
                 "8a533e15",
                 "observation",
-                "Mission/setup (drift candidate: was task in v1, observation in v2)",
+                "Mission/setup (drift candidate: was task in v1, observation in v2-v5; v6 target: task)",
                 "Mission for the engram.m3.dogfood scope: We are testing the Engram agent memory system via its MCP toolset. We are testing for accuracy, making sure that facts don't drift negatively, and that searches return expected information.\n\nWhen scope is a parameter, we will use \"engram.m3.dogfood\".\n\nFor any of our conversations, the agent will always consult the facts and thoughts in that scope, giving more weight to facts than thoughts. The agent will add any interesting thought that it or the operator comes up with during the conversation. If unsure, the agent will ask the operator whether it should be stored.",
             ),
             (
                 "047d0ce8",
                 "observation",
-                "Probe 2B definitional (drift candidate: was reference in v1, observation in v2)",
+                "Probe 2B definitional (v5 dogfood: emitted adjectival entities `embedding-based`, `lexical signals`; v6 target: NEITHER in entities)",
                 "The agent memory protocol provides five operations: writing notes, querying them by similarity or recency, fetching by id, and marking notes untrusted. Querying combines embedding-based and lexical signals, optionally re-scored by a cross-encoder.",
+            ),
+            (
+                "63ad01e0",
+                "observation",
+                "Probe 2A surface-check (v5 dogfood: hallucinated `pg_trgm` from \"trigram retrieval\"; v6 target: `pg_trgm` NOT in entities)",
+                "engram's MCP tool surface exposes capture, search_thoughts, get_thought, recent_thoughts, and retract_thought. Search supports hybrid vector + trigram retrieval with optional cross-encoder rerank.",
             ),
             (
                 "22bccb3a",
@@ -1275,12 +1403,16 @@ mod tests {
         let t =
             OpenAICompatibleTagger::new(cfg).expect("OpenAICompatibleTagger::new should succeed");
 
-        // Per-fixture results: short_id -> (descriptor, current_kind, [observed_kinds; N]).
-        type Observed = (String, String, Vec<String>);
+        // Per-fixture results: short_id -> (descriptor, current_kind,
+        // [observed_kinds; N], [observed_entities; N]). v6 added the
+        // entity-set capture so the operator can eyeball the pg_trgm
+        // hallucination and adjectival-regression cases in the same run.
+        type Observed = (String, String, Vec<String>, Vec<Vec<String>>);
         let mut results: Vec<(String, Observed)> = Vec::new();
 
         for (short_id, current_kind, descriptor, content) in &fixtures {
-            let mut observed: Vec<String> = Vec::with_capacity(N_RUNS);
+            let mut observed_kinds: Vec<String> = Vec::with_capacity(N_RUNS);
+            let mut observed_entities: Vec<Vec<String>> = Vec::with_capacity(N_RUNS);
             for run in 0..N_RUNS {
                 eprintln!("[diagnostic] {short_id} run {}/{} ...", run + 1, N_RUNS);
                 match t.tag(content, None).await {
@@ -1289,36 +1421,45 @@ mod tests {
                             .kind
                             .map(|k| format!("{k:?}").to_lowercase())
                             .unwrap_or_else(|| "null".to_string());
-                        observed.push(k);
+                        observed_kinds.push(k);
+                        observed_entities.push(tags.entities);
                     }
                     Err(e) => {
                         eprintln!("[diagnostic] {short_id} run {} ERR: {e}", run + 1);
-                        observed.push(format!("ERR({e})"));
+                        observed_kinds.push(format!("ERR({e})"));
+                        observed_entities.push(vec![]);
                     }
                 }
             }
             results.push((
                 short_id.to_string(),
-                (descriptor.to_string(), current_kind.to_string(), observed),
+                (
+                    descriptor.to_string(),
+                    current_kind.to_string(),
+                    observed_kinds,
+                    observed_entities,
+                ),
             ));
         }
 
         // Render results as a markdown table on stderr.
         eprintln!();
-        eprintln!("## v2 kind-stability diagnostic results (N={N_RUNS} per thought)");
-        eprintln!();
         eprintln!(
-            "Tagger: ollama/qwen3-coder:30b @ http://localhost:11434/v1, bundled v2 prompt, temperature 0.2, vocab=None."
+            "## v{ver} kind-stability diagnostic results (N={N_RUNS} per thought)",
+            ver = BUNDLED_TAGGER_VERSION
         );
         eprintln!();
         eprintln!(
-            "| short_id | current kind (v2 stored) | descriptor | kind distribution (N=10) |"
+            "Tagger: ollama/qwen3-coder:30b @ http://localhost:11434/v1, bundled v{ver} prompt, temperature 0.2, vocab=None.",
+            ver = BUNDLED_TAGGER_VERSION
         );
+        eprintln!();
+        eprintln!("| short_id | current kind (stored) | descriptor | kind distribution (N=10) |");
         eprintln!("|---|---|---|---|");
-        for (short_id, (descriptor, current_kind, observed)) in &results {
+        for (short_id, (descriptor, current_kind, kinds, _)) in &results {
             let mut counts: std::collections::BTreeMap<&str, usize> =
                 std::collections::BTreeMap::new();
-            for k in observed {
+            for k in kinds {
                 *counts.entry(k.as_str()).or_insert(0) += 1;
             }
             let dist = counts
@@ -1329,9 +1470,17 @@ mod tests {
             eprintln!("| `{short_id}` | `{current_kind}` | {descriptor} | {dist} |");
         }
         eprintln!();
-        eprintln!("Raw observations (one row per fixture):");
-        for (short_id, (_, _, observed)) in &results {
-            eprintln!("- {short_id}: {observed:?}");
+        eprintln!("Raw kind observations (one row per fixture):");
+        for (short_id, (_, _, kinds, _)) in &results {
+            eprintln!("- {short_id}: {kinds:?}");
+        }
+        eprintln!();
+        eprintln!("Entity emissions per fixture (one row per run):");
+        for (short_id, (_, _, _, entities)) in &results {
+            eprintln!("- {short_id}:");
+            for (i, e) in entities.iter().enumerate() {
+                eprintln!("    run {}: {e:?}", i + 1);
+            }
         }
     }
 
@@ -1358,12 +1507,16 @@ mod tests {
 
         let t = diagnostic_tagger();
 
-        type Observed = (String, String, String, Vec<String>);
+        // (scope, descriptor, current_kind, observed_kinds, observed_entities).
+        // v6 captures entities alongside kind so the operator can verify the
+        // surface-only / adjectival regression cases in the same run.
+        type Observed = (String, String, String, Vec<String>, Vec<Vec<String>>);
         let mut results: Vec<(String, Observed)> = Vec::new();
 
         for (short_id, scope, current_kind, descriptor, content) in &fixtures {
             let vocab = diagnostic_scope_vocab(scope);
-            let mut observed: Vec<String> = Vec::with_capacity(N_RUNS);
+            let mut observed_kinds: Vec<String> = Vec::with_capacity(N_RUNS);
+            let mut observed_entities: Vec<Vec<String>> = Vec::with_capacity(N_RUNS);
             for run in 0..N_RUNS {
                 eprintln!(
                     "[diagnostic-vocab] {short_id} ({scope}) run {}/{} ...",
@@ -1376,11 +1529,13 @@ mod tests {
                             .kind
                             .map(|k| format!("{k:?}").to_lowercase())
                             .unwrap_or_else(|| "null".to_string());
-                        observed.push(k);
+                        observed_kinds.push(k);
+                        observed_entities.push(tags.entities);
                     }
                     Err(e) => {
                         eprintln!("[diagnostic-vocab] {short_id} run {} ERR: {e}", run + 1);
-                        observed.push(format!("ERR({e})"));
+                        observed_kinds.push(format!("ERR({e})"));
+                        observed_entities.push(vec![]);
                     }
                 }
             }
@@ -1390,24 +1545,29 @@ mod tests {
                     scope.to_string(),
                     descriptor.to_string(),
                     current_kind.to_string(),
-                    observed,
+                    observed_kinds,
+                    observed_entities,
                 ),
             ));
         }
 
         eprintln!();
-        eprintln!("## v2 kind-stability diagnostic results — VOCAB-ON (N={N_RUNS} per thought)");
+        eprintln!(
+            "## v{ver} kind-stability diagnostic results — VOCAB-ON (N={N_RUNS} per thought)",
+            ver = BUNDLED_TAGGER_VERSION
+        );
         eprintln!();
         eprintln!(
-            "Tagger: ollama/qwen3-coder:30b @ http://localhost:11434/v1, bundled v2 prompt, temperature 0.2, vocab=Some(<frozen scope vocab>)."
+            "Tagger: ollama/qwen3-coder:30b @ http://localhost:11434/v1, bundled v{ver} prompt, temperature 0.2, vocab=Some(<frozen scope vocab>).",
+            ver = BUNDLED_TAGGER_VERSION
         );
         eprintln!();
         eprintln!("| short_id | scope | stored kind | descriptor | kind distribution (N=10) |");
         eprintln!("|---|---|---|---|---|");
-        for (short_id, (scope, descriptor, current_kind, observed)) in &results {
+        for (short_id, (scope, descriptor, current_kind, kinds, _)) in &results {
             let mut counts: std::collections::BTreeMap<&str, usize> =
                 std::collections::BTreeMap::new();
-            for k in observed {
+            for k in kinds {
                 *counts.entry(k.as_str()).or_insert(0) += 1;
             }
             let dist = counts
@@ -1418,9 +1578,17 @@ mod tests {
             eprintln!("| `{short_id}` | `{scope}` | `{current_kind}` | {descriptor} | {dist} |");
         }
         eprintln!();
-        eprintln!("Raw observations (one row per fixture):");
-        for (short_id, (_, _, _, observed)) in &results {
-            eprintln!("- {short_id}: {observed:?}");
+        eprintln!("Raw kind observations (one row per fixture):");
+        for (short_id, (_, _, _, kinds, _)) in &results {
+            eprintln!("- {short_id}: {kinds:?}");
+        }
+        eprintln!();
+        eprintln!("Entity emissions per fixture (one row per run):");
+        for (short_id, (_, _, _, _, entities)) in &results {
+            eprintln!("- {short_id}:");
+            for (i, e) in entities.iter().enumerate() {
+                eprintln!("    run {}: {e:?}", i + 1);
+            }
         }
     }
 }

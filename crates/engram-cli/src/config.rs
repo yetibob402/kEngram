@@ -206,11 +206,15 @@ pub struct TaggerConfig {
     /// Conventionally `<vendor>/<model>`. Defaults to `"vllm/qwen2.5-7b-instruct"`.
     pub model_id: String,
     /// Schema-version for `thoughts.tags_extractor_version`. Default tracks
-    /// `engram_extract::BUNDLED_TAGGER_VERSION` (currently 5 — the M6.1
-    /// tagger-extracted-relations addition: prompt + schema gain a
-    /// `relations` field emitting closed-vocabulary edges to non-thought
-    /// targets). Bump when the prompt or schema changes such that prior
-    /// tags shouldn't be considered comparable; `engram tag --rerun --since
+    /// `engram_extract::BUNDLED_TAGGER_VERSION` (currently 7 — two
+    /// post-M6.1 dogfood iterations: v6 rebalanced kind classification +
+    /// added entity surface-only rule + tightened URL emission but
+    /// repeated the v3→v4 backfire by listing adjectival phrases as
+    /// negative examples; v7 drops the literal-phrase NOT-entities list,
+    /// relying on the structural NAME-vs-DESCRIBE test alone, and
+    /// documents topics-as-concept-mapping intent explicitly). Bump when
+    /// the prompt or schema changes such that prior tags shouldn't be
+    /// considered comparable; `engram tag --rerun --since
     /// 1970-01-01T00:00:00Z` then backfills.
     pub model_version: i32,
     pub api_key: Option<String>,
@@ -247,8 +251,13 @@ impl Default for TaggerConfig {
             // v2, bumped to v3 (entities anti-padding + kind isolation),
             // bumped to v4 (lead-with-empty entities + vocab softening) after
             // dogfood revealed the v3 negative-example list backfired, bumped
-            // to v5 (M6.1) adding tagger-extracted relations.
-            model_version: 5,
+            // to v5 (M6.1) adding tagger-extracted relations, bumped to v6
+            // (post-M6.1 dogfood pass 1) rebalancing kind + surface-only
+            // entities + URL tightening, bumped to v7 (post-M6.1 dogfood
+            // pass 2) after v6 listed adjectival phrases as negative
+            // examples and re-triggered the v3→v4 backfire — v7 drops the
+            // NOT-entities phrase list, relies on the structural test alone.
+            model_version: 7,
             api_key: None,
             timeout_seconds: 60,
             temperature: 0.2,
@@ -360,8 +369,9 @@ mod tests {
         // Tracks engram_extract::BUNDLED_TAGGER_VERSION; M4.1 shipped at
         // v2; v3 added entities anti-padding + kind isolation; v4 restructured
         // entities to lead-with-empty + softened vocab to tie-break; v5 (M6.1)
-        // added tagger-extracted relations.
-        assert_eq!(c.tagger.model_version, 5);
+        // added tagger-extracted relations; v6 (post-M6.1 dogfood) rebalanced
+        // kind + added surface-only entities rule + tightened URL emission.
+        assert_eq!(c.tagger.model_version, 7);
         assert!(c.tagger.api_key.is_none());
         // Default is the bundled prompt — no file override.
         assert!(c.tagger.system_prompt_file.is_none());
@@ -385,7 +395,7 @@ mod tests {
             .unwrap();
         assert_eq!(c.tagger.provider, "openai-compatible");
         assert_eq!(c.tagger.endpoint, "http://localhost:8000/v1");
-        assert_eq!(c.tagger.model_version, 5);
+        assert_eq!(c.tagger.model_version, 7);
     }
 
     /// Operator can disable scope-vocabulary injection or tune its size via

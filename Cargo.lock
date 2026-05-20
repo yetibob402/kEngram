@@ -606,7 +606,6 @@ dependencies = [
  "engram-mcp",
  "engram-storage",
  "figment",
- "futures",
  "rmcp",
  "serde",
  "serde_json",

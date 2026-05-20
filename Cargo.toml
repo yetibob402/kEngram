@@ -52,10 +52,6 @@ pgvector = { version = "0.4", features = ["sqlx"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 axum    = "0.8"
 
-# Stream combinators (used to construct a never-emitting SSE keep-alive stream
-# in engram-cli; small, well-established, MIT/Apache-2.0).
-futures  = "0.3"
-
 # Config
 figment = { version = "0.10", features = ["toml", "env"] }
 

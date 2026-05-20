@@ -9,13 +9,9 @@ mod backup;
 mod bench;
 mod config;
 
-use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
-use axum::{
-    response::sse::{Event, KeepAlive, Sse},
-    routing::get,
-};
 use clap::{Parser, Subcommand};
 use engram_core::{Embedder, EmbeddingModel, Tagger};
 use engram_embed::{
@@ -23,10 +19,6 @@ use engram_embed::{
 };
 use engram_extract::{OpenAICompatibleConfig as TaggerConfigBuilder, OpenAICompatibleTagger};
 use engram_mcp::EngramServer;
-use futures::{
-    StreamExt,
-    stream::{self, Stream},
-};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -330,30 +322,6 @@ fn build_tagger(c: &TaggerConfig) -> anyhow::Result<ResolvedTagger> {
     }
 }
 
-/// Stand-in for the streamable-HTTP server→client SSE channel. rmcp serves
-/// `/mcp` in stateless mode, which means rmcp itself rejects `GET /mcp` with
-/// 405. Strict MCP clients (Dart `ChatMcpiOSClient`) treat that 405 as
-/// handshake-incomplete and never transition past their "connecting" UI
-/// state. This handler intercepts GET *before* the request reaches rmcp,
-/// returns an immediately-open SSE response that emits an empty comment as
-/// the first frame (so any client gating on "first-event-within-Xs" is
-/// satisfied instantly) and then falls back to periodic keep-alive comments
-/// every 5 s. Engram doesn't push server-initiated MCP messages, so the
-/// stream stays content-free aside from these comments.
-///
-/// Crucially this stream carries NO `id:` field on any frame. That's the
-/// mechanism that broke iOS in our prior stateful-mode attempts: rmcp's
-/// SSE machinery tags every event with a resumable id like `0/0`, and the
-/// Dart client extracts that id for `Last-Event-Id` on reconnect, which
-/// routes through rmcp's request-wise resume path and produces a tight
-/// retry loop. Event::default().comment("") emits just `: \n\n`, no id.
-async fn mcp_get_handler() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    tracing::info!("mcp GET stream opened");
-    let immediate = stream::once(async { Ok(Event::default().comment("")) });
-    let rest = stream::pending::<Result<Event, Infallible>>();
-    Sse::new(immediate.chain(rest)).keep_alive(KeepAlive::new().interval(Duration::from_secs(5)))
-}
-
 async fn run_serve(config: Config) -> anyhow::Result<()> {
     let pool = PgPoolOptions::new()
         .max_connections(config.database.max_connections)
@@ -400,13 +368,6 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
     // mcp-remote bridge) comes back after idling past the 5-minute default.
     // `json_response: true` pairs naturally — replies are plain JSON, no SSE
     // framing overhead.
-    //
-    // Stateless rmcp returns 405 for `GET /mcp`, which strict clients (Dart's
-    // `ChatMcpiOSClient`) treat as handshake-incomplete. We intercept GET at
-    // the axum layer via `mcp_get_handler` below, serving a no-op SSE
-    // keep-alive stream. POST/DELETE/etc still pass through rmcp's
-    // stateless+JSON path that Claude Desktop / Code / mcp-remote depend on.
-    //
     // DNS-rebinding protection: rmcp ships with a safe default allowlist
     // (`localhost` / `127.0.0.1` / `::1`). Operators binding to a non-loopback
     // interface (Tailnet, LAN) must extend the allowlist via
@@ -422,8 +383,7 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
     let mcp_service =
         StreamableHttpService::new(factory, LocalSessionManager::default().into(), http_cfg);
 
-    let mcp_route = get(mcp_get_handler).fallback_service(mcp_service);
-    let app = axum::Router::new().route("/mcp", mcp_route);
+    let app = axum::Router::new().nest_service("/mcp", mcp_service);
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding HTTP server to {bind}"))?;

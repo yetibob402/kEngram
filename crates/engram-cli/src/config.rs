@@ -207,7 +207,7 @@ pub struct TaggerConfig {
     /// Conventionally `<vendor>/<model>`. Defaults to `"vllm/qwen2.5-7b-instruct"`.
     pub model_id: String,
     /// Schema-version for `thoughts.tags_extractor_version`. Default tracks
-    /// `engram_extract::BUNDLED_TAGGER_VERSION` (currently 8 — three
+    /// `engram_extract::BUNDLED_TAGGER_VERSION` (currently 9 — four
     /// post-M6.1 dogfood iterations: v6 rebalanced kind classification +
     /// added entity surface-only rule + tightened URL emission but
     /// repeated the v3→v4 backfire by listing adjectival phrases as
@@ -216,7 +216,9 @@ pub struct TaggerConfig {
     /// documents topics-as-concept-mapping intent explicitly; v8 removes
     /// Rust from the topics examples list and from the kind=observation
     /// exemplar after first-item example-list priming caused topic-
-    /// overreach to `"rust"` on tech-adjacent thoughts). Bump when
+    /// overreach to `"rust"` on tech-adjacent thoughts; v9 drops the
+    /// topics `Examples: ...` clause entirely after v8's swap just
+    /// rotated the priming target from `"rust"` to `"databases"`). Bump when
     /// the prompt or schema changes such that prior tags shouldn't be
     /// considered comparable; `engram tag --rerun --since
     /// 1970-01-01T00:00:00Z` then backfills.

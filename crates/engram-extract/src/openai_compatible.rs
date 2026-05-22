@@ -121,7 +121,18 @@ impl OpenAICompatibleConfig {
 /// Entities examples still include "Rust" — the surface-only rule
 /// prevents spurious emission there, and it's a legitimate canonical
 /// entity in this corpus.
-pub const BUNDLED_TAGGER_VERSION: i32 = 8;
+/// **v9 (post-v8 dogfood pass 4)** drops the standalone topics
+/// `Examples: ...` clause entirely. v8's swap (Rust out, databases
+/// in) just rotated the priming target — across the post-v8 retag
+/// 13 of 18 thoughts emitting `"databases"` as a topic weren't
+/// about databases (engram API design, branding, capture discipline,
+/// serialization, etc.). The structural issue was the example list,
+/// not which items were in it. v9 leans on the prose example at the
+/// end of the topics paragraph ("a thought naming engram and
+/// pgvector might have topics [memory-systems, databases]") and
+/// the concept-mapping intent statement to teach the field, without
+/// a free-floating priming list.
+pub const BUNDLED_TAGGER_VERSION: i32 = 9;
 
 #[derive(Debug, Clone)]
 pub struct OpenAICompatibleTagger {
@@ -242,7 +253,7 @@ You are a tagging assistant. Given a single thought from a memory service, retur
 
 - action_items: short imperative phrases describing tasks the thought commits to or implies (e.g., \"fix the login bug\", \"review the migration plan\"). Empty array if none. Distinct from kind=task: action_items is the per-thought list of items; kind=task is the thought's overall classification.
 
-- topics: 1-3 short tag-like subject categories, lowercase, hyphen-separated, no punctuation. What broad SUBJECT AREA is this thought about? Examples: \"memory-systems\", \"team-management\", \"databases\", \"information-retrieval\". Topics map prose to canonical subject categories — they may be inferred from context when the subject is clear, even if the exact topic word doesn't appear in the thought. Two thoughts about the same subject (e.g. one mentioning \"trigram retrieval\", another mentioning \"vector similarity\") may share topics (\"information-retrieval\") even with disjoint surface vocabulary. This is concept-mapping behavior, not surface-lexeme lifting. Distinct from entities: a topic is a category the thought falls under; an entity is a specific named thing the thought mentions. A thought naming \"engram\" and \"pgvector\" might have entities [\"engram\", \"pgvector\"] and topics [\"memory-systems\", \"databases\"].
+- topics: 1-3 short tag-like subject categories, lowercase, hyphen-separated, no punctuation. What broad SUBJECT AREA is this thought about? Topics map prose to canonical subject categories — they may be inferred from context when the subject is clear, even if the exact topic word doesn't appear in the thought. Two thoughts about the same subject (e.g. one mentioning \"trigram retrieval\", another mentioning \"vector similarity\") may share topics (\"information-retrieval\") even with disjoint surface vocabulary. This is concept-mapping behavior, not surface-lexeme lifting. Distinct from entities: a topic is a category the thought falls under; an entity is a specific named thing the thought mentions. A thought naming \"engram\" and \"pgvector\" might have entities [\"engram\", \"pgvector\"] and topics [\"memory-systems\", \"databases\"].
 
 - dates_mentioned: any dates or temporal references appearing in the prose (\"next Thursday\", \"Q3\", \"2026-05-15\", \"before the release\"). Free-form strings, copied roughly as they appear. Empty array if none.
 
@@ -1010,7 +1021,7 @@ mod tests {
         );
 
         // Presets track BUNDLED_TAGGER_VERSION.
-        assert_eq!(BUNDLED_TAGGER_VERSION, 8);
+        assert_eq!(BUNDLED_TAGGER_VERSION, 9);
         let cfg = OpenAICompatibleConfig::vllm_local();
         assert_eq!(cfg.model_version, BUNDLED_TAGGER_VERSION);
         let cfg = OpenAICompatibleConfig::open_router("k".into(), "m".into());

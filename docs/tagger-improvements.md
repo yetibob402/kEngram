@@ -32,23 +32,32 @@ specifically a code-specialized fine-tune artifact, not a small-model ceiling.
 Concrete change: `[tagger].model_name` and `model_id` swapped to `gemma3:12b`
 in `~/.config/engram/engram.toml`. Prompt version unchanged.
 
-### Topic overreach to "rust" — fixed by v8 prompt edit
+### Topic overreach — fixed by v9 (after v8 only rotated the target)
 
 Root cause confirmed in source review: the bundled tagger prompt's `topics`
-example list led with `"rust"` (line 237 of
-`crates/engram-extract/src/openai_compatible.rs`), and the `kind=observation`
-exemplar pair led with `"Rust has stronger memory safety than C."` (line
-229). First-item priming in few-shot example lists disproportionately shapes
-what the LLM treats as canonical vocabulary — exactly the failure pattern
-observed on probes C, D, G.
+example list (`Examples: ...`) was the priming mechanism. First-item
+priming in few-shot example lists disproportionately shapes what the LLM
+treats as canonical vocabulary.
 
-Concrete change (v8): topics examples now lead with `memory-systems`,
-followed by `team-management`, `databases`, `information-retrieval`. The
-observation exemplar swaps the Rust-vs-C claim for a Postgres autovacuum
-fact. `BUNDLED_TAGGER_VERSION` bumped 7 → 8; rerun `engram tag --rerun` to
-retag the corpus under the new prompt. Entities example list still includes
-"Rust" — surface-only rule prevents spurious emission, and Rust is a
-legitimate canonical entity when actually mentioned.
+**v8 attempt (partial fix):** removed `"rust"` from the topics examples and
+the kind=observation exemplar. Topics examples re-led with `memory-systems`
+then `team-management`, `databases`, `information-retrieval`. Observation
+exemplar swapped the Rust-vs-C claim for a Postgres autovacuum fact.
+Post-v8 corpus retag confirmed `"rust"` overreach was gone (only 2 of 58
+thoughts kept `"rust"` topic, both genuinely about Rust). **But:**
+`"databases"` over-emission appeared in 13 of 18 thoughts that got it as
+a topic — engram API design, branding, capture-discipline observations,
+etc. v8 had simply rotated the priming target from `"rust"` to `"databases"`.
+
+**v9 fix:** dropped the standalone `Examples: ...` clause from the topics
+field instruction entirely. The topics paragraph now relies on the prose
+example at the end ("a thought naming engram and pgvector might have
+topics [memory-systems, databases]") plus the concept-mapping intent
+statement to teach the field — no free-floating list of canonical items
+for the model to over-anchor to. `BUNDLED_TAGGER_VERSION` bumped 8 → 9.
+Lesson: the structural issue was the example list itself, not its
+contents. Entities example list still carries one (it's needed for the
+surface-only rule's clarity) but topics now has none.
 
 ## Open issues
 

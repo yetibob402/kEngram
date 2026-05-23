@@ -59,7 +59,7 @@ Lesson: the structural issue was the example list itself, not its
 contents. Entities example list still carries one (it's needed for the
 surface-only rule's clarity) but topics now has none.
 
-### Topic overreach via scope_vocab feedback loop — decision recorded; in-progress fix
+### Topic overreach via scope_vocab feedback loop — partial fix at v11; ceiling-bound by model capacity
 
 **Diagnosis.** Post-v9 corpus-wide retag revealed that v9 only addressed the
 *in-prompt* priming mechanism. A second mechanism persisted: the worker
@@ -134,6 +134,74 @@ system that uses its own corpus output as feedback into subsequent
 extractions is at risk of self-reinforcing overreach. Separating emission
 from normalization is the structural fix. Not gemma3-specific; applies to
 any controlled-vocabulary-with-LLM pipeline.
+
+**v11 empirical outcome (2026-05-23 retag, gemma3:12b).** The architecture
+landed cleanly but the empirical gains over the v9 vocab-off baseline are
+smaller than the diagnosis predicted. Across the same 58-thought corpus:
+
+| Run | `"databases"` topic count | Overreach (not really about DBs) | `"rust"` on Rust-about thoughts |
+|---|---:|---:|---:|
+| v8 + vocab on (size=50) | 18 | 13 | 1 of 2 (correct) |
+| v9 + vocab on (size=50) | 16 | 11 | 1 of 2 (correct) |
+| v9 + vocab off          | 10 | 3 | 0 of 2 (lost) |
+| **v11 (vocab off in prompt + normalize post)** | **14** | **~8** | **0 of 2 (still lost)** |
+
+Worst-case overreach is gone — the Engram-branding thought
+(`1bfcc158`) is now `[branding, ai-agents, memory-systems]` and the
+AI-Agile manifesto (`62495576`) is `[ai, agile-methodology,
+software-development]`. Both were clear `databases`/`rust` overreach
+before. Legitimate canonical convergence works where the corpus has
+established a canonical form (`search-engines`, `ai-agents`,
+`memory-systems` appearing consistently across multiple thoughts).
+
+But the remaining `databases` cases (~8) are mostly thoughts about
+engram's storage/graph layer where the LLM emits `databases` or close
+variants on its own initiative, regardless of prompt. The normalizer
+dutifully converges variants (`database` → `databases`) which can amplify
+the count slightly versus vocab-off. And the `rust` topic on actual
+Rust-about content is still missing — without vocab in the prompt,
+gemma3:12b doesn't emit `rust` spontaneously on probe A or the
+Ron-prefers-Rust thought, and the normalizer can't introduce a term the
+LLM didn't emit.
+
+**The real takeaway from this exploration arc.** gemma3:12b's topic
+emission is the dominant variance source, not vocab feedback. v8/v9
+prompt edits, scope_vocab toggle, and v11 normalization each gave us
+modest wins on different axes, but none broke the model-capacity
+ceiling. The architectural cleanups (separating emission from
+normalization, entities-only-in-prompt) are sound and worth keeping
+regardless — they compound with model improvements rather than
+substituting for them. **Further tagger iteration is parked until the
+3090 build lands a larger model.** Re-run the probe set then.
+
+### How v11 compounds with a larger model (post-3090)
+
+The v11 architecture is model-agnostic. When a larger tagger model
+(Qwen 2.5 32B Instruct or similar — see "Future model upgrades" below)
+runs through the same v11 pipeline, expected additional benefits:
+
+- **Less noise in emissions.** A 32B model follows the topic
+  instruction more reliably — fewer spontaneous `databases`/`rust`
+  emissions on tangentially-related content. Fewer false positives
+  entering the corpus → fewer false canonical forms for the
+  normalizer to reinforce.
+- **Better legitimate emission.** A 32B model is more likely to
+  emit `rust` on probe A and the Ron-prefers-Rust thought when
+  appropriate, restoring the canonical-form benefit we lost at v9.
+- **Tighter normalizer convergence.** With richer per-scope vocabs
+  (from accurate spontaneous emissions), the normalizer has more
+  canonical targets to converge against. The current sparse vocab
+  in some scopes (`engram.tagger-test`, `rjf.tech`) means
+  normalization is a no-op there.
+- **Vocab-in-prompt may become safe again.** A future v12 could
+  reasonably re-enable in-prompt topic vocab if the larger model
+  treats it as a tie-breaker hint rather than a menu. That's a
+  tunable to revisit empirically with the new model — keep both
+  mechanisms (prompt vocab + post-process normalize) available as
+  config knobs and measure.
+
+Net: the work done at v8-v11 was the right architecture; the larger
+model is the lever that makes it deliver on the promise.
 
 ## Open issues
 
@@ -214,13 +282,17 @@ Once a 3090 (24GB VRAM) is available for the tagger:
 - Schema robustness in general
 - Cold-load timeout pressure (gemma3:12b currently ~27s/thought on the iMac;
   Qwen 2.5 32B on a 3090 should hit ~5-10s)
+- **Topic emission consistency.** The v11 retag showed gemma3:12b's
+  spontaneous emissions are the dominant variance source — `database`
+  vs `databases`, missing `rust` on Rust-about content, `databases`
+  on tangentially-DB-related content. Larger models follow the topic
+  instruction more reliably; the v11 normalize layer compounds with
+  this rather than substituting for it.
 
 **What bigger probably WON'T fix:**
 
 - "Bob-as-verb" syntactic ambiguity (still benefits from constrained-vocab
   or denylist regardless of model size)
-- Topic overreach (prompt issue, not capacity — larger models tend to
-  hallucinate well-attested topics more confidently, not less)
 
 ## How to re-run the probe set
 

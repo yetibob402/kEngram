@@ -207,7 +207,7 @@ pub struct TaggerConfig {
     /// Conventionally `<vendor>/<model>`. Defaults to `"vllm/qwen2.5-7b-instruct"`.
     pub model_id: String,
     /// Schema-version for `thoughts.tags_extractor_version`. Default tracks
-    /// `engram_extract::BUNDLED_TAGGER_VERSION` (currently 12 — six
+    /// `engram_extract::BUNDLED_TAGGER_VERSION` (currently 13 — seven
     /// post-M6.1 dogfood iterations: v6 rebalanced kind classification +
     /// added entity surface-only rule + tightened URL emission but
     /// repeated the v3→v4 backfire by listing adjectival phrases as
@@ -228,7 +228,10 @@ pub struct TaggerConfig {
     /// syntactic-disambiguation rule for verb-vs-name ambiguity at
     /// sentence-start, plus a post-process disjointness validator in
     /// `engram-mcp::drain` that strips entities-array entries that
-    /// duplicate a people-array entry). Bump when
+    /// duplicate a people-array entry; v13 adds use-mention discipline
+    /// to the prompt — a top-level USE-vs-MENTION section plus 6 worked
+    /// examples — fixing the corpus-wide pollution of meta-content
+    /// thoughts that mention names as linguistic examples). Bump when
     /// the prompt or schema changes such that prior tags shouldn't be
     /// considered comparable; `engram tag --rerun --since
     /// 1970-01-01T00:00:00Z` then backfills.

@@ -164,7 +164,22 @@ impl OpenAICompatibleConfig {
 /// tie; the validator is unconditional and runs after the existing
 /// topic-normalize step. Catches field contamination regardless of
 /// which model or prompt version emitted the tags.
-pub const BUNDLED_TAGGER_VERSION: i32 = 12;
+/// **v13 (post-v12 dogfood pass 7)** adds use-mention discipline to
+/// the prompt — a `# First discipline: USE vs MENTION` section at the
+/// top, a matching `# Rules` bullet, and a `# Examples` section with
+/// 6 worked input→output pairs covering parenthetical mentions,
+/// demonstrative lists, quoted-directive citations, real-reference
+/// controls, and meta-discussion of other thoughts. Iterated locally
+/// against gemma3:12b using the new `examples/tagger_eval.rs` harness
+/// against `crates/engram-extract/tests/fixtures/use_mention.json`
+/// (12 fixtures) until ≥11/12 stably passed (6/6 control plus 5/6
+/// use_mention; only `meta-discussion-of-contamination` resists —
+/// Sarah lands in `entities`, a residual that needs either a
+/// structural pre-process or a larger model). Fixes the corpus-wide
+/// pollution of meta-content thoughts (engram.m3.dogfood scope,
+/// recommendation thoughts) that mention names as linguistic
+/// examples.
+pub const BUNDLED_TAGGER_VERSION: i32 = 13;
 
 #[derive(Debug, Clone)]
 pub struct OpenAICompatibleTagger {
@@ -247,6 +262,18 @@ impl OpenAICompatibleTagger {
 pub const BUNDLED_TAGGER_PROMPT: &str = "\
 You are a tagging assistant. Given a single thought from a memory service, return its metadata tags as JSON.
 
+# First discipline: USE vs MENTION
+
+Before extracting anything, decide: is each token in the prose being USED, or being MENTIONED?
+
+USED — a real reference, an actor, a directive THIS thought commits to, a named thing this thought is genuinely about. Extract.
+
+MENTIONED — a token cited as a linguistic example, a candidate being weighed in a brainstorm, a quoted directive THIS thought describes but does not itself issue, a name referenced because another thought tagged or discussed it, an item in an \"e.g.\" or \"such as\" or \"like\" list. Do NOT extract.
+
+When a thought is itself ABOUT names, tags, or other thoughts (meta-discussion), every name listed as a discussion target is a MENTION. Empty `people`, `entities`, and `action_items` arrays are the correct output when the entire thought consists of mentions.
+
+Apply this check FIRST. Then proceed to the field rules below.
+
 # Output shape
 { \"people\": [...], \"entities\": [...], \"kind\": \"...\", \"action_items\": [...], \"topics\": [...], \"dates_mentioned\": [...], \"relations\": [...] }
 
@@ -313,6 +340,37 @@ You are a tagging assistant. Given a single thought from a memory service, retur
 - One kind only; if genuinely ambiguous, return null.
 - This is a tagging pass, not a paraphrase. Do not rephrase content; only emit metadata.
 - A name belongs in EITHER `people` OR `entities`, never both. Persons go in `people`; non-person named things go in `entities`. If a single string would legitimately fit both categories (a tool named after a person), pick one based on the thought's dominant framing.
+- USE vs MENTION discipline: tokens that appear inside quotation marks, inside parenthetical \"e.g.\" or \"such as\" or \"like\" constructs, in demonstrative lists of candidates, as enumerated brainstorm items, or as illustrative linguistic examples are MENTIONED, not USED. They describe candidates being weighed, examples being cited, or words being discussed — not actors, references, or directives. Do NOT extract their contents into `people`, `entities`, or `action_items`. Apply this check before each emission. When a thought is itself ABOUT names or tags (meta-discussion), names listed as examples are mentions, not people.
+
+# Examples
+
+These show how to apply the rules above. Pay attention to use-mention discipline: tokens that appear inside quotation marks, parenthetical \"e.g.\" or \"such as\" constructs, demonstrative lists of candidates, or brainstorm enumerations are MENTIONED, not USED. Do not extract their contents into people, entities, or action_items.
+
+Example 1 — parenthetical mention does not extract:
+Thought: 'The Bob-as-verb pattern (e.g., \"Bob the index rebuild\") needs investigation in the next sprint.'
+Output: {\"people\": [], \"entities\": [], \"action_items\": [\"investigate the Bob-as-verb pattern\"], \"topics\": [\"linguistics\"], \"dates_mentioned\": [\"next sprint\"], \"kind\": \"task\", \"relations\": []}
+
+Example 2 — demonstrative list of names does not extract:
+Thought: 'Common verb-as-name first names include: Bob, Mark, Rob, Frank.'
+Output: {\"people\": [], \"entities\": [], \"action_items\": [], \"topics\": [\"linguistics\"], \"dates_mentioned\": [], \"kind\": \"observation\", \"relations\": []}
+
+Example 3 — real references DO extract (contrast with Example 2):
+Thought: 'Sarah and Bob agreed on the migration plan after this morning's standup.'
+Output: {\"people\": [\"Sarah\", \"Bob\"], \"entities\": [], \"action_items\": [], \"topics\": [\"project-management\"], \"dates_mentioned\": [\"this morning\"], \"kind\": \"observation\", \"relations\": []}
+
+Example 4 — quoted directives are citations of language, not directives THIS thought makes:
+Thought: 'The probe should use prompts like \"evaluate options A through F\" and \"pick one\" to test how the tagger handles list-shaped instructions.'
+Output: {\"people\": [], \"entities\": [], \"action_items\": [\"test how the tagger handles list-shaped instructions\"], \"topics\": [\"tagging-systems\"], \"dates_mentioned\": [], \"kind\": \"task\", \"relations\": []}
+
+Example 5 — meta-discussion: when a thought is ABOUT other thoughts and lists names as illustrative cases, those names are mentions, not people:
+Thought: 'Thought abc123 mentions Ron, Sarah, and Bob only as examples of contamination cases — none of them are referenced as actors in this thought.'
+Output: {\"people\": [], \"entities\": [], \"action_items\": [], \"topics\": [\"tagging-systems\"], \"dates_mentioned\": [], \"kind\": \"observation\", \"relations\": []}
+
+Example 6 — meta-discussion of tagger behavior: when prose describes a previous tagger's behavior on a different thought, the names in that description are mentions of what was tagged, not extractions for THIS thought:
+Thought: 'Probe E at v11 emitted Sarah in both people and entities. The disjointness validator catches this contamination pattern.'
+Output: {\"people\": [], \"entities\": [], \"action_items\": [], \"topics\": [\"tagging-systems\"], \"dates_mentioned\": [], \"kind\": \"observation\", \"relations\": []}
+
+Key signal: if the prose explicitly says \"as examples,\" \"only as mentions,\" \"not referenced as actors,\" or describes what a name was tagged-as in another context, the name is a mention. Do not extract.
 
 # Before you emit — final pass
 
@@ -1053,7 +1111,7 @@ mod tests {
         );
 
         // Presets track BUNDLED_TAGGER_VERSION.
-        assert_eq!(BUNDLED_TAGGER_VERSION, 12);
+        assert_eq!(BUNDLED_TAGGER_VERSION, 13);
         let cfg = OpenAICompatibleConfig::vllm_local();
         assert_eq!(cfg.model_version, BUNDLED_TAGGER_VERSION);
         let cfg = OpenAICompatibleConfig::open_router("k".into(), "m".into());

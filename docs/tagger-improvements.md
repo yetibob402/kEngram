@@ -251,6 +251,53 @@ in the `# Rules` section ("a name belongs in EITHER `people` OR
 `entities`, never both") so the LLM has a fair chance of getting it
 right on first emission; the validator backstops when it doesn't.
 
+### Use-mention pollution — fixed by v13 prompt edit (gemma3:12b)
+
+**Diagnosis.** Post-v12 evaluation report identified use-mention as the
+#1 G1/G3 gap: meta-content thoughts (engram.m3.dogfood scope, v11/v12
+recommendation thoughts in engram.tagger-test) were extracting tokens
+that appeared in quoted strings, parenthetical examples, demonstrative
+lists, and brainstorm enumerations as if they were object-level content.
+Probe data showed Bob / Mark / Rob / Frank / Pat all extracted as
+`people` on `de1411c1`; `"evaluate options A through F"` extracted as
+`action_item` on `74b46543`; etc.
+
+**Fix (v13).** Iterated `BUNDLED_TAGGER_PROMPT` locally against
+gemma3:12b using the new `examples/tagger_eval.rs` harness +
+12-fixture set at `crates/engram-extract/tests/fixtures/use_mention.json`.
+Result: 11/12 stable PASS (6/6 control + 5/6 use_mention) over two
+runs. Prompt additions (all in `BUNDLED_TAGGER_PROMPT`):
+
+- `# First discipline: USE vs MENTION` section at the top of the
+  prompt — defines USED (extract) vs MENTIONED (don't), calls out
+  meta-discussion as the case where every name is typically a mention.
+- One use-mention bullet appended to `# Rules` restating the
+  discipline at emission time.
+- `# Examples` section between `# Rules` and `# Before you emit —
+  final pass` with 6 worked input→output pairs covering parenthetical
+  mentions, demonstrative lists, real-references contrast, quoted
+  directives, meta-discussion of other thoughts, and meta-discussion
+  of tagger behavior.
+
+**Residual.** `meta-discussion-of-contamination` fixture still fails:
+when prose says "Sarah was emitted in both people and entities" the
+model puts Sarah in `entities`. The v12 disjointness validator can't
+help because Sarah isn't in `people` (LLM never emits her there).
+Closing this would require either a structural pre-process layer that
+strips quoted/cited spans before tagging, or a larger model
+(post-3090). Documented as a known residual rather than blocking
+ship.
+
+**Empirical-method note.** The previous /goal iteration against
+gemma3:4b mis-attributed two control failures to "fixture-spec issues"
+(HNSW recall on `maria-david-pgvector-control`, Postgres
+canonicalization on `postgres-no-people-control`). Re-baseline against
+gemma3:12b showed both PASS at v12 baseline with zero changes — they
+were model-capacity issues on 4b, not fixture issues. Lesson for
+future goal artifacts: iterate against the production model when
+feasible; small-model headroom-for-discrimination is real but
+ambiguity-of-failure-class is also real.
+
 ## Open issues
 
 ### 1. "Bob-as-verb" ambiguity (residual)

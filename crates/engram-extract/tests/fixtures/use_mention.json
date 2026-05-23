@@ -1,0 +1,114 @@
+{
+  "fixtures": [
+    {
+      "name": "parenthetical-bob-example",
+      "category": "use_mention",
+      "content": "The Bob-as-verb pattern (e.g., 'Bob the index rebuild') needs investigation before the next dogfood round.",
+      "assertions": {
+        "people_must_not_contain": ["Bob"],
+        "action_items_must_not_contain_substring": ["Bob the index rebuild"]
+      }
+    },
+    {
+      "name": "quoted-directive-citation",
+      "category": "use_mention",
+      "content": "The list-shape probe should use prompts like 'evaluate options A through F' and 'pick one for the next sprint' to test brainstorm expansion.",
+      "assertions": {
+        "action_items_must_not_contain_substring": [
+          "evaluate options A through F",
+          "pick one for the next sprint"
+        ]
+      }
+    },
+    {
+      "name": "demonstrative-name-list",
+      "category": "use_mention",
+      "content": "Common verb-as-name first names include: Bob, Mark, Rob, Frank, and Pat. None of these are real people in this context.",
+      "assertions": {
+        "people_must_not_contain": ["Bob", "Mark", "Rob", "Frank", "Pat"]
+      }
+    },
+    {
+      "name": "brainstorm-with-single-directive",
+      "category": "use_mention",
+      "content": "Brainstorm follow-up candidates: surveillance metrics, customer journey, capacity planning, cost transparency, hire-vs-buy. Pick one for the next planning cycle.",
+      "assertions": {
+        "action_items_must_not_contain_substring": [
+          "explore surveillance metrics",
+          "explore customer journey",
+          "explore capacity planning",
+          "explore cost transparency",
+          "explore hire-vs-buy"
+        ]
+      }
+    },
+    {
+      "name": "meta-discussion-of-contamination",
+      "category": "use_mention",
+      "content": "Probe E at v11 emitted Sarah in both people and entities. The disjointness validator catches this contamination pattern by stripping the duplicate from entities.",
+      "assertions": {
+        "people_must_not_contain": ["Sarah"],
+        "entities_must_not_contain": ["Sarah"]
+      }
+    },
+    {
+      "name": "nested-quoted-name-mentions",
+      "category": "use_mention",
+      "content": "The recommendation thought de1411c1 mentions Ron, Sarah, and Bob only as examples of v11 contamination cases — none of them are referenced as actors in this thought.",
+      "assertions": {
+        "people_must_not_contain": ["Ron", "Sarah", "Bob"]
+      }
+    },
+    {
+      "name": "casey-wordle-control",
+      "category": "control",
+      "content": "Casey is Ron's buddy who plays Wordle daily. He uses DEALT as his opening word.",
+      "assertions": {
+        "people_must_contain": ["Casey", "Ron"]
+      }
+    },
+    {
+      "name": "maria-david-pgvector-control",
+      "category": "control",
+      "content": "Met with Maria and David to review the pgvector migration on staging. Maria flagged HNSW index bloat; David proposed a feature-flag rollout.",
+      "assertions": {
+        "people_must_contain": ["Maria", "David"],
+        "entities_must_contain": ["pgvector", "HNSW"]
+      }
+    },
+    {
+      "name": "priya-marcus-elena-control",
+      "category": "control",
+      "content": "Priya asked Marcus to circle back with Elena on the M7 retrospective. Elena wants the action items written up before next Friday.",
+      "assertions": {
+        "people_must_contain": ["Priya", "Marcus", "Elena"]
+      }
+    },
+    {
+      "name": "sarah-bob-real-actors-control",
+      "category": "control",
+      "content": "Sarah owns the longer-term capacity plan; Bob is helping with the short-term mitigation while she's on PTO.",
+      "assertions": {
+        "people_must_contain": ["Sarah", "Bob"]
+      }
+    },
+    {
+      "name": "pgvector-no-people-control",
+      "category": "control",
+      "content": "Configure pgvector's HNSW index parameters for the production corpus. Tune ef_construction and m based on recall-vs-latency benchmarks.",
+      "assertions": {
+        "people_must_not_contain": ["Configure", "Tune"],
+        "entities_must_contain": ["pgvector", "HNSW"]
+      }
+    },
+    {
+      "name": "postgres-no-people-control",
+      "category": "control",
+      "content": "Postgres autovacuum thresholds are tunable per-table. Tables with high write-churn benefit from a lower scale_factor.",
+      "assertions": {
+        "people_must_not_contain": ["Postgres"],
+        "entities_must_contain": ["Postgres"]
+      }
+    }
+  ]
+}

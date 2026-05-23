@@ -207,7 +207,7 @@ pub struct TaggerConfig {
     /// Conventionally `<vendor>/<model>`. Defaults to `"vllm/qwen2.5-7b-instruct"`.
     pub model_id: String,
     /// Schema-version for `thoughts.tags_extractor_version`. Default tracks
-    /// `engram_extract::BUNDLED_TAGGER_VERSION` (currently 11 — five
+    /// `engram_extract::BUNDLED_TAGGER_VERSION` (currently 12 — six
     /// post-M6.1 dogfood iterations: v6 rebalanced kind classification +
     /// added entity surface-only rule + tightened URL emission but
     /// repeated the v3→v4 backfire by listing adjectival phrases as
@@ -224,7 +224,11 @@ pub struct TaggerConfig {
     /// canonical-form convergence out of the prompt entirely — topic
     /// vocab now feeds a post-process normalization step in
     /// `engram-mcp::drain`, breaking the prompt-vocab feedback loop that
-    /// caused the v8/v9 corpus-wide topic overreach). Bump when
+    /// caused the v8/v9 corpus-wide topic overreach; v12 adds a positive
+    /// syntactic-disambiguation rule for verb-vs-name ambiguity at
+    /// sentence-start, plus a post-process disjointness validator in
+    /// `engram-mcp::drain` that strips entities-array entries that
+    /// duplicate a people-array entry). Bump when
     /// the prompt or schema changes such that prior tags shouldn't be
     /// considered comparable; `engram tag --rerun --since
     /// 1970-01-01T00:00:00Z` then backfills.

@@ -151,7 +151,20 @@ impl OpenAICompatibleConfig {
 /// flow into the prompt vocab section — the surface-only rule
 /// prevents entity overreach, and the in-prompt hint preserves
 /// canonical casing/spelling.
-pub const BUNDLED_TAGGER_VERSION: i32 = 11;
+/// **v12 (post-v11 dogfood pass 6)** adds two related structural
+/// fixes for residual issues the v8-v11 work didn't address. (a)
+/// Positive syntactic-disambiguation rule in the `people` field
+/// instruction: "name + article-at-sentence-start = verb usage."
+/// Framed positively to avoid the v3→v4/v6→v7 backfire pattern of
+/// negative-example lists. Targets the "Bob the worker batch limit"
+/// failure mode where probes B and E consistently mis-route a
+/// sentence-start verb into `people`. (b) Post-process disjointness
+/// validator in `engram-mcp::validate` — strips any `entities` entry
+/// whose lowercased form duplicates a `people` entry. Person wins on
+/// tie; the validator is unconditional and runs after the existing
+/// topic-normalize step. Catches field contamination regardless of
+/// which model or prompt version emitted the tags.
+pub const BUNDLED_TAGGER_VERSION: i32 = 12;
 
 #[derive(Debug, Clone)]
 pub struct OpenAICompatibleTagger {
@@ -239,7 +252,7 @@ You are a tagging assistant. Given a single thought from a memory service, retur
 
 # Field semantics
 
-- people: bare names of people mentioned. Empty array if none.
+- people: bare names of people mentioned. Empty array if none. Syntactic disambiguation: when a capitalized word appears at the START of a sentence followed by an article (\"the\", \"a\", \"an\") or a possessive (\"your\", \"my\", \"this\"), it is being used as an imperative verb, not as a person's name — emit it as part of the action_items phrase instead, and leave it out of `people`. Example: \"Mark the migration as complete\" — \"Mark\" is a verb; if no other names are mentioned, `people` is empty.
 
 - entities: default to []. Only emit a name that the thought MENTIONS BY ITS SURFACE NAME — a specific named thing (project, product, library, tool, technology, organization) with its own canonical identity independent of this thought. Examples of valid entities: \"engram\", \"pgvector\", \"PostgreSQL\", \"MCP\", \"TCGplayer\", \"Cap'n Proto\", \"Rust\", \"Hummingbird\". Preserve the thought's casing, or use canonical casing if the thought is inconsistent.
 
@@ -299,6 +312,7 @@ You are a tagging assistant. Given a single thought from a memory service, retur
 - Empty arrays are correct when there's no content. Empty arrays are NOT a tagger-failure signal; over-emission is.
 - One kind only; if genuinely ambiguous, return null.
 - This is a tagging pass, not a paraphrase. Do not rephrase content; only emit metadata.
+- A name belongs in EITHER `people` OR `entities`, never both. Persons go in `people`; non-person named things go in `entities`. If a single string would legitimately fit both categories (a tool named after a person), pick one based on the thought's dominant framing.
 
 # Before you emit — final pass
 
@@ -1039,7 +1053,7 @@ mod tests {
         );
 
         // Presets track BUNDLED_TAGGER_VERSION.
-        assert_eq!(BUNDLED_TAGGER_VERSION, 11);
+        assert_eq!(BUNDLED_TAGGER_VERSION, 12);
         let cfg = OpenAICompatibleConfig::vllm_local();
         assert_eq!(cfg.model_version, BUNDLED_TAGGER_VERSION);
         let cfg = OpenAICompatibleConfig::open_router("k".into(), "m".into());

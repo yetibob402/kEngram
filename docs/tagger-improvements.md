@@ -203,6 +203,54 @@ runs through the same v11 pipeline, expected additional benefits:
 Net: the work done at v8-v11 was the right architecture; the larger
 model is the lever that makes it deliver on the promise.
 
+**v12 follow-up (2026-05-23):** two small additions on top of v11
+that don't depend on a model swap.
+
+1. **Positive syntactic-disambiguation rule in the `people` field
+   instruction.** Targets the "Bob the worker batch limit" failure
+   mode where probes B and E mis-route a sentence-start imperative
+   verb into `people`. Framed positively ("when X, do Y") to dodge
+   the v3→v4/v6→v7 backfire pattern; prior is ~30% probability of
+   landing on gemma3:12b. Non-load-bearing — measured but not
+   gated. If probes B/E still mis-tag "Bob" at v12, the next
+   escape hatch is a deterministic syntactic check, deferred until
+   after the 3090 model swap.
+2. **Post-process disjointness validator.** See next subsection.
+
+### Field separation (people-in-entities) — fixed by v12 disjointness validator
+
+**Symptom.** Probe E at v11 emitted `people: ["Bob", "Sarah"]` and
+`entities: ["Sarah"]` — same string in both arrays. Earlier samples
+showed the same pattern intermittently on other thoughts. Small LLMs
+occasionally route the same name into both fields; no prompt
+instruction reliably prevents it.
+
+**Why it's not a prompt fix.** This is a structural invariant of valid
+`Tags` (a string cannot legitimately occupy both fields), so the right
+place to enforce it is a deterministic post-process step, not the LLM.
+Same architectural rationale as the topic normalizer at v11: separate
+the LLM's emission from the structural cleanup.
+
+**Fix (v12).** New module `crates/engram-mcp/src/validate.rs` exposes
+`enforce_people_entities_disjoint(&mut tags)`. Behavior:
+
+- Build a case-insensitive set of `tags.people`.
+- Retain only those `tags.entities` whose lowercased form is NOT in
+  that set. Person wins on tie (the `people` classification is more
+  semantically constrained).
+- Pure function over `&mut Tags`; mutates entities in place.
+
+Called unconditionally in `process_tag_job` after the topic normalize
+step, before `update_thought_tags` persists. Eight unit tests cover
+disjoint pass-through, exact and case-insensitive duplicate stripping,
+empty-array no-ops, order preservation, and people-array
+untouchability.
+
+Belt-and-suspenders pairing: the v12 prompt also has a redundant rule
+in the `# Rules` section ("a name belongs in EITHER `people` OR
+`entities`, never both") so the LLM has a fair chance of getting it
+right on first emission; the validator backstops when it doesn't.
+
 ## Open issues
 
 ### 1. "Bob-as-verb" ambiguity (residual)
@@ -238,23 +286,7 @@ the small-model ceiling, not a clean bug.
 larger model is running, then measure whether it's still worth the post-hoc
 filter or the constrained-vocab work.
 
-### 2. Field separation (people-in-entities) — likely a one-off
-
-**Symptom.** Probe E (gemma3:12b) put "Sarah" in BOTH `people` and
-`entities`. Did NOT recur on F or H (also gemma3:12b, multi-person + entity
-content).
-
-**Status.** Insufficient evidence to call it systematic. Watch on real
-corpus.
-
-**If it recurs:**
-
-- **Tighten schema prompt** with explicit "a person's name belongs in
-  `people`, not `entities`" guidance.
-- **Post-hoc dedup** in the tagger output adapter: anything appearing in
-  both arrays gets removed from `entities` (people-wins-tie).
-
-### 3. `action_items` coverage is uneven
+### 2. `action_items` coverage is uneven
 
 **Symptom.** gemma3:12b on probe E captured 2 of 3 imperatives, missing the
 "Bob the worker batch limit" item — plausibly because "Bob" got routed into

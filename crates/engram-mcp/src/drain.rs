@@ -13,7 +13,7 @@
 //! `insert_thought_embedding` and `mark_embedded`, the next tick re-claims
 //! the row, re-embeds, re-inserts (no-op), and marks embedded — clean.
 
-use crate::normalize;
+use crate::{normalize, validate};
 use engram_core::{
     Embedder, EmbedderError, Embedding, EmbeddingError, ExtractedRelation, LinkSource, Tagger,
     ThoughtId,
@@ -288,6 +288,12 @@ async fn process_tag_job(
             {
                 output.tags.topics = normalize::normalize_topics(&output.tags.topics, &v.topics);
             }
+            // v12 structural-invariant enforcement. Removes any entries
+            // from `tags.entities` whose lowercased form duplicates a
+            // `tags.people` entry — the LLM sometimes routes the same
+            // name into both arrays (probe E saw "Sarah" in both). No
+            // vocab dependency; this is a pure-Tags property check.
+            validate::enforce_people_entities_disjoint(&mut output.tags);
             if let Err(e) = engram_storage::update_thought_tags(
                 pool,
                 job.thought_id,

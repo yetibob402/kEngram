@@ -17,6 +17,7 @@ pub mod relate;
 pub mod retract;
 pub mod search;
 pub mod server;
+mod validate;
 
 pub use backfill::{BackfillError, BackfillReport, embed_backfill};
 pub use capture::{CaptureError, CaptureRequest, CaptureResponse, MAX_CONTENT_LEN, capture};

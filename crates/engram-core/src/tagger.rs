@@ -75,6 +75,24 @@ impl ExtractedTarget {
     }
 }
 
+/// The public contract for tagger backends. Anyone implementing this
+/// trait is pluggable — the engram-cli `build_tagger` match arm is the
+/// registry of *known* implementations, not the contract itself. See
+/// `docs/tagger-backends.md` for the recipe to add a new backend.
+///
+/// Stock implementations live in `engram-extract`:
+/// - `OpenAICompatibleTagger` — calls vLLM / OpenRouter / Ollama via the
+///   `/v1/chat/completions` endpoint with structured-output enforcement.
+/// - `HttpTagger` — speaks engram's own JSON wire contract (see
+///   `engram-tagger-protocol`) for sidecar implementations in any
+///   language. Reference sidecar lives at
+///   `crates/engram-tagger-deterministic/`.
+/// - `FakeTagger` — deterministic in-memory tagger for tests.
+///
+/// External implementations are welcome and don't require forking engram;
+/// they can either implement this trait directly (in-process, Rust) or
+/// run as a sidecar speaking the `engram-tagger-protocol` wire shape (any
+/// language, over HTTP).
 #[async_trait]
 pub trait Tagger: Send + Sync {
     /// Stable model identifier — written into `thoughts.tags_extractor_model`

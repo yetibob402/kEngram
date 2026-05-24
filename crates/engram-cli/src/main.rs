@@ -297,6 +297,19 @@ fn build_tagger(c: &TaggerConfig) -> anyhow::Result<ResolvedTagger> {
         "tagger: resolved config",
     );
 
+    // Provider registry. The `Tagger` trait at engram-core is the public
+    // contract for tagger backends — anyone who implements it is pluggable.
+    // The match below is the registry of *known* implementations, not the
+    // contract itself. To add a new in-tree backend:
+    //   1. Write a struct implementing engram_core::Tagger.
+    //   2. Add a config sub-section to TaggerConfig if it needs config
+    //      beyond the flat fields openai-compatible already uses.
+    //   3. Add an arm to this match mapping a new provider string to your
+    //      constructor.
+    // For out-of-tree backends, prefer the sidecar pattern: run an HTTP
+    // service that speaks engram's wire contract (the engram-tagger-protocol
+    // crate is the spec) and use provider = "http" to point at it.
+    // See `docs/tagger-backends.md` for the full contract + recipe.
     match c.provider.as_str() {
         "openai-compatible" | "openrouter" => {
             let tagger = OpenAICompatibleTagger::new(TaggerConfigBuilder {
@@ -317,7 +330,7 @@ fn build_tagger(c: &TaggerConfig) -> anyhow::Result<ResolvedTagger> {
             })
         }
         other => anyhow::bail!(
-            "unknown tagger provider: {other:?} (valid: 'openai-compatible', 'openrouter', or empty for silent-disable)"
+            "unknown tagger provider: {other:?} (valid: 'openai-compatible', 'openrouter', 'http' for sidecar, or empty for silent-disable). See docs/tagger-backends.md for how to register a new backend."
         ),
     }
 }

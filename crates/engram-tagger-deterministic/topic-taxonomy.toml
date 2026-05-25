@@ -1,0 +1,109 @@
+# Operator-curated topic taxonomy for the deterministic tagger.
+#
+# Each `[topics.<label>]` entry has:
+#   description : prose blob the embedder turns into a vector at startup
+#                 (richer than the label alone — concrete examples + synonyms
+#                 give bge-m3 enough surface to match semantically related
+#                 thoughts).
+#   threshold   : optional per-label cosine threshold override. If omitted,
+#                 the tagger uses `topic_threshold_default` (0.60 by default).
+#                 Lower it for broad categories that should match liberally;
+#                 raise it for narrow technical terms where false-positives
+#                 are worse than false-negatives.
+#
+# Labels use kebab-case to match the existing engram corpus convention
+# (see DESIGN.md §10 + `topics` field semantics).
+#
+# This file is seed-only — operators are expected to grow it against their
+# own corpus. Re-tagging with a changed taxonomy is idempotent at the row
+# level (capture writes new pending_tags; worker re-extracts).
+
+[topics.memory-systems]
+description = "agent memory, persistent context, vector store, embedding-based retrieval, conversational state across sessions"
+
+[topics.information-retrieval]
+description = "search relevance, ranking, semantic search, hybrid retrieval, fusion of lexical and vector scores, reranking"
+
+[topics.embeddings]
+description = "dense vector representations, sentence embeddings, model dimensions, cosine similarity, bge-m3, text-embeddings-inference"
+
+[topics.databases]
+description = "postgres, sqlx, schema migrations, indexes, query planning, jsonb, transactions, connection pooling"
+
+[topics.pgvector]
+description = "pgvector extension, HNSW index, IVFFlat, vector similarity search inside postgres, ANN tuning"
+
+[topics.rust]
+description = "rust programming language, ownership, lifetimes, async/await, tokio runtime, cargo workspace, traits, error handling"
+
+[topics.async-runtime]
+description = "tokio tasks, futures, async traits, channels, joinset, cancellation, blocking calls in async context"
+
+[topics.testing]
+description = "unit tests, integration tests, fixtures, golden files, deterministic test inputs, test isolation, sqlx::test, mocking versus real services"
+
+[topics.mcp-protocol]
+description = "model context protocol, mcp servers, tool definitions, json-rpc, transport modes, streamable http, sse, rmcp crate"
+
+[topics.tagging-systems]
+description = "extracting structured metadata from text, named entity recognition, classification, controlled vocabulary, tagger evaluation"
+
+[topics.llm-prompting]
+description = "prompt engineering, system messages, structured output, response_format json_schema, prompt iteration, few-shot examples"
+
+[topics.llm-evaluation]
+description = "benchmarking model outputs, eval harness, fixture-based testing, per-failure-mode analysis, pass rate, regression tracking"
+
+[topics.nlp]
+description = "natural language processing, tokenization, NER models, GLiNER, zero-shot extraction, parsers, ONNX inference"
+
+[topics.observability]
+description = "tracing spans, structured logging, metrics, journald, debugging production behavior, instrumentation, request IDs"
+
+[topics.deployment]
+description = "systemd units, docker compose, container orchestration, service lifecycle, environment configuration, secrets management"
+
+[topics.api-design]
+description = "REST endpoints, request/response shapes, versioning, backward compatibility, idempotency, error codes, openapi"
+
+[topics.client-integration]
+description = "client libraries, SDK design, ios client, web client, claude desktop, claude code, opencode, chatgpt integration"
+
+[topics.ios-development]
+description = "swift, swiftui, ios app architecture, network layer, sse client, mobile UX"
+
+[topics.frontend-development]
+description = "react, typescript, ui components, browser rendering, css, responsive design, frontend tooling"
+
+[topics.team-management]
+description = "engineering leadership, organizational design, hiring decisions, performance management, one-on-ones, career coaching"
+
+[topics.product-strategy]
+description = "product roadmap, prioritization, customer feedback, market positioning, competitive analysis, go-to-market"
+
+[topics.project-planning]
+description = "milestones, scope decisions, design docs, plan files, decomposition into phases, dependency ordering"
+
+[topics.agile-development]
+description = "sprints, standups, retros, story points, kanban, iteration planning, release cadence"
+
+[topics.debugging]
+description = "investigating bugs, root cause analysis, stack traces, reproducer steps, bisection, regression hunting"
+
+[topics.refactoring]
+description = "code restructuring, extracting modules, renaming, deduplication, simplifying abstractions, paying down technical debt"
+
+[topics.architecture]
+description = "system design, component boundaries, trait abstractions, plugin contracts, separation of concerns, dependency direction"
+
+[topics.security]
+description = "authentication, authorization, secrets, credentials, OAuth, API tokens, input validation, OWASP top-10"
+
+[topics.performance]
+description = "latency, throughput, profiling, hot paths, memory allocation, batching, caching strategies, benchmark numbers"
+
+[topics.dogfooding]
+description = "using your own product, capturing real usage thoughts, internal validation, eating your own dog food, self-hosting"
+
+[topics.documentation]
+description = "design docs, runbooks, README, onboarding guides, inline doc comments, milestone documents, changelogs"

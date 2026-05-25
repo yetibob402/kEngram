@@ -387,6 +387,95 @@ residuals persist at the higher capacity tier, then extend the
 fixture set with the iteration-tractable items above and
 /goal-iterate against the surviving subset.
 
+## v14: deterministic backend explored as a reference sidecar (2026-05-24)
+
+After parking the LLM-prompt iteration at v13 we surveyed non-LLM
+tagging approaches. The 2026 Rust-native NLP stack (`gline-rs`
+zero-shot NER on `ort` + regex date extraction + `bge-m3` taxonomy
++ kind classification) maps cleanly to the LLM failure modes we
+couldn't close — compound product names, date transposition,
+ALL-CAPS heading anchoring, use-mention pollution on
+meta-discussion.
+
+**Path taken.** Rather than ship the deterministic backend in-tree
+as a second built-in, we made the `Tagger` trait an explicit public
+contract (the pluggability framework) + added an engram-native
+HTTP-tagger client (`provider = "http"`) that speaks the
+`engram-tagger-protocol` wire shape, then repackaged the
+deterministic pipeline as a reference sidecar at
+[`crates/engram-tagger-deterministic/`](../crates/engram-tagger-deterministic/).
+Engram's main binary doesn't carry gline-rs / ort / interim deps;
+operators who want non-LLM tagging run the sidecar (or write their
+own in any language) and point engram at it.
+
+**Empirical measurement (2026-05-24).** Local Ollama with
+gemma3:12b (v13 prompt) and bge-m3 embeddings; gline-rs ONNX
+loaded from `~/models/gliner_small-v2.1`. Same 25 fixtures
+(originally on the `gliner-spike` branch as
+`tests/fixtures/{deterministic,use_mention}.json`) against both
+backends via `TAGGER_BACKEND=...`:
+
+| | Deterministic (calibrated) | LLM (gemma3:12b v13) |
+|---|---|---|
+| Pass rate | **20/25 (80%)** | **24/25 (96%)** |
+| Latency per fixture | ~300ms | ~5–30s |
+
+**Calibration applied to reach 20/25.** Topic threshold dropped
+from 0.60 → 0.45 (real bge-m3 cosine clusters in the 0.35-0.55
+range on engram content, not 0.55+). `strip_trailing_years`
+post-process for person spans (the "Semon 1904" greedy-boundary
+case). `title` label added to NER_LABELS to give gline-rs a
+destination for role tokens (didn't redirect "CTO" empirically,
+but the option is there).
+
+**Per-fixture divergence (5 LLM-only wins).** All five gaps are
+*discourse pragmatics* — exactly the place LLMs are inherently
+strong (use-vs-mention, role-vs-person, implicit action items,
+list discrimination, nested quotation). `gline-rs` is a
+token-level NER model, not a discourse reasoner.
+
+- `tcgplayer-cto-role-descriptor` — LLM excluded "CTO"; gline-rs
+  extracted it despite the new `title` label.
+- `person-with-product-and-action` — LLM extracted "verify the
+  latency"; gline-rs missed the imperative.
+- `demonstrative-name-list` — LLM excluded Bob/Mark/Rob/Frank/Pat
+  from "Common verb-as-name first names include: ..."; our
+  preprocessor catches `e.g.`/`such as`/`like` parentheticals but
+  not colon-introduced enumerations.
+- `meta-discussion-of-contamination` — LLM understood "emitted
+  Sarah in both people and entities" as meta-discussion; gline-rs
+  extracted Sarah.
+- `nested-quoted-name-mentions` — LLM correctly excluded
+  Ron/Sarah/Bob from nested-quote meta-content; our quote-stripper
+  handles only one nesting level.
+
+**Deterministic-only win.** `github-handle-in-path` — deterministic
+excluded "antoinezambelli"; the v13 LLM extracted it as a person.
+gline-rs has a handle-vs-name prior the prompt doesn't enforce
+strongly enough.
+
+**What this means.** The deterministic backend is NOT a drop-in
+replacement for v13. 96% vs 80% is meaningful, concentrated in
+patterns that matter for engram's meta-content-heavy corpus.
+Latency is 10-50× better and the LLM dependency is removed, but
+those wins don't compensate for the discourse-pragmatic
+regressions on tagging quality.
+
+**Status.** The pluggability framework + HTTP-tagger client + the
+reference sidecar are shipped. The LLM tagger
+(`provider = "openai-compatible"`) remains the default. Operators
+with strict latency / cost / determinism requirements can flip to
+`provider = "http"` + run the reference sidecar; everyone else
+keeps what works. Rollback is one config line; the eval harness
+supports `TAGGER_BACKEND={openai-compatible,http}` for ongoing
+comparison.
+
+The exploration branch (`gliner-spike`, commits `de5da43` through
+`3dc35f2`) remains in git history as the research record. The
+working code lives at
+[`crates/engram-tagger-deterministic/`](../crates/engram-tagger-deterministic/)
+on `main`.
+
 ## Open issues
 
 ### 1. "Bob-as-verb" ambiguity (residual)

@@ -1,5 +1,6 @@
-# Dev-only Postgres + TEI reranker for Engram. Production deployment uses
-# systemd-managed services (see DESIGN.md §11), not this file.
+# Dev-only Postgres + TEI reranker (+ optional deterministic tagger sidecar)
+# for Engram. Production deployment uses systemd-managed services (see
+# DESIGN.md §11), not this file.
 #
 # The pgvector/pgvector:pg16 image bundles the `vector`, `pg_trgm`, and
 # `pgcrypto` extensions — i.e. everything the M1 migration's CREATE EXTENSION
@@ -76,6 +77,64 @@ services:
       timeout: 5s
       retries: 30
       start_period: 120s
+
+  # Reference HTTP-sidecar tagger (engram-tagger-deterministic). Opt-in via
+  # the `tagger` compose profile: `docker compose --profile tagger up -d`.
+  # Default `docker compose up -d` does NOT start this service so dev
+  # environments without the GLiNER model don't crashloop on startup.
+  #
+  # Prerequisites BEFORE first `docker compose --profile tagger up`:
+  # 1. Download the GLiNER ONNX model to ~/models/gliner_small-v2.1/
+  #    (see crates/engram-tagger-deterministic/README.md for curl invocations).
+  # 2. Ensure an embedder is reachable. The default points at Ollama on the
+  #    host via host.docker.internal:11434 — start Ollama and `ollama pull
+  #    bge-m3` first.
+  #
+  # First build is slow (~5-10 min on Apple Silicon) — cargo compiles
+  # gline-rs + ort native deps. Subsequent builds are fast (cached layers).
+  tagger-deterministic:
+    profiles: ["tagger"]
+    build:
+      context: .
+      dockerfile: crates/engram-tagger-deterministic/Dockerfile
+    container_name: engram-tagger-deterministic
+    restart: unless-stopped
+    environment:
+      # Reach the host's Ollama for bge-m3 embeddings. Operators with a
+      # different embedder setup (TEI configured for embedding, hosted
+      # service, etc.) override this var.
+      EMBEDDER_ENDPOINT: http://host.docker.internal:11434/v1
+      EMBEDDER_MODEL: bge-m3
+      GLINER_MODEL_DIR: /models/gliner
+      TOPIC_TAXONOMY_PATH: /etc/engram/topic-taxonomy.toml
+      KIND_THRESHOLD: "0.55"
+      TOPIC_THRESHOLD: "0.45"
+      MODEL_ID: deterministic/gliner-small-v2.1+regex+bge-m3
+      MODEL_VERSION: "1"
+      RUST_LOG: info
+    extra_hosts:
+      # macOS Docker Desktop maps this automatically; Linux needs the
+      # explicit declaration so host.docker.internal resolves to the
+      # gateway. Harmless on macOS.
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8081:8081"
+    volumes:
+      # GLiNER ONNX assets — operator-supplied (see README).
+      - ${HOME}/models/gliner_small-v2.1:/models/gliner:ro
+      # Topic taxonomy from the repo. Editing topic-taxonomy.toml on the
+      # host requires restarting this service for the new vectors to take
+      # effect (taxonomy is embedded once at startup).
+      - ./crates/engram-tagger-deterministic/topic-taxonomy.toml:/etc/engram/topic-taxonomy.toml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Startup loads the ~580MB ONNX model + embeds taxonomy + 6 kind
+      # prototypes against the embedder. 3s on dev hardware; 30s is
+      # generous headroom.
+      start_period: 30s
 
 volumes:
   engram-pg-data:

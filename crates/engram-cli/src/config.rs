@@ -193,9 +193,10 @@ impl Default for WorkerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TaggerConfig {
-    /// `""` (default) = disabled; `"openai-compatible"` (vLLM, etc.) or
-    /// `"openrouter"`. Other providers can be added later by extending the
-    /// `build_tagger` match.
+    /// `""` (default) = disabled; `"openai-compatible"` (vLLM, etc.),
+    /// `"openrouter"`, or `"http"` (engram-native sidecar — see
+    /// `[tagger.http]` below + `docs/tagger-backends.md`). Other providers
+    /// can be added later by extending the `build_tagger` match.
     pub provider: String,
     /// `/v1` base URL. For vLLM: `"http://localhost:8000/v1"`. For
     /// OpenRouter: `"https://openrouter.ai/api/v1"`.
@@ -255,6 +256,44 @@ pub struct TaggerConfig {
     /// give the model more context but cost prompt tokens; smaller values
     /// let new terms emerge faster. Default 50.
     pub scope_vocab_size: u32,
+    /// Sub-section for the HTTP-sidecar backend (`provider = "http"`).
+    /// `None` when that backend isn't selected; the `[tagger.http]` toml
+    /// block deserializes into `Some(...)`. The flat fields above remain
+    /// the openai-compatible backend's home — no operator's existing
+    /// `engram.toml` needs to change to keep their LLM tagging working.
+    pub http: Option<HttpTaggerConfig>,
+}
+
+/// `[tagger.http]` — configuration for the engram-native HTTP-tagger
+/// sidecar backend (`provider = "http"`). The sidecar speaks the
+/// `engram-tagger-protocol` wire shape; engram POSTs `/tag` with the
+/// thought content and parses the response as `Tags + relations`. See
+/// `docs/tagger-backends.md` and `docs/tagger-sidecar-protocol.md` for
+/// the wire contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HttpTaggerConfig {
+    /// Base URL of the sidecar. The client appends `/tag` to this.
+    /// Example: `"http://localhost:8081"`.
+    pub endpoint: String,
+    /// Optional bearer token sent as `Authorization: Bearer <token>`.
+    /// `None` means no Authorization header (sidecars on a private
+    /// network are the common case).
+    pub api_key: Option<String>,
+    /// Per-request timeout in seconds. Defaults to 60s to match the
+    /// openai-compatible backend's default (sidecars doing CPU
+    /// inference can run long on first call).
+    pub timeout_seconds: u64,
+}
+
+impl Default for HttpTaggerConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: "http://localhost:8081".to_string(),
+            api_key: None,
+            timeout_seconds: 60,
+        }
+    }
 }
 
 impl Default for TaggerConfig {
@@ -276,6 +315,7 @@ impl Default for TaggerConfig {
             system_prompt_file: None,
             scope_vocab_enabled: true,
             scope_vocab_size: 50,
+            http: None,
         }
     }
 }
@@ -385,6 +425,41 @@ mod tests {
         // Scope vocabulary injection is enabled by default at 50 terms each.
         assert!(c.tagger.scope_vocab_enabled);
         assert_eq!(c.tagger.scope_vocab_size, 50);
+        // The `http` sub-section is opt-in. Absent `[tagger.http]` block
+        // → None; back-compat for every existing engram.toml.
+        assert!(c.tagger.http.is_none());
+    }
+
+    /// Operator opt-in: setting `[tagger.http]` round-trips through
+    /// figment and the new HttpTaggerConfig values surface as `Some(...)`
+    /// on `TaggerConfig.http`.
+    #[test]
+    fn tagger_http_subsection_round_trips_from_toml() {
+        let toml = r#"
+            [tagger]
+            provider = "http"
+            model_id = "myorg/my-sidecar-v1"
+            model_version = 1
+
+            [tagger.http]
+            endpoint = "http://localhost:8081"
+            timeout_seconds = 30
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert_eq!(c.tagger.provider, "http");
+        assert_eq!(c.tagger.model_id, "myorg/my-sidecar-v1");
+        let http = c
+            .tagger
+            .http
+            .as_ref()
+            .expect("http sub-section should be Some after toml override");
+        assert_eq!(http.endpoint, "http://localhost:8081");
+        assert_eq!(http.timeout_seconds, 30);
+        assert!(http.api_key.is_none());
     }
 
     /// Operator opt-in: setting `[tagger].provider = "openai-compatible"`

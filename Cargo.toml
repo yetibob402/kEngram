@@ -7,6 +7,8 @@ members = [
   "crates/engram-extract",
   "crates/engram-mcp",
   "crates/engram-cli",
+  "crates/engram-tagger-protocol",
+  "crates/engram-tagger-deterministic",
 ]
 
 [workspace.package]
@@ -17,11 +19,12 @@ authors = ["Ron Forrester <ron.forrester@me.com>"]
 
 [workspace.dependencies]
 # Internal crates
-engram-core    = { path = "crates/engram-core" }
-engram-storage = { path = "crates/engram-storage" }
-engram-embed   = { path = "crates/engram-embed" }
-engram-extract = { path = "crates/engram-extract" }
-engram-mcp     = { path = "crates/engram-mcp" }
+engram-core            = { path = "crates/engram-core" }
+engram-storage         = { path = "crates/engram-storage" }
+engram-embed           = { path = "crates/engram-embed" }
+engram-extract         = { path = "crates/engram-extract" }
+engram-mcp             = { path = "crates/engram-mcp" }
+engram-tagger-protocol = { path = "crates/engram-tagger-protocol" }
 
 # Async runtime + traits
 tokio       = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }

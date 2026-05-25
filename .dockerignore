@@ -1,0 +1,40 @@
+# Keep the docker build context lean — without this the
+# `crates/engram-tagger-deterministic/Dockerfile` COPY would include
+# the workspace's target/ directory (gigabytes) and .git/ history.
+
+# Build artifacts
+target/
+**/target/
+*.rlib
+*.rmeta
+
+# VCS + IDE
+.git/
+.github/
+.idea/
+.vscode/
+*.swp
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Local environment
+.env
+.envrc
+*.log
+
+# Local agent/plugin state
+.claude/
+
+# Documentation & non-build assets that aren't needed at build time
+README.md
+DESIGN.md
+DEVELOPMENT.md
+ONBOARDING.md
+AGENTS.md
+docs/
+
+# Local override scripts
+start_server.sh
+start_worker.sh

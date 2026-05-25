@@ -56,11 +56,15 @@ RUN cargo build --release -p engram-tagger-deterministic
 
 FROM debian:bookworm-slim AS runtime
 
-# Runtime deps: libssl for reqwest (rustls is statically linked but the
-# OpenSSL build path remains as a fallback for cargo), ca-certificates
-# for TLS to remote embedder/sidecar endpoints.
+# Runtime deps:
+# - ca-certificates: TLS to remote embedder/sidecar endpoints.
+# - curl: required by the HEALTHCHECK directive at the bottom of this
+#   Dockerfile (the slim base image doesn't ship curl). Without it the
+#   container reports "unhealthy" even when /health returns 200 from the
+#   host, because Docker can't execute the healthcheck command inside.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 sidecar
 

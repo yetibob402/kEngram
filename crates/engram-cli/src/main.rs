@@ -329,6 +329,31 @@ fn build_tagger(c: &TaggerConfig) -> anyhow::Result<ResolvedTagger> {
                 version: c.model_version,
             })
         }
+        "http" => {
+            let http_cfg = c.http.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "provider = \"http\" requires a [tagger.http] config section (endpoint, optional api_key, optional timeout_seconds). See docs/tagger-backends.md.",
+                )
+            })?;
+            let tagger = engram_extract::HttpTagger::new(engram_extract::HttpTaggerConfig {
+                endpoint: http_cfg.endpoint.clone(),
+                model_id: c.model_id.clone(),
+                model_version: c.model_version,
+                api_key: http_cfg.api_key.clone(),
+                timeout: Duration::from_secs(http_cfg.timeout_seconds),
+            })
+            .with_context(|| {
+                format!(
+                    "constructing http tagger for endpoint {}",
+                    http_cfg.endpoint
+                )
+            })?;
+            Ok(ResolvedTagger {
+                tagger: Some(Arc::new(tagger)),
+                model_id: Some(c.model_id.clone()),
+                version: c.model_version,
+            })
+        }
         other => anyhow::bail!(
             "unknown tagger provider: {other:?} (valid: 'openai-compatible', 'openrouter', 'http' for sidecar, or empty for silent-disable). See docs/tagger-backends.md for how to register a new backend."
         ),

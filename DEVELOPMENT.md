@@ -127,10 +127,10 @@ docker compose --profile tagger ps tagger-deterministic
 Smoke:
 
 ```bash
-curl -fsS http://localhost:8081/health
+curl -fsS http://localhost:8082/health
 # expect: {"status":"ok"}
 
-curl -sS -X POST http://localhost:8081/tag \
+curl -sS -X POST http://localhost:8082/tag \
   -H 'Content-Type: application/json' \
   -d '{"protocol_version":"1","content":"Sarah pushed the bge-m3 reranker config."}' \
   | jq .
@@ -146,7 +146,7 @@ model_id = "deterministic/gliner-small-v2.1+regex+bge-m3"   # stamped onto thoug
 model_version = 1                                            # the sidecar's schema version
 
 [tagger.http]
-endpoint = "http://localhost:8081"
+endpoint = "http://localhost:8082"
 timeout_seconds = 30
 # api_key = "..."   # optional bearer; sidecars on a private network typically omit
 ```
@@ -160,7 +160,7 @@ cargo run --bin engram -- worker
 # expect: "tagger: resolved config ... provider=http ..." in the startup logs
 ```
 
-**Port collision watch.** The sidecar's default host port is `8081`, which is also the convention for `engram serve`'s Tier 1 (Tailnet) bind in this doc. If your `[server].bind` uses `0.0.0.0:8081`, you'll need to either change the sidecar's published port (edit `docker-compose.yml` to `"8082:8081"` and update `[tagger.http].endpoint = "http://localhost:8082"`) or change `engram serve`'s bind.
+**Port note.** The sidecar's default host port is `8082` (the Tier 1 `engram serve` convention is `:8081`, so the defaults coexist on one machine). If you've customized either to overlap, change one of them — `docker-compose.yml`'s `ports` line for the sidecar or `[server].bind` for engram serve.
 
 **To bring the sidecar down** without stopping the rest of the stack: `docker compose --profile tagger stop tagger-deterministic`. **To recreate after editing `topic-taxonomy.toml`**: `docker compose --profile tagger restart tagger-deterministic` (taxonomy is embedded once at startup, so a restart is required for new vectors to take effect). **To stop the whole stack and bring back only specific services**: `docker compose down` tears down everything regardless of profile; bring back with `docker compose --profile tagger up -d` (default-profile services + tagger) or omit the profile to leave the sidecar off.
 
@@ -330,7 +330,7 @@ scope_vocab_size = 50
 # LLM); operators can also ship sidecars in Python, Go, etc. See
 # docs/tagger-backends.md + docs/tagger-sidecar-protocol.md.
 # [tagger.http]
-# endpoint = "http://localhost:8081"
+# endpoint = "http://localhost:8082"
 # timeout_seconds = 30
 # api_key = ""                                          # optional bearer
 
@@ -416,7 +416,7 @@ Active only when `[tagger].provider = "http"`. Engram POSTs `/tag` against the s
 
 | knob | default | what it does |
 |---|---|---|
-| `endpoint` | `"http://localhost:8081"` | Base URL of the sidecar. The client appends `/tag` to this. |
+| `endpoint` | `"http://localhost:8082"` | Base URL of the sidecar. The client appends `/tag` to this. Default-coexists with the Tier 1 `engram serve` convention at `:8081`. |
 | `api_key` | `None` | Optional bearer token sent as `Authorization: Bearer <token>` to the sidecar. |
 | `timeout_seconds` | `60` | Per-request timeout. Sidecars doing CPU inference can run long on first call. |
 

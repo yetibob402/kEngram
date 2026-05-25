@@ -274,7 +274,7 @@ pub struct TaggerConfig {
 #[serde(default)]
 pub struct HttpTaggerConfig {
     /// Base URL of the sidecar. The client appends `/tag` to this.
-    /// Example: `"http://localhost:8081"`.
+    /// Example: `"http://localhost:8082"`.
     pub endpoint: String,
     /// Optional bearer token sent as `Authorization: Bearer <token>`.
     /// `None` means no Authorization header (sidecars on a private
@@ -289,7 +289,7 @@ pub struct HttpTaggerConfig {
 impl Default for HttpTaggerConfig {
     fn default() -> Self {
         Self {
-            endpoint: "http://localhost:8081".to_string(),
+            endpoint: "http://localhost:8082".to_string(),
             api_key: None,
             timeout_seconds: 60,
         }
@@ -442,7 +442,7 @@ mod tests {
             model_version = 1
 
             [tagger.http]
-            endpoint = "http://localhost:8081"
+            endpoint = "http://localhost:8082"
             timeout_seconds = 30
         "#;
         let c: Config = Figment::new()
@@ -457,7 +457,7 @@ mod tests {
             .http
             .as_ref()
             .expect("http sub-section should be Some after toml override");
-        assert_eq!(http.endpoint, "http://localhost:8081");
+        assert_eq!(http.endpoint, "http://localhost:8082");
         assert_eq!(http.timeout_seconds, 30);
         assert!(http.api_key.is_none());
     }

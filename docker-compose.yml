@@ -118,7 +118,10 @@ services:
       # gateway. Harmless on macOS.
       - "host.docker.internal:host-gateway"
     ports:
-      - "8081:8081"
+      # Host:container port 8082 (not 8081) so we don't collide with the
+      # documented Tier 1 `engram serve` bind on 0.0.0.0:8081. Operators
+      # running engram on a different port can remap freely.
+      - "8082:8082"
     volumes:
       # GLiNER ONNX assets — operator-supplied (see README).
       - ${HOME}/models/gliner_small-v2.1:/models/gliner:ro
@@ -127,7 +130,7 @@ services:
       # effect (taxonomy is embedded once at startup).
       - ./crates/engram-tagger-deterministic/topic-taxonomy.toml:/etc/engram/topic-taxonomy.toml:ro
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8081/health"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8082/health"]
       interval: 30s
       timeout: 5s
       retries: 3

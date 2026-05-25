@@ -80,7 +80,7 @@ All config via env. Twelve-factor.
 
 | Var | Default | What |
 |---|---|---|
-| `BIND_ADDR` | `0.0.0.0:8081` | Listen address |
+| `BIND_ADDR` | `0.0.0.0:8082` | Listen address |
 | `EMBEDDER_ENDPOINT` | `http://localhost:11434/v1` | OpenAI-compatible embedder (Ollama, TEI, OpenAI, ...) |
 | `EMBEDDER_MODEL` | `bge-m3` | Model name as the embedder backend understands it |
 | `EMBEDDER_API_KEY` | unset | Bearer token for the embedder, if needed |
@@ -155,7 +155,7 @@ docker run --rm \
   -e TOPIC_TAXONOMY_PATH=/etc/engram/topic-taxonomy.toml \
   -v $HOME/models/gliner_small-v2.1:/models/gliner:ro \
   -v $PWD/crates/engram-tagger-deterministic/topic-taxonomy.toml:/etc/engram/topic-taxonomy.toml:ro \
-  -p 8081:8081 \
+  -p 8082:8082 \
   engram-tagger-deterministic:latest
 ```
 
@@ -177,9 +177,9 @@ services:
       - $HOME/models/gliner_small-v2.1:/models/gliner:ro
       - ./crates/engram-tagger-deterministic/topic-taxonomy.toml:/etc/engram/topic-taxonomy.toml:ro
     ports:
-      - "8081:8081"
+      - "8082:8082"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8081/health"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8082/health"]
       interval: 30s
       timeout: 5s
       start_period: 30s
@@ -195,7 +195,7 @@ model_id = "deterministic/gliner-small-v2.1+regex+bge-m3"
 model_version = 1
 
 [tagger.http]
-endpoint = "http://localhost:8081"
+endpoint = "http://localhost:8082"
 timeout_seconds = 30
 ```
 

@@ -13,11 +13,11 @@
 #     -e TOPIC_TAXONOMY_PATH=/etc/engram/topic-taxonomy.toml \
 #     -v $HOME/models/gliner_small-v2.1:/models/gliner:ro \
 #     -v $PWD/crates/engram-tagger-deterministic/topic-taxonomy.toml:/etc/engram/topic-taxonomy.toml:ro \
-#     -p 8081:8081 \
+#     -p 8082:8082 \
 #     engram-tagger-deterministic:latest
 #
 # Then point engram at it: provider = "http", endpoint =
-# "http://localhost:8081" in [tagger] / [tagger.http].
+# "http://localhost:8082" in [tagger] / [tagger.http].
 
 # --- Build stage ---------------------------------------------------------
 
@@ -74,7 +74,7 @@ WORKDIR /home/sidecar
 COPY --from=builder /workspace/target/release/engram-tagger-deterministic /usr/local/bin/
 
 # Sensible defaults — operators override via -e.
-ENV BIND_ADDR=0.0.0.0:8081 \
+ENV BIND_ADDR=0.0.0.0:8082 \
     EMBEDDER_ENDPOINT=http://host.docker.internal:11434/v1 \
     EMBEDDER_MODEL=bge-m3 \
     GLINER_MODEL_DIR=/models/gliner \
@@ -85,9 +85,9 @@ ENV BIND_ADDR=0.0.0.0:8081 \
     MODEL_VERSION=1 \
     RUST_LOG=info
 
-EXPOSE 8081
+EXPOSE 8082
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD curl -fsS http://localhost:8081/health || exit 1
+    CMD curl -fsS http://localhost:8082/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/engram-tagger-deterministic"]

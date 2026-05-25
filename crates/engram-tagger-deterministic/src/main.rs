@@ -7,7 +7,7 @@
 //! TOML config file. Twelve-factor.
 //!
 //! Env vars:
-//!   BIND_ADDR             — default 0.0.0.0:8081 — listen address
+//!   BIND_ADDR             — default 0.0.0.0:8082 — listen address
 //!   EMBEDDER_ENDPOINT     — default http://localhost:11434/v1
 //!   EMBEDDER_MODEL        — default bge-m3
 //!   EMBEDDER_API_KEY      — optional, sent as Bearer to the embedder
@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let bind_addr: SocketAddr = std::env::var("BIND_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:8081".to_string())
+        .unwrap_or_else(|_| "0.0.0.0:8082".to_string())
         .parse()
         .context("parsing BIND_ADDR")?;
 

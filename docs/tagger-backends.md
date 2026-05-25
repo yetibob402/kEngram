@@ -116,7 +116,7 @@ it as an HTTP sidecar and point engram at it via `provider = "http"`:
    model_version = 1
 
    [tagger.http]
-   endpoint = "http://localhost:8081"
+   endpoint = "http://localhost:8082"
    timeout_seconds = 30
    ```
 

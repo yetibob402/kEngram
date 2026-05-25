@@ -24,7 +24,7 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub struct HttpTaggerConfig {
     /// Base URL of the sidecar. The client appends `/tag` to this.
-    /// Example: `"http://localhost:8081"`.
+    /// Example: `"http://localhost:8082"`.
     pub endpoint: String,
     /// Engram-side stable identity written into
     /// `thoughts.tags_extractor_model`. Conventionally

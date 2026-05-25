@@ -10,7 +10,7 @@ Reference: [`m4-collapse-to-thoughts.md`](./m4-collapse-to-thoughts.md) for the 
 
 ### Q2 — Tagger backfill UX
 
-**Decided: `engram tag --rerun [--since RFC3339] [--scope X] [--limit N]`.** Mirrors `engram reflect --rerun`'s surface from M3 (same operator muscle memory). Default behavior without `--rerun`: tag thoughts that are currently untagged (`tags_extractor_version IS NULL`). With `--rerun`: re-tag thoughts whose `tags_extractor_version < current_tagger_version` (i.e. tagger prompt has changed). `--since` filters by `thoughts.created_at`. `--scope` filters by scope. `--limit` caps per-run.
+**Decided: `kengram tag --rerun [--since RFC3339] [--scope X] [--limit N]`.** Mirrors `kengram reflect --rerun`'s surface from M3 (same operator muscle memory). Default behavior without `--rerun`: tag thoughts that are currently untagged (`tags_extractor_version IS NULL`). With `--rerun`: re-tag thoughts whose `tags_extractor_version < current_tagger_version` (i.e. tagger prompt has changed). `--since` filters by `thoughts.created_at`. `--scope` filters by scope. `--limit` caps per-run.
 
 ### Q3 — `is_duplicate` field on capture response
 
@@ -29,9 +29,9 @@ No extensions beyond OB1 in v1. If dogfood shows the need for `urls`, `code_snip
 
 ### Q5 — Empty `[tagger]` config behavior
 
-**Decided: silent-disable at capture time.** When `[tagger].provider` is empty (or the section is missing), the tag-job enqueue at capture is a no-op. No rows go into `pending_tags`. The tag drainer task in `engram worker` doesn't spawn. Thoughts capture cleanly, embed normally, search normally — they just stay with `tags = '{}'` forever. Matches the `[reranker]` silent-disable pattern from Phase B. Operator can flip `[tagger].provider = "openai-compatible"` later and run `engram tag --rerun --since 1970-01-01T00:00:00Z` to tag the backlog.
+**Decided: silent-disable at capture time.** When `[tagger].provider` is empty (or the section is missing), the tag-job enqueue at capture is a no-op. No rows go into `pending_tags`. The tag drainer task in `kengram worker` doesn't spawn. Thoughts capture cleanly, embed normally, search normally — they just stay with `tags = '{}'` forever. Matches the `[reranker]` silent-disable pattern from Phase B. Operator can flip `[tagger].provider = "openai-compatible"` later and run `kengram tag --rerun --since 1970-01-01T00:00:00Z` to tag the backlog.
 
-## Final types (engram-core)
+## Final types (kengram-core)
 
 ### `Thought` struct (extended; existing fields unchanged)
 
@@ -126,7 +126,7 @@ Same is-transient discipline as `EmbedderError` / `RerankerError` / (defunct) `E
 {
   "type": "json_schema",
   "json_schema": {
-    "name": "engram_tags",
+    "name": "kengram_tags",
     "strict": true,
     "schema": {
       "type": "object",
@@ -310,7 +310,7 @@ CREATE TABLE pending_tags (
 - The `target_kind = 'fact'` enum value (or CHECK constraint) is **not** removed by this migration. Leaving the value in lets us add the facts table back later without a schema migration if Path B-OB1 ever proves insufficient.
 - `pending_tags` uses `thought_id` as primary key (not a separate `id`) so re-enqueueing for the same thought is idempotent (ON CONFLICT (thought_id) DO NOTHING). One pending tag job per thought at a time.
 
-## Storage function signatures (engram-storage)
+## Storage function signatures (kengram-storage)
 
 ```rust
 // NewThought gains content_fingerprint; everything else as-is.
@@ -414,18 +414,18 @@ pub async fn find_untagged_or_stale_thoughts(
 ## CLI subcommand shape
 
 ```
-engram tag [--scope X] [--limit N] [--rerun] [--since RFC3339]
+kengram tag [--scope X] [--limit N] [--rerun] [--since RFC3339]
 ```
 
-Semantics (mirrors `engram reflect` from M3):
+Semantics (mirrors `kengram reflect` from M3):
 
 - Without `--rerun`: walks `find_untagged_or_stale_thoughts(target_version, rerun=false, ...)` — thoughts where `tags_extractor_version IS NULL`. Tags each one via the configured `[tagger]`. Skips thoughts whose `tags_extractor_version` is already set.
 - With `--rerun`: walks `find_untagged_or_stale_thoughts(target_version, rerun=true, ...)` — thoughts where `tags_extractor_version IS NULL OR tags_extractor_version < target_version`. Re-tags any stale ones; overwrites the `tags` column + provenance.
 - `--scope X`: restricts to one scope (exact match; same scope-filter semantics as M3 search).
-- `--since RFC3339`: restricts to `thoughts.created_at >= since`. Allowed with or without `--rerun` (unlike `engram reflect --since`, which required `--rerun`).
+- `--since RFC3339`: restricts to `thoughts.created_at >= since`. Allowed with or without `--rerun` (unlike `kengram reflect --since`, which required `--rerun`).
 - `--limit N`: caps how many thoughts to process this run.
 
-Empty/missing `[tagger]` config → errors at startup with a clear message ("`engram tag` requires a configured `[tagger]` section; see DEVELOPMENT.md"). Same hard-fail shape as `engram bench rerank` when no reranker.
+Empty/missing `[tagger]` config → errors at startup with a clear message ("`kengram tag` requires a configured `[tagger]` section; see DEVELOPMENT.md"). Same hard-fail shape as `kengram bench rerank` when no reranker.
 
 ## `[tagger]` config section
 
@@ -439,7 +439,7 @@ model_version         = 1                     # tagger prompt version; bump on p
 api_key               = ""                    # optional bearer token
 timeout_seconds       = 60
 temperature           = 0.2
-# system_prompt_file = "~/.config/engram/tagger-prompt.txt"
+# system_prompt_file = "~/.config/kengram/tagger-prompt.txt"
 # Optional: replace the bundled v1 prompt. Operator responsible for bumping
 # model_version when overriding.
 ```
@@ -471,28 +471,28 @@ Total estimated deletions: ~110 tests. Net target with new tagger/fingerprint/ta
 
 | Crate / file | Wave | Action |
 |---|---|---|
-| `crates/engram-core/src/thought.rs` | 2 (CORE) | Modify (add fields) |
-| `crates/engram-core/src/tags.rs` | 2 (CORE) | New |
-| `crates/engram-core/src/extractor.rs` | 2 (CORE) | Rename to `tagger.rs`; replace contents |
-| `crates/engram-core/src/fact.rs` | 2 (CORE) | **Delete** |
-| `crates/engram-core/src/lib.rs` | 2 (CORE) | Modify re-exports |
+| `crates/kengram-core/src/thought.rs` | 2 (CORE) | Modify (add fields) |
+| `crates/kengram-core/src/tags.rs` | 2 (CORE) | New |
+| `crates/kengram-core/src/extractor.rs` | 2 (CORE) | Rename to `tagger.rs`; replace contents |
+| `crates/kengram-core/src/fact.rs` | 2 (CORE) | **Delete** |
+| `crates/kengram-core/src/lib.rs` | 2 (CORE) | Modify re-exports |
 | `migrations/0006_collapse_to_thoughts.sql` | 3b (MIGRATION) | New |
-| `crates/engram-storage/src/lib.rs` | 3a (STORAGE) | Major rewrite (drop ~30%, add ~20%) |
-| `crates/engram-extract/src/lib.rs` | 3c (EXTRACT) | Modify re-exports |
-| `crates/engram-extract/src/openai_compatible.rs` | 3c (EXTRACT) | Rewrite to tagger |
-| `crates/engram-extract/src/fake_extractor.rs` | 3c (EXTRACT) | Rename to `fake_tagger.rs`; rewrite |
-| `crates/engram-mcp/src/reflect.rs` | 4 (MCP) | **Delete** |
-| `crates/engram-mcp/src/correct.rs` | 4 (MCP) | **Delete** |
-| `crates/engram-mcp/src/search.rs` | 4 (MCP) | Major simplify (drop fact code, add tag_filter) |
-| `crates/engram-mcp/src/server.rs` | 4 (MCP) | Drop fact tools, add tags serialization |
-| `crates/engram-mcp/src/capture.rs` | 4 (MCP) | Fingerprint dedup + dual enqueue |
-| `crates/engram-mcp/src/retract.rs` | 4 (MCP) | Drop fact-cascade reporting |
-| `crates/engram-mcp/src/drain.rs` | 4 (MCP) | Split into embed + tag drainers |
-| `crates/engram-mcp/src/backfill.rs` | 4 (MCP) | Drop fact target |
-| `crates/engram-mcp/src/lib.rs` | 4 (MCP) | Modify re-exports |
-| `crates/engram-cli/src/main.rs` | 5a (CLI) | Reflect→Tag subcommand; drop reflector cron |
-| `crates/engram-cli/src/config.rs` | 5a (CLI) | Rename [extractor]→[tagger], drop [reflector] |
-| `crates/engram-cli/src/bench.rs` | 5a (CLI) | Drop BenchTarget, fact dispatch |
+| `crates/kengram-storage/src/lib.rs` | 3a (STORAGE) | Major rewrite (drop ~30%, add ~20%) |
+| `crates/kengram-extract/src/lib.rs` | 3c (EXTRACT) | Modify re-exports |
+| `crates/kengram-extract/src/openai_compatible.rs` | 3c (EXTRACT) | Rewrite to tagger |
+| `crates/kengram-extract/src/fake_extractor.rs` | 3c (EXTRACT) | Rename to `fake_tagger.rs`; rewrite |
+| `crates/kengram-mcp/src/reflect.rs` | 4 (MCP) | **Delete** |
+| `crates/kengram-mcp/src/correct.rs` | 4 (MCP) | **Delete** |
+| `crates/kengram-mcp/src/search.rs` | 4 (MCP) | Major simplify (drop fact code, add tag_filter) |
+| `crates/kengram-mcp/src/server.rs` | 4 (MCP) | Drop fact tools, add tags serialization |
+| `crates/kengram-mcp/src/capture.rs` | 4 (MCP) | Fingerprint dedup + dual enqueue |
+| `crates/kengram-mcp/src/retract.rs` | 4 (MCP) | Drop fact-cascade reporting |
+| `crates/kengram-mcp/src/drain.rs` | 4 (MCP) | Split into embed + tag drainers |
+| `crates/kengram-mcp/src/backfill.rs` | 4 (MCP) | Drop fact target |
+| `crates/kengram-mcp/src/lib.rs` | 4 (MCP) | Modify re-exports |
+| `crates/kengram-cli/src/main.rs` | 5a (CLI) | Reflect→Tag subcommand; drop reflector cron |
+| `crates/kengram-cli/src/config.rs` | 5a (CLI) | Rename [extractor]→[tagger], drop [reflector] |
+| `crates/kengram-cli/src/bench.rs` | 5a (CLI) | Drop BenchTarget, fact dispatch |
 | `tests/fixtures/bench-rerank.example.json` | 5a (CLI) | Drop `target` field |
 | `README.md` | 5b (DOCS) | Major rewrite of extraction sections |
 | `DEVELOPMENT.md` | 5b (DOCS) | Drop reflect/extractor, add tag/tagger |
@@ -506,10 +506,10 @@ Total estimated deletions: ~110 tests. Net target with new tagger/fingerprint/ta
 
 ## Reused patterns (don't reinvent)
 
-- **`Embedder` / `Reranker` HTTP-client construction + reqwest error mapping** in engram-embed — direct template for `OpenAICompatibleTagger` and `TaggerError`.
-- **`pending_embeddings` queue + drainer pattern** in engram-mcp/drain.rs and engram-storage — direct template for `pending_tags` + tag drainer.
+- **`Embedder` / `Reranker` HTTP-client construction + reqwest error mapping** in kengram-embed — direct template for `OpenAICompatibleTagger` and `TaggerError`.
+- **`pending_embeddings` queue + drainer pattern** in kengram-mcp/drain.rs and kengram-storage — direct template for `pending_tags` + tag drainer.
 - **`FakeEmbedder` / `FakeReranker` mock pattern with last-call recording** — direct template for `FakeTagger`.
-- **`build_embedder` / `build_reranker`** in engram-cli/main.rs — template for `build_tagger`.
+- **`build_embedder` / `build_reranker`** in kengram-cli/main.rs — template for `build_tagger`.
 - **Phase A startup config log** (commit 1d627e4) — template for tagger startup log.
 - **Phase C `flagged` JSONB-shaped surface** in `SearchFactHit` — comparable to surfacing `tags` on `SearchHit`.
 

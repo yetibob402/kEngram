@@ -1,7 +1,7 @@
-# Engram — Local Agent Memory Service
+# Kengram — Local Agent Memory Service
 
 **Status:** Draft v0.1 · for review
-**Working name:** Engram (placeholder; trivial to rename)
+**Name:** Kengram (renamed from "Engram" on 2026-05-25 — see revision history)
 **Author:** [you]
 **Reviewers:** [TBD]
 **Last updated:** 2026-05-18
@@ -10,7 +10,7 @@
 
 ## 1. Summary
 
-Engram is a self-hosted, MCP-native memory service for AI agents. It runs alongside vLLM (or equivalent) on a personal headless inference server, reachable from the operator's devices over Tailscale wherever they happen to be. It provides a persistent, model-agnostic backing store that any MCP-capable client (Claude Code, Claude Desktop, opencode, ChatGPT, Cursor, Gemini CLI, custom Rust agents) can read from and write to.
+Kengram is a self-hosted, MCP-native memory service for AI agents. It runs alongside vLLM (or equivalent) on a personal headless inference server, reachable from the operator's devices over Tailscale wherever they happen to be. It provides a persistent, model-agnostic backing store that any MCP-capable client (Claude Code, Claude Desktop, opencode, ChatGPT, Cursor, Gemini CLI, custom Rust agents) can read from and write to.
 
 It is OB1's architectural shape — Postgres + pgvector + a thin MCP gateway — implemented as a single Rust binary, with the local vLLM endpoint serving as the embedding and extraction backend, designed so that swapping the underlying embedding or extraction model is a routine operation rather than a migration.
 
@@ -29,7 +29,7 @@ The system is built incrementally across six milestones (§3.5). The remainder o
 
 ## 3. Non-goals
 
-- Not an agent runtime (cf. Letta). Engram stores and retrieves; agents live elsewhere.
+- Not an agent runtime (cf. Letta). Kengram stores and retrieves; agents live elsewhere.
 - Not a temporal knowledge graph (cf. Graphiti). Facts are timestamped and supersedable, but we do not model validity windows as first-class entities.
 - Not a vector database product. We use pgvector and we are happy.
 - Not multi-tenant SaaS. Single operator, optional shared with trusted humans.
@@ -53,26 +53,26 @@ The system is built in six capability milestones, preceded by a small environmen
 - Tier 0 auth (localhost-only). Tier 1 (Tailnet) is a config change, not a code change.
 
 **M2 — Facts pipeline.** *(Retired in M4; documented here for history.)*
-- `engram-extract` crate became real with a vLLM client; `Extractor` trait gained its first implementation.
-- Worker process appeared (`engram worker` subcommand). Reflector cron job ran.
+- `kengram-extract` crate became real with a vLLM client; `Extractor` trait gained its first implementation.
+- Worker process appeared (`kengram worker` subcommand). Reflector cron job ran.
 - `facts` table populated; new MCP tools `search_facts`, `correct_fact`.
 - The async-embedding seam designed at M1 was exercised: `capture` posts a job; the worker computes the embedding.
 
 **M3 — Search quality.**
 - Cross-encoder reranker (via TEI) plugged in after RRF fusion. Retrieve top-50, rerank to top-N.
-- MCP search interface unchanged; quality goes up. A/B benchmarking harness (`engram bench rerank`) added so the latency/quality tradeoff is measurable.
+- MCP search interface unchanged; quality goes up. A/B benchmarking harness (`kengram bench rerank`) added so the latency/quality tradeoff is measurable.
 
 **M4 — Collapse to thoughts-only (Path B-OB1).**
 - The M3 Phase D dogfood showed the facts pipeline's structured-triple abstraction was the wrong shape for the operator's use case (statements faithful, triples broken; 7 dogfood rounds). M4 collapses the schema: facts table goes away, replaced by a JSONB `tags` sidecar column on `thoughts` populated by an LLM tagger drainer.
 - Content-fingerprint dedup at the thought level (SHA-256 unique constraint) so duplicate captures collapse to the same `thought_id`.
-- `engram-extract` repurposed: `Extractor`/`ExtractedFact`/SPO machinery gone; `Tagger`/`Tags`/JSONB output. Initial M4 tag fields are `people`, `action_items`, `topics`, `dates_mentioned`, `kind` (M4.1 adds `entities`).
+- `kengram-extract` repurposed: `Extractor`/`ExtractedFact`/SPO machinery gone; `Tagger`/`Tags`/JSONB output. Initial M4 tag fields are `people`, `action_items`, `topics`, `dates_mentioned`, `kind` (M4.1 adds `entities`).
 - MCP surface shrinks: `search_facts` and `correct_fact` removed; `search_thoughts` gains an optional `tag_filter` (JSONB containment); `capture` response gains `is_duplicate`.
-- CLI surface: `engram reflect` → `engram tag` (same shape; tags are advisory and overwritten on `--rerun` rather than supersede-chained).
+- CLI surface: `kengram reflect` → `kengram tag` (same shape; tags are advisory and overwritten on `--rerun` rather than supersede-chained).
 
 **M4.1 — v2 tagging.**
 - Dogfood on the M4 v1 tagger surfaced two patterns: (1) the model already half-distinguished named-entities from inferred-categories but the v1 schema collapsed them; (2) topics were phrase-driven, producing divergent terms across paraphrases of the same concept. M4.1 ships a v2 prompt + small trait/storage/drainer adjustments to address both.
 - `Tags` gains an `entities` field separate from `topics`. Schema is additive (JSONB-backed; no migration). The `Tagger` trait gains an optional `vocab: &ScopeVocab` parameter; the drainer pre-fetches the top-N most-frequent topic + entity terms in the thought's scope and renders them into the prompt as a controlled-vocabulary hint.
-- Tagger version bumps 1→2; operator runs `engram tag --rerun --since 1970-01-01T00:00:00Z` to backfill existing rows.
+- Tagger version bumps 1→2; operator runs `kengram tag --rerun --since 1970-01-01T00:00:00Z` to backfill existing rows.
 
 **M5 — Selective relations.**
 - Thought-to-thought graph layer on top of the M4 substrate. Closed relation vocabulary (initially `replaces`, `requires`, `references`, `belongs_to`, `decided_by`, `refines`; M5.1 added `supports` after day-one dogfood). Thought-to-thought edges at M5.
@@ -82,28 +82,28 @@ The system is built in six capability milestones, preceded by a small environmen
 **M5.2 — Heterogeneous targets + audit + CLI scope-prefix (close-the-M5-loop).**
 - Polymorphic targets on `thought_links`: the `to` side can be a thought, an entity (free-text), a person (free-text), or a URL. Migration 0009 adds discriminator + per-kind columns + generated `to_value`.
 - Soft-delete on `thought_links` (`deleted_at`); `unlink_thoughts` returns three-way status (`deleted_now` / `already_deleted` / `never_existed`). Partial unique index makes re-creating a previously-removed edge succeed cleanly.
-- `migration_audit` table + `engram audit migrations` CLI subcommand for operator-visible diagnostics on per-migration row impact.
-- `engram tag` and `engram embed-backfill` gain `--scope-prefix` (mutex with `--scope`), completing the M5.x retrieval-side scope_prefix work.
+- `migration_audit` table + `kengram audit migrations` CLI subcommand for operator-visible diagnostics on per-migration row impact.
+- `kengram tag` and `kengram embed-backfill` gain `--scope-prefix` (mutex with `--scope`), completing the M5.x retrieval-side scope_prefix work.
 
-**M6 — Corpus stats CLI + tagger-extracted relations (v1, non-thought targets).** *(The original M6 was artifacts/long-form ingestion; that plan was dropped after a 2026-05-17 live-corpus measurement showed engram occupies a high-signal-density sweet spot that long-form ingestion would dilute. M5.2's `to_url` link target already covers the "reference external doc" case. See revision history for the pivot.)*
-- New `engram stats` CLI subcommand prints corpus + storage telemetry (thought counts, embeddings, links, queues, per-scope summary, per-table sizes) without requiring psql. Operator-facing; no MCP surface in v1.
+**M6 — Corpus stats CLI + tagger-extracted relations (v1, non-thought targets).** *(The original M6 was artifacts/long-form ingestion; that plan was dropped after a 2026-05-17 live-corpus measurement showed kengram occupies a high-signal-density sweet spot that long-form ingestion would dilute. M5.2's `to_url` link target already covers the "reference external doc" case. See revision history for the pivot.)*
+- New `kengram stats` CLI subcommand prints corpus + storage telemetry (thought counts, embeddings, links, queues, per-scope summary, per-table sizes) without requiring psql. Operator-facing; no MCP surface in v1.
 - v5 tagger prompt + schema add a `relations` field — the LLM emits closed-vocabulary `(relation, to_kind, to_value)` edges from prose. v1 ships non-thought targets only (`url` / `entity` / `person`); thought-to-thought tagger relations require entity resolution and are deferred.
 - Drainer inserts emissions into `thought_links` with `source = 'tagger'`. Re-tag soft-deletes prior tagger emissions from the thought before fresh inserts (agent-supplied edges untouched). Bypass-on-error: malformed individual emissions are logged + skipped.
 
 **M7 — Operational maturity.**
 - Prometheus `/metrics` endpoint.
 - Tier 2 bearer-token auth + audit log.
-- `engram backup` / `engram restore` subcommands wrapping `pg_dump`/`pg_restore` with a manifest sidecar (schema head, embedder, tagger, corpus counts) and compatibility checks on restore. Shipped in M7.0.
+- `kengram backup` / `kengram restore` subcommands wrapping `pg_dump`/`pg_restore` with a manifest sidecar (schema head, embedder, tagger, corpus counts) and compatibility checks on restore. Shipped in M7.0.
 - Backup retention + cron policy (separate from the on-demand subcommands above).
 - Eval suite (capture-recall, cross-model retrieval consistency, LongMemEval-style).
 
-**Order rationale.** M1 is the floor: nothing else makes sense without capture and retrieval. M2 (facts) before M3 (rerank) because at the time facts added capability and rerank improved quality, and quality without capability felt unmotivated. M3 dogfood produced negative knowledge that motivated M4 (collapse to thoughts-only) — the facts pipeline didn't earn its complexity for the operator's actual queries. M5 (selective relations) comes after M4 because the citation-chain pattern that emerged from the M4.1 dogfood (thoughts referencing and refining each other in prose) was the strongest signal for the next architectural addition — making implicit graph structure first-class. M6's original "artifacts/long-form ingestion" plan was dropped after a live-corpus measurement showed engram occupies a high-signal-density sweet spot that long-form ingestion would dilute; the reshaped M6 ships `engram stats` and tagger-extracted relations instead (see revision history 2026-05-17). M7 (operational maturity) closes out the v0 plan.
+**Order rationale.** M1 is the floor: nothing else makes sense without capture and retrieval. M2 (facts) before M3 (rerank) because at the time facts added capability and rerank improved quality, and quality without capability felt unmotivated. M3 dogfood produced negative knowledge that motivated M4 (collapse to thoughts-only) — the facts pipeline didn't earn its complexity for the operator's actual queries. M5 (selective relations) comes after M4 because the citation-chain pattern that emerged from the M4.1 dogfood (thoughts referencing and refining each other in prose) was the strongest signal for the next architectural addition — making implicit graph structure first-class. M6's original "artifacts/long-form ingestion" plan was dropped after a live-corpus measurement showed kengram occupies a high-signal-density sweet spot that long-form ingestion would dilute; the reshaped M6 ships `kengram stats` and tagger-extracted relations instead (see revision history 2026-05-17). M7 (operational maturity) closes out the v0 plan.
 
 ## 4. High-level architecture
 
 ```
                    ┌──────────────────────────────────────────┐
-                   │             Engram (single binary)       │
+                   │             Kengram (single binary)       │
                    │                                          │
   MCP clients      │   ┌──────────┐    ┌────────────────┐     │
   (Claude Code, ──→│──→│ MCP/HTTP │───→│   Core service │     │──┐
@@ -137,7 +137,7 @@ The system is built in six capability milestones, preceded by a small environmen
                             └──────────────────┘
 ```
 
-Engram is a *client* of the local vLLM endpoint, not the operator of it. vLLM is presumed to be serving primary inference traffic to other Tailscale-connected devices anyway; Engram piggybacks on that infrastructure. Three logical components, one binary:
+Kengram is a *client* of the local vLLM endpoint, not the operator of it. vLLM is presumed to be serving primary inference traffic to other Tailscale-connected devices anyway; Kengram piggybacks on that infrastructure. Three logical components, one binary:
 
 - **MCP/HTTP surface.** Streamable HTTP transport speaking MCP. Same binary also exposes an admin HTTP API.
 - **Core service.** Capture, search, retraction, scope management.
@@ -182,7 +182,7 @@ CREATE INDEX thoughts_tags_gin
 -- Migration 0001 also ships `artifacts` and `artifact_chunks` tables for
 -- what was then a planned long-form-ingestion milestone. That plan was
 -- dropped in the M6 reshape (2026-05-17) after a live-corpus measurement
--- showed engram occupies a high-signal-density sweet spot that long-form
+-- showed kengram occupies a high-signal-density sweet spot that long-form
 -- ingestion would dilute. Those two tables are inert and slated for
 -- removal by a future drop migration; they are intentionally omitted
 -- from the schema block above.
@@ -215,7 +215,7 @@ CREATE INDEX embeddings_bge_m3_hnsw
 -- architectural rationale.
 
 -- Durable FIFO queue backing the async embedding seam. Capture inserts a
--- row; `engram worker`'s drainer task pulls batches via
+-- row; `kengram worker`'s drainer task pulls batches via
 -- `UPDATE ... FROM (SELECT ... FOR UPDATE SKIP LOCKED LIMIT $1)`.
 -- The UNIQUE constraint makes enqueue idempotent.
 CREATE TABLE pending_embeddings (
@@ -248,7 +248,7 @@ CREATE TABLE pending_tags (
 
 **One HNSW index per model.** Each active embedding model gets its own partial index, predicated on a literal `model_id` string. This is required for correctness: Postgres demands partial-index predicates be `IMMUTABLE`, and `current_setting()` is `STABLE`. The "active embedder" is therefore a config concern (see §9), not a database GUC. Operationally, swapping the active model means: ship a migration that adds the new partial index, update config to point at the new `model_id`, restart.
 
-**Scoping.** Free-form string, default `global`. Convention rather than enforcement: `work.tcgplayer`, `personal`, `project.engram`, etc. A `scopes` registry table can come later if introspection is wanted.
+**Scoping.** Free-form string, default `global`. Convention rather than enforcement: `work.tcgplayer`, `personal`, `project.kengram`, etc. A `scopes` registry table can come later if introspection is wanted.
 
 ## 6. Ingest path
 
@@ -264,15 +264,15 @@ There is one write path. It terminates in a `thoughts` row plus an embedding plu
 
 ## 6.5 Tagging sidecar
 
-[M4+] The tagger reads each new thought and writes a JSONB metadata blob onto the same row. Six fields: `people`, `entities`, `action_items`, `topics`, `dates_mentioned`, `kind`. `entities` and `topics` are separate slots ([M4.1+]): `entities` lists proper-noun-style identifiers the prose mentions by name (projects, products, libraries, named concepts); `topics` lists broader subject categories the thought falls under. Keeping them separate lets `tag_filter` distinguish "thoughts that mention engram by name" from "thoughts categorized under memory-systems." Tags are advisory metadata — they don't gate storage or supersede each other; they're an optional filtering signal at retrieval time and a UX-time annotation in `search_thoughts` responses.
+[M4+] The tagger reads each new thought and writes a JSONB metadata blob onto the same row. Six fields: `people`, `entities`, `action_items`, `topics`, `dates_mentioned`, `kind`. `entities` and `topics` are separate slots ([M4.1+]): `entities` lists proper-noun-style identifiers the prose mentions by name (projects, products, libraries, named concepts); `topics` lists broader subject categories the thought falls under. Keeping them separate lets `tag_filter` distinguish "thoughts that mention kengram by name" from "thoughts categorized under memory-systems." Tags are advisory metadata — they don't gate storage or supersede each other; they're an optional filtering signal at retrieval time and a UX-time annotation in `search_thoughts` responses.
 
 **Why a sidecar, not a separate table.** M2 shipped a `facts` pipeline that decomposed each thought into structured `(subject, predicate, object, confidence, statement)` rows. M3 Phase D dogfood (7 rounds, 2026-05-13 → 2026-05-16) produced a consistent finding: the *statement* field came back faithful to the source thought, but the *triples* came back broken — comparative S/O inversion, self-referential subjects, conditional-as-subject, predicate verbosity, polarity contradictions, triple-semantic drift. The producer (local 30B-class coding model) couldn't reliably emit triples; the consumer (LLM agents reading prose) didn't query by `(S, P, O)`. M4 collapsed the pipeline: drop the `facts` table, write a JSONB sidecar on the thought instead, and treat tagger output as *overwriteable* rather than supersede-chained. The architectural antecedent is OB1's `metadata` column; the design philosophy is *raw data is permanent, derived signals are recomputable*.
 
-**The pipeline.** Four steps, all in `engram worker`'s tag-drainer task:
+**The pipeline.** Four steps, all in `kengram worker`'s tag-drainer task:
 
 1. **Drain.** `SELECT thought_id, tagger_model_id FROM pending_tags ORDER BY enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT $batch_size`. Fetched in the same idempotent style as `pending_embeddings`.
 
-2. **Tag.** Call `Tagger::tag(content, vocab)`. The default impl (`OpenAICompatibleTagger`) POSTs to `/v1/chat/completions` with the bundled prompt (currently v7) + `response_format: { type: "json_schema", strict: true, schema: { ... } }`. Schema (live in `crates/engram-extract/src/openai_compatible.rs`):
+2. **Tag.** Call `Tagger::tag(content, vocab)`. The default impl (`OpenAICompatibleTagger`) POSTs to `/v1/chat/completions` with the bundled prompt (currently v7) + `response_format: { type: "json_schema", strict: true, schema: { ... } }`. Schema (live in `crates/kengram-extract/src/openai_compatible.rs`):
 
     ```json
     {
@@ -302,13 +302,13 @@ There is one write path. It terminates in a `thoughts` row plus an embedding plu
 
     [M6.1+] The LLM emits both `tags` fields (persisted to `thoughts.tags` JSONB) and `relations` (routed to `thought_links` with `source='tagger'`, not persisted into the JSONB — see §6.7). `Tagger::tag` returns `TagOutput { tags, relations }`; the drainer destructures and writes the two halves through separate code paths.
 
-    [M4.1+] Before the tagger call, the drainer optionally pre-fetches the top-N most-frequent topic and entity terms from the thought's scope (via `engram_storage::fetch_scope_vocab`) and passes them to `Tagger::tag(content, Some(&vocab))`. The default `OpenAICompatibleTagger` renders the vocab into a "controlled vocabulary" section appended to the system prompt — the model is told to prefer established terms when they fit and coin new ones only for genuinely unseen concepts. This produces consistent topic vocabulary at the corpus level: the same author writing about the same subject in different prose now lands in overlapping topic terms, addressing v1's phrase-driven divergence. Controlled by `[tagger].scope_vocab_enabled` (default `true`) and `[tagger].scope_vocab_size` (default `50`).
+    [M4.1+] Before the tagger call, the drainer optionally pre-fetches the top-N most-frequent topic and entity terms from the thought's scope (via `kengram_storage::fetch_scope_vocab`) and passes them to `Tagger::tag(content, Some(&vocab))`. The default `OpenAICompatibleTagger` renders the vocab into a "controlled vocabulary" section appended to the system prompt — the model is told to prefer established terms when they fit and coin new ones only for genuinely unseen concepts. This produces consistent topic vocabulary at the corpus level: the same author writing about the same subject in different prose now lands in overlapping topic terms, addressing v1's phrase-driven divergence. Controlled by `[tagger].scope_vocab_enabled` (default `true`) and `[tagger].scope_vocab_size` (default `50`).
 
     On per-thought tagger failure (`Timeout`, `Unreachable`, `Backend 5xx`, `MalformedResponse`), the drainer **soft-fails**: logs a warning with `transient = err.is_transient()`, increments the row's `attempts` counter, and leaves it in `pending_tags`. Next tick retries. Vocab-fetch failure folds into the same transient bucket.
 
 3. **Write.** `UPDATE thoughts SET tags = $tags, tags_extractor_model = $model_id, tags_extractor_version = $version, tags_extracted_at = NOW() WHERE id = $thought_id`; then `DELETE FROM pending_tags WHERE thought_id = $thought_id`. The two statements run in one transaction. There is no supersede chain — the tags column is overwritten on every successful tagger pass.
 
-4. **(Optional) Re-tag.** `engram tag --rerun [--since <RFC3339>] [--scope X] [--limit N]` walks thoughts whose `tags_extractor_version < current_tagger_version` (or `IS NULL`, for the first pass on a previously-untagged thought), calls the tagger, and overwrites. Use this after bumping `[tagger].model_version` on a prompt or schema change.
+4. **(Optional) Re-tag.** `kengram tag --rerun [--since <RFC3339>] [--scope X] [--limit N]` walks thoughts whose `tags_extractor_version < current_tagger_version` (or `IS NULL`, for the first pass on a previously-untagged thought), calls the tagger, and overwrites. Use this after bumping `[tagger].model_version` on a prompt or schema change.
 
 **Concrete example.** A thought: *"Talked to Sarah today about the PR backlog. She wants migration #0042 fast-tracked because the mobile freeze starts Thursday."* The tagger returns:
 
@@ -380,7 +380,7 @@ CREATE UNIQUE INDEX thought_links_live_uq
 
 **Pipeline.** Two write paths land in this table — agent-supplied via MCP and tagger-extracted via the M6.1 drainer (covered in §6.7). Read path is shared.
 
-1. **`link_thoughts(from, relation, to, note?)`** [M5+, M5.2 polymorphic] takes exactly one of `to_thought_id` / `to_entity` / `to_person` / `to_url`. Validates self-link (for thought targets), note length, and endpoint existence (for thought targets), then calls `engram_storage::insert_link` with ON CONFLICT idempotency against the live unique index. Returns `is_new: bool` (mirrors `capture`'s `is_duplicate` polarity) plus the `link_id`.
+1. **`link_thoughts(from, relation, to, note?)`** [M5+, M5.2 polymorphic] takes exactly one of `to_thought_id` / `to_entity` / `to_person` / `to_url`. Validates self-link (for thought targets), note length, and endpoint existence (for thought targets), then calls `kengram_storage::insert_link` with ON CONFLICT idempotency against the live unique index. Returns `is_new: bool` (mirrors `capture`'s `is_duplicate` polarity) plus the `link_id`.
 2. **`unlink_thoughts(from, relation, to)`** [M5+, M5.2 three-way status] soft-deletes by stamping `deleted_at`. Returns a three-way `status: deleted_now | already_deleted | never_existed` so the caller can distinguish a no-op-because-already-gone from a no-op-because-never-there. A subsequent `link_thoughts` of the same triple succeeds cleanly.
 3. **`get_related_thoughts(thought_id, relations?, target_kinds?, direction?)`** walks the graph from a single thought. Returns grouped `outbound` (edges where this thought is `from`) and `inbound` (edges where it's `to`, thought-target rows only). Each edge carries `to_kind`, `to_value`, `link_source` (`agent` | `tagger`), and `note`. Thought-target hits additionally surface the related thought's content_preview, scope, and retraction state. Filters: `relations` (closed-vocab subset), `target_kinds` (outbound only — restrict to specific `to_kind` values), `direction` (`outbound` | `inbound` | `both`).
 
@@ -394,9 +394,9 @@ link_thoughts(137dba1d, "references", to_url: "https://example.org/probe-2", not
 
 `get_related_thoughts(8a533e15, direction: "inbound")` returns the inbound `refines` edge from `6d2ef58e`. `get_related_thoughts(137dba1d, direction: "outbound")` returns the `refines→6d2ef58e` (a thought hit, with content_preview) and the `references→<url>` (a URL hit). `unlink_thoughts(137dba1d, "references", to_url: "...")` returns `deleted_now`; a re-issued `unlink_thoughts` on the same triple returns `already_deleted`; a third `link_thoughts` on the same triple succeeds because the soft-deleted row is excluded from the live unique index.
 
-**Migration audit (M5.2 ancillary).** Migration 0010 also introduces a `migration_audit` table that any row-touching migration populates by convention. `engram audit migrations` surfaces the log so an operator can answer "what did each migration actually touch on my corpus" without psql. Currently populated by 0009, 0010, and 0011.
+**Migration audit (M5.2 ancillary).** Migration 0010 also introduces a `migration_audit` table that any row-touching migration populates by convention. `kengram audit migrations` surfaces the log so an operator can answer "what did each migration actually touch on my corpus" without psql. Currently populated by 0009, 0010, and 0011.
 
-**Out of scope at v0.** First-class `entities` / `persons` tables (the free-text columns on `thought_links` are the v0 representation; entity resolution is its own multi-conversation problem). Reverse traversal from non-thought targets, restore-link tool, hard-purge of soft-deleted edges, sibling `engram audit links` / `engram audit thoughts` resources, bulk-link tooling, multi-hop traversal (`get_thoughts_n_hops_away`), an `engram link` CLI shortcut — deferred per usage demand.
+**Out of scope at v0.** First-class `entities` / `persons` tables (the free-text columns on `thought_links` are the v0 representation; entity resolution is its own multi-conversation problem). Reverse traversal from non-thought targets, restore-link tool, hard-purge of soft-deleted edges, sibling `kengram audit links` / `kengram audit thoughts` resources, bulk-link tooling, multi-hop traversal (`get_thoughts_n_hops_away`), an `kengram link` CLI shortcut — deferred per usage demand.
 
 ## 6.7 Tagger-extracted relations (M6.1)
 
@@ -409,9 +409,9 @@ link_thoughts(137dba1d, "references", to_url: "https://example.org/probe-2", not
 **Pipeline.** The tag drainer (§6.5 step 2) already calls `Tagger::tag(content, vocab)`. Post-M6.1 that call returns `TagOutput { tags, relations }`. The drainer destructures:
 
 1. **Write tags** (unchanged from §6.5): `update_thought_tags` writes `tags` into `thoughts.tags` JSONB.
-2. **Apply relations** ([M6.1]): `engram_mcp::apply_tagger_relations(thought_id, &output.relations, pool)` first calls `soft_delete_tagger_edges_for_thought(thought_id)` — every existing `source='tagger'` edge from the thought is stamped with `deleted_at = NOW()`. Then each emission in `output.relations` is validated (`link::validate_target` — URL must be `http(s)://`, names ≤200 chars) and inserted via the standard `insert_link` path with `source = 'tagger'`. Bypass-on-error: a single malformed emission is logged and skipped; the rest of the batch still lands; the tag job is never failed by a bad relation.
+2. **Apply relations** ([M6.1]): `kengram_mcp::apply_tagger_relations(thought_id, &output.relations, pool)` first calls `soft_delete_tagger_edges_for_thought(thought_id)` — every existing `source='tagger'` edge from the thought is stamped with `deleted_at = NOW()`. Then each emission in `output.relations` is validated (`link::validate_target` — URL must be `http(s)://`, names ≤200 chars) and inserted via the standard `insert_link` path with `source = 'tagger'`. Bypass-on-error: a single malformed emission is logged and skipped; the rest of the batch still lands; the tag job is never failed by a bad relation.
 
-Re-tag cycles (operator-initiated via `engram tag --rerun`) replay step 2: prior tagger edges are soft-deleted and fresh ones inserted. Agent-supplied edges (`source = 'agent'`) are untouched — only the tagger-owned subset churns.
+Re-tag cycles (operator-initiated via `kengram tag --rerun`) replay step 2: prior tagger edges are soft-deleted and fresh ones inserted. Agent-supplied edges (`source = 'agent'`) are untouched — only the tagger-owned subset churns.
 
 **Why not persist into the `tags` JSONB.** v5/M6.1 originally wrote tagger emissions into BOTH `thoughts.tags.relations` (raw frozen JSONB) AND `thought_links` rows. The live-corpus dogfood revealed every persisted JSONB entry had a corresponding `thought_links` row — pure DRY violation. v9 (2026-05-18, migration 0011) dropped the `tags.relations` JSONB field; `thought_links` is now the single canonical store. The LLM-side response schema (§6.5) still asks for a top-level `relations` array — `OpenAICompatibleTagger` parses it into the transient `TagOutput.relations` field; only the persistence shape changed.
 
@@ -465,7 +465,7 @@ Tools and the milestone in which each ships. Names and signatures are part of th
 | `unlink_thoughts` | M5 (M5.2 soft-delete + three-way status) | Soft-delete a link by its `(from, relation, target)` triple. Returns `status: deleted_now | already_deleted | never_existed`. Re-creating a soft-deleted edge succeeds. |
 | `get_related_thoughts` | M5 (M5.2 polymorphic) | Walk the link graph. Returns grouped `outbound` + `inbound` arrays. Each hit carries `to_kind` / `to_value` / `link_source`; thought-target hits additionally surface the target's content_preview, scope, retraction state. Optional filters: `relations`, `target_kinds` (outbound only), `direction`. |
 
-Operator-only surfaces (not exposed as MCP tools): `engram stats` (corpus + storage telemetry, shipped at M6.0) and `engram audit migrations` (per-migration row impact log, shipped at M5.2) are CLI subcommands; an MCP `stats` tool is deferred to M7+. `ingest_artifact` was on the original M6 surface and was dropped when M6 was reshaped (see revision history 2026-05-17).
+Operator-only surfaces (not exposed as MCP tools): `kengram stats` (corpus + storage telemetry, shipped at M6.0) and `kengram audit migrations` (per-migration row impact log, shipped at M5.2) are CLI subcommands; an MCP `stats` tool is deferred to M7+. `ingest_artifact` was on the original M6 surface and was dropped when M6 was reshaped (see revision history 2026-05-17).
 
 `search_facts` and `correct_fact` shipped in M2 and were removed in M4 when the facts pipeline was retired. Operators correcting a wrong claim now `retract_thought` and capture a corrected one; tags are advisory and re-derivable, so per-tag operator correction was unnecessary.
 
@@ -503,7 +503,7 @@ pub trait Tagger: Send + Sync {
 }
 ```
 
-Data shapes (`Tags`, `ScopeVocab`, `TagOutput`, `ExtractedRelation`, `RelationKind`, `LinkTarget`, `LinkSource`, `ThoughtLink`) live in `crates/engram-core`; the SQL forms in §5 and §6.6 are the contract, and the Rust shapes follow them. All three trait error enums carry `is_transient(&self) -> bool` so capture/drain orchestrators can decide retry vs. mark-failed per call. `Timeout`, `Unreachable`, and `Backend { status: 500..=599, .. }` are transient; everything else is not.
+Data shapes (`Tags`, `ScopeVocab`, `TagOutput`, `ExtractedRelation`, `RelationKind`, `LinkTarget`, `LinkSource`, `ThoughtLink`) live in `crates/kengram-core`; the SQL forms in §5 and §6.6 are the contract, and the Rust shapes follow them. All three trait error enums carry `is_transient(&self) -> bool` so capture/drain orchestrators can decide retry vs. mark-failed per call. `Timeout`, `Unreachable`, and `Backend { status: 500..=599, .. }` are transient; everything else is not.
 
 **Default implementations:**
 
@@ -513,16 +513,16 @@ Data shapes (`Tags`, `ScopeVocab`, `TagOutput`, `ExtractedRelation`, `RelationKi
 - **`OpenAICompatibleTagger`** [M4] — one type covering every OpenAI-`/v1/chat/completions`-shaped backend that supports `response_format: { type: "json_schema", strict: true }`. Named-constructor presets `OpenAICompatibleConfig::vllm_local()` (default `http://localhost:8000/v1`, no key) and `::open_router(api_key, model)` cover the production-sidecar and cloud-fallback paths.
 - **`FakeTagger`** [M4] — deterministic in-memory tagger mirroring `FakeEmbedder`. `Empty` / `Canned(Tags)` / `Substring(map<&str, Tags>)` behaviors for unit-test control; `always_failing(FakeBehavior)` exercises the soft-fail path.
 
-The trait boundary is the buffer-from-model-changes guarantee. Swapping vLLM's served model, swapping to SGLang, swapping to a cloud provider — all happen behind the same interface. The only operation that propagates beyond the trait is a re-embed when the *embedder* changes (which is why §5 makes embeddings a separate table); a tagger swap is just `engram tag --rerun --since 1970-01-01T00:00:00Z` and tags overwrite in place.
+The trait boundary is the buffer-from-model-changes guarantee. Swapping vLLM's served model, swapping to SGLang, swapping to a cloud provider — all happen behind the same interface. The only operation that propagates beyond the trait is a re-embed when the *embedder* changes (which is why §5 makes embeddings a separate table); a tagger swap is just `kengram tag --rerun --since 1970-01-01T00:00:00Z` and tags overwrite in place.
 
-**Active-embedder selection.** From M1 onward the active embedder is identified by `model_id` (e.g. `bge-m3:1024`) and is a config field — the engram TOML declares which model is active; that string must match the predicate of an existing HNSW partial index. There is intentionally no Postgres-side GUC.
+**Active-embedder selection.** From M1 onward the active embedder is identified by `model_id` (e.g. `bge-m3:1024`) and is a config field — the kengram TOML declares which model is active; that string must match the predicate of an existing HNSW partial index. There is intentionally no Postgres-side GUC.
 
 Configuration is a TOML file:
 
 ```toml
 [database]
 # Postgres connection. Overridden by DATABASE_URL env var if set (sqlx convention).
-url = "postgres://engram:engram@localhost:5432/engram"
+url = "postgres://kengram:kengram@localhost:5432/kengram"
 max_connections = 10
 
 [server]                                        # [M1]
@@ -535,7 +535,7 @@ allowed_hosts = []                              # [M5.x] DNS-rebinding allowlist
 provider     = "openai-compatible"
 endpoint     = "http://localhost:11434/v1"      # Ollama in dev; TEI in production
 model        = "bge-m3"                         # backend-side model name
-model_id     = "bge-m3:1024"                    # Engram-side identity; must match an HNSW index
+model_id     = "bge-m3:1024"                    # Kengram-side identity; must match an HNSW index
 dimensions   = 1024
 timeout_seconds = 5
 
@@ -563,19 +563,19 @@ temperature     = 0.2
 
 The `[extractor]` and `[reflector]` sections that shipped in M2 were removed by M4. The tagger drainer is always-on when `[tagger].provider` is non-empty — no cron, no opt-in flag, no confidence-band routing.
 
-**Embedder placement is a deployment-time choice, not a code change.** TEI ships CPU and CUDA builds with identical HTTP APIs (`ghcr.io/huggingface/text-embeddings-inference:cpu-1.x` vs `:1.x`). Switching is a systemd unit edit; the Engram TOML doesn't change.
+**Embedder placement is a deployment-time choice, not a code change.** TEI ships CPU and CUDA builds with identical HTTP APIs (`ghcr.io/huggingface/text-embeddings-inference:cpu-1.x` vs `:1.x`). Switching is a systemd unit edit; the Kengram TOML doesn't change.
 
 ## 10. Operational shape — what makes the store honest
 
 §6.5 describes the tagging sidecar as a capability — what it produces and how. This section is the operational counterweight: what guarantees the store gives the operator, what it explicitly does *not* guarantee, and why the M4 architecture deliberately stops short of drift-defense ceremony that the M2 facts pipeline carried.
 
-**The five operational properties Engram guarantees:**
+**The five operational properties Kengram guarantees:**
 
 1. **Raw thoughts are immutable.** Capture writes a `thoughts` row once and never updates the `content` column. The only mutations on `thoughts` are state flips — `retracted_at` (M3), the `tags` JSONB (M4), and the tagger provenance triplet — none of which touch content. If a derived signal (embedding, tag) drifts, the truth is recoverable: re-embed, re-tag.
 
 2. **Content-fingerprint dedup.** [M4] `thoughts.content_fingerprint` is SHA-256 of `content` with a `UNIQUE` constraint. Capture is `INSERT ... ON CONFLICT (content_fingerprint) DO NOTHING RETURNING id`; duplicate content from any source (same agent retrying, two agents capturing the same observation, an explicit re-capture) collapses to the existing `thought_id`. Agents see a stable id for a given content, and `is_duplicate: true` on the response so they can react to "I already told you this" if they care.
 
-3. **Derived signals are recomputable.** The `embeddings` table is per-model and per-version; a new embedding model is a new partial HNSW index + a re-embed pass — no data loss, no migration on `thoughts`. The `tags` column is overwritten in place by `engram tag --rerun` whenever `[tagger].model_version` advances; no supersede chain to walk, no audit trail to reconcile, because tags are advisory metadata, not load-bearing.
+3. **Derived signals are recomputable.** The `embeddings` table is per-model and per-version; a new embedding model is a new partial HNSW index + a re-embed pass — no data loss, no migration on `thoughts`. The `tags` column is overwritten in place by `kengram tag --rerun` whenever `[tagger].model_version` advances; no supersede chain to walk, no audit trail to reconcile, because tags are advisory metadata, not load-bearing.
 
 4. **Retraction is durable.** [M3] `retract_thought` sets `retracted_at` and `retracted_reason` on the row. Every retrieval path (`search_thoughts`, `recent_thoughts`) filters `WHERE retracted_at IS NULL`. `get_thought` is the audit path — it returns the row with retraction state visible. The row never leaves the database; the retracted-thought UX is "untrusted but inspectable."
 
@@ -584,10 +584,10 @@ The `[extractor]` and `[reflector]` sections that shipped in M2 were removed by 
 **What this architecture deliberately does NOT have, post-M4:**
 
 - **No confidence-band routing.** Tags don't carry confidence. The tagger emits a single object per thought; if it's wrong, re-tagging overwrites it. (The M2 `review_queue_below` / `min_confidence_to_store` machinery is gone with the facts table.)
-- **No supersede chain on tagger output.** Tags are overwritten on `engram tag --rerun`. There's no `tags_superseded_by`, no history table, no audit trail on what the tagger said last week. The provenance triplet (`tags_extractor_model`, `tags_extractor_version`, `tags_extracted_at`) tells you what produced the *current* tags; if the operator wants pre-`--rerun` state, they restore from a backup.
+- **No supersede chain on tagger output.** Tags are overwritten on `kengram tag --rerun`. There's no `tags_superseded_by`, no history table, no audit trail on what the tagger said last week. The provenance triplet (`tags_extractor_model`, `tags_extractor_version`, `tags_extracted_at`) tells you what produced the *current* tags; if the operator wants pre-`--rerun` state, they restore from a backup.
 - **No fact-review queue.** The `facts_review_queue` table was dropped by migration 0006. Tagger output goes straight onto the row; there's no operator-review gate.
 - **No `correct_fact` MCP tool.** Operators who notice a wrong tag don't correct it; they ignore it (tags are advisory) or `retract_thought` if the underlying content is wrong. The cost of being wrong about a tag is small enough that operator-correction infrastructure isn't worth the complexity.
-- **No drift-defense `engram audit` job.** M2's audit story keyed on extractor drift across model versions; M4's tags are recomputable from raw text whenever the operator wants. M6.0 shipped `engram stats` as a CLI subcommand for the operator-facing snapshot — current state, not drift.
+- **No drift-defense `kengram audit` job.** M2's audit story keyed on extractor drift across model versions; M4's tags are recomputable from raw text whenever the operator wants. M6.0 shipped `kengram stats` as a CLI subcommand for the operator-facing snapshot — current state, not drift.
 
 **The pre-M4 design (preserved here for history).** M2 shipped a `facts` table with `(subject, predicate, object, confidence, statement)` rows, a reflector cron, a confidence-band review queue, `correct_fact` MCP tool, and a `--rerun` flow with supersede-via-statement-or-triple-match dedup. M3 Phase D dogfood (commits `34ba756` → `2000059` on the m4-collapse-to-thoughts branch tell the full story) revealed that the (S, P, O) abstraction was generating most of the operator-visible failure modes (inverted comparatives, self-referential subjects, conditional-as-subject, predicate verbosity, polarity contradictions, triple-semantic drift). Statements were faithful; triples were brittle. **None of the M2-era drift-defense machinery was the wrong design for a fact store — it was the right design for the wrong abstraction.** M4 swapped the abstraction; the defensive machinery went with it.
 
@@ -597,16 +597,16 @@ This section is the design-level operational shape. Operator-facing runbooks (fi
 
 **Components:**
 
-- `engram` — the single Rust binary; subcommands cover the server, the drainer worker, and operator utilities (current set in `DEVELOPMENT.md`).
-- Postgres 16+ with `pgvector` ≥ 0.7, `pg_trgm`, `pgcrypto`. Connection is configured by URL (TOML or `DATABASE_URL` env). Local Unix socket is the simplest deployment; remote TCP — same Tailnet, separate NAS or DB host, or anywhere reachable — is fully supported. **Extensions must be installed on the Postgres server**, not the Engram host.
-- `text-embeddings-inference` HTTP server for the embedder, sidecar pattern. CPU and CUDA builds expose the same HTTP shape; choice is a deployment-time decision (no Engram code or config change). From M3 onward, TEI also serves the cross-encoder reranker on the same HTTP shape (separate model).
-- vLLM (or any OpenAI-compatible chat-completions endpoint) serving an instruct model — required from M4 onward when the tagger is configured. **Operated independently of Engram.** Engram is a client; the operator manages vLLM's lifecycle, model choice, and serving config.
+- `kengram` — the single Rust binary; subcommands cover the server, the drainer worker, and operator utilities (current set in `DEVELOPMENT.md`).
+- Postgres 16+ with `pgvector` ≥ 0.7, `pg_trgm`, `pgcrypto`. Connection is configured by URL (TOML or `DATABASE_URL` env). Local Unix socket is the simplest deployment; remote TCP — same Tailnet, separate NAS or DB host, or anywhere reachable — is fully supported. **Extensions must be installed on the Postgres server**, not the Kengram host.
+- `text-embeddings-inference` HTTP server for the embedder, sidecar pattern. CPU and CUDA builds expose the same HTTP shape; choice is a deployment-time decision (no Kengram code or config change). From M3 onward, TEI also serves the cross-encoder reranker on the same HTTP shape (separate model).
+- vLLM (or any OpenAI-compatible chat-completions endpoint) serving an instruct model — required from M4 onward when the tagger is configured. **Operated independently of Kengram.** Kengram is a client; the operator manages vLLM's lifecycle, model choice, and serving config.
 
-**Process model:** systemd units. `engram-server.service` runs the MCP server; `engram-worker.service` runs the drainer process and from M4 onward runs *two* drainer tasks inside one process: the embed drainer (always on, pulls jobs off `pending_embeddings`) and the tag drainer (M4; pulls off `pending_tags` when `[tagger].provider` is non-empty). The embedder sidecar and vLLM run as their own units, managed independently.
+**Process model:** systemd units. `kengram-server.service` runs the MCP server; `kengram-worker.service` runs the drainer process and from M4 onward runs *two* drainer tasks inside one process: the embed drainer (always on, pulls jobs off `pending_embeddings`) and the tag drainer (M4; pulls off `pending_tags` when `[tagger].provider` is non-empty). The embedder sidecar and vLLM run as their own units, managed independently.
 
 **Why two drainers, no cron** [M4+]. The M2 reflector ran on a cron schedule (default `0 0 3 * * *`) to batch fact extraction overnight and avoid contending with the operator's daytime agent loads. M4's tagger is a single chat-completion per thought, runs in the 1–2 s range, and produces 100–300 output tokens — small enough that ticking through `pending_tags` continuously alongside the embed drainer is cheap. No nightly scheduled run, no missed-cron catch-up logic, no time-of-day contention question.
 
-**Backups:** `pg_dump --format=custom` nightly to a separate disk; weekly to a remote (Backblaze B2 or rsync.net). Embeddings are derived data and don't strictly need backing up — re-running `engram embed-backfill` regenerates them — but including them speeds disaster recovery. For one-shot machine-to-machine migration, `engram backup` / `engram restore` ([M7.0]) wrap `pg_dump`/`pg_restore` with a manifest sidecar and compatibility checks (schema head, embedder, tagger); see DEVELOPMENT.md "Migrating between machines."
+**Backups:** `pg_dump --format=custom` nightly to a separate disk; weekly to a remote (Backblaze B2 or rsync.net). Embeddings are derived data and don't strictly need backing up — re-running `kengram embed-backfill` regenerates them — but including them speeds disaster recovery. For one-shot machine-to-machine migration, `kengram backup` / `kengram restore` ([M7.0]) wrap `pg_dump`/`pg_restore` with a manifest sidecar and compatibility checks (schema head, embedder, tagger); see DEVELOPMENT.md "Migrating between machines."
 
 **Migrations:** `sqlx migrate`. Schema changes ship with the binary.
 
@@ -624,9 +624,9 @@ Three relevant tiers. They map to milestones, not to deployment options offered 
 
 A "Tier 3 — public + multi-user" option exists in principle but is **explicitly out of scope** for the current roadmap. It would require OAuth2, per-client tokens, and audit log; implementable later if the system is genuinely shared with another person, which is not a current requirement.
 
-**Tier 1 is the recommended endpoint for single-user deployment.** Engram binds to the Tailnet interface and is reachable as `engram.tailXXXX.ts.net` from every personal device, using the same MagicDNS pattern as vLLM. No code change vs. Tier 0; only the bind address.
+**Tier 1 is the recommended endpoint for single-user deployment.** Kengram binds to the Tailnet interface and is reachable as `kengram.tailXXXX.ts.net` from every personal device, using the same MagicDNS pattern as vLLM. No code change vs. Tier 0; only the bind address.
 
-**Auth at Tier 2** [M7]. Bearer token validated against a hashed allowlist in `engram_tokens`. Tokens carry a scope-list — a token can be locked to `work.*` and not see `personal.*`. Audit log records `(token_id, tool, args_hash, ts)` for every call.
+**Auth at Tier 2** [M7]. Bearer token validated against a hashed allowlist in `kengram_tokens`. Tokens carry a scope-list — a token can be locked to `work.*` and not see `personal.*`. Audit log records `(token_id, tool, args_hash, ts)` for every call.
 
 ## 13. Evaluation
 
@@ -638,7 +638,7 @@ A "Tier 3 — public + multi-user" option exists in principle but is **explicitl
 2. **Cross-model retrieval consistency.** Re-embed the same fixture with a new embedder; measure overlap of top-10 results vs. baseline. Drop > 30% triggers a manual review before the swap is committed in production scopes.
 3. **LongMemEval-style.** Subset of the public benchmark adapted to our schema. Apples-to-apples comparison against published Mem0 / Zep / Letta numbers.
 
-Eval runs end-to-end in `engram eval --suite <name>` and dumps a JSON report.
+Eval runs end-to-end in `kengram eval --suite <name>` and dumps a JSON report.
 
 ## 14. Open questions
 
@@ -650,9 +650,9 @@ Resolved during the milestone-roadmap planning conversation (see Revision histor
 
 Carrying forward:
 
-5. **Naming.** Engram is a placeholder. (Hippocampus, Cortex, Lattice, Mneme are all in the drawer.)
+5. ~~**Naming.**~~ Resolved (2026-05-25): renamed to **Kengram** after a collision cross-check — Engram, Engrain, and Pengram were all already taken in-niche. See revision history.
 6. **Sync.** Do we ever want multi-machine replication? Logical replication on Postgres is straightforward, but only worth doing if you'll actually use it. Defer.
-7. **Capture UX.** OB1's Slack capture is clever. Equivalents: a Telegram bot, a CLI `engram capture`, a Raycast/Alfred extension, a browser extension. Out of scope until at least M6.
+7. **Capture UX.** OB1's Slack capture is clever. Equivalents: a Telegram bot, a CLI `kengram capture`, a Raycast/Alfred extension, a browser extension. Out of scope until at least M6.
 8. **Embedding model default.** v0 commits to BGE-M3 (well-established, multilingual, runs in ~1.5 GB, supports rerank). A future milestone should bake off Qwen3-Embedding-4B and Qwen3-Embedding-8B against our own eval fixture before any production-scope re-embed. The embeddings table design (§5) makes this a routine swap rather than a migration.
 9. **Are we storing agent transcripts?** Open. The original M5/M6 artifacts plan would have held them as long-form content; that plan was dropped in the M6 reshape (transcripts dilute the high-signal-density sweet spot per §3.5). The remaining options are explicit per-message capture, scope-prefixed session transcripts, or letting agents decide. No decision yet.
 10. **Tagger model: dense vs. MoE.** Dense (Qwen2.5-32B class) is the v0 default. MoE alternatives (Qwen3-30B-A3B style, ~3B active) likely win on throughput; quality on tagger output is unmeasured against the current prompt. Decide via the M7 eval suite.
@@ -662,7 +662,7 @@ Carrying forward:
 - Knowledge-graph reasoning (Cognee/Graphiti territory). Retired with the M4 collapse; structured `(S, P, O)` triples were the wrong abstraction for this use case.
 - Memory forgetting / TTL policies (everything is forever; pruning is a post-M6 conversation).
 - Multi-modal memory (images, audio).
-- Federated query across multiple Engram instances.
+- Federated query across multiple Kengram instances.
 - A web UI. Postgres + `psql` is the admin interface.
 - Public + multi-user deployment ("Tier 3" in §12).
 
@@ -700,3 +700,5 @@ Carrying forward:
 
 
 - **2026-05-18** — **M7.0 ship: `engram backup` / `engram restore`.** First M7 surface to land. Two new `Command` variants in `engram-cli` wrap `pg_dump` / `pg_restore` with a `manifest.json` sidecar (engram version, schema head, embedder model, tagger version, corpus counts) packaged in a single `.tar.gz`. Restore validates the manifest against the target before any destructive action: numeric schema-head compare (refuses on mismatch — guards against the lex-compare bug that would flip `version 11` vs `version 9`), embedder/tagger drift surfaced as warnings (not refusals; restore is lossless and downstream `engram embed-backfill` / `engram tag --rerun` handle the mismatch), and `--force` is required only when the target's `thoughts` table is non-empty so first-time-on-new-machine restore is a one-liner. New module `crates/engram-cli/src/backup.rs` (~580 lines incl. tests); 10 unit tests covering manifest round-trip, schema-compat outcomes (including the two-digit regression case), and URL redaction; end-to-end smoke verified by round-tripping the live 12 MB corpus into a fresh `engram_test` database with exact-match row counts (42 live thoughts, 10 retracted, 52 embeddings, 96 links, 5 scopes). Postgres client tools (`pg_dump` + `pg_restore`) added as a runtime dependency on both source and target machines; documented in DEVELOPMENT.md "Migrating between machines." Doc updates: §3.5 M7 description gains a backup/restore bullet; §11 Backups paragraph points at the new subcommands as the one-shot machine-migration path (the nightly retention story stays separate). Decisions ratified before the ship: `--force` is conditional (empty target skips); no auto-migrate on restore (operator runs `sqlx migrate run` explicitly); embeddings included by default (`--skip-embeddings` is the opt-out for size-sensitive backups).
+
+- **2026-05-25** — **Renamed Engram → Kengram.** The 2026-05-18 entry above retained "Engram" as a working name while flagging 8+ colliding live AI-memory / MCP projects. A focused cross-check confirmed the collision is untenable: the `engram-core` / `engram-ai-core` crates already exist on crates.io, and `lamb356/engram` + `edg-l/engram-mcp` are near-identical Rust + MCP + agent-memory projects. Candidate alternatives were rejected on the same grounds — **Engrain** (a proptech company, a separate "Engrain AI" company, the `engrain-io` GitHub org, and the EnGRaiN OSS project) and **Pengram** (`penfieldlabs/pengram`, a live LLM knowledge-graph extractor with an overlapping typed-relation vocabulary). **Kengram** cleared a full sweep: crates.io and npm namespaces empty, no neighbouring AI/memory project; only a hobbyist GitHub username and an unrelated EdTech `.com`. Etymology: *ken* (to know) + *-gram* (a recorded mark) — "a recorded unit of knowing." The rename is mechanical and behaviour-preserving: all crates `engram-*` → `kengram-*`, binary `engram` → `kengram`, MCP server identity → `kengram` (tools become `mcp__kengram__*`), env-var prefix `ENGRAM_` → `KENGRAM_`, config path `~/.config/engram` → `~/.config/kengram`, and the Postgres database + Docker stack → `kengram`. Dated history (this revision log, the `m{1,2,3}-progress.md` docs, `docs/tagger-improvements.md`, and applied migration comments) is preserved verbatim — including the "Engram" references — so the record stays honest. No schema-shape or behavioural changes.

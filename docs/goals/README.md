@@ -43,7 +43,7 @@ that means "done." Must be:
   cycles we're trying to escape.
 
 Example:
-> Running `cargo run --example tagger_eval -- crates/engram-extract/tests/fixtures/use_mention.json` reports 6/6 PASS in `category=control` and ≥5/6 PASS in `category=use_mention` (net 11/12 or better).
+> Running `cargo run --example tagger_eval -- crates/kengram-extract/tests/fixtures/use_mention.json` reports 6/6 PASS in `category=control` and ≥5/6 PASS in `category=use_mention` (net 11/12 or better).
 
 ### 3. Iteration loop
 

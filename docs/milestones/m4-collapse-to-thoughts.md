@@ -6,7 +6,7 @@ M3's Phase D dogfood produced negative knowledge: the `facts` pipeline as curren
 
 Independent corroboration came from Nate B. Jones's [Open Brain (OB1)](https://github.com/NateBJones-Projects/OB1) released 2026-03-11: same problem space (MCP-native personal memory), single `thoughts` table, LLM extraction collapsed into a JSONB `metadata` column on the same row rather than a separate `facts` entity. Stated philosophy: *"raw data is permanent, embeddings are derived."*
 
-**M4 collapses Engram to thoughts-only with a metadata sidecar** ([Path B-OB1](../../DESIGN.md#path-b-ob1), decided 2026-05-16). The `facts` table goes away. The reflector's role narrows from "extract structured atomic claims with (S, P, O, confidence)" to "tag each thought with metadata (people, action_items, topics, type)." Retrieval continues to use the M3-shipped hybrid + cross-encoder rerank pipeline — operating only on thoughts, with tags as an optional JSONB filter signal. Content-fingerprint dedup is added at the thought level (SHA-256, unique-indexed) so we don't regress vs OB1 on duplicate-handling.
+**M4 collapses Kengram to thoughts-only with a metadata sidecar** ([Path B-OB1](../../DESIGN.md#path-b-ob1), decided 2026-05-16). The `facts` table goes away. The reflector's role narrows from "extract structured atomic claims with (S, P, O, confidence)" to "tag each thought with metadata (people, action_items, topics, type)." Retrieval continues to use the M3-shipped hybrid + cross-encoder rerank pipeline — operating only on thoughts, with tags as an optional JSONB filter signal. Content-fingerprint dedup is added at the thought level (SHA-256, unique-indexed) so we don't regress vs OB1 on duplicate-handling.
 
 **What we keep that OB1 doesn't have:**
 - `pg_trgm` + RRF hybrid + cross-encoder rerank (OB1 is pure cosine).
@@ -58,7 +58,7 @@ ALTER TABLE thoughts
 CREATE INDEX thoughts_tags_gin ON thoughts USING gin (tags);
 ```
 
-### Thought struct (engram-core)
+### Thought struct (kengram-core)
 
 ```rust
 pub struct Thought {
@@ -91,7 +91,7 @@ pub enum TagKind {
 
 `Tags` is `JSONB-shaped`; an empty `Tags::default()` round-trips as `{}`. Untagged thoughts (newly captured, pre-drainer) carry the default.
 
-### Tagger (engram-extract, repurposed)
+### Tagger (kengram-extract, repurposed)
 
 Replace `Extractor` trait with `Tagger`. Output shape:
 
@@ -178,7 +178,7 @@ Same scope semantics whether new or duplicate — agents see a stable `thought_i
 
 ### Drainer (worker)
 
-`engram worker` drains two queue tables:
+`kengram worker` drains two queue tables:
 
 - `pending_embeddings` (unchanged): worker calls embedder, inserts into `embeddings`.
 - `pending_tags` (NEW): worker calls tagger, updates `thoughts.tags` + provenance columns.
@@ -201,12 +201,12 @@ Both drain in parallel ticks. Same `tick_interval_seconds` + `batch_size` knobs.
 
 | Subcommand | M3 state | M4 state |
 |---|---|---|
-| `engram serve` | MCP server | Unchanged |
-| `engram worker` | Embed drainer + reflector cron | Embed drainer + **tag drainer** (reflector cron gone) |
-| `engram migrate` | Apply migrations | Unchanged |
-| `engram embed-backfill` | Heal-then-drain for thoughts + facts | Thoughts only |
-| `engram reflect [--rerun --since X]` | One-shot facts extraction | **Removed**; replaced by `engram tag [--rerun --since X]` (one-shot tagger run; reruns re-tag thoughts) |
-| `engram bench rerank --corpus X` | A/B harness over thoughts + facts | Thoughts only (fixture format simplifies — `target` field goes away) |
+| `kengram serve` | MCP server | Unchanged |
+| `kengram worker` | Embed drainer + reflector cron | Embed drainer + **tag drainer** (reflector cron gone) |
+| `kengram migrate` | Apply migrations | Unchanged |
+| `kengram embed-backfill` | Heal-then-drain for thoughts + facts | Thoughts only |
+| `kengram reflect [--rerun --since X]` | One-shot facts extraction | **Removed**; replaced by `kengram tag [--rerun --since X]` (one-shot tagger run; reruns re-tag thoughts) |
+| `kengram bench rerank --corpus X` | A/B harness over thoughts + facts | Thoughts only (fixture format simplifies — `target` field goes away) |
 
 ### Config surface delta
 
@@ -260,20 +260,20 @@ Wave 5: CLI, DOCS (2 agents, parallel) → INTEGRATE (coordinator)
 
 **Owner:** CORE agent.
 
-**Goal:** establish the engram-core type contract.
+**Goal:** establish the kengram-core type contract.
 
 **Inputs:** SPEC doc.
 
 **Files changed:**
-- `crates/engram-core/src/thought.rs`: add fields per spec.
-- `crates/engram-core/src/tags.rs` (NEW): `Tags`, `TagKind` types with serde + tests.
-- `crates/engram-core/src/lib.rs`: re-exports.
-- `crates/engram-core/src/extractor.rs` → repurpose to `tagger.rs`: drop `ExtractedFact`, `ExtractionContext`, `ExtractMode`, `Extractor` trait; add `Tagger` trait + `TaggerError`.
-- `crates/engram-core/src/fact.rs`: **delete entirely**.
+- `crates/kengram-core/src/thought.rs`: add fields per spec.
+- `crates/kengram-core/src/tags.rs` (NEW): `Tags`, `TagKind` types with serde + tests.
+- `crates/kengram-core/src/lib.rs`: re-exports.
+- `crates/kengram-core/src/extractor.rs` → repurpose to `tagger.rs`: drop `ExtractedFact`, `ExtractionContext`, `ExtractMode`, `Extractor` trait; add `Tagger` trait + `TaggerError`.
+- `crates/kengram-core/src/fact.rs`: **delete entirely**.
 
 **Tests:** Tags serde roundtrip; default Tags is `{}`-equivalent; TagKind enum lowercases; Thought struct serde roundtrip with full + minimal tags.
 
-**Acceptance:** `cargo build -p engram-core` clean; `cargo test -p engram-core` clean; `cargo clippy -p engram-core` clean. Other crates won't build yet — that's expected.
+**Acceptance:** `cargo build -p kengram-core` clean; `cargo test -p kengram-core` clean; `cargo clippy -p kengram-core` clean. Other crates won't build yet — that's expected.
 
 ### Wave 3 — STORAGE, MIGRATION, EXTRACT (3 agents, parallel, ~3 hours each)
 
@@ -281,10 +281,10 @@ Wave 5: CLI, DOCS (2 agents, parallel) → INTEGRATE (coordinator)
 
 **Owner:** STORAGE agent.
 
-**Goal:** rewrite engram-storage against the new Thought shape.
+**Goal:** rewrite kengram-storage against the new Thought shape.
 
 **Files changed:**
-- `crates/engram-storage/src/lib.rs`:
+- `crates/kengram-storage/src/lib.rs`:
   - **Delete:** `NewFact`, `FactHit`, all fact functions (`insert_fact`, `fetch_fact`, `supersede_fact`, `find_matching_active_facts`, `find_matching_superseded_facts`, `find_subsuming_active_facts`, `list_active_facts_for_thought`, `search_facts_trigram`, `search_facts_vector_knn`, `enqueue_unembedded_facts`, `insert_fact_embedding`), `RunId`, `start_run`, `finish_run`, all `reflector_runs` queries, `NewReviewRow`, `insert_review_queue_row`, `fact_from_columns`, `FactVectorSearchRow`.
   - **Modify `NewThought`**: add `content_fingerprint: [u8; 32]`. (Tags are not provided at capture time; they're written by the tagger drainer later.)
   - **Modify `insert_thought`**: compute fingerprint, INSERT with ON CONFLICT (content_fingerprint) returning either new id + `is_new=true` or existing id + `is_new=false`.
@@ -303,7 +303,7 @@ Wave 5: CLI, DOCS (2 agents, parallel) → INTEGRATE (coordinator)
 - `enqueue_tag_job_inserts_into_pending_tags`
 - All existing thought-search tests continue to pass; their fixtures may need to recompute fingerprints.
 
-**Acceptance:** `cargo build -p engram-storage` clean; `cargo test -p engram-storage` clean (subset of M3 tests survives + 4-5 new tests); clippy clean.
+**Acceptance:** `cargo build -p kengram-storage` clean; `cargo test -p kengram-storage` clean (subset of M3 tests survives + 4-5 new tests); clippy clean.
 
 #### Wave 3b — MIGRATION
 
@@ -316,7 +316,7 @@ Wave 5: CLI, DOCS (2 agents, parallel) → INTEGRATE (coordinator)
 - (No Rust changes — sqlx picks up the migration on next build.)
 
 **Verification:**
-- Apply against a fresh `engram` test database after `engram migrate` has applied 0001-0005.
+- Apply against a fresh `kengram` test database after `kengram migrate` has applied 0001-0005.
 - `\d thoughts` shows the new columns + index + unique constraint.
 - `\dt` confirms `facts`, `facts_review_queue`, `reflector_runs` are gone.
 - `SELECT COUNT(*) FROM embeddings WHERE target_kind = 'fact'` returns 0.
@@ -327,17 +327,17 @@ Wave 5: CLI, DOCS (2 agents, parallel) → INTEGRATE (coordinator)
 
 **Owner:** EXTRACT agent.
 
-**Goal:** turn engram-extract into the tagger module.
+**Goal:** turn kengram-extract into the tagger module.
 
 **Files changed:**
-- `crates/engram-extract/src/lib.rs`: re-exports for new types.
-- `crates/engram-extract/src/openai_compatible.rs`:
+- `crates/kengram-extract/src/lib.rs`: re-exports for new types.
+- `crates/kengram-extract/src/openai_compatible.rs`:
   - Replace `OpenAICompatibleExtractor` → `OpenAICompatibleTagger`.
   - Replace `OpenAICompatibleConfig`'s `max_facts_per_thought` with no replacement.
   - Replace `BUNDLED_SYSTEM_PROMPT` with the tagger prompt (above).
   - Replace `facts_response_format()` with `tags_response_format()` per the JSON schema.
   - `tag()` method: POST to chat-completions with the new prompt + schema; deserialize into `Tags`.
-- `crates/engram-extract/src/fake_extractor.rs` → `fake_tagger.rs`: `FakeTagger` returns canned `Tags` from a deterministic mapping or operator-set behavior.
+- `crates/kengram-extract/src/fake_extractor.rs` → `fake_tagger.rs`: `FakeTagger` returns canned `Tags` from a deterministic mapping or operator-set behavior.
 - Tests in this crate update to match.
 
 **Tests:**
@@ -347,36 +347,36 @@ Wave 5: CLI, DOCS (2 agents, parallel) → INTEGRATE (coordinator)
 - `tagger_v1_prompt_contains_field_semantics_section` (regression pin).
 - FakeTagger tests for the determinism modes (`Empty`, `Canned(Tags)`, `Substring(map<&str, Tags>)`).
 
-**Acceptance:** `cargo build -p engram-extract` clean; tests pass; clippy clean.
+**Acceptance:** `cargo build -p kengram-extract` clean; tests pass; clippy clean.
 
 ### Wave 4 — MCP (1 agent, sequential after Wave 3, ~4 hours)
 
 **Owner:** MCP agent.
 
-**Goal:** rewrite engram-mcp against the new engram-storage + engram-extract.
+**Goal:** rewrite kengram-mcp against the new kengram-storage + kengram-extract.
 
 **Files changed:**
-- `crates/engram-mcp/src/reflect.rs`: **delete entirely**.
-- `crates/engram-mcp/src/correct.rs`: **delete entirely**.
-- `crates/engram-mcp/src/search.rs`:
+- `crates/kengram-mcp/src/reflect.rs`: **delete entirely**.
+- `crates/kengram-mcp/src/correct.rs`: **delete entirely**.
+- `crates/kengram-mcp/src/search.rs`:
   - **Delete:** `search_facts`, `SearchFactHit`, `SearchFactsRequest`, `SearchFactsResponse`, `rrf_fuse_facts`, `apply_rerank_to_fact_hits`, all fact-related code.
   - **Modify `search_thoughts`**: add `tag_filter` field; thread into `search_vector_knn` + `search_trigram` via a new WHERE clause `AND tags @> $tag_filter`.
   - **Modify `SearchHit`**: add `tags: Tags` field.
-- `crates/engram-mcp/src/server.rs`:
+- `crates/kengram-mcp/src/server.rs`:
   - **Delete:** `SearchFactsArgs`, `CorrectFactArgs`, `CorrectFactReplacementArgs`, `search_facts_response_json`, `search_facts` + `correct_fact` tool handlers.
   - **Modify `SearchThoughtsArgs`**: add `tag_filter: Option<serde_json::Value>` with schemars description.
   - **Modify `search_thoughts_response_json`**: emit `tags` per hit.
   - **Modify `get_thought_response_json`**: drop `linked_facts` from `provenance`; emit `tags` + tag provenance.
-  - **Modify `EngramServer::new`**: drop the reranker-only signature confusion — wait, reranker is unchanged; it's just the reflector/extractor wiring that goes. EngramServer no longer holds an `Arc<dyn Extractor>` — that lives only in the worker now.
-- `crates/engram-mcp/src/capture.rs`:
+  - **Modify `KengramServer::new`**: drop the reranker-only signature confusion — wait, reranker is unchanged; it's just the reflector/extractor wiring that goes. KengramServer no longer holds an `Arc<dyn Extractor>` — that lives only in the worker now.
+- `crates/kengram-mcp/src/capture.rs`:
   - Compute SHA-256 of content; pass to NewThought; handle `is_new` in the response (`is_duplicate: !is_new`).
   - On successful insert, enqueue both embedding job and tag job.
-- `crates/engram-mcp/src/retract.rs`: drop the fact-cascade reporting.
-- `crates/engram-mcp/src/drain.rs`:
+- `crates/kengram-mcp/src/retract.rs`: drop the fact-cascade reporting.
+- `crates/kengram-mcp/src/drain.rs`:
   - Split into two drainer functions: `drain_pending_embeddings` (unchanged shape) and `drain_pending_tags` (NEW).
   - Tag drainer fetches the thought, calls `tagger.tag(content)`, calls `update_thought_tags`. Soft-fail per the embed-drainer's Q9 pattern.
-- `crates/engram-mcp/src/backfill.rs`: drop the fact-target arm; embed-backfill is thoughts-only.
-- `crates/engram-mcp/src/lib.rs`: update re-exports.
+- `crates/kengram-mcp/src/backfill.rs`: drop the fact-target arm; embed-backfill is thoughts-only.
+- `crates/kengram-mcp/src/lib.rs`: update re-exports.
 
 **Tests:**
 - `search_thoughts_filters_by_tag_containment`
@@ -389,25 +389,25 @@ Wave 5: CLI, DOCS (2 agents, parallel) → INTEGRATE (coordinator)
 - `get_thought_response_carries_tags_and_provenance`
 - Delete all reflect / correct / search_facts tests.
 
-**Acceptance:** `cargo build -p engram-mcp` clean; tests pass (test count substantially lower than M3's 105); clippy clean.
+**Acceptance:** `cargo build -p kengram-mcp` clean; tests pass (test count substantially lower than M3's 105); clippy clean.
 
 ### Wave 5a — CLI (1 agent, parallel with DOCS, ~3 hours)
 
 **Owner:** CLI agent.
 
-**Goal:** rewrite engram-cli against the new MCP surface.
+**Goal:** rewrite kengram-cli against the new MCP surface.
 
 **Files changed:**
-- `crates/engram-cli/src/main.rs`:
-  - `Command::Reflect { ... }` → `Command::Tag { scope, limit, rerun, since }`. Subcommand semantics: like `engram reflect` but for the tagger.
+- `crates/kengram-cli/src/main.rs`:
+  - `Command::Reflect { ... }` → `Command::Tag { scope, limit, rerun, since }`. Subcommand semantics: like `kengram reflect` but for the tagger.
   - `run_reflect` → `run_tag`: builds the tagger (via `build_tagger(&config.tagger)`), iterates thoughts (unfacted-or-rerun semantics adapted to "untagged-or-rerun"), calls `tagger.tag()` per thought, writes via `update_thought_tags`.
   - Worker: drop reflector cron. Just runs embed-drainer + tag-drainer in tick loops.
   - `run_embed_backfill`: drop the `--target` flag (thoughts only).
-- `crates/engram-cli/src/config.rs`:
+- `crates/kengram-cli/src/config.rs`:
   - **Rename `ExtractorConfig` → `TaggerConfig`**: drop `max_facts_per_thought`. Reset `model_version` default to 1.
   - **Delete `ReflectorOptions`/`ReflectorConfig`** entirely. Tag drainer is always-on with no cron (drains on every worker tick).
   - Config struct: drop `reflector` field; rename `extractor` to `tagger`.
-- `crates/engram-cli/src/bench.rs`:
+- `crates/kengram-cli/src/bench.rs`:
   - Drop `BenchTarget` enum.
   - `BenchQuery`: drop `target` field; all queries are thought queries.
   - `run_pair`: drop the fact-target dispatch.
@@ -419,7 +419,7 @@ Wave 5: CLI, DOCS (2 agents, parallel) → INTEGRATE (coordinator)
 - Bench harness tests: update to drop target dispatch.
 - Delete reflect-related CLI tests.
 
-**Acceptance:** `cargo build -p engram-cli` clean; `engram --help` shows the new subcommand set; tests pass; clippy clean.
+**Acceptance:** `cargo build -p kengram-cli` clean; `kengram --help` shows the new subcommand set; tests pass; clippy clean.
 
 ### Wave 5b — DOCS (1 agent, parallel with CLI, ~3 hours)
 
@@ -436,7 +436,7 @@ Wave 5: CLI, DOCS (2 agents, parallel) → INTEGRATE (coordinator)
   - Update `## Configuration reference`: rename `[extractor]` block to `[tagger]`; drop `[reflector]` block; update field tables.
   - Update Status line + Roadmap.
 - `DEVELOPMENT.md`:
-  - Drop `engram reflect` examples; add `engram tag` examples.
+  - Drop `kengram reflect` examples; add `kengram tag` examples.
   - Drop `[extractor]`/`[reflector]` config blocks; add `[tagger]` block.
   - Drop "Tier 2" reflector setup section; add "Tagger backend setup" (short).
 - `DESIGN.md`: major revision. The "facts pipeline" section (§6 and §10) gets rewritten as "tagging sidecar." Decisions reset: no SPO, no confidence routing, no review queue. Content_fingerprint dedup added.
@@ -461,16 +461,16 @@ Wave 5: CLI, DOCS (2 agents, parallel) → INTEGRATE (coordinator)
 3. Merge Wave 5a (CLI) and Wave 5b (DOCS) on top.
 4. Resolve conflicts (mostly in `Cargo.toml`, `Cargo.lock`, and lib re-export sites).
 5. Run full workspace: `cargo build --workspace`, `cargo test --workspace`, `cargo clippy --all-targets -- -D warnings`.
-6. Apply migration against the local DB: `engram migrate`.
+6. Apply migration against the local DB: `kengram migrate`.
 7. Smoke-test:
-   - `engram serve` starts; `engram worker` starts.
+   - `kengram serve` starts; `kengram worker` starts.
    - Capture a thought via Claude Desktop / MCP inspector.
    - Confirm `thoughts.tags` is `{}` initially, becomes populated within a worker tick.
    - Capture the same content again — same `thought_id` returned, no new row.
    - `search_thoughts` returns results with `tags` field populated.
    - `search_thoughts` with `tag_filter: {"kind": "task"}` filters correctly.
-   - `engram reflect --rerun` is gone; `engram tag --rerun` works.
-   - `engram bench rerank --corpus tests/fixtures/bench-rerank.example.json` runs (with no `target` field) and prints the table.
+   - `kengram reflect --rerun` is gone; `kengram tag --rerun` works.
+   - `kengram bench rerank --corpus tests/fixtures/bench-rerank.example.json` runs (with no `target` field) and prints the table.
 8. Confirm no orphaned references: `git grep -i "search_facts\|correct_fact\|reflector\|ExtractedFact\|reflect.rs\|correct.rs"` returns nothing in code (only legitimate hits in m3 archive docs).
 
 **Acceptance:** all of the above. Then commit as a single bundled commit `M4: collapse to thoughts-only with metadata-tagging sidecar (Path B-OB1)`. Body covers what M4 shipped, what M3 close-out looked like, the test count delta, and the architectural narrative.
@@ -479,9 +479,9 @@ Wave 5: CLI, DOCS (2 agents, parallel) → INTEGRATE (coordinator)
 
 - **Foreign key ordering in migration.** The migration drops three tables with cross-references (facts → facts_review_queue? facts → reflector_runs?). Use `CASCADE` on the DROPs and order them from leaves to roots. MIGRATION agent validates against an existing DB before merging.
 - **Lossy data**: existing facts (Ron's dogfood corpus) are deleted by the migration. Operator-acceptable per the Path B decision (2026-05-16). If hedge desired, MIGRATION agent can `pg_dump facts > /tmp/facts-snapshot-pre-m4.sql` as a pre-migration step. Recommendation: take the snapshot, never restore.
-- **Existing thoughts arrive untagged**: `content_fingerprint` is backfilled in the migration via `digest(content, 'sha256')`; `tags` defaults to `{}`. Tags get populated by `engram tag --rerun --since <epoch>` as a one-time operator step post-migration.
-- **Concurrent agent edits to shared files**: Cargo.toml at workspace level changes minimally (only if a crate is added/removed; we're not adding any). Each agent's worktree contains only their crate's edits. INTEGRATE handles Cargo.lock by regenerating (`cargo update -p engram-core` etc.).
-- **MCP wire-shape change is breaking**: `search_facts` and `correct_fact` tools disappear. Any in-flight MCP client that calls them errors with "unknown tool." Acceptable — Engram is single-user, single-operator; Ron updates his MCP client configs.
+- **Existing thoughts arrive untagged**: `content_fingerprint` is backfilled in the migration via `digest(content, 'sha256')`; `tags` defaults to `{}`. Tags get populated by `kengram tag --rerun --since <epoch>` as a one-time operator step post-migration.
+- **Concurrent agent edits to shared files**: Cargo.toml at workspace level changes minimally (only if a crate is added/removed; we're not adding any). Each agent's worktree contains only their crate's edits. INTEGRATE handles Cargo.lock by regenerating (`cargo update -p kengram-core` etc.).
+- **MCP wire-shape change is breaking**: `search_facts` and `correct_fact` tools disappear. Any in-flight MCP client that calls them errors with "unknown tool." Acceptable — Kengram is single-user, single-operator; Ron updates his MCP client configs.
 - **Test count drops sharply**: M3 ended at 307 tests; M4 will land closer to ~150-180. The dropped tests were exercising removed code paths, not real regressions. Coordinator confirms no orphan removals (every deleted test maps to a removed function).
 - **Tagger output quality**: the tagger is a new prompt against the same local model that struggled with SPO. Mitigation: tags are advisory metadata, not load-bearing. A wrong tag on a thought that you'd find by content anyway is low-impact. The dogfood signal for the tagger should be much cleaner than for the extractor was — but the same model brittleness exists.
 
@@ -490,7 +490,7 @@ Wave 5: CLI, DOCS (2 agents, parallel) → INTEGRATE (coordinator)
 1. `cargo build --workspace` clean.
 2. `cargo test --workspace` clean (~150-180 tests).
 3. `cargo clippy --all-targets -- -D warnings` clean.
-4. `engram migrate` applies cleanly against the current state of the DB.
+4. `kengram migrate` applies cleanly against the current state of the DB.
 5. End-to-end smoke (steps in Wave 6 step 7).
 6. `git grep` audit confirms no code references to the removed entities.
 7. README + DEVELOPMENT.md + DESIGN.md tell a consistent story.
@@ -498,7 +498,7 @@ Wave 5: CLI, DOCS (2 agents, parallel) → INTEGRATE (coordinator)
 
 ## Out of scope (deferred)
 
-- **Backfill existing thoughts' tags**: post-merge operator step (`engram tag --rerun --since 1970-01-01T00:00:00Z` or similar). Not part of the M4 commit.
+- **Backfill existing thoughts' tags**: post-merge operator step (`kengram tag --rerun --since 1970-01-01T00:00:00Z` or similar). Not part of the M4 commit.
 - **Tagger quality dogfood loop**: M4 ships the new pipeline; dogfood validation comes after, as a new milestone-D-shaped phase. Don't pre-iterate.
 - **Schema-extension for richer tag semantics** (relations between tags, hierarchical topics, etc.): M5+. M4 ships the OB1-equivalent shape; richer comes later if dogfood demands.
 - **Removing the `target_kind` enum value `'fact'`**: defer indefinitely. Leaving the value in lets us add facts back without a schema change if Path B ever proves insufficient.
@@ -507,7 +507,7 @@ Wave 5: CLI, DOCS (2 agents, parallel) → INTEGRATE (coordinator)
 ## Open questions to settle in Wave 1 (SPEC)
 
 1. **Tag drainer cadence**: same `[worker]` knobs as embed drainer, or separate `[tagger] tick_interval_seconds`? Default: same knobs, cheapest path.
-2. **Tagger backfill UX**: `engram tag --rerun --since <epoch>` for "tag everything that's untagged" — same shape as `engram reflect --rerun` had. Confirm.
+2. **Tagger backfill UX**: `kengram tag --rerun --since <epoch>` for "tag everything that's untagged" — same shape as `kengram reflect --rerun` had. Confirm.
 3. **`is_duplicate` field on capture response**: surface explicitly, or just return the existing thought_id silently? Recommendation: surface — agents may want to handle "I already captured this" differently from "freshly captured."
 4. **Tag schema field names**: `people` / `action_items` / `topics` / `dates_mentioned` / `kind` matches OB1. Any preference to rename? `kind` could be `classification` or `category`; the others are conventional.
 5. **Empty `[tagger]` config behavior**: silently disable (no tag drainer runs)? Or refuse to boot? Recommendation: silent-disable, matches `[reranker]` pattern from Phase B.
@@ -521,15 +521,15 @@ Living checklist tracking M4 implementation; **History** at the bottom captures 
 ### Wave 1 — SPEC
 - [x] `docs/milestones/m4-spec.md` written; 5 open questions answered; types, JSON schema, prompt v1, migration SQL all locked.
 
-### Wave 2 — CORE (`engram-core`)
+### Wave 2 — CORE (`kengram-core`)
 - [x] `Thought` extended with `content_fingerprint: [u8; 32]` + 4 tag-related fields.
 - [x] `tags.rs` new module: `Tags` struct + `TagKind` enum with serde + tests.
 - [x] `extractor.rs` repurposed to `tagger.rs`: `Tagger` trait + `TaggerError` (with `is_transient`).
 - [x] `fact.rs` deleted.
 - [x] Re-exports in `lib.rs` updated.
-- [x] `cargo build -p engram-core` / `cargo test -p engram-core` / clippy clean.
+- [x] `cargo build -p kengram-core` / `cargo test -p kengram-core` / clippy clean.
 
-### Wave 3a — STORAGE (`engram-storage`)
+### Wave 3a — STORAGE (`kengram-storage`)
 - [x] Drop all fact functions, `RunId`, `start_run`/`finish_run`, review-queue helpers, `NewReviewRow`.
 - [x] `NewThought` gains `content_fingerprint`; `insert_thought` returns `(InsertedThought, is_new)` via ON CONFLICT.
 - [x] `retract_thought` drops fact-cascade UPDATE.
@@ -546,13 +546,13 @@ Living checklist tracking M4 implementation; **History** at the bottom captures 
 - [x] CREATE `pending_tags` queue table.
 - [x] Clean apply against fresh DB; idempotent re-run.
 
-### Wave 3c — EXTRACT (`engram-extract`)
+### Wave 3c — EXTRACT (`kengram-extract`)
 - [x] `OpenAICompatibleExtractor` → `OpenAICompatibleTagger`; new `BUNDLED_TAGGER_PROMPT` + `tags_response_format`.
 - [x] `FakeExtractor` → `FakeTagger` with `Empty` / `Canned(Tags)` / `Substring(map)` / soft-fail behaviors.
 - [x] Lib re-exports updated; tests rewritten.
-- [x] `cargo build -p engram-extract` / tests / clippy clean.
+- [x] `cargo build -p kengram-extract` / tests / clippy clean.
 
-### Wave 4 — MCP (`engram-mcp`)
+### Wave 4 — MCP (`kengram-mcp`)
 - [x] Delete `reflect.rs`, `correct.rs`, all `search_facts` code in `search.rs`.
 - [x] `search_thoughts` gains `tag_filter`; `SearchHit` gains `tags`.
 - [x] `capture` computes SHA-256, threads `is_new` → `is_duplicate`; enqueues both embedding and tag jobs on insert.
@@ -560,9 +560,9 @@ Living checklist tracking M4 implementation; **History** at the bottom captures 
 - [x] `drain.rs` split into embed-drainer + tag-drainer.
 - [x] `backfill.rs` drops fact-target arm (thoughts-only).
 - [x] Server tool wiring: drop `search_facts` / `correct_fact` tools; add `tag_filter` arg + `tags` in response shapes.
-- [x] `cargo build -p engram-mcp` / tests / clippy clean.
+- [x] `cargo build -p kengram-mcp` / tests / clippy clean.
 
-### Wave 5a — CLI (`engram-cli`)
+### Wave 5a — CLI (`kengram-cli`)
 - [ ] `Command::Reflect` → `Command::Tag`; `run_reflect` → `run_tag` against tagger.
 - [ ] Worker drops reflector cron; runs embed + tag drainers in tick loops.
 - [ ] `embed-backfill` drops `--target` flag.
@@ -572,7 +572,7 @@ Living checklist tracking M4 implementation; **History** at the bottom captures 
 
 ### Wave 5b — DOCS
 - [x] `README.md`: "How fact extraction works" → "How tagging works"; MCP surface table updated; `[extractor]`/`[reflector]` config replaced with `[tagger]`; status + roadmap reflect M4-shipped, M5/M6 planned.
-- [x] `DEVELOPMENT.md`: `engram reflect` examples → `engram tag`; `[tagger]` config block; tagger backend setup notes.
+- [x] `DEVELOPMENT.md`: `kengram reflect` examples → `kengram tag`; `[tagger]` config block; tagger backend setup notes.
 - [x] `DESIGN.md`: §6 + §10 rewritten as tagging sidecar + operational shape; §5 schema rewritten; SPO / confidence-routing / supersede-facts / correct-fact / dedup-via-supersession discussion all dropped.
 - [x] `docs/milestones/m3-progress.md` + `m3-search-quality.md`: M3 ✅ for retrieval; extraction-side close-out forward-references M4.
 - [x] `docs/milestones/m4-collapse-to-thoughts.md`: this Progress section.
@@ -584,7 +584,7 @@ Living checklist tracking M4 implementation; **History** at the bottom captures 
 - [x] Full workspace clean: `cargo build --workspace`, `cargo test --workspace` (234 passing across all 6 crates), `cargo clippy --all-targets -- -D warnings`.
 - [x] Migration `0006_collapse_to_thoughts.sql` applied to dev DB during Wave 3b; verified post-merge that `\d thoughts` shows the new schema and the facts tables are gone.
 - [x] `git grep` audit clean — only 3 hits, all in source-file doc-comments framing the M4 removal historically (no live code references).
-- [x] CLI surface verified: `engram --help` shows `tag` (replaces `reflect`); `embed-backfill` has no `--target` flag; `worker` description mentions both drainers; tag drainer silent-disables when `[tagger]` provider empty.
+- [x] CLI surface verified: `kengram --help` shows `tag` (replaces `reflect`); `embed-backfill` has no `--target` flag; `worker` description mentions both drainers; tag drainer silent-disables when `[tagger]` provider empty.
 - [x] M4 ships as a sequence of wave commits on `m4-collapse-to-thoughts` rather than a single squashed commit — the wave-by-wave audit trail captures the parallel-team-of-agents execution shape and is more useful than a flat squash. Final close-out commit on the branch documents the integration.
 
 ## History

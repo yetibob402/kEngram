@@ -1,0 +1,56 @@
+[package]
+name = "kengram-tagger-deterministic"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+# Reference sidecar for the kengram HTTP-tagger wire contract.
+# Bundles a Rust-native deterministic tagger (gline-rs zero-shot NER +
+# regex date extraction + bge-m3 taxonomy + kind classification) behind
+# an axum HTTP server that speaks `kengram-tagger-protocol`.
+#
+# This crate exists as a working reference implementation operators can
+# study, fork, or `docker run` directly. Kengram's main binary does NOT
+# depend on this crate; the only coupling is via the shared
+# `kengram-tagger-protocol` JSON wire shape.
+
+[lib]
+name = "kengram_tagger_deterministic"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kengram-tagger-deterministic"
+path = "src/main.rs"
+
+[dependencies]
+kengram-core.workspace = true
+kengram-embed.workspace = true
+kengram-tagger-protocol.workspace = true
+
+# Async + HTTP server stack (mirrors kengram-cli's choices)
+axum.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
+async-trait.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Errors
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Serde for the wire types + taxonomy TOML
+serde.workspace = true
+serde_json.workspace = true
+toml = "1"
+
+# Deterministic NLP stack (the actual tagger pipeline)
+gline-rs = "1"
+orp = "0.9"
+regex = "1"
+
+[dev-dependencies]
+kengram-embed.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

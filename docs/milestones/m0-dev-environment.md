@@ -10,9 +10,9 @@ This is the floor under the floor. M0 doesn't deliver any user-facing capability
 
 - A `docker-compose.yml` at the repo root that brings up Postgres 16 with `pgvector` extension support (the `pgvector/pgvector:pg16` image bundles `vector`, `pg_trgm`, and `pgcrypto`, which is everything our schema needs). Persistent named volume; port `5432` exposed on localhost; healthcheck.
 - A short `DEVELOPMENT.md` (or equivalent section in the README) with first-time-setup steps: clone, `docker compose up -d postgres`, set `DATABASE_URL`, `ollama pull bge-m3`, you're ready.
-- Defaults: database name `engram`, role `engram`, password `engram` (dev-only — fine because the container only accepts connections from `localhost`). Connection string `postgres://engram:engram@localhost:5432/engram`.
-- Decision on the M1 dev-mode embedder: **Ollama**, since the operator already has it installed. The `CloudEmbedder` impl in `engram-embed` is pointed at Ollama's OpenAI-compatible endpoint (`http://localhost:11434/v1/embeddings`) with the `bge-m3` model. No additional sidecar process needed in dev. Production retains the TEI sidecar via systemd — this is a dev-only convenience.
-- (Optional) a `Makefile` or `justfile` with `db-up`, `db-down`, `db-reset`, `db-shell` recipes. Optional because `docker compose up -d`, `docker compose down`, and `docker exec -it engram-postgres psql -U engram` are all short enough to type.
+- Defaults: database name `kengram`, role `kengram`, password `kengram` (dev-only — fine because the container only accepts connections from `localhost`). Connection string `postgres://kengram:kengram@localhost:5432/kengram`.
+- Decision on the M1 dev-mode embedder: **Ollama**, since the operator already has it installed. The `CloudEmbedder` impl in `kengram-embed` is pointed at Ollama's OpenAI-compatible endpoint (`http://localhost:11434/v1/embeddings`) with the `bge-m3` model. No additional sidecar process needed in dev. Production retains the TEI sidecar via systemd — this is a dev-only convenience.
+- (Optional) a `Makefile` or `justfile` with `db-up`, `db-down`, `db-reset`, `db-shell` recipes. Optional because `docker compose up -d`, `docker compose down`, and `docker exec -it kengram-postgres psql -U kengram` are all short enough to type.
 
 ## Out of scope (deferred to which milestone)
 
@@ -23,7 +23,7 @@ This is the floor under the floor. M0 doesn't deliver any user-facing capability
 
 ## Schema impact
 
-None. M0 doesn't write migrations. The `pgvector/pgvector:pg16` image ships the extensions; the M1 migration's `CREATE EXTENSION IF NOT EXISTS …` lines actually install them in the engram database when the migration runs.
+None. M0 doesn't write migrations. The `pgvector/pgvector:pg16` image ships the extensions; the M1 migration's `CREATE EXTENSION IF NOT EXISTS …` lines actually install them in the kengram database when the migration runs.
 
 ## MCP surface delta
 
@@ -47,7 +47,7 @@ None. M0 has no code.
 M0 is complete when, on a fresh checkout:
 
 1. `docker compose up -d postgres` starts a healthy Postgres container within ~10 seconds.
-2. `docker exec -it engram-postgres psql -U engram -d engram -c '\dx'` lists the available extensions; `pgvector`, `pg_trgm`, and `pgcrypto` are all installable (will be `CREATE EXTENSION`-ed by the M1 migration; M0 just needs them available).
+2. `docker exec -it kengram-postgres psql -U kengram -d kengram -c '\dx'` lists the available extensions; `pgvector`, `pg_trgm`, and `pgcrypto` are all installable (will be `CREATE EXTENSION`-ed by the M1 migration; M0 just needs them available).
 3. `ollama pull bge-m3` succeeds; `curl http://localhost:11434/v1/embeddings -d '{"model":"bge-m3","input":"hello"}'` returns a 1024-element vector.
 4. The operator can stop and start the database (`docker compose down` / `up -d`) without losing data, thanks to the named volume.
 5. `DEVELOPMENT.md` walks a new contributor (which is to say: future-you) through these steps in order without surprises.
@@ -56,5 +56,5 @@ M0 is complete when, on a fresh checkout:
 
 - **Host port conflict.** If the operator already runs Postgres on `5432`, the bind needs to move (e.g. `5433:5432`). Default to `5432`; document the override in `DEVELOPMENT.md`. Resolve as needed when the conflict is real.
 - **Ollama embedding output dim.** Need to verify `ollama pull bge-m3` produces 1024-dim vectors (it should — `bge-m3` is 1024 by definition — but worth confirming on first run).
-- **Volume strategy.** Named volume (`engram-pg-data`) is the default — survives `compose down`, lost on `compose down -v`. Bind mount to `./.data/postgres` is an alternative (visible in the working tree). Picked named volume for cleanliness; revisit if the operator wants to inspect the raw DB files.
+- **Volume strategy.** Named volume (`kengram-pg-data`) is the default — survives `compose down`, lost on `compose down -v`. Bind mount to `./.data/postgres` is an alternative (visible in the working tree). Picked named volume for cleanliness; revisit if the operator wants to inspect the raw DB files.
 - **Should `DEVELOPMENT.md` also document the production TEI path?** Probably yes, briefly, for the operator's future-self. Not a blocker.

@@ -1,6 +1,6 @@
-# Engram — agent usage
+# Kengram — agent usage
 
-Behavioral preferences for any MCP agent connected to engram. The MCP server's `SERVER_INSTRUCTIONS` (delivered at the initialization handshake) covers tools, tag shape, kind enum, relation vocabulary, and `is_duplicate` semantics. This document complements that with the preferences it doesn't cover.
+Behavioral preferences for any MCP agent connected to kengram. The MCP server's `SERVER_INSTRUCTIONS` (delivered at the initialization handshake) covers tools, tag shape, kind enum, relation vocabulary, and `is_duplicate` semantics. This document complements that with the preferences it doesn't cover.
 
 ## Who I am
 
@@ -8,7 +8,7 @@ I'm Ron. Address me by name, not "operator" or "user." Identify yourself by clie
 
 ## Reading
 
-Search engram opportunistically by judgment — not every turn, not never. Search when I reference prior work / decisions / findings, when the topic intersects engram or my work, or when prior context plausibly exists. Skip on casual chat and unambiguous novel topics. **When you do search, report what you found** (short_id + one-line gist) so I can verify.
+Search kengram opportunistically by judgment — not every turn, not never. Search when I reference prior work / decisions / findings, when the topic intersects kengram or my work, or when prior context plausibly exists. Skip on casual chat and unambiguous novel topics. **When you do search, report what you found** (short_id + one-line gist) so I can verify.
 
 ## Writing
 
@@ -30,12 +30,12 @@ Set `source` on capture to identify yourself: `agent:claude-code`, `agent:claude
 
 ## Tagger output is best-effort
 
-The LLM-extracted `tags` fields (especially `entities`) are best-effort, not strict claims. The v7 prompt's structural NAME-vs-DESCRIBE test has a known ceiling — see the design-v0 revision history for the four-iteration arc and structural diagnosis. In practice the `entities` field may include adjectival or descriptive phrases (e.g. `embedding-based`) alongside legitimate names (e.g. `engram`). Treat `tag_filter: {"entities": [...]}` as a positive signal — "thoughts the tagger associated with this term" — not a strict membership claim.
+The LLM-extracted `tags` fields (especially `entities`) are best-effort, not strict claims. The v7 prompt's structural NAME-vs-DESCRIBE test has a known ceiling — see the design-v0 revision history for the four-iteration arc and structural diagnosis. In practice the `entities` field may include adjectival or descriptive phrases (e.g. `embedding-based`) alongside legitimate names (e.g. `kengram`). Treat `tag_filter: {"entities": [...]}` as a positive signal — "thoughts the tagger associated with this term" — not a strict membership claim.
 
 The tagger also emits relations from prose (URL / entity / person targets, closed relation vocabulary). Those emissions are written **only** to `thought_links` with `link_source: "tagger"` — they are queryable via `get_related_thoughts` like any agent-supplied edge. They are NOT persisted into the `tags` JSONB; `thought_links` is the single canonical store for the link graph. When a tagger-emitted edge is wrong, `unlink_thoughts(from, relation, {to_entity|to_person|to_url})` soft-deletes it (audit trail preserved). The entities field on the thought itself is corrected by re-tag cycles or direct psql edit — both operator-initiated, neither blocking your normal flow.
 
 ## Honesty
 
-If you didn't search engram, don't claim to. If you searched and found nothing relevant, say so. Misrepresenting the corpus costs me trust in the tool.
+If you didn't search kengram, don't claim to. If you searched and found nothing relevant, say so. Misrepresenting the corpus costs me trust in the tool.
 
-Negative findings about engram (or any subsystem you're driving via MCP tools) need out-of-band verification before capture. "I called X with parameter P and the response came back as if P were ignored" is empirically indistinguishable between (a) X is broken, (b) P was stripped client-side, (c) P never reached the wire. Don't publish "engram has a regression" findings into the corpus without corroborating via a different tool, agent, or transport — false-positives that land in memory become authoritative-looking to future readers.
+Negative findings about kengram (or any subsystem you're driving via MCP tools) need out-of-band verification before capture. "I called X with parameter P and the response came back as if P were ignored" is empirically indistinguishable between (a) X is broken, (b) P was stripped client-side, (c) P never reached the wire. Don't publish "kengram has a regression" findings into the corpus without corroborating via a different tool, agent, or transport — false-positives that land in memory become authoritative-looking to future readers.

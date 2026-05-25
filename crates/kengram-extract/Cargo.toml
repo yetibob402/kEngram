@@ -1,0 +1,28 @@
+[package]
+name = "kengram-extract"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[dependencies]
+kengram-core.workspace = true
+kengram-tagger-protocol.workspace = true
+
+async-trait.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+time.workspace = true
+wiremock.workspace = true
+
+[features]
+# Enables integration tests that hit a real OpenAI-compatible /v1 endpoint
+# (vLLM by default). Off by default; run with `cargo test --features integration`.
+integration = []

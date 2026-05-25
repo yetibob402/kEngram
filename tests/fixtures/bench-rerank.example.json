@@ -1,5 +1,5 @@
 {
-  "_comment": "Example fixture for `engram bench rerank --corpus <path>`. UUIDs are placeholders — running this against any live DB will emit one 'no relevant_ids found' warning per query and report 0.000 nDCG / MRR across the board. Operators should copy this file and replace the UUIDs with real thought_ids drawn from their captured corpus. The bench command compares RRF-only vs cross-encoder-reranked retrieval orderings against thoughts (M4 collapsed the facts target).",
+  "_comment": "Example fixture for `kengram bench rerank --corpus <path>`. UUIDs are placeholders — running this against any live DB will emit one 'no relevant_ids found' warning per query and report 0.000 nDCG / MRR across the board. Operators should copy this file and replace the UUIDs with real thought_ids drawn from their captured corpus. The bench command compares RRF-only vs cross-encoder-reranked retrieval orderings against thoughts (M4 collapsed the facts target).",
   "queries": [
     {
       "_comment": "M3 Phase B step 2 regression target — verifies rerank surfaces Nix-reproducibility thoughts above Redis. Graded relevance: the Nix/Make comparative is weight 1.0; the secondary thought is weight 0.7.",

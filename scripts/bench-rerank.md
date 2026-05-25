@@ -1,6 +1,6 @@
-# Engram — rerank A/B bench runbook
+# Kengram — rerank A/B bench runbook
 
-End-to-end procedure for the operator to verify the `engram bench rerank` harness against a live Engram instance, and to use it to settle "does the cross-encoder reranker earn its latency on my actual corpus?" Shipped as M3 Phase B step 3 (closes M3 success criterion 1); post-M4 the harness operates on thoughts only (the facts pipeline was retired in M4 — see `docs/milestones/m4-collapse-to-thoughts.md`).
+End-to-end procedure for the operator to verify the `kengram bench rerank` harness against a live Kengram instance, and to use it to settle "does the cross-encoder reranker earn its latency on my actual corpus?" Shipped as M3 Phase B step 3 (closes M3 success criterion 1); post-M4 the harness operates on thoughts only (the facts pipeline was retired in M4 — see `docs/milestones/m4-collapse-to-thoughts.md`).
 
 ## Prerequisites
 
@@ -15,12 +15,12 @@ docker compose ps   # both should be "healthy"
 ollama serve &       # if not already running
 ollama list | grep bge-m3
 
-# Engram server + worker
-DATABASE_URL=... cargo run --bin engram -- serve &
-DATABASE_URL=... cargo run --bin engram -- worker &
+# Kengram server + worker
+DATABASE_URL=... cargo run --bin kengram -- serve &
+DATABASE_URL=... cargo run --bin kengram -- worker &
 ```
 
-Verify `[reranker]` is configured in `~/.config/engram/engram.toml`:
+Verify `[reranker]` is configured in `~/.config/kengram/kengram.toml`:
 
 ```toml
 [reranker]
@@ -42,7 +42,7 @@ curl -s http://localhost:8080/rerank \
 Define the psql helper from `scripts/smoke.md`:
 
 ```bash
-engram-psql() { docker exec -i engram-postgres psql -U engram -d engram -t -c "$1"; }
+kengram-psql() { docker exec -i kengram-postgres psql -U kengram -d kengram -t -c "$1"; }
 ```
 
 ## 1. Smoke the harness with the bundled example fixture
@@ -50,8 +50,8 @@ engram-psql() { docker exec -i engram-postgres psql -U engram -d engram -t -c "$
 This first run confirms the parser, the CLI wiring, the reranker config, and the soft-fail warning path — without depending on your real corpus shape.
 
 ```bash
-DATABASE_URL='postgres://engram:engram@localhost:5432/engram' \
-  cargo run --bin engram -- bench rerank \
+DATABASE_URL='postgres://kengram:kengram@localhost:5432/kengram' \
+  cargo run --bin kengram -- bench rerank \
     --corpus tests/fixtures/bench-rerank.example.json
 ```
 
@@ -88,15 +88,15 @@ For each query you want to benchmark:
 If you know the thought you want to surface, grab its ID directly:
 
 ```bash
-engram-psql "SELECT id, content FROM thoughts WHERE content ILIKE '%Nix%reproducible%' AND retracted_at IS NULL"
-engram-psql "SELECT id, content FROM thoughts WHERE content ILIKE '%TCGPlayer%' AND retracted_at IS NULL"
+kengram-psql "SELECT id, content FROM thoughts WHERE content ILIKE '%Nix%reproducible%' AND retracted_at IS NULL"
+kengram-psql "SELECT id, content FROM thoughts WHERE content ILIKE '%TCGPlayer%' AND retracted_at IS NULL"
 ```
 
 Copy the UUIDs into `relevant_ids` in your fixture.
 
 ### 2c. Fixture file shape
 
-Save to `~/.engram/bench-rerank.json` (or anywhere outside the repo so it doesn't get committed):
+Save to `~/.kengram/bench-rerank.json` (or anywhere outside the repo so it doesn't get committed):
 
 ```json
 {
@@ -128,9 +128,9 @@ All IDs are `thought_id`s — M4 retired the facts pipeline, so the harness is t
 ## 3. Run the bench against your real fixture
 
 ```bash
-DATABASE_URL='postgres://engram:engram@localhost:5432/engram' \
-  cargo run --bin engram -- bench rerank \
-    --corpus ~/.engram/bench-rerank.json
+DATABASE_URL='postgres://kengram:kengram@localhost:5432/kengram' \
+  cargo run --bin kengram -- bench rerank \
+    --corpus ~/.kengram/bench-rerank.json
 ```
 
 **Expected output:** a markdown table with one row per query plus an `AVERAGE` row, followed by a summary line like:
@@ -168,7 +168,7 @@ The fixture is operator-owned — keep it outside the repo so commits don't leak
 
 ## Troubleshooting
 
-- **`bench rerank requires a configured [reranker] section`** — add `[reranker] provider = "tei" …` to `engram.toml` and restart. The harness deliberately refuses to silently run RRF-only twice; the comparison would be meaningless.
-- **All rows show 0.000 nDCG / MRR** — every fixture entry warned about no-match. The `relevant_ids` you authored aren't being retrieved by either ranking. Verify the IDs exist (`engram-psql "SELECT id FROM thoughts WHERE id = '<uuid>'"`), the rows aren't retracted (`AND retracted_at IS NULL`), and the queries you wrote are likely to retrieve them at all (try the query in Claude Desktop first).
+- **`bench rerank requires a configured [reranker] section`** — add `[reranker] provider = "tei" …` to `kengram.toml` and restart. The harness deliberately refuses to silently run RRF-only twice; the comparison would be meaningless.
+- **All rows show 0.000 nDCG / MRR** — every fixture entry warned about no-match. The `relevant_ids` you authored aren't being retrieved by either ranking. Verify the IDs exist (`kengram-psql "SELECT id FROM thoughts WHERE id = '<uuid>'"`), the rows aren't retracted (`AND retracted_at IS NULL`), and the queries you wrote are likely to retrieve them at all (try the query in Claude Desktop first).
 - **TEI errors mid-run** — the harness doesn't soft-fail; the comparison would be invalid. Check `docker compose logs tei`; restart if needed.
 - **Embedder unreachable** — Ollama isn't running or `bge-m3` isn't pulled. `ollama list` should show `bge-m3`. The harness propagates the error rather than running trigram-only on both sides, since that defeats the point.

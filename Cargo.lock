@@ -820,146 +820,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
 
 [[package]]
-name = "engram-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "engram-core",
- "engram-embed",
- "engram-extract",
- "engram-mcp",
- "engram-storage",
- "figment",
- "rmcp",
- "serde",
- "serde_json",
- "sqlx",
- "time",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "engram-core"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "hex",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "time",
- "uuid",
-]
-
-[[package]]
-name = "engram-embed"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "engram-core",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "wiremock",
-]
-
-[[package]]
-name = "engram-extract"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "engram-core",
- "engram-tagger-protocol",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tracing",
- "wiremock",
-]
-
-[[package]]
-name = "engram-mcp"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "engram-core",
- "engram-embed",
- "engram-extract",
- "engram-storage",
- "rmcp",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "engram-storage"
-version = "0.1.0"
-dependencies = [
- "engram-core",
- "pgvector",
- "serde_json",
- "sha2",
- "sqlx",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "engram-tagger-deterministic"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "engram-core",
- "engram-embed",
- "engram-tagger-protocol",
- "gline-rs",
- "orp",
- "regex",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "toml 1.1.2+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "engram-tagger-protocol"
-version = "0.1.0"
-dependencies = [
- "engram-core",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1736,6 +1596,146 @@ dependencies = [
  "futures-util",
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "kengram-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "figment",
+ "kengram-core",
+ "kengram-embed",
+ "kengram-extract",
+ "kengram-mcp",
+ "kengram-storage",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "kengram-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+ "uuid",
+]
+
+[[package]]
+name = "kengram-embed"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "kengram-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
+name = "kengram-extract"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "kengram-core",
+ "kengram-tagger-protocol",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
+name = "kengram-mcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "kengram-core",
+ "kengram-embed",
+ "kengram-extract",
+ "kengram-storage",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "kengram-storage"
+version = "0.1.0"
+dependencies = [
+ "kengram-core",
+ "pgvector",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "kengram-tagger-deterministic"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "gline-rs",
+ "kengram-core",
+ "kengram-embed",
+ "kengram-tagger-protocol",
+ "orp",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "kengram-tagger-protocol"
+version = "0.1.0"
+dependencies = [
+ "kengram-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

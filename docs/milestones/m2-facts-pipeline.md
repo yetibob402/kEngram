@@ -2,26 +2,26 @@
 
 ## Goal
 
-Engram derives structured facts from captured thoughts on a scheduled basis. The operator can search facts, correct wrong ones, and trust that the thoughts/facts split preserves provenance and supports re-extraction.
+Kengram derives structured facts from captured thoughts on a scheduled basis. The operator can search facts, correct wrong ones, and trust that the thoughts/facts split preserves provenance and supports re-extraction.
 
-This is the milestone that takes engram beyond "search engine for thoughts" and toward "memory with structure." It also exercises the async-embedding seam designed (but not used) in M1.
+This is the milestone that takes kengram beyond "search engine for thoughts" and toward "memory with structure." It also exercises the async-embedding seam designed (but not used) in M1.
 
 ## In scope
 
-- The `Extractor` trait (in `engram-core`) plus two implementations: `OpenAICompatibleExtractor` (vLLM `/v1/chat/completions` with structured-output) and `OpenRouterExtractor` (cloud fallback).
-- Worker process: a new `engram worker` subcommand. Long-running; runs the reflector cron + drains async-embedding queue.
+- The `Extractor` trait (in `kengram-core`) plus two implementations: `OpenAICompatibleExtractor` (vLLM `/v1/chat/completions` with structured-output) and `OpenRouterExtractor` (cloud fallback).
+- Worker process: a new `kengram worker` subcommand. Long-running; runs the reflector cron + drains async-embedding queue.
 - Async embedding: capture posts a job (in `pending_embeddings` or via NOTIFY/LISTEN; mechanism TBD); worker drains and calls `Embedder::embed`. Capture returns immediately with the thought ID. Brief window where the thought is searchable by trigram only.
 - Reflector: scheduled task that walks recent thoughts in a scope, calls `Extractor::extract`, writes facts with `extractor_model`, `extractor_version`, `confidence`.
 - Confidence-gated commit: facts below `review_queue_below` go to a review queue; between that and `min_confidence_to_store` are flagged but committed; above are committed normally.
 - Two new MCP tools: `search_facts`, `correct_fact`. `get_thought` now joins linked facts.
-- New CLI subcommands: `engram worker`, `engram reflect [--rerun] [--scope <s>] [--since <date>]`.
+- New CLI subcommands: `kengram worker`, `kengram reflect [--rerun] [--scope <s>] [--since <date>]`.
 - Optional dual-extractor reconciliation (`extractor.dual_run = true`): commit only facts that two distinct extractors both produce.
 
 ## Out of scope (deferred to which milestone)
 
 - Cross-encoder reranker → **M3**
 - Artifact ingestion → **M4**
-- `engram audit` reports, human review UI, eval suite, Prometheus metrics, Tier 2 auth → **M5**
+- `kengram audit` reports, human review UI, eval suite, Prometheus metrics, Tier 2 auth → **M5**
 - Knowledge-graph reasoning → out of scope indefinitely
 
 ## Schema impact
@@ -41,10 +41,10 @@ The existing `facts` table is now populated by code. No structural change to `fa
 
 ## Crate structure delta
 
-- **New crate: `engram-extract`.** Defines the `Extractor` trait (moved from `engram-core` — or kept in `engram-core` and re-exported, TBD) and concrete impls `OpenAICompatibleExtractor`, `OpenRouterExtractor`. JSON-Schema response handling lives here.
-- **`engram-cli`** gains the `worker` and `reflect` subcommands; the `serve` subcommand learns to refuse async-embedding work (it goes to the worker).
-- **`engram-storage`** gains repository functions for facts: insert with provenance, search facts (vector + trigram fused, similar shape to thoughts), supersede a fact, query the review queue.
-- **`engram-mcp`** gains the two new tool handlers.
+- **New crate: `kengram-extract`.** Defines the `Extractor` trait (moved from `kengram-core` — or kept in `kengram-core` and re-exported, TBD) and concrete impls `OpenAICompatibleExtractor`, `OpenRouterExtractor`. JSON-Schema response handling lives here.
+- **`kengram-cli`** gains the `worker` and `reflect` subcommands; the `serve` subcommand learns to refuse async-embedding work (it goes to the worker).
+- **`kengram-storage`** gains repository functions for facts: insert with provenance, search facts (vector + trigram fused, similar shape to thoughts), supersede a fact, query the review queue.
+- **`kengram-mcp`** gains the two new tool handlers.
 
 ## Dependencies
 
@@ -57,7 +57,7 @@ The existing `facts` table is now populated by code. No structural change to `fa
 2. `search_facts` returns relevant facts for a query that the underlying thoughts cover.
 3. `correct_fact` correctly supersedes a prior fact (`superseded_by`, `superseded_at` set on the old row; new row inserted) and `search_facts` no longer surfaces the old one (assuming it filters `WHERE superseded_at IS NULL`).
 4. **Async embedding correctness:** capture a thought while TEI is down. Capture succeeds and returns a thought ID. Bring TEI back up. Within one worker tick, the embedding row appears and `search_thoughts` finds the thought via vector.
-5. **Re-extraction idempotency:** `engram reflect --rerun --scope work --since 2026-01-01` run twice produces the same `facts` table (same rows; same supersession history; no duplicate facts).
+5. **Re-extraction idempotency:** `kengram reflect --rerun --scope work --since 2026-01-01` run twice produces the same `facts` table (same rows; same supersession history; no duplicate facts).
 6. **Operator dogfood:** the operator runs M2 for at least a week, has at least one `correct_fact` round-trip, and is satisfied with the rate of false-positive vs. false-negative facts.
 
 ## Open questions
@@ -106,7 +106,7 @@ How do we get structured output from vLLM?
 
 A nullable `UUID` column populated per reflection run. Lets a bad run's facts be jointly retracted later.
 
-- **For:** cheap to add now; the consumer UX (`engram audit`) lands in M5 but the data is there waiting.
+- **For:** cheap to add now; the consumer UX (`kengram audit`) lands in M5 but the data is there waiting.
 - **Against:** M2 has no consumer for it; we usually push back on "add column for hypothetical future."
 
 **Lean: genuinely undecided. Operator call.** (My instinct says yes — small cost, real provenance value — but it's exactly the kind of speculative addition the project pattern rejects.)
@@ -135,17 +135,17 @@ A nullable `UUID` column populated per reflection run. Lets a bad run's facts be
 
 ### 7. Trait location for `Extractor`
 
-- **(a)** In `engram-core`, alongside `Embedder`. Trait lives at the abstraction boundary; impls live in `engram-extract`. Symmetry with M1.
-- **(b)** In `engram-extract` (where it lives). Smaller `engram-core`.
+- **(a)** In `kengram-core`, alongside `Embedder`. Trait lives at the abstraction boundary; impls live in `kengram-extract`. Symmetry with M1.
+- **(b)** In `kengram-extract` (where it lives). Smaller `kengram-core`.
 
-**Lean: (a).** Avoids any circular-dep concern; lets `engram-mcp` depend only on `engram-core` for the trait.
+**Lean: (a).** Avoids any circular-dep concern; lets `kengram-mcp` depend only on `kengram-core` for the trait.
 
 **RJF:** (a)
 
 ### 8. Worker process structure
 
-- **(a)** One `engram worker` process running two Tokio tasks: embed-queue drainer (every few seconds) + reflector cron (daily by default). One systemd unit.
-- **(b)** Two subcommands (`engram worker --drain`, `engram worker --reflect`). Two systemd units.
+- **(a)** One `kengram worker` process running two Tokio tasks: embed-queue drainer (every few seconds) + reflector cron (daily by default). One systemd unit.
+- **(b)** Two subcommands (`kengram worker --drain`, `kengram worker --reflect`). Two systemd units.
 
 **Lean: (a).** Reflector idle 23h/day is fine. Simpler to operate.
 

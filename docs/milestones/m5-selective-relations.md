@@ -51,7 +51,7 @@ Decisions:
 
 ### Core types
 
-`crates/engram-core/src/relation.rs`:
+`crates/kengram-core/src/relation.rs`:
 
 ```rust
 pub enum RelationKind { Replaces, Requires, References, BelongsTo, DecidedBy, Refines }
@@ -65,7 +65,7 @@ All snake_case-serialized; closed enums; `Display` + `FromStr` impls for clean M
 
 ### Storage helpers
 
-`crates/engram-storage/src/lib.rs`:
+`crates/kengram-storage/src/lib.rs`:
 
 - `insert_link(pool, from, relation, to, source, note) -> (LinkId, is_new)` — `ON CONFLICT ON CONSTRAINT thought_links_unique_edge DO NOTHING` then re-fetch on conflict to return the stable `link_id`.
 - `delete_link(pool, from, relation, to) -> existed` — bare DELETE.
@@ -75,7 +75,7 @@ All snake_case-serialized; closed enums; `Display` + `FromStr` impls for clean M
 
 ### MCP surface
 
-Three new tools wired through `crates/engram-mcp/src/{link.rs,relate.rs,server.rs}`:
+Three new tools wired through `crates/kengram-mcp/src/{link.rs,relate.rs,server.rs}`:
 
 - **`link_thoughts(from_thought_id, relation, to_thought_id, note?)`** — pre-validates self-link, note length (≤1000 chars), and endpoint existence with distinct `LinkError` variants for actionable error messages. Idempotent on the triple. Returns `{link_id, from_thought_id, relation, to_thought_id, is_new}`.
 - **`unlink_thoughts(from_thought_id, relation, to_thought_id)`** — DELETE the edge. Idempotent on already-deleted. Returns `{existed}`.
@@ -85,22 +85,22 @@ Three new tools wired through `crates/engram-mcp/src/{link.rs,relate.rs,server.r
 
 ### CLI
 
-No new subcommands. Linking is MCP-only — operators link via Claude Code/Desktop. If future dogfood reveals an `engram link` CLI shortcut is wanted, it's a small additional iteration.
+No new subcommands. Linking is MCP-only — operators link via Claude Code/Desktop. If future dogfood reveals an `kengram link` CLI shortcut is wanted, it's a small additional iteration.
 
 ## Files
 
 **New:**
 - `migrations/0007_thought_links.sql`
-- `crates/engram-core/src/relation.rs`
-- `crates/engram-mcp/src/link.rs`
-- `crates/engram-mcp/src/relate.rs`
+- `crates/kengram-core/src/relation.rs`
+- `crates/kengram-mcp/src/link.rs`
+- `crates/kengram-mcp/src/relate.rs`
 - `docs/milestones/m5-selective-relations.md` (this file)
 
 **Modified:**
-- `crates/engram-core/src/lib.rs` — re-exports
-- `crates/engram-storage/src/lib.rs` — storage helpers + 12 integration tests
-- `crates/engram-mcp/src/server.rs` — three `#[tool]` methods, SERVER_INSTRUCTIONS, regression test
-- `crates/engram-mcp/src/lib.rs` — module declarations + re-exports
+- `crates/kengram-core/src/lib.rs` — re-exports
+- `crates/kengram-storage/src/lib.rs` — storage helpers + 12 integration tests
+- `crates/kengram-mcp/src/server.rs` — three `#[tool]` methods, SERVER_INSTRUCTIONS, regression test
+- `crates/kengram-mcp/src/lib.rs` — module declarations + re-exports
 - `README.md` — roadmap table (M5/M6/M7); MCP tool surface table; new "How relations work" section
 - `DESIGN.md` — §3.5 roadmap renumbered; §6.6 selective relations sidecar added; §8 MCP surface table updated; §9 type listing; revision history
 
@@ -111,7 +111,7 @@ No new subcommands. Linking is MCP-only — operators link via Claude Code/Deskt
 ## Verification
 
 - `cargo build --workspace` — clean.
-- `cargo test --workspace` — clean. New test count: 9 in `engram-core` (relation module), 12 in `engram-storage` (insert/delete/fetch + cascade/retracted edge cases), 7 in `engram-mcp::link` (happy path + each `LinkError` variant), 6 in `engram-mcp::relate` (direction filter, relation filter, content truncation, retracted state, missing-thought error), 1 extended in `engram-mcp::server` (SERVER_INSTRUCTIONS pin).
+- `cargo test --workspace` — clean. New test count: 9 in `kengram-core` (relation module), 12 in `kengram-storage` (insert/delete/fetch + cascade/retracted edge cases), 7 in `kengram-mcp::link` (happy path + each `LinkError` variant), 6 in `kengram-mcp::relate` (direction filter, relation filter, content truncation, retracted state, missing-thought error), 1 extended in `kengram-mcp::server` (SERVER_INSTRUCTIONS pin).
 - `cargo clippy --all-targets -- -D warnings` — clean.
 - `cargo fmt --all -- --check` — clean.
 - Migration 0007 applies cleanly; `\d thought_links` shows the constraints + indexes documented above.
@@ -132,7 +132,7 @@ No new subcommands. Linking is MCP-only — operators link via Claude Code/Deskt
    - `requires` and `decided_by` may be rare — if they're never used, candidates for removal in a future iteration.
 3. **Watch for the "I want to link to a non-thought" failure mode.** Every time you wish you could link to an entity-tag, a person, or a URL, that's a vote for the M5.x heterogeneous-targets work.
 4. **Watch for the "I want the LLM to auto-link" failure mode.** Every time you manually link in a way the prose already implied, that's a vote for M5.x tagger-extracted relations.
-5. **Capture findings as thoughts in `engram.m3.dogfood`** — and link them. Meta-dogfood: the relations layer documenting itself via its own substrate.
+5. **Capture findings as thoughts in `kengram.m3.dogfood`** — and link them. Meta-dogfood: the relations layer documenting itself via its own substrate.
 
 ## Risks
 
@@ -147,7 +147,7 @@ No new subcommands. Linking is MCP-only — operators link via Claude Code/Deskt
 - Heterogeneous targets (to-entity, to-person, to-URL) → M5.x or M6 (polymorphic schema work).
 - Bulk-link/unlink MCP tools → M5.x if usage demands.
 - Multi-hop traversal (`get_thoughts_n_hops_away`) → M5.x.
-- `engram link` CLI subcommand → if dogfood demands.
+- `kengram link` CLI subcommand → if dogfood demands.
 - Relation confidence/provenance metadata (M3-style) → not needed for agent-supplied; revisit when tagger-extraction lands.
 
 ## Decision log
@@ -204,9 +204,9 @@ Migration 0008 is a pure CHECK constraint relax — drops the old `thought_links
 
 ### Files changed
 
-- `crates/engram-core/src/relation.rs` — added `Supports` variant to `RelationKind` enum; `as_str`, `FromStr`, `ALL`, error message text all updated. `ALL` is now `[RelationKind; 7]`.
+- `crates/kengram-core/src/relation.rs` — added `Supports` variant to `RelationKind` enum; `as_str`, `FromStr`, `ALL`, error message text all updated. `ALL` is now `[RelationKind; 7]`.
 - `migrations/0008_relation_supports.sql` — CHECK constraint extension.
-- `crates/engram-mcp/src/server.rs` — `LinkThoughtsArgs.relation` description gains the `supports` entry + "Common mistakes" block; `UnlinkThoughtsArgs.relation` and `GetRelatedThoughtsArgs.relations` descriptions mention `supports`; `SERVER_INSTRUCTIONS` lists all seven relations + the `references`/`supports` distinction; regression test `server_instructions_advertise_*` pins `supports`.
+- `crates/kengram-mcp/src/server.rs` — `LinkThoughtsArgs.relation` description gains the `supports` entry + "Common mistakes" block; `UnlinkThoughtsArgs.relation` and `GetRelatedThoughtsArgs.relations` descriptions mention `supports`; `SERVER_INSTRUCTIONS` lists all seven relations + the `references`/`supports` distinction; regression test `server_instructions_advertise_*` pins `supports`.
 - `README.md`, `DESIGN.md` — vocabulary table / §6.6 / §9 / revision history updated.
 
 ### Dogfood plan (post-merge)
@@ -253,7 +253,7 @@ Most parsimonious diagnosis: the conversion was a two-step (`unlink_thoughts` th
 
 Two operator-visible improvements would prevent this class of confusion in M5.x:
 
-1. **Migration audit signal.** When `engram migrate` applies an edge-affecting migration (delete / update of `thought_links` rows), record the row count delta into a `migration_audit` table or emit a structured tracing event with the migration version + delta. Operators can then distinguish "the migration touched my edges" from "the migration was schema-only." Migration 0008 has zero edge-affecting clauses; future migrations should self-classify so the operator-visible signal is unambiguous.
+1. **Migration audit signal.** When `kengram migrate` applies an edge-affecting migration (delete / update of `thought_links` rows), record the row count delta into a `migration_audit` table or emit a structured tracing event with the migration version + delta. Operators can then distinguish "the migration touched my edges" from "the migration was schema-only." Migration 0008 has zero edge-affecting clauses; future migrations should self-classify so the operator-visible signal is unambiguous.
 
 2. **`unlink_thoughts` discriminator.** Distinguish "never-existed" from "previously-removed" in the response. Cheapest implementation: a soft-delete model on `thought_links` (`deleted_at TIMESTAMPTZ`). Edges resolve in queries by filtering `WHERE deleted_at IS NULL`; `unlink_thoughts` returns `existed: false, previously_removed: true | null`. More expensive: a `thought_links_history` table tracking inserts + deletes with timestamps and source. Either gives operators an "I unlinked this myself" vs. "something else happened" diagnostic bit.
 
@@ -267,7 +267,7 @@ Three places still said "one of six closed-vocabulary relations" while enumerati
 
 `_sqlx_migrations` records only versions 1-6. Migrations 0007 and 0008 were applied directly via `docker exec psql` during M5 / M5.1 development sessions, so the migrations table doesn't reflect them. The schema state is correct (verified via `\d thought_links`) but the migrations table is stale.
 
-The fix is operator-side: run `engram migrate` to record the applied migrations. sqlx::migrate should recognize the existing schema state and update the table accordingly (or, if it complains about applied-but-not-recorded migrations, the resolution is a manual `INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES ...` for the two missing entries).
+The fix is operator-side: run `kengram migrate` to record the applied migrations. sqlx::migrate should recognize the existing schema state and update the table accordingly (or, if it complains about applied-but-not-recorded migrations, the resolution is a manual `INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES ...` for the two missing entries).
 
 Tracked as an M5.x cleanup item; not urgent.
 
@@ -289,9 +289,9 @@ This is the citation-chain pattern the M5 milestone was motivated by, now visibl
 
 2. **Soft-delete + three-way unlink status.** `thought_links.deleted_at TIMESTAMPTZ NULL`. `delete_link` becomes UPDATE-with-RETURNING. `unlink_thoughts` returns a three-way status enum: `deleted_now` / `already_deleted` / `never_existed`. The partial unique index ignores soft-deleted rows, so re-creating a previously-removed edge inserts a fresh live row.
 
-3. **Migration audit table + CLI subcommand.** `migration_audit (id, migration, ran_at, rows_touched, notes)` populated by per-migration `INSERT` statements (process discipline; migration 0010 seeds the table with rows for 0009 + 0010). `engram audit migrations [--since X] [--limit N]` prints the log most-recent-first.
+3. **Migration audit table + CLI subcommand.** `migration_audit (id, migration, ran_at, rows_touched, notes)` populated by per-migration `INSERT` statements (process discipline; migration 0010 seeds the table with rows for 0009 + 0010). `kengram audit migrations [--since X] [--limit N]` prints the log most-recent-first.
 
-4. **CLI scope-prefix flags.** `engram tag` and `engram embed-backfill` gain `--scope-prefix` (mutually exclusive with `--scope` via clap `conflicts_with`), threaded through to the corresponding storage helpers.
+4. **CLI scope-prefix flags.** `kengram tag` and `kengram embed-backfill` gain `--scope-prefix` (mutually exclusive with `--scope` via clap `conflicts_with`), threaded through to the corresponding storage helpers.
 
 5. **MCP surface deltas.** `link_thoughts` / `unlink_thoughts` args gain `to_entity` / `to_person` / `to_url` alongside `to_thought_id` (mutex; exactly-one validated server-side). `get_related_thoughts` args gain `target_kinds`; response gains `to_kind` / `to_value`, with thought-target hits retaining the existing scope / content_preview / retracted fields and non-thought hits leaving them null. SERVER_INSTRUCTIONS updated with the polymorphic-target surface; regression test extended to pin the four target-kind fields and the three-way unlink status enum.
 
@@ -307,19 +307,19 @@ This is the citation-chain pattern the M5 milestone was motivated by, now visibl
 
 - **Partial unique index for soft-delete idempotency.** `CREATE UNIQUE INDEX ... WHERE deleted_at IS NULL` lets a previously-soft-deleted edge sit inert while a fresh insert with the same triple succeeds. ON CONFLICT can target a partial unique index by `ON CONFLICT (cols) WHERE predicate` — works as expected; verified in `insert_after_soft_delete_creates_fresh_live_row` integration test.
 
-- **Free-text entities and persons (no first-class table).** Entities and persons are stored as strings on `thought_links.to_entity` / `to_person` rather than as FKs to dedicated tables. Engram has no entity-resolution layer in v0; first-class entity tables would precede tagger-extracted relations (still M5.x), and over-engineering them now would block M5.2 ship. Free-text is consistent with how the tagger already represents entities (in the `tags.entities[]` array — free-form strings).
+- **Free-text entities and persons (no first-class table).** Entities and persons are stored as strings on `thought_links.to_entity` / `to_person` rather than as FKs to dedicated tables. Kengram has no entity-resolution layer in v0; first-class entity tables would precede tagger-extracted relations (still M5.x), and over-engineering them now would block M5.2 ship. Free-text is consistent with how the tagger already represents entities (in the `tags.entities[]` array — free-form strings).
 
 - **Three-way unlink status, not boolean discriminator.** `{ existed: bool, previously_removed: bool }` would work but composes awkwardly with future states (e.g., a `restored` status if `restore_link` ever ships). A tagged enum (`status`) leaves room for that without breaking the response shape further.
 
 - **`migration_audit` as a schema artifact + CLI surface, not a code helper.** Every future row-touching migration ends with an `INSERT INTO migration_audit` statement by convention (DEVELOPMENT.md note). A code-side `migration_audit_record!` helper would be over-engineered for one-line-per-migration usage. The CLI subcommand prints the log; no MCP-side surface for v1.
 
-- **`engram audit migrations` resource-as-positional, not `engram audit-migrations`.** Future audit resources (`engram audit links`, `engram audit thoughts`) compose under `engram audit <resource>`; a flat subcommand would have to add new top-level subcommands per resource.
+- **`kengram audit migrations` resource-as-positional, not `kengram audit-migrations`.** Future audit resources (`kengram audit links`, `kengram audit thoughts`) compose under `kengram audit <resource>`; a flat subcommand would have to add new top-level subcommands per resource.
 
 - **Schema breaking change accepted on `unlink_thoughts` response.** The shape moves from `{ existed: bool }` to `{ status: enum }`. Acceptable in single-operator dogfood; called out here so a future operator-facing changelog can pick it up.
 
 ## Tests added
 
-Eleven new integration tests in engram-storage (heterogeneous-target writes, URL format CHECK, unique-edge across kinds, soft-delete + lookup_link_status three-way + fresh-row-after-soft-delete, target_kinds filter, migration_audit presence + ordering), seven new in engram-mcp (entity / URL / non-http rejection writes via the orchestrator, empty-name rejection, three-way unlink status, link-after-unlink, heterogeneous outbound retrieval, target_kinds filter), one CLI regression-shape extension. 317 total tests passing post-M5.2.
+Eleven new integration tests in kengram-storage (heterogeneous-target writes, URL format CHECK, unique-edge across kinds, soft-delete + lookup_link_status three-way + fresh-row-after-soft-delete, target_kinds filter, migration_audit presence + ordering), seven new in kengram-mcp (entity / URL / non-http rejection writes via the orchestrator, empty-name rejection, three-way unlink status, link-after-unlink, heterogeneous outbound retrieval, target_kinds filter), one CLI regression-shape extension. 317 total tests passing post-M5.2.
 
 ## Out of scope (deferred)
 
@@ -329,4 +329,4 @@ Eleven new integration tests in engram-storage (heterogeneous-target writes, URL
 - A `restore_link` tool. Operator can re-link via `link_thoughts` (fresh row) or UPDATE via psql.
 - Hard-purge / retention policy for soft-deleted edges.
 - Backfilling `migration_audit` for migrations 0001-0008.
-- `engram audit links`, `engram audit thoughts`, etc. — only `migrations` ships in M5.2.
+- `kengram audit links`, `kengram audit thoughts`, etc. — only `migrations` ships in M5.2.

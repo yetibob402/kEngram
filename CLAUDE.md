@@ -1,8 +1,8 @@
-# Engram — Claude Code Project Context
+# Kengram — Claude Code Project Context
 
 ## What this is
 
-Engram is a self-hosted, MCP-native AI memory service. It stores agent "thoughts" and extracted facts in Postgres + pgvector, and exposes a small set of MCP tools (capture, search, etc.) so any MCP-capable client — Claude Code, opencode, Claude Desktop, ChatGPT — reads and writes the same persistent backing store.
+Kengram is a self-hosted, MCP-native AI memory service. It stores agent "thoughts" and extracted facts in Postgres + pgvector, and exposes a small set of MCP tools (capture, search, etc.) so any MCP-capable client — Claude Code, opencode, Claude Desktop, ChatGPT — reads and writes the same persistent backing store.
 
 The system is being built across seven capability milestones (M1 → M7), preceded by an environment milestone (M0). All milestones through M6.1 are shipped as of 2026-05-18; M7 (operational maturity) is the next focus. The terminal-state design lives in `DESIGN.md`; per-milestone scope and success criteria live in `docs/milestones/`.
 
@@ -32,7 +32,7 @@ If you find yourself reasoning about a design choice that the design doc already
 | Embedding sidecar | Hugging Face `text-embeddings-inference` (HTTP API, external process) |
 | Extraction backend | vLLM (OpenAI-compatible API at `/v1`, external process) |
 
-**Do not introduce Python, Node, or TypeScript dependencies.** The deployment is the Engram binary plus pre-existing TEI and vLLM services. If you find yourself wanting a Python tool for something, check whether a Rust crate or `sqlx-cli` covers it first.
+**Do not introduce Python, Node, or TypeScript dependencies.** The deployment is the Kengram binary plus pre-existing TEI and vLLM services. If you find yourself wanting a Python tool for something, check whether a Rust crate or `sqlx-cli` covers it first.
 
 ## Repo layout
 
@@ -47,23 +47,23 @@ If you find yourself reasoning about a design choice that the design doc already
 ├── docs/
 │   └── milestones/         # one doc per milestone
 ├── crates/
-│   ├── engram-core/        # domain types, Embedder trait, retrieval fusion (pure)
-│   ├── engram-storage/     # sqlx + migrations + repository functions
-│   ├── engram-embed/       # Embedder impls: TEI, cloud (dev/test)
-│   ├── engram-mcp/         # rmcp tool definitions and handlers
-│   └── engram-cli/         # the only binary; axum + transport, config, subcommands
+│   ├── kengram-core/        # domain types, Embedder trait, retrieval fusion (pure)
+│   ├── kengram-storage/     # sqlx + migrations + repository functions
+│   ├── kengram-embed/       # Embedder impls: TEI, cloud (dev/test)
+│   ├── kengram-mcp/         # rmcp tool definitions and handlers
+│   └── kengram-cli/         # the only binary; axum + transport, config, subcommands
 ├── migrations/             # sqlx migrations, numbered (0001_initial.sql, ...)
 └── config/
-    └── engram.example.toml
+    └── kengram.example.toml
 ```
 
-Five crates in M1. `engram-extract` joins at M2 when the facts pipeline lands. Library crates have no `main`. `engram-cli` is the only binary. Each library crate exposes a small, well-named API surface; cross-crate calls go through trait abstractions where the design doc indicates (the `Embedder` trait being the primary one in M1).
+Five crates in M1. `kengram-extract` joins at M2 when the facts pipeline lands. Library crates have no `main`. `kengram-cli` is the only binary. Each library crate exposes a small, well-named API surface; cross-crate calls go through trait abstractions where the design doc indicates (the `Embedder` trait being the primary one in M1).
 
 ## Conventions
 
 - **Async by default.** Any I/O is async. Sync code is reserved for pure computation.
 - **No `unwrap()` outside tests.** Use `expect()` with a descriptive message if you genuinely cannot recover at the call site.
-- **Errors:** `thiserror` enums in library crates with one variant per genuine failure mode. `anyhow::Error` is fine in `engram-cli` only. Do not propagate `anyhow::Error` across library boundaries.
+- **Errors:** `thiserror` enums in library crates with one variant per genuine failure mode. `anyhow::Error` is fine in `kengram-cli` only. Do not propagate `anyhow::Error` across library boundaries.
 - **Compile-time SQL.** Use `sqlx::query!` / `sqlx::query_as!`. Reserve string SQL for genuinely dynamic shapes (e.g., constructing the hybrid search query at runtime).
 - **No clever macros** unless they replace at least 50 lines of boilerplate they're not just hiding.
 - **No `Box<dyn Error>` in public APIs.** It eats type information.
@@ -73,7 +73,7 @@ Five crates in M1. `engram-extract` joins at M2 when the facts pipeline lands. L
 
 ## What NOT to do
 
-- Do not make Engram operate vLLM or TEI. Those are external services with their own systemd units. Engram only *consumes* their HTTP APIs.
+- Do not make Kengram operate vLLM or TEI. Those are external services with their own systemd units. Kengram only *consumes* their HTTP APIs.
 - Do not add a "hosted mode" or multi-tenant abstractions. Single user, single active session is a design assumption (§1 of the design doc).
 - Do not introduce an ORM (Diesel, SeaORM). `sqlx` is the choice and the reasons (compile-time checking, async-native, no macro magic) are intentional.
 - Do not implement a web UI in v0. Postgres + `psql` is the admin interface.
@@ -85,18 +85,18 @@ Five crates in M1. `engram-extract` joins at M2 when the facts pipeline lands. L
 
 ```bash
 # First time
-cp config/engram.example.toml config/engram.toml  # then edit
+cp config/kengram.example.toml config/kengram.toml  # then edit
 cargo build --workspace
 
-# Database (assumes local Postgres with the engram db created)
+# Database (assumes local Postgres with the kengram db created)
 sqlx database create
 sqlx migrate run
 
 # Run the server
-cargo run --bin engram -- serve
+cargo run --bin kengram -- serve
 
 # (M2+) Run the worker (reflector + re-embed jobs)
-# cargo run --bin engram -- worker
+# cargo run --bin kengram -- worker
 
 # Tests
 cargo test --workspace

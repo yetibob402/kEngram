@@ -1,5 +1,5 @@
 # Dev-only Postgres + TEI reranker (+ optional deterministic tagger sidecar)
-# for Engram. Production deployment uses systemd-managed services (see
+# for Kengram. Production deployment uses systemd-managed services (see
 # DESIGN.md §11), not this file.
 #
 # The pgvector/pgvector:pg16 image bundles the `vector`, `pg_trgm`, and
@@ -11,25 +11,25 @@
 # HTTP. Added M3 Phase B step 2. Embeddings stay on Ollama in dev — TEI runs
 # rerank-task only.
 #
-# Defaults are dev-friendly (engram/engram on localhost:5432). The container
+# Defaults are dev-friendly (kengram/kengram on localhost:5432). The container
 # only accepts connections from localhost; a real password is unnecessary
 # at this trust boundary.
 
 services:
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: engram-postgres
+    container_name: kengram-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: engram
-      POSTGRES_PASSWORD: engram
-      POSTGRES_DB: engram
+      POSTGRES_USER: kengram
+      POSTGRES_PASSWORD: kengram
+      POSTGRES_DB: kengram
     ports:
       - "5432:5432"
     volumes:
-      - engram-pg-data:/var/lib/postgresql/data
+      - kengram-pg-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U engram -d engram"]
+      test: ["CMD-SHELL", "pg_isready -U kengram -d kengram"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -37,7 +37,7 @@ services:
 
   tei:
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-arm64-latest
-    container_name: engram-tei
+    container_name: kengram-tei
     restart: unless-stopped
     environment:
       # TEI honors $HF_HOME for the model cache.
@@ -45,7 +45,7 @@ services:
     ports:
       - "8080:80"
     volumes:
-      - engram-tei-models:/data
+      - kengram-tei-models:/data
     command:
       - --model-id=cross-encoder/ms-marco-MiniLM-L-6-v2
       # MiniLM-L-6-v2 is the small (~22M params) dev reranker — ONNX
@@ -64,7 +64,7 @@ services:
       # boot; on Apple Silicon CPU each warmup step takes seconds, so
       # bumping the cap to 128 (an early Phase B step 2 attempt) made
       # warmup hang for many minutes. The matching `DEFAULT_RERANK_
-      # CANDIDATE_POOL` in engram-mcp/src/search.rs is 32; per-call
+      # CANDIDATE_POOL` in kengram-mcp/src/search.rs is 32; per-call
       # callers can override via the `candidate_pool` request field if
       # they need a larger pool for quality measurement.
     healthcheck:
@@ -78,14 +78,14 @@ services:
       retries: 30
       start_period: 120s
 
-  # Reference HTTP-sidecar tagger (engram-tagger-deterministic). Opt-in via
+  # Reference HTTP-sidecar tagger (kengram-tagger-deterministic). Opt-in via
   # the `tagger` compose profile: `docker compose --profile tagger up -d`.
   # Default `docker compose up -d` does NOT start this service so dev
   # environments without the GLiNER model don't crashloop on startup.
   #
   # Prerequisites BEFORE first `docker compose --profile tagger up`:
   # 1. Download the GLiNER ONNX model to ~/models/gliner_small-v2.1/
-  #    (see crates/engram-tagger-deterministic/README.md for curl invocations).
+  #    (see crates/kengram-tagger-deterministic/README.md for curl invocations).
   # 2. Ensure an embedder is reachable. The default points at Ollama on the
   #    host via host.docker.internal:11434 — start Ollama and `ollama pull
   #    bge-m3` first.
@@ -96,8 +96,8 @@ services:
     profiles: ["tagger"]
     build:
       context: .
-      dockerfile: crates/engram-tagger-deterministic/Dockerfile
-    container_name: engram-tagger-deterministic
+      dockerfile: crates/kengram-tagger-deterministic/Dockerfile
+    container_name: kengram-tagger-deterministic
     restart: unless-stopped
     environment:
       # Reach the host's Ollama for bge-m3 embeddings. Operators with a
@@ -106,7 +106,7 @@ services:
       EMBEDDER_ENDPOINT: http://host.docker.internal:11434/v1
       EMBEDDER_MODEL: bge-m3
       GLINER_MODEL_DIR: /models/gliner
-      TOPIC_TAXONOMY_PATH: /etc/engram/topic-taxonomy.toml
+      TOPIC_TAXONOMY_PATH: /etc/kengram/topic-taxonomy.toml
       KIND_THRESHOLD: "0.55"
       TOPIC_THRESHOLD: "0.45"
       MODEL_ID: deterministic/gliner-small-v2.1+regex+bge-m3
@@ -119,8 +119,8 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       # Host:container port 8082 (not 8081) so we don't collide with the
-      # documented Tier 1 `engram serve` bind on 0.0.0.0:8081. Operators
-      # running engram on a different port can remap freely.
+      # documented Tier 1 `kengram serve` bind on 0.0.0.0:8081. Operators
+      # running kengram on a different port can remap freely.
       - "8082:8082"
     volumes:
       # GLiNER ONNX assets — operator-supplied (see README).
@@ -128,7 +128,7 @@ services:
       # Topic taxonomy from the repo. Editing topic-taxonomy.toml on the
       # host requires restarting this service for the new vectors to take
       # effect (taxonomy is embedded once at startup).
-      - ./crates/engram-tagger-deterministic/topic-taxonomy.toml:/etc/engram/topic-taxonomy.toml:ro
+      - ./crates/kengram-tagger-deterministic/topic-taxonomy.toml:/etc/kengram/topic-taxonomy.toml:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8082/health"]
       interval: 30s
@@ -140,5 +140,5 @@ services:
       start_period: 30s
 
 volumes:
-  engram-pg-data:
-  engram-tei-models:
+  kengram-pg-data:
+  kengram-tei-models:

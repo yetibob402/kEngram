@@ -1,6 +1,6 @@
 # Development setup
 
-The operator reference for Engram: first-time setup, common operations, the full configuration knob list, tagger version history, the relational link graph, day-to-day workflows, and troubleshooting. README is the front-door pitch; everything operator-facing lives here.
+The operator reference for Kengram: first-time setup, common operations, the full configuration knob list, tagger version history, the relational link graph, day-to-day workflows, and troubleshooting. README is the front-door pitch; everything operator-facing lives here.
 
 Quick start assumes macOS with Docker, Rust (`rustc` 1.95+), `sqlx-cli`, and Ollama already installed.
 
@@ -22,7 +22,7 @@ If you don't already have these, here's the canonical install for each:
   cargo install sqlx-cli --no-default-features --features rustls,postgres
   ```
 
-  `--no-default-features` keeps MySQL/SQLite codepaths out; `rustls` matches the workspace's TLS choice; `postgres` is the only DB Engram uses. This gives you the `sqlx migrate run` command used in step 4 below, plus `cargo sqlx prepare` for regenerating the committed `.sqlx/` offline-query metadata after changing any `sqlx::query!` macro (see step 5).
+  `--no-default-features` keeps MySQL/SQLite codepaths out; `rustls` matches the workspace's TLS choice; `postgres` is the only DB Kengram uses. This gives you the `sqlx migrate run` command used in step 4 below, plus `cargo sqlx prepare` for regenerating the committed `.sqlx/` offline-query metadata after changing any `sqlx::query!` macro (see step 5).
 
 - **Ollama** — `brew install ollama` on macOS (or download from [ollama.com](https://ollama.com/download)). The desktop app starts the daemon automatically; otherwise run `ollama serve`.
 
@@ -34,7 +34,7 @@ If you don't already have these, here's the canonical install for each:
 docker compose up -d postgres
 ```
 
-This launches `pgvector/pgvector:pg16` with the `vector`, `pg_trgm`, and `pgcrypto` extensions available. The container is named `engram-postgres`. Data lives in a named Docker volume (`engram-pg-data`) and survives `docker compose down`.
+This launches `pgvector/pgvector:pg16` with the `vector`, `pg_trgm`, and `pgcrypto` extensions available. The container is named `kengram-postgres`. Data lives in a named Docker volume (`kengram-pg-data`) and survives `docker compose down`.
 
 Wait for it to be healthy:
 
@@ -46,10 +46,10 @@ docker compose ps postgres
 ### 2. Set the database URL
 
 ```bash
-export DATABASE_URL="postgres://engram:engram@localhost:5432/engram"
+export DATABASE_URL="postgres://kengram:kengram@localhost:5432/kengram"
 ```
 
-`sqlx` and the engram binary both read this. Add it to your shell rc if you don't want to set it every session.
+`sqlx` and the kengram binary both read this. Add it to your shell rc if you don't want to set it every session.
 
 `sqlx::query!` macros and the `sqlx::test` attribute both require `DATABASE_URL` to be set at *build time*, not just at runtime. The `.env` file at the workspace root is read by `sqlx-cli` but NOT by `cargo build` — set `DATABASE_URL` in your shell or pass it inline: `DATABASE_URL=... cargo build`.
 
@@ -61,7 +61,7 @@ Make sure the Ollama daemon is running (`ollama serve` if it isn't already; the 
 ollama pull bge-m3
 ```
 
-Engram's dev-mode embedder talks to Ollama's OpenAI-compatible endpoint (`http://localhost:11434/v1/embeddings`) and uses `bge-m3` for 1024-dim embeddings.
+Kengram's dev-mode embedder talks to Ollama's OpenAI-compatible endpoint (`http://localhost:11434/v1/embeddings`) and uses `bge-m3` for 1024-dim embeddings.
 
 Verify:
 
@@ -76,7 +76,7 @@ The configured `embedder.model_id = "bge-m3:1024"` carries the dimension as a su
 
 ### 3b. (Optional) Start TEI for the rerank stage
 
-The cross-encoder reranker runs in a TEI Docker container alongside Postgres. It's optional — `engram serve` works without it. The search pipeline silently skips the rerank stage when no `[reranker]` section is configured and the results come back in RRF + recency order with `rerank_used: false`.
+The cross-encoder reranker runs in a TEI Docker container alongside Postgres. It's optional — `kengram serve` works without it. The search pipeline silently skips the rerank stage when no `[reranker]` section is configured and the results come back in RRF + recency order with `rerank_used: false`.
 
 ```bash
 docker compose up -d tei
@@ -101,7 +101,7 @@ curl -s http://localhost:8080/rerank \
 # expect: array of {"index": i, "score": s} sorted by score desc
 ```
 
-Then add a `[reranker]` section to your `engram.toml` (see Configuration below) and `engram serve`'s startup log will show `reranker: resolved config`.
+Then add a `[reranker]` section to your `kengram.toml` (see Configuration below) and `kengram serve`'s startup log will show `reranker: resolved config`.
 
 **Model choice.** `docker-compose.yml` pins `cross-encoder/ms-marco-MiniLM-L-6-v2` — the small (~22M parameter) dev reranker that has ONNX exports on HF (TEI takes the fast ORT path; sub-100ms per call on Apple Silicon CPU). For production with a GPU host, override via `[reranker].model_id` to `BAAI/bge-reranker-v2-m3` or another full-size model.
 
@@ -109,11 +109,11 @@ The Apple Silicon variant of the image (`cpu-arm64-latest`) is what's pinned. Pr
 
 ### 3c. (Optional) Start the deterministic tagger sidecar
 
-If you want non-LLM tagging (the engram-native HTTP-tagger pattern), the reference sidecar runs in docker-compose under the `tagger` profile. It's opt-in — `docker compose up -d` does NOT start it by default.
+If you want non-LLM tagging (the kengram-native HTTP-tagger pattern), the reference sidecar runs in docker-compose under the `tagger` profile. It's opt-in — `docker compose up -d` does NOT start it by default.
 
 **Prerequisites.** Before first `docker compose --profile tagger up`:
 
-1. Download the GLiNER ONNX model to `~/models/gliner_small-v2.1/`. See [`crates/engram-tagger-deterministic/README.md`](crates/engram-tagger-deterministic/README.md#1-download-the-gliner-onnx-model) for the curl invocations (~580MB).
+1. Download the GLiNER ONNX model to `~/models/gliner_small-v2.1/`. See [`crates/kengram-tagger-deterministic/README.md`](crates/kengram-tagger-deterministic/README.md#1-download-the-gliner-onnx-model) for the curl invocations (~580MB).
 2. Make sure Ollama is running with `bge-m3` available (the sidecar's default `EMBEDDER_ENDPOINT` points at the host's Ollama via `host.docker.internal:11434`).
 
 ```bash
@@ -137,7 +137,7 @@ curl -sS -X POST http://localhost:8082/tag \
 # expect: {"protocol_version":"1","tags":{"people":["Sarah"],...},"relations":[]}
 ```
 
-Then flip `[tagger]` in your `~/.config/engram/engram.toml` to the http provider. Complete block (replace your existing `[tagger]` section with this):
+Then flip `[tagger]` in your `~/.config/kengram/kengram.toml` to the http provider. Complete block (replace your existing `[tagger]` section with this):
 
 ```toml
 [tagger]
@@ -153,14 +153,14 @@ timeout_seconds = 30
 
 The flat `[tagger]` fields openai-compatible uses (`endpoint`, `model_name`, `api_key`, `temperature`, `system_prompt_file`, `scope_vocab_*`) are ignored when `provider = "http"`. Leave them as-is — they'll quietly do nothing — or delete them entirely.
 
-Restart the worker (and `engram serve` if you want clean logs):
+Restart the worker (and `kengram serve` if you want clean logs):
 
 ```bash
-cargo run --bin engram -- worker
+cargo run --bin kengram -- worker
 # expect: "tagger: resolved config ... provider=http ..." in the startup logs
 ```
 
-**Port note.** The sidecar's default host port is `8082` (the Tier 1 `engram serve` convention is `:8081`, so the defaults coexist on one machine). If you've customized either to overlap, change one of them — `docker-compose.yml`'s `ports` line for the sidecar or `[server].bind` for engram serve.
+**Port note.** The sidecar's default host port is `8082` (the Tier 1 `kengram serve` convention is `:8081`, so the defaults coexist on one machine). If you've customized either to overlap, change one of them — `docker-compose.yml`'s `ports` line for the sidecar or `[server].bind` for kengram serve.
 
 **To bring the sidecar down** without stopping the rest of the stack: `docker compose --profile tagger stop tagger-deterministic`. **To recreate after editing `topic-taxonomy.toml`**: `docker compose --profile tagger restart tagger-deterministic` (taxonomy is embedded once at startup, so a restart is required for new vectors to take effect). **To stop the whole stack and bring back only specific services**: `docker compose down` tears down everything regardless of profile; bring back with `docker compose --profile tagger up -d` (default-profile services + tagger) or omit the profile to leave the sidecar off.
 
@@ -174,11 +174,11 @@ On a fresh checkout, run migrations with `sqlx-cli` directly — no compilation 
 sqlx migrate run
 ```
 
-Once the workspace is built (step 5), `cargo run --bin engram -- migrate` is the equivalent idempotent form.
+Once the workspace is built (step 5), `cargo run --bin kengram -- migrate` is the equivalent idempotent form.
 
 The migration set (currently 11 numbered files in `migrations/`) ships the schema described in `DESIGN.md` §5, plus subsequent additions: thought retraction, the thought_links graph layer, polymorphic link targets, soft-delete + migration_audit, and the JSONB cleanup that removed the redundant `tags.relations` copy.
 
-**Migration audit.** The `migration_audit` table (introduced in 0010) records what each migration did — `migration`, `ran_at`, `rows_touched`, optional `notes`. Convention going forward: any row-touching migration ends with an `INSERT INTO migration_audit (...)` statement so the operator can verify per-migration impact via `engram audit migrations` rather than psql. Schema-only migrations should still insert an audit row with `rows_touched = 0` and a one-line `notes` summary. See [Operator workflows](#operator-workflows) for the `engram audit migrations` walkthrough.
+**Migration audit.** The `migration_audit` table (introduced in 0010) records what each migration did — `migration`, `ran_at`, `rows_touched`, optional `notes`. Convention going forward: any row-touching migration ends with an `INSERT INTO migration_audit (...)` statement so the operator can verify per-migration impact via `kengram audit migrations` rather than psql. Schema-only migrations should still insert an audit row with `rows_touched = 0` and a one-line `notes` summary. See [Operator workflows](#operator-workflows) for the `kengram audit migrations` walkthrough.
 
 ### 5. Build, test, run
 
@@ -187,10 +187,10 @@ cargo build --workspace
 cargo test --workspace                       # unit + sqlx::test
 cargo test --workspace --features integration   # adds a live-Ollama round-trip test
 
-cargo run --bin engram -- serve              # starts the MCP server on 127.0.0.1:8080
-cargo run --bin engram -- worker             # in a second shell — drains pending_embeddings + pending_tags
-cargo run --bin engram -- stats              # corpus + storage telemetry; operator-facing snapshot
-cargo run --bin engram -- audit migrations   # per-migration audit log
+cargo run --bin kengram -- serve              # starts the MCP server on 127.0.0.1:8080
+cargo run --bin kengram -- worker             # in a second shell — drains pending_embeddings + pending_tags
+cargo run --bin kengram -- stats              # corpus + storage telemetry; operator-facing snapshot
+cargo run --bin kengram -- audit migrations   # per-migration audit log
 ```
 
 **Offline `sqlx::query!` validation.** The `.sqlx/` directory at the workspace root is committed; it holds per-query JSON metadata generated by `cargo sqlx prepare --workspace` and lets `cargo build` succeed without a live database when `DATABASE_URL` is unset. If you've set `DATABASE_URL` and want to skip the live-DB round-trip anyway (e.g. you've changed branches and don't want to migrate first), set `SQLX_OFFLINE=true` and the macros will read `.sqlx/` instead.
@@ -214,7 +214,7 @@ Point an MCP-capable client (Claude Code, Claude Desktop, `mcp-inspector`) at `h
 - `retract_thought` — mark a thought as untrusted (excluded from retrieval; still visible via `get_thought` for audit).
 - `link_thoughts`, `unlink_thoughts`, `get_related_thoughts` — the graph layer. See [Relational data and link graph](#relational-data-and-link-graph).
 
-`engram serve` and `engram worker` are paired: `serve` writes thoughts and enqueues embedding + tag jobs; `worker` drains both queues (`pending_embeddings` and `pending_tags`). Running `serve` without `worker` is fine — thoughts are still durable and trigram-searchable — but vector kNN won't surface them and tags stay empty until the worker runs. When `[tagger].provider` is empty, the tag-job enqueue at capture is a no-op and the tag drainer doesn't spawn.
+`kengram serve` and `kengram worker` are paired: `serve` writes thoughts and enqueues embedding + tag jobs; `worker` drains both queues (`pending_embeddings` and `pending_tags`). Running `serve` without `worker` is fine — thoughts are still durable and trigram-searchable — but vector kNN won't surface them and tags stay empty until the worker runs. When `[tagger].provider` is empty, the tag-job enqueue at capture is a no-op and the tag drainer doesn't spawn.
 
 ## Common operations
 
@@ -226,7 +226,7 @@ docker compose down
 docker compose down -v
 
 # Open a psql session in the container
-docker exec -it engram-postgres psql -U engram -d engram
+docker exec -it kengram-postgres psql -U kengram -d kengram
 
 # Tail Postgres logs
 docker compose logs -f postgres
@@ -238,13 +238,13 @@ Heal-then-drain: enqueue any unembedded thoughts that lack a queue row (pre-M2 c
 
 ```bash
 # Whole corpus, up to 1000 rows.
-cargo run --bin engram -- embed-backfill --limit 1000
+cargo run --bin kengram -- embed-backfill --limit 1000
 
 # One scope only (exact match).
-cargo run --bin engram -- embed-backfill --scope work --limit 100
+cargo run --bin kengram -- embed-backfill --scope work --limit 100
 
 # A namespace of scopes (prefix match). Mutually exclusive with --scope.
-cargo run --bin engram -- embed-backfill --scope-prefix engram. --limit 500
+cargo run --bin kengram -- embed-backfill --scope-prefix kengram. --limit 500
 ```
 
 `--scope` and `--scope-prefix` are mutually exclusive. Empty strings on either flag are normalised to "no filter."
@@ -254,9 +254,9 @@ cargo run --bin engram -- embed-backfill --scope-prefix engram. --limit 500
 Like a single tick of the worker's tag drainer. Tags thoughts where `tags_extractor_version IS NULL`. Requires a configured `[tagger]` section. Useful for catching up after capturing a batch of thoughts before enabling the tagger.
 
 ```bash
-cargo run --bin engram -- tag --limit 50
-cargo run --bin engram -- tag --scope work --limit 100
-cargo run --bin engram -- tag --scope-prefix engram. --limit 200
+cargo run --bin kengram -- tag --limit 50
+cargo run --bin kengram -- tag --scope work --limit 100
+cargo run --bin kengram -- tag --scope-prefix kengram. --limit 200
 ```
 
 ### Re-tag after tagger version bump
@@ -264,28 +264,28 @@ cargo run --bin engram -- tag --scope-prefix engram. --limit 200
 Re-run the tagger over thoughts whose stored `tags_extractor_version` is below the configured current version. Use this after bumping `[tagger].model_version` (typically after a prompt or schema change). Tags are overwritten in place — no supersede semantics, no audit chain. Pair with `--since` to bound the rerun to recent thoughts; use `--since 1970-01-01T00:00:00Z` to re-tag the entire corpus.
 
 ```bash
-cargo run --bin engram -- tag --rerun --scope work
-cargo run --bin engram -- tag --rerun --scope-prefix engram. --since 2026-04-01T00:00:00Z
-cargo run --bin engram -- tag --rerun --since 1970-01-01T00:00:00Z   # whole corpus
+cargo run --bin kengram -- tag --rerun --scope work
+cargo run --bin kengram -- tag --rerun --scope-prefix kengram. --since 2026-04-01T00:00:00Z
+cargo run --bin kengram -- tag --rerun --since 1970-01-01T00:00:00Z   # whole corpus
 ```
 
-If you've pinned `model_version` in your local `~/.config/engram/engram.toml`, bump it manually. The new bundled default (currently 7) only applies when the field is absent from your TOML. The log line at startup reports the resolved value: look for `target_version=7`. If it says `target_version=N` with `N < 7`, your config still overrides; either update the line or delete it.
+If you've pinned `model_version` in your local `~/.config/kengram/kengram.toml`, bump it manually. The new bundled default (currently 7) only applies when the field is absent from your TOML. The log line at startup reports the resolved value: look for `target_version=7`. If it says `target_version=N` with `N < 7`, your config still overrides; either update the line or delete it.
 
 For the procedural detail and the full v1→v7 changelog, see [Tagger version history and safe re-tag procedure](#tagger-version-history-and-safe-re-tag-procedure).
 
 ### Reranker A/B benchmark
 
-A/B-benchmark the reranker against RRF-only on an operator-curated fixture corpus. Prints a markdown table to stdout with per-query nDCG@10 and MRR for both rankings, plus an AVERAGE row. Requires a configured `[reranker]` section in `engram.toml` and the corpus's `relevant_ids` to point at real `thought_id` rows in your DB. See `tests/fixtures/bench-rerank.example.json` for the schema.
+A/B-benchmark the reranker against RRF-only on an operator-curated fixture corpus. Prints a markdown table to stdout with per-query nDCG@10 and MRR for both rankings, plus an AVERAGE row. Requires a configured `[reranker]` section in `kengram.toml` and the corpus's `relevant_ids` to point at real `thought_id` rows in your DB. See `tests/fixtures/bench-rerank.example.json` for the schema.
 
 ```bash
-cargo run --bin engram -- bench rerank --corpus ~/.engram/my-bench.json
+cargo run --bin kengram -- bench rerank --corpus ~/.kengram/my-bench.json
 ```
 
 ## Configuration reference
 
-Defaults live in code. Override via `~/.config/engram/engram.toml`, a `--config <path>` argument, or `ENGRAM_*` env vars (nested via `__`, e.g. `ENGRAM_DATABASE__URL`). Layering order: defaults → user TOML → `--config` TOML → env. Later wins.
+Defaults live in code. Override via `~/.config/kengram/kengram.toml`, a `--config <path>` argument, or `KENGRAM_*` env vars (nested via `__`, e.g. `KENGRAM_DATABASE__URL`). Layering order: defaults → user TOML → `--config` TOML → env. Later wins.
 
-Example `engram.toml` (every knob spelled out — most can be omitted to take the default):
+Example `kengram.toml` (every knob spelled out — most can be omitted to take the default):
 
 ```toml
 [server]
@@ -293,7 +293,7 @@ bind = "127.0.0.1:8080"
 allowed_hosts = []                                      # see below
 
 [database]
-url = "postgres://engram:engram@localhost:5432/engram"
+url = "postgres://kengram:kengram@localhost:5432/kengram"
 max_connections = 10
 
 [embedder]
@@ -322,11 +322,11 @@ timeout_seconds = 60
 temperature = 0.2
 scope_vocab_enabled = true
 scope_vocab_size = 50
-# system_prompt_file = "~/.config/engram/tagger-prompt.txt"
+# system_prompt_file = "~/.config/kengram/tagger-prompt.txt"
 
-# HTTP-sidecar backend (provider = "http"). Points engram at any tagger
-# sidecar speaking the engram-tagger-protocol wire shape. The reference
-# implementation is crates/engram-tagger-deterministic/ (Rust-native, no
+# HTTP-sidecar backend (provider = "http"). Points kengram at any tagger
+# sidecar speaking the kengram-tagger-protocol wire shape. The reference
+# implementation is crates/kengram-tagger-deterministic/ (Rust-native, no
 # LLM); operators can also ship sidecars in Python, Go, etc. See
 # docs/tagger-backends.md + docs/tagger-sidecar-protocol.md.
 # [tagger.http]
@@ -339,7 +339,7 @@ tick_interval_seconds = 5
 batch_size = 16
 ```
 
-Env override examples: `ENGRAM_WORKER__TICK_INTERVAL_SECONDS=2 cargo run --bin engram -- worker` (snappier ticks for development), `ENGRAM_TAGGER__API_KEY=sk-...` (OpenRouter key without checking it into config), `ENGRAM_TAGGER__PROVIDER="" cargo run --bin engram -- serve` (silent-disable the tagger for a run).
+Env override examples: `KENGRAM_WORKER__TICK_INTERVAL_SECONDS=2 cargo run --bin kengram -- worker` (snappier ticks for development), `KENGRAM_TAGGER__API_KEY=sk-...` (OpenRouter key without checking it into config), `KENGRAM_TAGGER__PROVIDER="" cargo run --bin kengram -- serve` (silent-disable the tagger for a run).
 
 ### `[server]`
 
@@ -364,7 +364,7 @@ allowed_hosts = [
 
 | knob | default | what it does |
 |---|---|---|
-| `url` | `"postgres://engram:engram@localhost:5432/engram"` | Postgres connection string. Single-tenant; one database per Engram deployment. |
+| `url` | `"postgres://kengram:kengram@localhost:5432/kengram"` | Postgres connection string. Single-tenant; one database per Kengram deployment. |
 | `max_connections` | `10` | Size of the sqlx connection pool. Bump for high-tag-volume worker hosts; single-user dogfood is fine at 10. |
 
 ### `[embedder]`
@@ -374,7 +374,7 @@ allowed_hosts = [
 | `provider` | `"openai-compatible"` | Only provider in current builds. Covers Ollama, TEI, OpenAI, Voyage by varying `endpoint`/`model`. |
 | `endpoint` | `"http://localhost:11434/v1"` | `/v1` base URL. Ollama in dev; TEI in production. |
 | `model` | `"bge-m3"` | Backend model name as the server understands it. |
-| `model_id` | `"bge-m3:1024"` | Engram-side stable identity. The `:NNNN` suffix is the embedding dimension — must match an HNSW partial index in Postgres. Change this only in lockstep with a migration. |
+| `model_id` | `"bge-m3:1024"` | Kengram-side stable identity. The `:NNNN` suffix is the embedding dimension — must match an HNSW partial index in Postgres. Change this only in lockstep with a migration. |
 | `dimensions` | `1024` | Embedding vector dimension. Must match the model's actual output dim AND the `:NNNN` suffix above. |
 | `api_key` | `None` | Bearer token for hosted endpoints. Omit for Ollama/TEI. |
 | `timeout_seconds` | `5` | Per-request timeout. Local Ollama is sub-100ms typical; bump for slower hosted endpoints. |
@@ -387,22 +387,22 @@ The reranker is the optional cross-encoder stage that re-scores the top `candida
 |---|---|---|
 | `provider` | `""` | `""` = disabled; `"tei"` = TEI sidecar (currently the only supported provider). |
 | `endpoint` | `"http://localhost:8080"` | Service root, no `/v1` suffix. The reranker client appends `/rerank`. |
-| `model_id` | `"BAAI/bge-reranker-v2-m3"` | Engram-side stable identity. Dev override: `"cross-encoder/ms-marco-MiniLM-L-6-v2"` (matches the docker-compose pin). |
+| `model_id` | `"BAAI/bge-reranker-v2-m3"` | Kengram-side stable identity. Dev override: `"cross-encoder/ms-marco-MiniLM-L-6-v2"` (matches the docker-compose pin). |
 | `timeout_seconds` | `30` | Per-request timeout. MiniLM is sub-100ms on Apple Silicon; BGE-v2-m3 on GPU is similar; ARM CPU runs of BGE-v2-m3 are minutes per call (don't). |
 
 When the reranker times out or errors, the pipeline silently degrades to RRF + recency order and the response has `rerank_used: false`. Search still returns results.
 
 ### `[tagger]`
 
-The tagger is the per-thought metadata sidecar. Empty `provider` is the silent-disable sentinel: capture proceeds, no tag jobs enqueue, the worker doesn't spawn a tag drainer. Flip `provider = "openai-compatible"` (LLM via vLLM / Ollama / OpenRouter) or `"http"` (engram-native HTTP sidecar, any language) to enable. See [`docs/tagger-backends.md`](docs/tagger-backends.md) for the pluggability contract.
+The tagger is the per-thought metadata sidecar. Empty `provider` is the silent-disable sentinel: capture proceeds, no tag jobs enqueue, the worker doesn't spawn a tag drainer. Flip `provider = "openai-compatible"` (LLM via vLLM / Ollama / OpenRouter) or `"http"` (kengram-native HTTP sidecar, any language) to enable. See [`docs/tagger-backends.md`](docs/tagger-backends.md) for the pluggability contract.
 
 | knob | default | what it does |
 |---|---|---|
-| `provider` | `""` | `""` = disabled; `"openai-compatible"` (vLLM, etc.), `"openrouter"`, or `"http"` (engram-native sidecar — requires `[tagger.http]` below). |
+| `provider` | `""` | `""` = disabled; `"openai-compatible"` (vLLM, etc.), `"openrouter"`, or `"http"` (kengram-native sidecar — requires `[tagger.http]` below). |
 | `endpoint` | `"http://localhost:8000/v1"` | `/v1` base URL. vLLM default port. OpenRouter is `"https://openrouter.ai/api/v1"`. Ignored when `provider = "http"`. |
 | `model_name` | `"qwen2.5-7b-instruct"` | Model name as the backend understands it. For OpenRouter: a model slug like `"anthropic/claude-haiku-4.5"`. Ignored when `provider = "http"`. |
-| `model_id` | `"vllm/qwen2.5-7b-instruct"` | Engram-side stable identity written into `thoughts.tags_extractor_model`. Conventionally `<vendor>/<model>`. Used by both LLM and HTTP-sidecar providers. |
-| `model_version` | `7` | Tracks `engram_extract::BUNDLED_TAGGER_VERSION`. Written into `thoughts.tags_extractor_version`. Bump when the prompt or schema changes such that prior tags shouldn't be considered comparable; then `engram tag --rerun`. See [Tagger version history](#tagger-version-history-and-safe-re-tag-procedure). |
+| `model_id` | `"vllm/qwen2.5-7b-instruct"` | Kengram-side stable identity written into `thoughts.tags_extractor_model`. Conventionally `<vendor>/<model>`. Used by both LLM and HTTP-sidecar providers. |
+| `model_version` | `7` | Tracks `kengram_extract::BUNDLED_TAGGER_VERSION`. Written into `thoughts.tags_extractor_version`. Bump when the prompt or schema changes such that prior tags shouldn't be considered comparable; then `kengram tag --rerun`. See [Tagger version history](#tagger-version-history-and-safe-re-tag-procedure). |
 | `api_key` | `None` | Bearer token for hosted LLM endpoints. The HTTP sidecar provider has its own `[tagger.http].api_key`. |
 | `timeout_seconds` | `60` | Per-request timeout for the LLM provider. The HTTP sidecar provider has its own `[tagger.http].timeout_seconds`. |
 | `temperature` | `0.2` | Generation temperature. Lower = more deterministic. 0 makes some backends loop. LLM provider only. |
@@ -412,11 +412,11 @@ The tagger is the per-thought metadata sidecar. Empty `provider` is the silent-d
 
 ### `[tagger.http]`
 
-Active only when `[tagger].provider = "http"`. Engram POSTs `/tag` against the sidecar's `endpoint` using the [`engram-tagger-protocol`](crates/engram-tagger-protocol/) wire shape. Sidecars can be in any language; the reference implementation is [`engram-tagger-deterministic`](crates/engram-tagger-deterministic/) (a Rust-native zero-LLM tagger). See [`docs/tagger-sidecar-protocol.md`](docs/tagger-sidecar-protocol.md) for the wire contract.
+Active only when `[tagger].provider = "http"`. Kengram POSTs `/tag` against the sidecar's `endpoint` using the [`kengram-tagger-protocol`](crates/kengram-tagger-protocol/) wire shape. Sidecars can be in any language; the reference implementation is [`kengram-tagger-deterministic`](crates/kengram-tagger-deterministic/) (a Rust-native zero-LLM tagger). See [`docs/tagger-sidecar-protocol.md`](docs/tagger-sidecar-protocol.md) for the wire contract.
 
 | knob | default | what it does |
 |---|---|---|
-| `endpoint` | `"http://localhost:8082"` | Base URL of the sidecar. The client appends `/tag` to this. Default-coexists with the Tier 1 `engram serve` convention at `:8081`. |
+| `endpoint` | `"http://localhost:8082"` | Base URL of the sidecar. The client appends `/tag` to this. Default-coexists with the Tier 1 `kengram serve` convention at `:8081`. |
 | `api_key` | `None` | Optional bearer token sent as `Authorization: Bearer <token>` to the sidecar. |
 | `timeout_seconds` | `60` | Per-request timeout. Sidecars doing CPU inference can run long on first call. |
 
@@ -429,9 +429,9 @@ Active only when `[tagger].provider = "http"`. Engram POSTs `/tag` against the s
 
 ## Tagger version history and safe re-tag procedure
 
-The tagger's prompt + JSON schema is versioned by `engram_extract::BUNDLED_TAGGER_VERSION` (currently **13** for the openai-compatible LLM backend). Each thought row carries a `tags_extractor_version` recording the version it was tagged under, so the drainer can identify stale rows when the version is bumped.
+The tagger's prompt + JSON schema is versioned by `kengram_extract::BUNDLED_TAGGER_VERSION` (currently **13** for the openai-compatible LLM backend). Each thought row carries a `tags_extractor_version` recording the version it was tagged under, so the drainer can identify stale rows when the version is bumped.
 
-The deterministic HTTP-sidecar backend has its own independent version line (currently **1**) stamped via the sidecar's `MODEL_VERSION` env var. Re-tagging across backends works the same way (`engram tag --rerun`) but the version comparison is per-`tags_extractor_model` — a row stamped by the LLM backend isn't "stale" relative to the deterministic backend's version 1.
+The deterministic HTTP-sidecar backend has its own independent version line (currently **1**) stamped via the sidecar's `MODEL_VERSION` env var. Re-tagging across backends works the same way (`kengram tag --rerun`) but the version comparison is per-`tags_extractor_model` — a row stamped by the LLM backend isn't "stale" relative to the deterministic backend's version 1.
 
 ### Version changelog (LLM backend)
 
@@ -441,7 +441,7 @@ The full prompt-iteration history (v1 through v13, plus the v14 deterministic-ba
 - **v5** (M6.1, 2026-05-17). Added tagger-extracted relations into `thought_links`.
 - **v6–v9** (post-M6.1 dogfood, 2026-05-18). Kind classification rebalance, NOT-entities-list iteration, topics-as-concept-mapping, `tags.relations` dropped from persisted JSONB (migration 0011).
 - **v10–v13** (2026-05-22/23). Scope-vocab experiment, topic canonical-form normalization moved to post-process, people↔entities disjointness validator, USE-vs-MENTION discipline added to the prompt. v13 is the current bundled default.
-- **v14** (2026-05-24). Not a prompt bump — the pluggability framework + reference HTTP-sidecar tagger (`engram-tagger-deterministic`) shipped. LLM backend default unchanged; deterministic backend is opt-in via `provider = "http"` per the `[tagger.http]` config recipe in Section 3c above.
+- **v14** (2026-05-24). Not a prompt bump — the pluggability framework + reference HTTP-sidecar tagger (`kengram-tagger-deterministic`) shipped. LLM backend default unchanged; deterministic backend is opt-in via `provider = "http"` per the `[tagger.http]` config recipe in Section 3c above.
 
 See [`docs/tagger-backends.md`](docs/tagger-backends.md) for the pluggability contract, [`docs/tagger-sidecar-protocol.md`](docs/tagger-sidecar-protocol.md) for the HTTP-sidecar wire spec, and [`docs/tagger-improvements.md`](docs/tagger-improvements.md) for the v14 head-to-head measurement and rollout rationale.
 
@@ -449,25 +449,25 @@ See [`docs/tagger-backends.md`](docs/tagger-backends.md) for the pluggability co
 
 After bumping the tagger version (or the bundled default rolls forward and you want the corpus on the new schema):
 
-1. **Verify the resolved target version.** Start `engram serve` (or `engram worker`). The startup log line is:
+1. **Verify the resolved target version.** Start `kengram serve` (or `kengram worker`). The startup log line is:
    ```
    tagger: resolved config ... model_version=13 ...
    ```
-   And on the re-tag side, `engram tag` prints:
+   And on the re-tag side, `kengram tag` prints:
    ```
-   engram tag starting ... target_version=13 ...
+   kengram tag starting ... target_version=13 ...
    ```
-   If `target_version` is lower than expected, your `~/.config/engram/engram.toml` is overriding the bundled default. Bump it manually or delete the `model_version` line so the bundled default takes over.
+   If `target_version` is lower than expected, your `~/.config/kengram/kengram.toml` is overriding the bundled default. Bump it manually or delete the `model_version` line so the bundled default takes over.
 
 2. **Re-tag the corpus.** Whole corpus:
    ```bash
-   cargo run --bin engram -- tag --rerun --since 1970-01-01T00:00:00Z
+   cargo run --bin kengram -- tag --rerun --since 1970-01-01T00:00:00Z
    ```
-   The drainer walks rows where `tags_extractor_version < target_version`. Bound it tighter if you only want a recent window — `--since 2026-04-01T00:00:00Z` or `--scope-prefix engram.`.
+   The drainer walks rows where `tags_extractor_version < target_version`. Bound it tighter if you only want a recent window — `--since 2026-04-01T00:00:00Z` or `--scope-prefix kengram.`.
 
    **Cross-backend retag note.** If you're switching providers (e.g. flipping from `openai-compatible` v13 to `http` v1, or vice-versa), the version comparison no longer maps cleanly — a row stamped `tags_extractor_version = 13` from the LLM backend isn't "stale" relative to the deterministic sidecar's `model_version = 1`. To force a full re-tag under the new backend without bumping its `model_version`, use `--since` with an old date to walk by creation time instead of version: `--rerun --since 1970-01-01T00:00:00Z`. Alternatively, set the new backend's `model_version` to one above the highest existing version on the rows you want re-tagged.
 
-3. **Monitor the worker logs for failures.** The `engram tag complete` line reports `n_candidates`, `tagged`, `failed`. Non-zero `failed` exits non-zero so cron / scripts can detect partial failures; per-row errors are logged at WARN with the `thought_id`.
+3. **Monitor the worker logs for failures.** The `kengram tag complete` line reports `n_candidates`, `tagged`, `failed`. Non-zero `failed` exits non-zero so cron / scripts can detect partial failures; per-row errors are logged at WARN with the `thought_id`.
 
 4. **Spot-check.** psql is fine for this; there's no dedicated CLI:
    ```sql
@@ -477,7 +477,7 @@ After bumping the tagger version (or the bundled default rolls forward and you w
    ORDER BY tags_extractor_updated_at DESC
    LIMIT 10;
    ```
-   If the change was a migration (e.g. v9's 0011), use `engram audit migrations` instead — see [Operator workflows](#operator-workflows).
+   If the change was a migration (e.g. v9's 0011), use `kengram audit migrations` instead — see [Operator workflows](#operator-workflows).
 
 5. **Note for `tag_filter` consumers.** Agents that hardcoded `tag_filter` queries against an earlier prompt shape may need updating. For example, descriptive phrases like `agent memory protocol` or `cross-encoder` that v2 sometimes landed in `entities` are now consistently routed to `topics` (v3+); queries on `entities` will miss those thoughts. Migrate `tag_filter` to use `topics` for descriptive-phrase searches.
 
@@ -512,7 +512,7 @@ The generated `to_value` column (`COALESCE(to_thought_id::text, to_entity, to_pe
 
 ### MCP tools
 
-Three tools on the graph layer. Full request/response schemas are documented in the MCP server instructions (the `SERVER_INSTRUCTIONS` constant in `crates/engram-mcp/src/server.rs`); one-paragraph overview each:
+Three tools on the graph layer. Full request/response schemas are documented in the MCP server instructions (the `SERVER_INSTRUCTIONS` constant in `crates/kengram-mcp/src/server.rs`); one-paragraph overview each:
 
 - **`link_thoughts(from_thought_id, relation, {to_thought_id | to_entity | to_person | to_url}, note?)`** — Assert an edge from a thought to a polymorphic target. Supply exactly one of the four target fields. Returns `is_new` + `link_id` + the `to_kind`/`to_value` discriminator. Idempotent on the `(from, relation, to_kind, to_value)` quadruple: re-asserting a live edge returns `is_new=false`. If the edge was previously soft-deleted, a fresh live row is inserted and `is_new=true`. Validates target existence + the no-self-reference rule for thought targets.
 - **`unlink_thoughts(from_thought_id, relation, {one-of-four-targets})`** — Soft-delete a link by its `(from, relation, target)` triple. Returns a three-way `status`: `deleted_now`, `already_deleted`, or `never_existed`. Soft-deleted edges sit inert in the table; re-creating the same edge via `link_thoughts` succeeds (fresh row).
@@ -543,7 +543,7 @@ Tagger-emitted edges target non-thought endpoints only (`entity` / `person` / `u
 
 ## Operator workflows
 
-Day-to-day patterns. Each one assumes `engram serve` is running and reachable.
+Day-to-day patterns. Each one assumes `kengram serve` is running and reachable.
 
 ### Discover-then-query (scopes)
 
@@ -551,18 +551,18 @@ Before capturing into a new scope, see what's already in use. Before searching a
 
 ```text
 list_scopes()                                  # all scopes, most-recently-used first
-list_scopes(prefix="engram.")                  # namespace discovery
-search_thoughts(query="...", scope_prefix="engram.")    # query across the namespace
-recent_thoughts(scope_prefix="engram.", limit=20)       # browse a namespace
+list_scopes(prefix="kengram.")                  # namespace discovery
+search_thoughts(query="...", scope_prefix="kengram.")    # query across the namespace
+recent_thoughts(scope_prefix="kengram.", limit=20)       # browse a namespace
 ```
 
-The CLI equivalent for the search side: `engram embed-backfill` and `engram tag` both accept `--scope-prefix`. The shell-side flag for `engram stats` is `--scope-prefix` (filters the scopes summary section).
+The CLI equivalent for the search side: `kengram embed-backfill` and `kengram tag` both accept `--scope-prefix`. The shell-side flag for `kengram stats` is `--scope-prefix` (filters the scopes summary section).
 
 ### Capacity audit
 
 ```bash
-cargo run --bin engram -- stats
-cargo run --bin engram -- stats --scope-prefix engram. --top-scopes 50
+cargo run --bin kengram -- stats
+cargo run --bin kengram -- stats --scope-prefix kengram. --top-scopes 50
 ```
 
 Output is a sectional plain-text report:
@@ -576,18 +576,18 @@ A non-zero `pending_embeddings` count with on-disk-tables that match expectation
 
 ### Re-tag after tagger version bump
 
-See [Tagger version history and safe re-tag procedure](#tagger-version-history-and-safe-re-tag-procedure) for the procedure. Short version: verify `target_version` in the startup log, `engram tag --rerun --since 1970-01-01T00:00:00Z`, watch the WARN logs for per-row failures, spot-check.
+See [Tagger version history and safe re-tag procedure](#tagger-version-history-and-safe-re-tag-procedure) for the procedure. Short version: verify `target_version` in the startup log, `kengram tag --rerun --since 1970-01-01T00:00:00Z`, watch the WARN logs for per-row failures, spot-check.
 
 ### Migration audit
 
 ```bash
-cargo run --bin engram -- audit migrations
-cargo run --bin engram -- audit migrations --since 2026-05-01T00:00:00Z --limit 20
+cargo run --bin kengram -- audit migrations
+cargo run --bin kengram -- audit migrations --since 2026-05-01T00:00:00Z --limit 20
 ```
 
 Prints one entry per migration (most recent first), with `ran_at` timestamp, `rows_touched`, the migration filename, and the free-text `notes` column on a second line. Use this:
 
-- After running `engram migrate` — confirm each pending migration ran and touched the expected row count.
+- After running `kengram migrate` — confirm each pending migration ran and touched the expected row count.
 - When a migration's effect is in question — `rows_touched > 0` means data changed; `notes` describes why.
 - For audit / forensics — the table is append-only (one row per `sqlx migrate run` per migration), so it's a complete record of schema evolution since 0010.
 
@@ -595,7 +595,7 @@ Prints one entry per migration (most recent first), with `ran_at` timestamp, `ro
 
 `search_thoughts` falls through to trigram-only when the embedder won't answer. The response has `vector_search_available: false`; results still come back, just from the lexical leg. This is not an error.
 
-Meanwhile, the worker keeps `pending_embeddings` rows pinned. When the embedder recovers, the drainer picks them up on the next tick. To force a heal-then-drain without waiting: `engram embed-backfill`.
+Meanwhile, the worker keeps `pending_embeddings` rows pinned. When the embedder recovers, the drainer picks them up on the next tick. To force a heal-then-drain without waiting: `kengram embed-backfill`.
 
 If thoughts captured during the outage didn't get a queue row at all (a crash race between capture and enqueue), `embed-backfill` finds them too — it walks `thoughts` left-joined against the embeddings table and re-enqueues anything missing for the active model.
 
@@ -603,20 +603,20 @@ If thoughts captured during the outage didn't get a queue row at all (a crash ra
 
 `[tagger].provider = ""` is the silent-disable sentinel. Capture proceeds normally; the tag-job enqueue is a no-op and the worker doesn't spawn a tag drainer. Thoughts go in with `tags_extractor_version = NULL`.
 
-To enable later: set `provider = "openai-compatible"` (or `"openrouter"`), bring up the backend, restart `serve` + `worker`, and run `engram tag --rerun --since 1970-01-01T00:00:00Z` to catch the backlog. The serve startup log line reports which state it resolved to:
+To enable later: set `provider = "openai-compatible"` (or `"openrouter"`), bring up the backend, restart `serve` + `worker`, and run `kengram tag --rerun --since 1970-01-01T00:00:00Z` to catch the backlog. The serve startup log line reports which state it resolved to:
 
 ```text
-engram serve started ... tagger=disabled
+kengram serve started ... tagger=disabled
 # or
-engram serve started ... tagger=enabled (vllm/qwen2.5-7b-instruct)
+kengram serve started ... tagger=enabled (vllm/qwen2.5-7b-instruct)
 ```
 
 ### Embed-backfill after embedder downtime
 
 ```bash
-cargo run --bin engram -- embed-backfill --limit 1000
-cargo run --bin engram -- embed-backfill --scope work --limit 100
-cargo run --bin engram -- embed-backfill --scope-prefix engram. --limit 500
+cargo run --bin kengram -- embed-backfill --limit 1000
+cargo run --bin kengram -- embed-backfill --scope work --limit 100
+cargo run --bin kengram -- embed-backfill --scope-prefix kengram. --limit 500
 ```
 
 Heal-then-drain: finds thoughts missing an embedding row for the active model, enqueues them if they aren't already, then drains the queue inline. `--limit` caps the run so a huge backlog doesn't pin the embedder for an hour; iterate until the queue clears.
@@ -625,15 +625,15 @@ Exit code is non-zero on partial failure (`failed > 0`), suitable for cron-style
 
 ### Migrating between machines
 
-`engram backup` and `engram restore` wrap `pg_dump` / `pg_restore` with a `manifest.json` sidecar (engram version, schema head version, embedder model, tagger version, corpus counts). Restore validates the manifest against the target before touching anything destructive.
+`kengram backup` and `kengram restore` wrap `pg_dump` / `pg_restore` with a `manifest.json` sidecar (kengram version, schema head version, embedder model, tagger version, corpus counts). Restore validates the manifest against the target before touching anything destructive.
 
 **Prereq:** Postgres client tools on PATH on both source and target (`brew install postgresql@16` on macOS; `apt install postgresql-client-16` on Debian/Ubuntu). `pg_dump` and `pg_restore` are the same binaries the Postgres server ships; the client-only package suffices.
 
 **Source machine.** Back up the corpus:
 
 ```bash
-cargo run --bin engram -- backup
-# → ./engram-backup-2026-05-19T01-02-46-Z.tar.gz (308.3 KiB)
+cargo run --bin kengram -- backup
+# → ./kengram-backup-2026-05-19T01-02-46-Z.tar.gz (308.3 KiB)
 #   schema:    11_drop_tags_relations
 #   thoughts:  42 live, 10 retracted
 #   embeddings: 52
@@ -643,12 +643,12 @@ cargo run --bin engram -- backup
 #   tagger:    vllm/qwen2.5-7b-instruct v7
 ```
 
-Defaults to `./engram-backup-<timestamp>.tar.gz`; override with `--to <path>`. Use `--skip-embeddings` to drop embedding rows from the archive (smaller backup; restore requires `engram embed-backfill` to repopulate vectors; HNSW index survives an empty table).
+Defaults to `./kengram-backup-<timestamp>.tar.gz`; override with `--to <path>`. Use `--skip-embeddings` to drop embedding rows from the archive (smaller backup; restore requires `kengram embed-backfill` to repopulate vectors; HNSW index survives an empty table).
 
 **Transfer.** Plain file move. Over Tailnet:
 
 ```bash
-rsync -avP ./engram-backup-*.tar.gz ron@target.tailnet.ts.net:/tmp/
+rsync -avP ./kengram-backup-*.tar.gz ron@target.tailnet.ts.net:/tmp/
 ```
 
 **Target machine.** Prereqs (per the [Install prerequisites](#install-prerequisites) section). On a fresh box: install Docker / Rust / sqlx-cli / Ollama, clone the repo, `docker compose up -d postgres`, then bring the schema to head:
@@ -660,10 +660,10 @@ sqlx migrate run
 Then restore. On an empty target the `--force` flag is unnecessary; on a target with existing thoughts, `--force` is required and the command first prints a dry-run summary:
 
 ```bash
-cargo run --bin engram -- restore --from /tmp/engram-backup-*.tar.gz
-# Empty target → proceeds; prints "restored from ... Run `engram stats` to verify."
+cargo run --bin kengram -- restore --from /tmp/kengram-backup-*.tar.gz
+# Empty target → proceeds; prints "restored from ... Run `kengram stats` to verify."
 
-cargo run --bin engram -- restore --from /tmp/engram-backup-*.tar.gz --force
+cargo run --bin kengram -- restore --from /tmp/kengram-backup-*.tar.gz --force
 # Non-empty target → required; replaces existing data.
 ```
 
@@ -672,18 +672,18 @@ cargo run --bin engram -- restore --from /tmp/engram-backup-*.tar.gz --force
 | Mismatch | Outcome |
 |---|---|
 | Target schema head < source | Refuses. Run `sqlx migrate run` on target first. |
-| Target schema head > source | Refuses. Restore on a matching engram version, or use `--skip-version-check`. |
-| Embedder `model_id` / dimensions differ | Warns only — embeddings restore as-is; run `engram embed-backfill` after if you want to recompute under the new model. |
-| Tagger `model_id` or `version` differs | Warns only — tags restore as-is; `engram tag --rerun --since 1970-01-01T00:00:00Z` to refresh. |
+| Target schema head > source | Refuses. Restore on a matching kengram version, or use `--skip-version-check`. |
+| Embedder `model_id` / dimensions differ | Warns only — embeddings restore as-is; run `kengram embed-backfill` after if you want to recompute under the new model. |
+| Tagger `model_id` or `version` differs | Warns only — tags restore as-is; `kengram tag --rerun --since 1970-01-01T00:00:00Z` to refresh. |
 
 **Verify after restore:**
 
 ```bash
-cargo run --bin engram -- stats
-# Counts should match the manifest summary printed by `engram backup`.
+cargo run --bin kengram -- stats
+# Counts should match the manifest summary printed by `kengram backup`.
 ```
 
-**Docker-Postgres vs systemd-Postgres** on the target — no practical difference for backup/restore. Both speak the same network Postgres protocol that `pg_dump` and `pg_restore` use; the only thing that has to match is the `DATABASE_URL` (or `ENGRAM_DATABASE__URL` env override).
+**Docker-Postgres vs systemd-Postgres** on the target — no practical difference for backup/restore. Both speak the same network Postgres protocol that `pg_dump` and `pg_restore` use; the only thing that has to match is the `DATABASE_URL` (or `KENGRAM_DATABASE__URL` env override).
 
 ## Configuration presets and troubleshooting
 
@@ -740,7 +740,7 @@ temperature = 0.2
 Set the API key out-of-band via env to keep it out of TOML:
 
 ```bash
-export ENGRAM_TAGGER__API_KEY="sk-or-v1-..."
+export KENGRAM_TAGGER__API_KEY="sk-or-v1-..."
 ```
 
 The `model_id` prefix is the convention — `openrouter/<slug>` — so provenance reads cleanly when looking at `thoughts.tags_extractor_model` later.
@@ -767,7 +767,7 @@ model_id = "BAAI/bge-reranker-v2-m3"
 timeout_seconds = 30
 ```
 
-The reranker model is set in TEI itself (the `--model-id` arg to `text-embeddings-router`); `[reranker].model_id` is just the Engram-side stable identity.
+The reranker model is set in TEI itself (the `--model-id` arg to `text-embeddings-router`); `[reranker].model_id` is just the Kengram-side stable identity.
 
 ### Troubleshooting
 
@@ -776,22 +776,22 @@ The reranker model is set in TEI itself (the `--model-id` arg to `text-embedding
 **Tagger silent-disable: no tags landing.** Symptom: `thoughts.tags_extractor_version` stays `NULL` on new captures. Verify via the serve startup log:
 
 ```text
-engram serve started ... tagger=disabled
+kengram serve started ... tagger=disabled
 ```
 
-This means `[tagger].provider` resolved to `""`. Set it to `"openai-compatible"` (or `"openrouter"`), restart, and run `engram tag --rerun --since 1970-01-01T00:00:00Z` to backfill.
+This means `[tagger].provider` resolved to `""`. Set it to `"openai-compatible"` (or `"openrouter"`), restart, and run `kengram tag --rerun --since 1970-01-01T00:00:00Z` to backfill.
 
 **Reranker timeout.** When the reranker is unreachable or slow, the pipeline silently degrades to RRF + recency. The response has `rerank_used: false`; results still come back. No error is raised. If reranks are systematically falling through, check the TEI container health and `[reranker].timeout_seconds`.
 
-**Port collisions on `:8080`.** docker-compose maps TEI to host `:8080`, and the engram serve default is also `:8080`. When both run on the same machine, set `[server].bind` away from `:8080` (`127.0.0.1:8081` for local Tier 0, or `0.0.0.0:8081` + `allowed_hosts` for Tailnet Tier 1 — the M5.2 history). The other direction works too — remap TEI to a different host port in `docker-compose.yml` — but moving engram is usually less disruptive.
+**Port collisions on `:8080`.** docker-compose maps TEI to host `:8080`, and the kengram serve default is also `:8080`. When both run on the same machine, set `[server].bind` away from `:8080` (`127.0.0.1:8081` for local Tier 0, or `0.0.0.0:8081` + `allowed_hosts` for Tailnet Tier 1 — the M5.2 history). The other direction works too — remap TEI to a different host port in `docker-compose.yml` — but moving kengram is usually less disruptive.
 
 **Tagger schema field stripped by claude.ai's MCP client.** The hosted claude.ai web client strips optional MCP tool fields whose JSON schema lacks a concrete `type`. The fix (M5.2) is to declare `tag_filter` and `metadata` on the relevant tools as `Option<Map<String, Value>>` rather than `Option<Value>`, so schemars renders `type: ["object", "null"]` (concrete) rather than letting `type` go missing. If a new tool field goes missing in the claude.ai client but works in `mcp-inspector`, check the field's Rust type — `serde_json::Value` is too lax, use a concrete container.
 
-**Migration didn't run / unexpected schema.** Run `engram audit migrations` first. If a migration is missing from the audit log, it didn't run — re-run `engram migrate`. If it's there but `rows_touched` is unexpected, read the `notes` column for the migration's rationale and compare against the migration file in `migrations/`.
+**Migration didn't run / unexpected schema.** Run `kengram audit migrations` first. If a migration is missing from the audit log, it didn't run — re-run `kengram migrate`. If it's there but `rows_touched` is unexpected, read the `notes` column for the migration's rationale and compare against the migration file in `migrations/`.
 
 ## Port conflicts
 
-If something else already binds `5432`, edit `docker-compose.yml` to map a different host port (e.g. `"5433:5432"`) and update `DATABASE_URL` accordingly. Same for `8080` — see the troubleshooting note above on the engram-vs-TEI collision.
+If something else already binds `5432`, edit `docker-compose.yml` to map a different host port (e.g. `"5433:5432"`) and update `DATABASE_URL` accordingly. Same for `8080` — see the troubleshooting note above on the kengram-vs-TEI collision.
 
 ## Production note
 

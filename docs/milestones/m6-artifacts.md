@@ -1,6 +1,6 @@
 # M6 — Artifacts (SUPERSEDED)
 
-> **Status:** dropped 2026-05-17. The original M6 (artifacts) was reshaped after a live-corpus measurement and dogfood conversation; engram occupies a high-signal-density "sweet spot" between transcripts and tags, and storing arbitrary long-form documents would dilute that. M5.2's `to_url` link target already covers the "this thought references that external doc" case.
+> **Status:** dropped 2026-05-17. The original M6 (artifacts) was reshaped after a live-corpus measurement and dogfood conversation; kengram occupies a high-signal-density "sweet spot" between transcripts and tags, and storing arbitrary long-form documents would dilute that. M5.2's `to_url` link target already covers the "this thought references that external doc" case.
 >
 > The new M6 ships corpus stats CLI + tagger-extracted relations. See `m6-stats-and-tagger-relations.md`.
 >
@@ -12,9 +12,9 @@
 
 ## Goal
 
-Engram ingests long-form content — PDFs, transcripts, code files, web pages — and unifies it with thoughts in a single search index. The operator can point engram at existing material (past notes, agent transcripts, project documents) and have it become part of the same memory store thoughts live in.
+Kengram ingests long-form content — PDFs, transcripts, code files, web pages — and unifies it with thoughts in a single search index. The operator can point kengram at existing material (past notes, agent transcripts, project documents) and have it become part of the same memory store thoughts live in.
 
-This is the milestone that turns engram from "memory of agent interactions" into "memory of everything the operator wants engram to remember."
+This is the milestone that turns kengram from "memory of agent interactions" into "memory of everything the operator wants kengram to remember."
 
 ## In scope
 
@@ -23,7 +23,7 @@ This is the milestone that turns engram from "memory of agent interactions" into
 - Fetchers for `file://`, `https://` (with content-type sniffing for HTML / PDF / plain-text), and a `raw_text` path for inline content the caller has already loaded.
 - `artifact_chunks` populated with embeddings on the same `model_id` as thoughts (the existing HNSW partial index covers them — no schema change needed).
 - `search_thoughts` extended to "search across thoughts AND artifact_chunks." Both target kinds fused under one RRF ranking. Response shape gains a `target_kind` field per result.
-- New CLI subcommand: `engram ingest <uri> [--kind ...] [--scope ...]` for ad-hoc shell-driven ingestion.
+- New CLI subcommand: `kengram ingest <uri> [--kind ...] [--scope ...]` for ad-hoc shell-driven ingestion.
 
 ## Out of scope (deferred to which milestone)
 
@@ -46,10 +46,10 @@ If the chunker needs persistent state (e.g. tokenizer-version tracking), that ma
 
 ## Crate structure delta
 
-- **`engram-core`** gains a chunking module: `Chunker` trait, fixed-token impl (using `tiktoken-rs` or comparable), sentence-aware impl optional.
-- **`engram-storage`** gains repository functions for artifacts and chunks.
-- **`engram-embed`** is unchanged in shape but exercises the `Embedder` against chunk content (which is functionally identical to thought content).
-- **`engram-cli`** gains the `ingest` subcommand and the worker now drains an artifact-ingestion job in addition to the embedding queue from M2.
+- **`kengram-core`** gains a chunking module: `Chunker` trait, fixed-token impl (using `tiktoken-rs` or comparable), sentence-aware impl optional.
+- **`kengram-storage`** gains repository functions for artifacts and chunks.
+- **`kengram-embed`** is unchanged in shape but exercises the `Embedder` against chunk content (which is functionally identical to thought content).
+- **`kengram-cli`** gains the `ingest` subcommand and the worker now drains an artifact-ingestion job in addition to the embedding queue from M2.
 - **No new crate.**
 
 ## Dependencies

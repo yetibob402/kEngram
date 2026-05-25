@@ -1,5 +1,5 @@
 # Keep the docker build context lean — without this the
-# `crates/engram-tagger-deterministic/Dockerfile` COPY would include
+# `crates/kengram-tagger-deterministic/Dockerfile` COPY would include
 # the workspace's target/ directory (gigabytes) and .git/ history.
 
 # Build artifacts

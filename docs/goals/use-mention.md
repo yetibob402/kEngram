@@ -17,7 +17,7 @@
 
 ## Goal
 
-Close the use-mention failure in the engram tagger prompt so that
+Close the use-mention failure in the kengram tagger prompt so that
 meta-content thoughts no longer pollute their own `people` and
 `action_items` tags by extracting names/phrases mentioned as linguistic
 examples, quoted directives, or items in demonstrative lists.
@@ -25,8 +25,8 @@ examples, quoted directives, or items in demonstrative lists.
 ## Success criterion
 
 ```sh
-cargo run --example tagger_eval -p engram-extract -- \
-  crates/engram-extract/tests/fixtures/use_mention.json
+cargo run --example tagger_eval -p kengram-extract -- \
+  crates/kengram-extract/tests/fixtures/use_mention.json
 ```
 
 Pass condition (parse from the stdout summary line `N/12 passed` or the
@@ -45,7 +45,7 @@ fixtures move from FAIL to PASS (or vice versa) per iteration.
 
 ## Iteration loop
 
-**File to modify:** `crates/engram-extract/src/openai_compatible.rs`,
+**File to modify:** `crates/kengram-extract/src/openai_compatible.rs`,
 the `BUNDLED_TAGGER_PROMPT` const (search for `pub const
 BUNDLED_TAGGER_PROMPT`).
 
@@ -103,10 +103,10 @@ existing v8/v9/v11/v12 commit-and-push pattern.
   13) is the *ship* step and only happens after the criterion is met.
   Iterating with the same version stamped means the harness keeps
   measuring against the same baseline.
-- **Do not change `Tags` schema** (`crates/engram-core/src/tags.rs`)
+- **Do not change `Tags` schema** (`crates/kengram-core/src/tags.rs`)
   or the JSON shape the tagger emits.
 - **Do not introduce new crate dependencies.** Prompt-only changes.
-- **Do not break `cargo test -p engram-extract`** (currently 30/30 pass).
+- **Do not break `cargo test -p kengram-extract`** (currently 30/30 pass).
 - **Do not change existing fixture files.** If a fixture turns out to
   be wrongly specified, stop and report rather than edit it.
 - **Do not commit / push.** Stop at the winning prompt diff and let the
@@ -155,7 +155,7 @@ When stopping, produce:
 ## Risk + rollback
 
 - Prompt changes are scoped to one Rust string constant. `git restore
-  crates/engram-extract/src/openai_compatible.rs` is a clean rollback.
+  crates/kengram-extract/src/openai_compatible.rs` is a clean rollback.
 - If a winning prompt ships as v13 and turns out to over-suppress
   legitimate emissions in the real corpus, the next operator retag
   surfaces it; revert and re-iterate with stronger control-fixture

@@ -1,19 +1,19 @@
 # Tagger sidecar protocol — wire contract
 
 The human-readable companion to
-[`crates/engram-tagger-protocol/src/lib.rs`](../crates/engram-tagger-protocol/src/lib.rs)
+[`crates/kengram-tagger-protocol/src/lib.rs`](../crates/kengram-tagger-protocol/src/lib.rs)
 (the serde-derived types in that crate ARE the spec; this doc targets
 non-Rust implementers who want to read the JSON shape without parsing
 Rust source).
 
-When engram's `[tagger].provider = "http"`, the worker POSTs to a
+When kengram's `[tagger].provider = "http"`, the worker POSTs to a
 sidecar that implements the protocol below. Sidecars can be written in
 any language; the only requirement is speaking the JSON wire shape and
 returning HTTP status codes that match the transient-vs-non-transient
-classification engram's drainer relies on.
+classification kengram's drainer relies on.
 
 The reference sidecar lives at
-[`crates/engram-tagger-deterministic/`](../crates/engram-tagger-deterministic/);
+[`crates/kengram-tagger-deterministic/`](../crates/kengram-tagger-deterministic/);
 its Dockerfile + README cover the asset setup. Anyone writing a sidecar
 in another language can copy the wire shape from this doc and ignore
 the Rust implementation entirely.
@@ -24,7 +24,7 @@ Current: `"1"`.
 
 Bumped when the JSON shapes change in a way that older sidecars can't
 honor. Sent on every request as a string field; sidecars may echo it
-in the response so engram can detect mismatches at the first call
+in the response so kengram can detect mismatches at the first call
 rather than as silent misbehavior.
 
 ## Endpoints
@@ -44,7 +44,7 @@ Content-Type: application/json
   "content": "Sarah pushed the new bge-m3 reranker config. Need to verify the latency improvement holds.",
   "vocab": {
     "topics":   ["memory-systems", "rust"],
-    "entities": ["engram", "pgvector"]
+    "entities": ["kengram", "pgvector"]
   }
 }
 ```
@@ -83,7 +83,7 @@ Field reference:
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `protocol_version` | string\|null | no | Optional. If present, must equal the request's version or engram rejects with `Misconfigured`. |
+| `protocol_version` | string\|null | no | Optional. If present, must equal the request's version or kengram rejects with `Misconfigured`. |
 | `tags` | object | yes | Persisted metadata. All fields are arrays except `kind` (string\|null). An empty `tags` (every field empty/null) is a valid "nothing extractable" response. |
 | `tags.people` | string[] | no | Default `[]`. Person names extracted from the thought. |
 | `tags.entities` | string[] | no | Default `[]`. Proper-noun-style identifiers (projects, products, libraries). Deprecated under the 5-field schema; non-LLM sidecars typically leave empty. |
@@ -99,7 +99,7 @@ Field reference:
 {
   "relation":  "supports",
   "to_kind":   "entity",
-  "to_value":  "engram",
+  "to_value":  "kengram",
   "note":      "optional commentary"
 }
 ```
@@ -117,7 +117,7 @@ it empty.
 
 ### `GET /health`
 
-Liveness probe. Engram doesn't call this directly, but Docker
+Liveness probe. Kengram doesn't call this directly, but Docker
 healthchecks + operator scripts often do.
 
 **Response:**
@@ -131,11 +131,11 @@ Content-Type: application/json
 
 The reference sidecar returns 200 as soon as startup completes (model
 loaded, taxonomy embedded). Sidecars are free to define their own
-liveness criteria — engram doesn't depend on this endpoint.
+liveness criteria — kengram doesn't depend on this endpoint.
 
 ## Error semantics
 
-Engram's drainer treats responses according to HTTP status:
+Kengram's drainer treats responses according to HTTP status:
 
 | Status range | Drainer behavior |
 |---|---|
@@ -151,13 +151,13 @@ but they're not mandated by the protocol):
 - `400 Bad Request` for unsupported `protocol_version` or malformed
   request bodies.
 - `422 Unprocessable Entity` for non-transient pipeline failures (e.g.
-  a model file is missing — engram retrying won't help).
+  a model file is missing — kengram retrying won't help).
 - `503 Service Unavailable` for transient pipeline failures (embedder
   unreachable, ONNX runtime hiccup — retry might succeed).
 - `500 Internal Server Error` for unexpected exceptions.
 
 Body for non-200 responses is conventionally `{"error": "..."}` but
-engram's client only reads the status code + raw body string for the
+kengram's client only reads the status code + raw body string for the
 error message; the exact shape doesn't matter.
 
 ## Writing a sidecar in another language
@@ -194,7 +194,7 @@ def health():
 ```
 
 That's the entire contract on the sidecar side. Anything that speaks
-this JSON over HTTP works with engram's `provider = "http"` arm.
+this JSON over HTTP works with kengram's `provider = "http"` arm.
 
 ## Compatibility commitments
 
@@ -202,7 +202,7 @@ The protocol crate's serde derives use `#[serde(default)]` for every
 optional field, so:
 
 - **Adding a new optional field to `tags`** is backward-compatible —
-  older sidecars omit the field; engram parses with the default.
+  older sidecars omit the field; kengram parses with the default.
 - **Adding a new variant to `kind`** is backward-compatible at the
   Rust level (the variants are an enum so unknown variants fail
   deserialization). Wire-protocol-wise, treat as a breaking change
@@ -212,8 +212,8 @@ optional field, so:
 - **Changing the meaning of an existing field** is a breaking change
   → bump `protocol_version`.
 
-When the protocol version bumps, engram's HTTP-tagger client and the
+When the protocol version bumps, kengram's HTTP-tagger client and the
 reference sidecar bump together. Non-Rust sidecars must update to the
 new version; the response's optional `protocol_version` field lets
-engram detect a mismatch at the first call rather than later as
+kengram detect a mismatch at the first call rather than later as
 malformed-data drift.

@@ -1,0 +1,19 @@
+[package]
+name = "kengram-tagger-protocol"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+# Wire contract for the HTTP tagger sidecar pattern. Defines the JSON
+# request/response shapes that kengram's HTTP-tagger client and any
+# sidecar (in any language) agree on. Re-exports the kengram-core types
+# the wire shape carries so a single dep covers both ends.
+
+[dependencies]
+kengram-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

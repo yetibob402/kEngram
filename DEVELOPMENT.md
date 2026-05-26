@@ -40,8 +40,8 @@ ollama pull qwen2.5:7b-instruct    # tagging (worker, on by default)
 | Script | What it does |
 |---|---|
 | `./start_stack.sh` | Brings up the backing containers (`postgres` + the `tei` reranker) and blocks until Postgres is ready. Pass `--tagger` to also start the opt-in deterministic tagger sidecar. Sets no env vars — service config lives in `docker-compose.yml`. |
-| `./start_server.sh` | Runs `kengram serve` in the foreground (MCP server on `127.0.0.1:8080`, endpoint `/mcp`). |
-| `./start_worker.sh` | Runs `kengram worker` in the foreground — drains `pending_embeddings` and (by default) `pending_tags`, tagging via local Ollama. |
+| `./start_server.sh` | Runs `kengram serve` in the foreground (MCP server on `127.0.0.1:8080`, endpoint `/mcp`). Reads its DB URL from `kengram.toml` / `KENGRAM_DATABASE__URL` / the built-in default. |
+| `./start_worker.sh` | Runs `kengram worker` in the foreground — drains `pending_embeddings` and `pending_tags`. Honors your `[tagger]` config; with no config file it defaults to tagging via local Ollama. `off` forces embed-only. |
 | `./stop_stack.sh` | Stops the backing containers. Default keeps the containers and the Postgres data volume for a fast resume; `--down` removes the containers and network (the data volume is still preserved). |
 
 **Two-terminal flow:**
@@ -61,26 +61,17 @@ ollama pull qwen2.5:7b-instruct    # tagging (worker, on by default)
 
 `start_stack.sh` exits once Postgres is ready (TEI keeps warming in the background — only reranked search waits on it). The server and worker both run in the foreground, so each wants its own terminal.
 
-**Tagging is on by default** via local Ollama (`qwen2.5:7b-instruct`). For an embed-only worker, pass `off`:
+**The worker honors your tagger config.** Precedence is built-in defaults < `~/.config/kengram/kengram.toml` < `KENGRAM_*` env. `start_worker.sh` stays out of the way: if you have a `kengram.toml` (or set `KENGRAM_TAGGER__*` yourself), it's used as-is. **Only when no config file exists** does the script enable a zero-config default — tagging via local Ollama (`qwen2.5:7b-instruct`) — so a fresh checkout tags out of the box.
 
 ```bash
-./start_worker.sh off            # drains embeddings only; no tagging
+./start_worker.sh                # honor kengram.toml; else default to Ollama tagging
+./start_worker.sh off            # force embed-only this run (no tagging)
+KENGRAM_TAGGER__MODEL_NAME=qwen2.5:14b-instruct ./start_worker.sh   # one-off override (wins over the file)
 ```
 
-Every tagger value is overridable from the environment without editing the script, e.g.:
+To run a different tagger backend persistently — vLLM, OpenRouter, the HTTP sidecar, or another Ollama model — put a `[tagger]` block in `~/.config/kengram/kengram.toml` (see [Configuration reference](#configuration-reference)); the script honors it.
 
-```bash
-KENGRAM_TAGGER__MODEL_NAME=qwen2.5:14b-instruct \
-KENGRAM_TAGGER__MODEL_ID=ollama/qwen2.5:14b-instruct \
-  ./start_worker.sh
-```
-
-> **Backfill note.** The worker only tags *newly enqueued* thoughts. If you captured thoughts before enabling the tagger, catch up once with:
-> ```bash
-> cargo run --bin kengram -- tag --rerun --since 1970-01-01T00:00:00Z
-> ```
-
-To use vLLM, OpenRouter, or the HTTP sidecar instead of Ollama, put the relevant `[tagger]` block in `~/.config/kengram/kengram.toml` (see [Configuration reference](#configuration-reference)); config-file settings and the script env defaults layer cleanly, with env winning.
+> **Backfill note.** The worker only tags *newly enqueued* thoughts. After enabling or switching the tagger, catch up the existing corpus with `kengram tag --force` (re-tags regardless of version), or `kengram tag --rerun --since 1970-01-01T00:00:00Z`.
 
 ---
 

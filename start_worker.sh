@@ -3,42 +3,37 @@
 # tagger provider is configured — pending_tags. Run ./start_stack.sh first and
 # ./start_server.sh in another terminal.
 #
-# Tagging defaults to ON via local Ollama (qwen2.5:7b-instruct on :11434), the
-# instruction-tuned model the bundled tagger prompt was iterated against. Every
-# value below is overridable from the environment; pass `off` as the first arg
-# to run an embed-only worker (no tagging).
+# Config precedence (later wins): built-in defaults < ~/.config/kengram/kengram.toml
+# < KENGRAM_* env. This script honors your config: if you have a kengram.toml
+# (or have set KENGRAM_TAGGER__* yourself), it is used as-is — the script injects
+# nothing. ONLY when no tagger config is present does it enable a zero-config
+# default — tagging via local Ollama (qwen2.5:7b-instruct on :11434) — so a fresh
+# checkout tags out of the box.
 #
-#   ./start_worker.sh            # embed + tag (Ollama qwen2.5:7b-instruct)
-#   ./start_worker.sh off        # embed only, no tagger
-#   KENGRAM_TAGGER__MODEL_NAME=qwen3-coder:30b ./start_worker.sh   # override model
+#   ./start_worker.sh            # honor kengram.toml; else default to Ollama tagging
+#   ./start_worker.sh off        # force embed-only (no tagging) this run
+#   KENGRAM_TAGGER__MODEL_NAME=… ./start_worker.sh   # one-off override (wins over the file)
 set -euo pipefail
 
-DB_URL='postgres://kengram:kengram@localhost:5432/kengram'
-
-# Tagger config. The [tagger] section's REAL keys (config.rs): a non-empty
-# provider is what ENABLES tagging — there is no separate `enabled` knob, and
-# there is no [reflector]/[extractor] section (renamed to [tagger] at M4).
-# "openai-compatible" covers Ollama's /v1 endpoint. Override any of these from
-# the environment; the defaults below match the config-file defaults.
-TAGGER_PROVIDER="${KENGRAM_TAGGER__PROVIDER:-openai-compatible}"
-TAGGER_ENDPOINT="${KENGRAM_TAGGER__ENDPOINT:-http://localhost:11434/v1}"
-TAGGER_MODEL_NAME="${KENGRAM_TAGGER__MODEL_NAME:-qwen2.5:7b-instruct}"
-TAGGER_MODEL_ID="${KENGRAM_TAGGER__MODEL_ID:-ollama/qwen2.5:7b-instruct}"
-TAGGER_TIMEOUT="${KENGRAM_TAGGER__TIMEOUT_SECONDS:-60}"
-
-# `off` → embed-only: leave provider empty so the tag drainer never spawns
-# (silent-disable sentinel, config.rs:302).
+# Force embed-only for this run, overriding whatever the config says. An empty
+# provider is the silent-disable sentinel — the tag drainer never spawns.
 if [[ "${1:-}" == "off" ]]; then
-  TAGGER_PROVIDER=""
+  exec env KENGRAM_TAGGER__PROVIDER="" cargo run --bin kengram -- worker
 fi
 
-# KENGRAM_DATABASE__URL is what the running binary reads; DATABASE_URL is what
-# the build-time sqlx::query! macros / sqlx-cli read. Set both from one value.
-KENGRAM_DATABASE__URL="$DB_URL" \
-DATABASE_URL="$DB_URL" \
-KENGRAM_TAGGER__PROVIDER="$TAGGER_PROVIDER" \
-KENGRAM_TAGGER__ENDPOINT="$TAGGER_ENDPOINT" \
-KENGRAM_TAGGER__MODEL_NAME="$TAGGER_MODEL_NAME" \
-KENGRAM_TAGGER__MODEL_ID="$TAGGER_MODEL_ID" \
-KENGRAM_TAGGER__TIMEOUT_SECONDS="$TAGGER_TIMEOUT" \
+# Honor the operator's config. If a config file exists, or a tagger provider is
+# already set in the environment, inject nothing — let kengram resolve [tagger]
+# (and [database]) from the file / env / built-in defaults on its own.
+if [[ -f "${HOME}/.config/kengram/kengram.toml" || -n "${KENGRAM_TAGGER__PROVIDER:-}" ]]; then
+  exec cargo run --bin kengram -- worker
+fi
+
+# Zero-config fallback: no config file and no tagger provider set, so enable
+# tagging via local Ollama out of the box. Any individual value is still
+# overridable from the environment.
+exec env \
+  KENGRAM_TAGGER__PROVIDER=openai-compatible \
+  KENGRAM_TAGGER__ENDPOINT="${KENGRAM_TAGGER__ENDPOINT:-http://localhost:11434/v1}" \
+  KENGRAM_TAGGER__MODEL_NAME="${KENGRAM_TAGGER__MODEL_NAME:-qwen2.5:7b-instruct}" \
+  KENGRAM_TAGGER__MODEL_ID="${KENGRAM_TAGGER__MODEL_ID:-ollama/qwen2.5:7b-instruct}" \
   cargo run --bin kengram -- worker

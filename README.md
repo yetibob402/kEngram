@@ -33,29 +33,30 @@ brew install ollama   # or: download from https://ollama.com/
 
 ### Run
 
+The fastest path uses the launch scripts at the repo root. (Manual steps and customization: [DEVELOPMENT.md](DEVELOPMENT.md#manual-setup-advanced).)
+
 ```bash
-# 1. Bring up Postgres
-docker compose up -d postgres
+# 0. Pull the models once (Ollama running)
+ollama pull bge-m3                 # embeddings
+ollama pull qwen2.5:7b-instruct    # tagging (worker, on by default)
 
-# 2. Bring up the embedding backend. Ollama runs as a background daemon on
-#    macOS via `brew services start ollama`; otherwise leave `ollama serve`
-#    running in a terminal. Then pull the 1024-dim BGE-M3 model:
-ollama pull bge-m3
+# 1. Backing containers (Postgres + TEI reranker); waits for Postgres to be ready
+./start_stack.sh
 
-# 3. Apply migrations (uses sqlx-cli directly; no compilation needed)
+# 2. Apply migrations (idempotent; safe to re-run)
 export DATABASE_URL='postgres://kengram:kengram@localhost:5432/kengram'
 sqlx migrate run
 
-# 4. Terminal 1: the MCP server (binds 127.0.0.1:8080, MCP endpoint at /mcp)
-cargo run --bin kengram -- serve
+# 3. Terminal 1 — MCP server (binds 127.0.0.1:8080, MCP endpoint /mcp)
+./start_server.sh
 
-# 5. Terminal 2: the worker (drains pending_embeddings and pending_tags)
-cargo run --bin kengram -- worker
+# 4. Terminal 2 — worker (drains embeddings + tags; pass `off` for embed-only)
+./start_worker.sh
 ```
 
-A freshly-captured thought returns `embedding_status: "pending"`; that's normal — the worker picks it up on the next tick (default 5 seconds) and the vector becomes searchable. Trigram (lexical) search picks the thought up immediately, so retrieval still works during the gap.
+A freshly-captured thought returns `embedding_status: "pending"` — that's normal; the worker picks it up on the next tick (default 5 seconds) and the vector becomes searchable. Lexical (trigram) search finds it immediately, so retrieval works during the gap.
 
-Once the server is up, point an MCP client at `http://127.0.0.1:8080/mcp` — see [Connecting MCP clients](#connecting-mcp-clients) below.
+Once the server is up, point an MCP client at `http://127.0.0.1:8080/mcp` — see [Connecting MCP clients](#connecting-mcp-clients).
 
 ## Connecting MCP clients
 
@@ -185,7 +186,7 @@ Any client speaking streamable-HTTP can point at `http://127.0.0.1:8080/mcp` dir
 | `get_related_thoughts` | Walk the link graph from a thought. Returns `outbound` + `inbound` groups; each hit carries a `to_kind`/`to_value` discriminator and a `link_source` (`agent` vs `tagger`). For thought-target hits, also surfaces the target's content-preview, scope, retraction state, and timestamps. Optional filters by relation, target kind, and direction. |
 | `list_scopes` | Enumerate scopes currently in use (each with `thought_count`, `first_activity_at`, `last_activity_at`), sorted most-recently-used first. Optional `prefix` filter. Pair with `scope_prefix` on `search_thoughts` / `recent_thoughts` to query across a namespace. |
 
-CLI subcommands: `kengram serve`, `kengram worker`, `kengram migrate`, `kengram embed-backfill`, `kengram tag`, `kengram stats`, `kengram bench`, `kengram audit migrations`. Operational details in [Operator workflows](DEVELOPMENT.md#operator-workflows) in DEVELOPMENT.md.
+CLI subcommands: `kengram serve`, `kengram worker`, `kengram migrate`, `kengram embed-backfill`, `kengram tag`, `kengram stats`, `kengram bench`, `kengram audit migrations`, `kengram backup`, `kengram restore`. Operational details in [Operator workflows](DEVELOPMENT.md#operator-workflows) in DEVELOPMENT.md.
 
 ## How tagging works
 
@@ -195,7 +196,7 @@ Thoughts are the unit of storage. Each thought is a free-form blob of text plus 
 
 **2. Drain.** The `kengram worker` process runs two drainers in parallel on the `[worker] tick_interval_seconds` cadence. The embed drainer calls the configured `[embedder]` and inserts vectors; the tag drainer calls the configured `[tagger]` and writes `tags` + provenance (`tags_extractor_model`, `tags_extractor_version`, `tags_extracted_at`).
 
-**3. Tag shape.** The tagger speaks OpenAI's `/v1/chat/completions` with `response_format: { type: "json_schema", strict: true, ... }`. Guided decoding (vLLM's `xgrammar`, OpenRouter's structured outputs) makes the response guaranteed-parseable. The prompt and schema live in `crates/kengram-extract/src/openai_compatible.rs`; the current version is **v7** (`BUNDLED_TAGGER_VERSION = 7`). Output shape:
+**3. Tag shape.** The tagger speaks OpenAI's `/v1/chat/completions` with `response_format: { type: "json_schema", strict: true, ... }`. Guided decoding (vLLM's `xgrammar`, OpenRouter's structured outputs) makes the response guaranteed-parseable. The prompt and schema live in `crates/kengram-extract/src/openai_compatible.rs`; the current version is **v13** (`BUNDLED_TAGGER_VERSION = 13`). Output shape:
 
 ```json
 {
@@ -210,7 +211,7 @@ Thoughts are the unit of storage. Each thought is a free-form blob of text plus 
 
 Tagger-emitted relations land in `thought_links` (with `source='tagger'`), not in this JSONB — `thought_links` is the single canonical store for the link graph; the `tags` JSONB is metadata only. Migration `0011_drop_tags_relations` removed the legacy `tags.relations` key from existing rows.
 
-`entities` are canonical proper names the prose mentions (projects, products, libraries, tools, organizations); descriptive phrases belong in `topics`. `topics` are broader subject categories. Keeping them separate lets `tag_filter` distinguish "thoughts that mention kengram by name" from "thoughts categorized under memory-systems." `kind` is one of `observation | task | idea | reference | person_note | session` (or `null` if the model is unsure). Tags are **advisory** — a wrong tag is low-impact because retrieval still works against the raw content via vector + trigram. See [Tagger version history](DEVELOPMENT.md#tagger-version-history-and-safe-re-tag-procedure) in DEVELOPMENT.md for the full v1→v7 changelog and re-tag procedure.
+`entities` are canonical proper names the prose mentions (projects, products, libraries, tools, organizations); descriptive phrases belong in `topics`. `topics` are broader subject categories. Keeping them separate lets `tag_filter` distinguish "thoughts that mention kengram by name" from "thoughts categorized under memory-systems." `kind` is one of `observation | task | idea | reference | person_note | session` (or `null` if the model is unsure). Tags are **advisory** — a wrong tag is low-impact because retrieval still works against the raw content via vector + trigram. See [Tagger version history](DEVELOPMENT.md#tagger-version-history-and-safe-re-tag-procedure) in DEVELOPMENT.md for the full v1→v13 changelog and re-tag procedure.
 
 **Scope-aware vocabulary.** Before tagging, the drainer fetches the top-N most-frequent topic and entity terms used in the same scope and injects them as a tie-break vocabulary hint. The v4+ prompt frames vocab as suggestions — the model uses a vocab term when it accurately fits and coins a new one when nothing does (precision over consistency). Configurable via `[tagger].scope_vocab_enabled` (default `true`) and `[tagger].scope_vocab_size` (default `50`). Tuning details in [Configuration presets and troubleshooting](DEVELOPMENT.md#configuration-presets-and-troubleshooting) in DEVELOPMENT.md.
 
@@ -271,10 +272,10 @@ crates/
 ├── kengram-embed/     # Embedder + Reranker impls: OpenAICompatibleEmbedder, TeiReranker, fakes
 ├── kengram-extract/   # Tagger impls: OpenAICompatibleTagger (vLLM/OpenRouter), FakeTagger
 ├── kengram-mcp/       # capture/search/get/recent/retract/link/unlink/related/scopes orchestrators + rmcp wiring
-└── kengram-cli/       # binary; serve/migrate/worker/embed-backfill/tag/stats/bench/audit subcommands
+└── kengram-cli/       # binary; serve/migrate/worker/embed-backfill/tag/stats/bench/audit/backup/restore subcommands
 migrations/           # sqlx migrations (numbered)
 docs/                 # design doc + per-milestone scope/progress
-scripts/              # operator-driven runbooks (smoke.md, bench-rerank.md)
+scripts/              # operator-driven runbooks (bench-rerank.md)
 ```
 
 ## Roadmap

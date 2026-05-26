@@ -16,7 +16,7 @@ It is OB1's architectural shape — Postgres + pgvector + a thin MCP gateway —
 
 The deployment target is single-user, single-active-session. Concurrent multi-user serving is explicitly not in scope.
 
-The system is built incrementally across six milestones (§3.5). The remainder of this document describes the *terminal* state — all six milestones complete. Inline milestone callouts (e.g. `[M1]`, `[M2+]`) flag features that arrive at a specific milestone. §3.5 is the source of truth for what ships when, and supersedes anything elsewhere in the document that reads as if a feature is "v0."
+The system is built incrementally across seven capability milestones (M1–M7), preceded by a small environment-setup milestone (M0) (§3.5). The remainder of this document describes the *terminal* state — all seven capability milestones complete (M7's backup/restore surface has shipped). Inline milestone callouts (e.g. `[M1]`, `[M2+]`) flag features that arrive at a specific milestone. §3.5 is the source of truth for what ships when, and supersedes anything elsewhere in the document that reads as if a feature is "v0."
 
 ## 2. Goals
 
@@ -37,7 +37,7 @@ The system is built incrementally across six milestones (§3.5). The remainder o
 
 ## 3.5 Milestone roadmap
 
-The system is built in six capability milestones, preceded by a small environment-setup milestone (M0). Each capability milestone is independently shippable: at the end of M1 the operator has a usable memory service; subsequent milestones add capability without invalidating prior ones.
+The system is built in seven capability milestones (M1–M7), preceded by a small environment-setup milestone (M0). Each capability milestone is independently shippable: at the end of M1 the operator has a usable memory service; subsequent milestones add capability without invalidating prior ones.
 
 **M0 — Development environment.** *The floor under the floor.*
 - Postgres 16 running in Docker via `docker-compose.yml` at the repo root, using the `pgvector/pgvector:pg16` image (bundles `vector`, `pg_trgm`, `pgcrypto`).
@@ -172,7 +172,9 @@ CREATE TABLE thoughts (
     UNIQUE (content_fingerprint)
 );
 
-CREATE INDEX thoughts_scope_recent_idx
+CREATE INDEX thoughts_scope_recent_idx                      -- [M1]
+    ON thoughts (scope, created_at DESC);
+CREATE INDEX thoughts_active_scope_recent_idx               -- [M3] excludes retracted
     ON thoughts (scope, created_at DESC) WHERE retracted_at IS NULL;
 CREATE INDEX thoughts_content_trgm_idx
     ON thoughts USING gin (content gin_trgm_ops);
@@ -272,7 +274,7 @@ There is one write path. It terminates in a `thoughts` row plus an embedding plu
 
 1. **Drain.** `SELECT thought_id, tagger_model_id FROM pending_tags ORDER BY enqueued_at ASC FOR UPDATE SKIP LOCKED LIMIT $batch_size`. Fetched in the same idempotent style as `pending_embeddings`.
 
-2. **Tag.** Call `Tagger::tag(content, vocab)`. The default impl (`OpenAICompatibleTagger`) POSTs to `/v1/chat/completions` with the bundled prompt (currently v7) + `response_format: { type: "json_schema", strict: true, schema: { ... } }`. Schema (live in `crates/kengram-extract/src/openai_compatible.rs`):
+2. **Tag.** Call `Tagger::tag(content, vocab)`. The default impl (`OpenAICompatibleTagger`) POSTs to `/v1/chat/completions` with the bundled prompt (currently v13) + `response_format: { type: "json_schema", strict: true, schema: { ... } }`. Schema (live in `crates/kengram-extract/src/openai_compatible.rs`):
 
     ```json
     {
@@ -371,7 +373,7 @@ CREATE TABLE thought_links (
 
 -- Idempotency on the live (non-deleted) triple. Soft-deleted rows don't
 -- conflict, so re-creating a previously-removed edge succeeds.
-CREATE UNIQUE INDEX thought_links_live_uq
+CREATE UNIQUE INDEX thought_links_unique_edge
     ON thought_links (from_thought_id, relation, to_kind, to_value)
     WHERE deleted_at IS NULL;
 ```
@@ -521,7 +523,10 @@ Configuration is a TOML file:
 
 ```toml
 [database]
-# Postgres connection. Overridden by DATABASE_URL env var if set (sqlx convention).
+# Postgres connection. The running binary reads this via figment; override at
+# runtime with KENGRAM_DATABASE__URL (KENGRAM_ prefix, __ for nesting). Plain
+# DATABASE_URL is honored only by sqlx-cli and the build-time sqlx::query! macros,
+# NOT by the running kengram binary.
 url = "postgres://kengram:kengram@localhost:5432/kengram"
 max_connections = 10
 
@@ -546,22 +551,30 @@ batch_size            = 16                      # max jobs per tick (per queue)
 [reranker]                                      # [M3]
 provider        = "tei"                         # "" = disabled (default)
 endpoint        = "http://localhost:8080"       # TEI; no /v1 suffix (impl appends /rerank)
-model_id        = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+model_id        = "BAAI/bge-reranker-v2-m3"     # code default; the dev docker-compose TEI
+                                                # serves cross-encoder/ms-marco-MiniLM-L-6-v2,
+                                                # so override this to match in dev
 timeout_seconds = 30
 
 [tagger]                                        # [M4]; empty provider = silent disable
-provider        = "openai-compatible"           # alternative: "openrouter"; "" = disabled
+provider        = "openai-compatible"           # alternatives: "openrouter", "http"; "" = disabled
 endpoint        = "http://localhost:8000/v1"    # vLLM default
 model_name      = "qwen2.5-7b-instruct"         # backend-side model name
 model_id        = "vllm/qwen2.5-7b-instruct"    # provenance label → thoughts.tags_extractor_model
-model_version   = 7                             # tracks BUNDLED_TAGGER_VERSION; bump on prompt/schema change
+model_version   = 13                            # tracks BUNDLED_TAGGER_VERSION; bump on prompt/schema change
 scope_vocab_enabled = true                      # [M4.1] controlled-vocabulary hint per scope
 scope_vocab_size    = 50                        # [M4.1] top-N established terms per scope
 timeout_seconds = 60
 temperature     = 0.2
+
+# Required only when [tagger].provider = "http" (the deterministic GLiNER+regex
+# sidecar). Ignored otherwise.
+[tagger.http]
+endpoint        = "http://localhost:8082"       # deterministic-tagger sidecar default
+timeout_seconds = 60
 ```
 
-The `[extractor]` and `[reflector]` sections that shipped in M2 were removed by M4. The tagger drainer is always-on when `[tagger].provider` is non-empty — no cron, no opt-in flag, no confidence-band routing.
+The `[extractor]` and `[reflector]` sections that shipped in M2 were removed by M4. The tagger drainer is always-on when `[tagger].provider` is non-empty — no cron, no opt-in flag, no confidence-band routing. Valid `[tagger].provider` values are `"openai-compatible"`, `"openrouter"`, `"http"`, or `""` (disabled); `"openai-compatible"` and `"openrouter"` both select `OpenAICompatibleTagger`, while `"http"` selects the deterministic GLiNER+regex sidecar and requires a `[tagger.http]` block (endpoint default `http://localhost:8082`), which is otherwise ignored.
 
 **Embedder placement is a deployment-time choice, not a code change.** TEI ships CPU and CUDA builds with identical HTTP APIs (`ghcr.io/huggingface/text-embeddings-inference:cpu-1.x` vs `:1.x`). Switching is a systemd unit edit; the Kengram TOML doesn't change.
 
@@ -598,7 +611,7 @@ This section is the design-level operational shape. Operator-facing runbooks (fi
 **Components:**
 
 - `kengram` — the single Rust binary; subcommands cover the server, the drainer worker, and operator utilities (current set in `DEVELOPMENT.md`).
-- Postgres 16+ with `pgvector` ≥ 0.7, `pg_trgm`, `pgcrypto`. Connection is configured by URL (TOML or `DATABASE_URL` env). Local Unix socket is the simplest deployment; remote TCP — same Tailnet, separate NAS or DB host, or anywhere reachable — is fully supported. **Extensions must be installed on the Postgres server**, not the Kengram host.
+- Postgres 16+ with `pgvector` ≥ 0.7, `pg_trgm`, `pgcrypto`. Connection is configured by URL in the TOML (`[database].url`) or overridden at runtime via `KENGRAM_DATABASE__URL` (figment reads the `KENGRAM_` prefix with `__` for nesting). Note that the *running binary does not read plain `DATABASE_URL`* — that variable is honored only by `sqlx-cli` and the build-time `sqlx::query!` macros. Local Unix socket is the simplest deployment; remote TCP — same Tailnet, separate NAS or DB host, or anywhere reachable — is fully supported. **Extensions must be installed on the Postgres server**, not the Kengram host.
 - `text-embeddings-inference` HTTP server for the embedder, sidecar pattern. CPU and CUDA builds expose the same HTTP shape; choice is a deployment-time decision (no Kengram code or config change). From M3 onward, TEI also serves the cross-encoder reranker on the same HTTP shape (separate model).
 - vLLM (or any OpenAI-compatible chat-completions endpoint) serving an instruct model — required from M4 onward when the tagger is configured. **Operated independently of Kengram.** Kengram is a client; the operator manages vLLM's lifecycle, model choice, and serving config.
 

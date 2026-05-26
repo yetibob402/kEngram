@@ -26,3 +26,8 @@ Thumbs.db
 
 # Local agent tooling / config
 .claude/
+
+# Development-only artifacts — kept locally, not shipped
+/READINESS.md
+/docs/goals/
+/scripts/smoke.md

@@ -39,7 +39,7 @@ curl -s http://localhost:8080/rerank \
 # expect: scored results, Nix first
 ```
 
-Define the psql helper from `scripts/smoke.md`:
+Define the psql helper:
 
 ```bash
 kengram-psql() { docker exec -i kengram-postgres psql -U kengram -d kengram -t -c "$1"; }

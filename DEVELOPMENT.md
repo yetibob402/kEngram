@@ -26,7 +26,63 @@ If you don't already have these, here's the canonical install for each:
 
 - **Ollama** — `brew install ollama` on macOS (or download from [ollama.com](https://ollama.com/download)). The desktop app starts the daemon automatically; otherwise run `ollama serve`.
 
-## First-time setup
+## Quick launch (recommended)
+
+Three checked-in scripts at the repo root bring the dev stack up with minimal typing. This is the recommended path; the step-by-step [Manual setup (advanced)](#manual-setup-advanced) below is the fallback when you need to run or customize an individual step.
+
+**One-time prerequisites** (see [Install prerequisites](#install-prerequisites)): Docker, the Rust toolchain, `sqlx-cli`, and Ollama installed and running. Pull the models the scripts use:
+
+```bash
+ollama pull bge-m3                 # embeddings
+ollama pull qwen2.5:7b-instruct    # tagging (worker, on by default)
+```
+
+| Script | What it does |
+|---|---|
+| `./start_stack.sh` | Brings up the backing containers (`postgres` + the `tei` reranker) and blocks until Postgres is ready. Pass `--tagger` to also start the opt-in deterministic tagger sidecar. Sets no env vars — service config lives in `docker-compose.yml`. |
+| `./start_server.sh` | Runs `kengram serve` in the foreground (MCP server on `127.0.0.1:8080`, endpoint `/mcp`). |
+| `./start_worker.sh` | Runs `kengram worker` in the foreground — drains `pending_embeddings` and (by default) `pending_tags`, tagging via local Ollama. |
+
+**Two-terminal flow:**
+
+```bash
+./start_stack.sh                 # add --tagger only if using the sidecar tagger
+
+# Terminal 1 — MCP server (foreground; Ctrl-C to stop):
+./start_server.sh
+
+# Terminal 2 — worker (foreground; Ctrl-C to stop):
+./start_worker.sh
+```
+
+`start_stack.sh` exits once Postgres is ready (TEI keeps warming in the background — only reranked search waits on it). The server and worker both run in the foreground, so each wants its own terminal.
+
+**Tagging is on by default** via local Ollama (`qwen2.5:7b-instruct`). For an embed-only worker, pass `off`:
+
+```bash
+./start_worker.sh off            # drains embeddings only; no tagging
+```
+
+Every tagger value is overridable from the environment without editing the script, e.g.:
+
+```bash
+KENGRAM_TAGGER__MODEL_NAME=qwen2.5:14b-instruct \
+KENGRAM_TAGGER__MODEL_ID=ollama/qwen2.5:14b-instruct \
+  ./start_worker.sh
+```
+
+> **Backfill note.** The worker only tags *newly enqueued* thoughts. If you captured thoughts before enabling the tagger, catch up once with:
+> ```bash
+> cargo run --bin kengram -- tag --rerun --since 1970-01-01T00:00:00Z
+> ```
+
+To use vLLM, OpenRouter, or the HTTP sidecar instead of Ollama, put the relevant `[tagger]` block in `~/.config/kengram/kengram.toml` (see [Configuration reference](#configuration-reference)); config-file settings and the script env defaults layer cleanly, with env winning.
+
+---
+
+## Manual setup (advanced)
+
+You don't need these steps if you used [Quick launch (recommended)](#quick-launch-recommended) above — they're here for when you want to run, understand, or customize an individual step. The numbered steps below are exactly what the scripts automate.
 
 ### 1. Start Postgres in Docker
 
@@ -49,7 +105,7 @@ docker compose ps postgres
 export DATABASE_URL="postgres://kengram:kengram@localhost:5432/kengram"
 ```
 
-`sqlx` and the kengram binary both read this. Add it to your shell rc if you don't want to set it every session.
+Plain `DATABASE_URL` is read by `sqlx-cli` (for `sqlx migrate run` / `cargo sqlx prepare`) and by the build-time `sqlx::query!` macros — it is NOT read by the running kengram binary. At runtime the binary reads its database URL from config via figment: the `KENGRAM_` env prefix with `__` nesting (`KENGRAM_DATABASE__URL`), the `~/.config/kengram/kengram.toml` `[database].url` key, or the hardcoded default. The two carry the same value by default, so exporting `DATABASE_URL` to the connection string above keeps the toolchain and the binary in agreement. Add it to your shell rc if you don't want to set it every session.
 
 `sqlx::query!` macros and the `sqlx::test` attribute both require `DATABASE_URL` to be set at *build time*, not just at runtime. The `.env` file at the workspace root is read by `sqlx-cli` but NOT by `cargo build` — set `DATABASE_URL` in your shell or pass it inline: `DATABASE_URL=... cargo build`.
 
@@ -269,9 +325,9 @@ cargo run --bin kengram -- tag --rerun --scope-prefix kengram. --since 2026-04-0
 cargo run --bin kengram -- tag --rerun --since 1970-01-01T00:00:00Z   # whole corpus
 ```
 
-If you've pinned `model_version` in your local `~/.config/kengram/kengram.toml`, bump it manually. The new bundled default (currently 7) only applies when the field is absent from your TOML. The log line at startup reports the resolved value: look for `target_version=7`. If it says `target_version=N` with `N < 7`, your config still overrides; either update the line or delete it.
+If you've pinned `model_version` in your local `~/.config/kengram/kengram.toml`, bump it manually. The new bundled default (currently 13) only applies when the field is absent from your TOML. The log line at startup reports the resolved value: look for `target_version=13`. If it says `target_version=N` with `N < 13`, your config still overrides; either update the line or delete it.
 
-For the procedural detail and the full v1→v7 changelog, see [Tagger version history and safe re-tag procedure](#tagger-version-history-and-safe-re-tag-procedure).
+For the procedural detail and the full v1→v13 changelog, see [Tagger version history and safe re-tag procedure](#tagger-version-history-and-safe-re-tag-procedure).
 
 ### Reranker A/B benchmark
 
@@ -316,7 +372,7 @@ provider = "openai-compatible"                          # "" = silent-disable; "
 endpoint = "http://localhost:8000/v1"                   # vLLM default; ignored when provider = "http"
 model_name = "qwen2.5-7b-instruct"                      # the model the backend serves
 model_id = "vllm/qwen2.5-7b-instruct"                   # provenance written into thoughts.tags_extractor_model
-model_version = 7                                       # tracks BUNDLED_TAGGER_VERSION; see Tagger version history
+model_version = 13                                      # tracks BUNDLED_TAGGER_VERSION; see Tagger version history
 # api_key = ""
 timeout_seconds = 60
 temperature = 0.2
@@ -402,7 +458,7 @@ The tagger is the per-thought metadata sidecar. Empty `provider` is the silent-d
 | `endpoint` | `"http://localhost:8000/v1"` | `/v1` base URL. vLLM default port. OpenRouter is `"https://openrouter.ai/api/v1"`. Ignored when `provider = "http"`. |
 | `model_name` | `"qwen2.5-7b-instruct"` | Model name as the backend understands it. For OpenRouter: a model slug like `"anthropic/claude-haiku-4.5"`. Ignored when `provider = "http"`. |
 | `model_id` | `"vllm/qwen2.5-7b-instruct"` | Kengram-side stable identity written into `thoughts.tags_extractor_model`. Conventionally `<vendor>/<model>`. Used by both LLM and HTTP-sidecar providers. |
-| `model_version` | `7` | Tracks `kengram_extract::BUNDLED_TAGGER_VERSION`. Written into `thoughts.tags_extractor_version`. Bump when the prompt or schema changes such that prior tags shouldn't be considered comparable; then `kengram tag --rerun`. See [Tagger version history](#tagger-version-history-and-safe-re-tag-procedure). |
+| `model_version` | `13` | Tracks `kengram_extract::BUNDLED_TAGGER_VERSION`. Written into `thoughts.tags_extractor_version`. Bump when the prompt or schema changes such that prior tags shouldn't be considered comparable; then `kengram tag --rerun`. See [Tagger version history](#tagger-version-history-and-safe-re-tag-procedure). |
 | `api_key` | `None` | Bearer token for hosted LLM endpoints. The HTTP sidecar provider has its own `[tagger.http].api_key`. |
 | `timeout_seconds` | `60` | Per-request timeout for the LLM provider. The HTTP sidecar provider has its own `[tagger.http].timeout_seconds`. |
 | `temperature` | `0.2` | Generation temperature. Lower = more deterministic. 0 makes some backends loop. LLM provider only. |
@@ -474,7 +530,7 @@ After bumping the tagger version (or the bundled default rolls forward and you w
    SELECT id, tags_extractor_version, tags_extractor_model
    FROM thoughts
    WHERE tags_extractor_version IS NOT NULL
-   ORDER BY tags_extractor_updated_at DESC
+   ORDER BY tags_extracted_at DESC
    LIMIT 10;
    ```
    If the change was a migration (e.g. v9's 0011), use `kengram audit migrations` instead — see [Operator workflows](#operator-workflows).
@@ -640,7 +696,7 @@ cargo run --bin kengram -- backup
 #   links:     96 live
 #   scopes:    5
 #   embedder:  bge-m3:1024 (1024d)
-#   tagger:    vllm/qwen2.5-7b-instruct v7
+#   tagger:    vllm/qwen2.5-7b-instruct v13
 ```
 
 Defaults to `./kengram-backup-<timestamp>.tar.gz`; override with `--to <path>`. Use `--skip-embeddings` to drop embedding rows from the archive (smaller backup; restore requires `kengram embed-backfill` to repopulate vectors; HNSW index survives an empty table).
@@ -697,7 +753,7 @@ provider = "openai-compatible"
 endpoint = "http://localhost:8000/v1"
 model_name = "qwen2.5-7b-instruct"
 model_id = "vllm/qwen2.5-7b-instruct"
-model_version = 7
+model_version = 13
 timeout_seconds = 60
 temperature = 0.2
 scope_vocab_enabled = true
@@ -732,7 +788,7 @@ provider = "openrouter"
 endpoint = "https://openrouter.ai/api/v1"
 model_name = "anthropic/claude-haiku-4.5"
 model_id = "openrouter/anthropic/claude-haiku-4.5"
-model_version = 7
+model_version = 13
 timeout_seconds = 30
 temperature = 0.2
 ```

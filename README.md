@@ -2,6 +2,8 @@
 
 Self-hosted, MCP-native memory service for AI agents. Single Rust binary; Postgres + pgvector backing store; vendor-neutral via an OpenAI-compatible embedding endpoint.
 
+> *Kengram* — **ken** (to know) + **-gram** (a recorded mark): a recorded unit of knowing. The name nods to the *engram*, the hypothetical trace a memory leaves in the brain.
+
 ## Why Kengram
 
 Kengram gives any MCP-capable agent (Claude Code, Claude Desktop, opencode, Cline, …) a **shared, persistent memory** backed by your own Postgres. A thought captured from one client is searchable from any other — across sessions, models, and machines.

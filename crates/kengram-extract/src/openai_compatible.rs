@@ -434,6 +434,27 @@ struct ChatChoiceMessage {
     content: String,
 }
 
+/// Strip a surrounding Markdown code fence from an LLM response.
+///
+/// Some OpenAI-compatible backends — notably Ollama-hosted models — ignore the
+/// `response_format: json_schema` directive and wrap the JSON in a Markdown
+/// code fence (language-tagged or bare). Strip the fence so the payload still
+/// decodes; unfenced JSON (the compliant case) passes through unchanged.
+fn strip_json_code_fence(s: &str) -> &str {
+    let trimmed = s.trim();
+    let Some(after_open) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    // The opening fence may carry a language tag (e.g. `json`); drop the rest
+    // of that first line, then the closing fence.
+    let body = match after_open.split_once('\n') {
+        Some((_lang, rest)) => rest,
+        None => after_open,
+    }
+    .trim();
+    body.strip_suffix("```").unwrap_or(body).trim()
+}
+
 #[async_trait]
 impl Tagger for OpenAICompatibleTagger {
     fn model_id(&self) -> &str {
@@ -512,7 +533,11 @@ impl Tagger for OpenAICompatibleTagger {
         // Tags fields AND relations. Split into TagOutput; the Tags
         // portion gets persisted to thoughts.tags JSONB, the relations
         // portion gets routed to thought_links by the drainer.
-        let doc: TaggerResponseDoc = serde_json::from_str(&content).map_err(|e| {
+        // Backends that honor `json_schema` return bare JSON; some (e.g. Ollama
+        // models) wrap it in a Markdown fence. Tolerate both. The error still
+        // reports the original `content` so a genuinely bad response is legible.
+        let payload = strip_json_code_fence(&content);
+        let doc: TaggerResponseDoc = serde_json::from_str(payload).map_err(|e| {
             TaggerError::MalformedResponse(format!(
                 "decoding tags payload (content={content:?}): {e}"
             ))
@@ -758,6 +783,28 @@ mod tests {
         assert_eq!(output.relations[1].note, None);
         // Tags structure still has its 6 named fields; relations is not one of them.
         assert_eq!(output.tags.entities, vec!["kengram".to_string()]);
+    }
+
+    #[test]
+    fn strip_json_code_fence_unwraps_fenced_json() {
+        // Bare JSON passes through unchanged (the json_schema-compliant case).
+        assert_eq!(strip_json_code_fence(r#"{"a":1}"#), r#"{"a":1}"#);
+
+        // A ```json … ``` fence (the Ollama case from the WARN logs) is stripped.
+        let fenced = "```json\n{\"people\":[],\"kind\":\"idea\"}\n```";
+        assert_eq!(
+            strip_json_code_fence(fenced),
+            r#"{"people":[],"kind":"idea"}"#
+        );
+
+        // Bare ``` fence (no language tag) with surrounding whitespace.
+        let bare = "\n```\n{\"x\":true}\n```\n";
+        assert_eq!(strip_json_code_fence(bare), r#"{"x":true}"#);
+
+        // A real fenced response now deserializes into the tags doc.
+        let real = "```json\n{\"people\":[],\"entities\":[\"Redis\"],\"kind\":\"observation\",\"action_items\":[],\"topics\":[\"databases\"],\"dates_mentioned\":[\"2026\"],\"relations\":[]}\n```";
+        let doc: TaggerResponseDoc = serde_json::from_str(strip_json_code_fence(real)).unwrap();
+        assert_eq!(doc.tags.entities, vec!["Redis".to_string()]);
     }
 
     #[test]

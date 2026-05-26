@@ -52,6 +52,9 @@ sqlx migrate run
 
 # 4. Terminal 2 — worker (drains embeddings + tags; pass `off` for embed-only)
 ./start_worker.sh
+
+# When done — server/worker stop with Ctrl-C; halt the containers with:
+./stop_stack.sh                    # add --down to also remove the containers
 ```
 
 A freshly-captured thought returns `embedding_status: "pending"` — that's normal; the worker picks it up on the next tick (default 5 seconds) and the vector becomes searchable. Lexical (trigram) search finds it immediately, so retrieval works during the gap.

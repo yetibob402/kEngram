@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, scope, content, source, created_at, metadata,\n               content_fingerprint, tags,\n               tags_extractor_model, tags_extractor_version, tags_extracted_at\n        FROM thoughts\n        WHERE retracted_at IS NULL\n          AND ($1::text IS NULL OR scope = $1)\n          AND ($2::text IS NULL OR scope LIKE $2 || '%')\n          AND ($3::timestamptz IS NULL OR created_at >= $3)\n          AND (\n              tags_extractor_version IS NULL\n              OR ($4::boolean AND tags_extractor_version < $5)\n          )\n        ORDER BY created_at ASC\n        LIMIT $6\n        ",
+  "query": "\n        SELECT id, scope, content, source, created_at, metadata,\n               content_fingerprint, tags,\n               tags_extractor_model, tags_extractor_version, tags_extracted_at\n        FROM thoughts\n        WHERE retracted_at IS NULL\n          AND ($1::text IS NULL OR scope = $1)\n          AND ($2::text IS NULL OR scope LIKE $2 || '%')\n          AND ($3::timestamptz IS NULL OR created_at >= $3)\n          AND (\n              $7::boolean\n              OR tags_extractor_version IS NULL\n              OR ($4::boolean AND tags_extractor_version < $5)\n          )\n        ORDER BY created_at ASC\n        LIMIT $6\n        ",
   "describe": {
     "columns": [
       {
@@ -66,7 +66,8 @@
         "Timestamptz",
         "Bool",
         "Int4",
-        "Int8"
+        "Int8",
+        "Bool"
       ]
     },
     "nullable": [
@@ -83,5 +84,5 @@
       true
     ]
   },
-  "hash": "fd165fbc3b6646aa955ca4c0069f02f2a6ad2b6d4703a5977807eedbecf6fef3"
+  "hash": "957274e6a31d1087eeafd9b74971fec0b0e9516ca20d8c3b3fb72048b9d14de2"
 }

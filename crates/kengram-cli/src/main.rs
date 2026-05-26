@@ -71,8 +71,9 @@ enum Command {
     /// One-shot tag run. By default walks untagged thoughts (where
     /// `tags_extractor_version IS NULL`). With `--rerun`, also walks
     /// thoughts whose `tags_extractor_version < [tagger].model_version`
-    /// (the tagger prompt has been bumped) — useful after upgrading the
-    /// tagger model or prompt.
+    /// (the tagger prompt has been bumped). With `--force`, re-tags every
+    /// matching thought regardless of version — useful after switching the
+    /// tagger model without bumping the prompt version.
     Tag {
         /// Restrict to a single scope (exact match). Mutually exclusive
         /// with `--scope-prefix`.
@@ -90,6 +91,12 @@ enum Command {
         /// never-tagged thoughts are walked.
         #[arg(long)]
         rerun: bool,
+        /// Re-tag every matching thought regardless of version (re-stamps the
+        /// configured model_version and records the new model_id). Use after
+        /// switching the tagger model. Bound the run with --scope /
+        /// --scope-prefix / --since / --limit.
+        #[arg(long)]
+        force: bool,
         /// Restrict to thoughts created at or after this RFC-3339 timestamp.
         /// Allowed with or without `--rerun` (unlike `kengram reflect`'s
         /// `--since`, which required `--rerun`).
@@ -725,6 +732,7 @@ async fn run_tag(
     scope_prefix: Option<String>,
     limit: i64,
     rerun: bool,
+    force: bool,
     since: Option<String>,
 ) -> anyhow::Result<()> {
     let parsed_since = match since {
@@ -768,6 +776,7 @@ async fn run_tag(
         scope_prefix = ?scope_prefix_filter,
         limit,
         rerun,
+        force,
         since = ?parsed_since,
         target_version = tagger_version,
         scope_vocab_limit = ?scope_vocab_limit,
@@ -778,6 +787,7 @@ async fn run_tag(
         &pool,
         tagger_version,
         rerun,
+        force,
         scope_filter.as_deref(),
         scope_prefix_filter.as_deref(),
         parsed_since,
@@ -881,8 +891,9 @@ async fn main() -> anyhow::Result<()> {
             scope_prefix,
             limit,
             rerun,
+            force,
             since,
-        } => run_tag(config, scope, scope_prefix, limit, rerun, since).await,
+        } => run_tag(config, scope, scope_prefix, limit, rerun, force, since).await,
         Command::Bench { action } => match action {
             BenchAction::Rerank { corpus } => run_bench_rerank(config, corpus).await,
         },

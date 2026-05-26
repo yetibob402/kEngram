@@ -827,11 +827,17 @@ pub async fn increment_tag_job_attempts(
 
 /// Walk thoughts that need tagging — either never-tagged (`tags_extractor_version
 /// IS NULL`) or stale (`tags_extractor_version < target_tagger_version`, only
-/// when `rerun = true`). Oldest first. Used by `kengram tag [--rerun]`.
+/// when `rerun = true`). When `force = true`, every matching thought is walked
+/// regardless of version (the scope / scope_prefix / since / limit filters still
+/// apply). Oldest first. Used by `kengram tag [--rerun] [--force]`.
+// Selection filters are independent knobs the CLI passes straight through;
+// bundling them into a struct would just relocate the same arguments.
+#[allow(clippy::too_many_arguments)]
 pub async fn find_untagged_or_stale_thoughts(
     pool: &PgPool,
     target_tagger_version: i32,
     rerun: bool,
+    force: bool,
     scope: Option<&str>,
     scope_prefix: Option<&str>,
     since: Option<OffsetDateTime>,
@@ -848,7 +854,8 @@ pub async fn find_untagged_or_stale_thoughts(
           AND ($2::text IS NULL OR scope LIKE $2 || '%')
           AND ($3::timestamptz IS NULL OR created_at >= $3)
           AND (
-              tags_extractor_version IS NULL
+              $7::boolean
+              OR tags_extractor_version IS NULL
               OR ($4::boolean AND tags_extractor_version < $5)
           )
         ORDER BY created_at ASC
@@ -860,6 +867,7 @@ pub async fn find_untagged_or_stale_thoughts(
         rerun,
         target_tagger_version,
         limit,
+        force,
     )
     .fetch_all(pool)
     .await?;
@@ -2307,7 +2315,8 @@ mod tests {
             .unwrap();
 
         let walk = find_untagged_or_stale_thoughts(
-            &pool, /*target_version*/ 1, /*rerun*/ false, None, None, None, 100,
+            &pool, /*target_version*/ 1, /*rerun*/ false, /*force*/ false, None,
+            None, None, 100,
         )
         .await
         .unwrap();
@@ -2329,13 +2338,49 @@ mod tests {
             .unwrap();
 
         // target_version=2, rerun=true → walks NULL and version<2.
-        let walk = find_untagged_or_stale_thoughts(&pool, 2, true, None, None, None, 100)
+        let walk = find_untagged_or_stale_thoughts(&pool, 2, true, false, None, None, None, 100)
             .await
             .unwrap();
         let ids: Vec<ThoughtId> = walk.iter().map(|t| t.id).collect();
         assert!(ids.contains(&untagged));
         assert!(ids.contains(&stale_v1));
         assert!(!ids.contains(&fresh_v2));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_untagged_or_stale_thoughts_returns_all_when_force_true(pool: PgPool) {
+        let untagged = insert_test_thought(&pool, "untagged", "global").await;
+        let stale_v1 = insert_test_thought(&pool, "stale at v1", "global").await;
+        update_thought_tags(&pool, stale_v1, &Tags::default(), "v1-model", 1)
+            .await
+            .unwrap();
+        let current_v2 = insert_test_thought(&pool, "current at v2", "global").await;
+        update_thought_tags(&pool, current_v2, &Tags::default(), "v2-model", 2)
+            .await
+            .unwrap();
+
+        // force=true (rerun=false) → every thought is walked regardless of
+        // version, including the one already at the target version.
+        let walk = find_untagged_or_stale_thoughts(&pool, 2, false, true, None, None, None, 100)
+            .await
+            .unwrap();
+        let ids: Vec<ThoughtId> = walk.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&untagged));
+        assert!(ids.contains(&stale_v1));
+        assert!(ids.contains(&current_v2));
+
+        // force still honours the scope filter (it narrows the forced set).
+        let other = insert_test_thought(&pool, "elsewhere", "other").await;
+        update_thought_tags(&pool, other, &Tags::default(), "v2-model", 2)
+            .await
+            .unwrap();
+        let scoped =
+            find_untagged_or_stale_thoughts(&pool, 2, false, true, Some("global"), None, None, 100)
+                .await
+                .unwrap();
+        let scoped_ids: Vec<ThoughtId> = scoped.iter().map(|t| t.id).collect();
+        assert!(scoped_ids.contains(&current_v2));
+        assert!(!scoped_ids.contains(&other));
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -3453,7 +3498,7 @@ mod tests {
         let retracted = insert_test_thought(&pool, "retracted", "global").await;
         retract_thought(&pool, retracted, None).await.unwrap();
 
-        let walk = find_untagged_or_stale_thoughts(&pool, 1, false, None, None, None, 100)
+        let walk = find_untagged_or_stale_thoughts(&pool, 1, false, false, None, None, None, 100)
             .await
             .unwrap();
         let ids: Vec<ThoughtId> = walk.iter().map(|t| t.id).collect();

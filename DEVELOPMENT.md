@@ -323,10 +323,13 @@ cargo run --bin kengram -- tag --scope-prefix kengram. --limit 200
 
 Re-run the tagger over thoughts whose stored `tags_extractor_version` is below the configured current version. Use this after bumping `[tagger].model_version` (typically after a prompt or schema change). Tags are overwritten in place — no supersede semantics, no audit chain. Pair with `--since` to bound the rerun to recent thoughts; use `--since 1970-01-01T00:00:00Z` to re-tag the entire corpus.
 
+If you **switched the tagger model** without bumping the prompt version, the stored version isn't actually lower, so `--rerun` skips those rows. Use `--force` to re-tag every matching thought regardless of version — it re-stamps the configured `model_version` and records the new `model_id`. Bound it with `--scope` / `--scope-prefix` / `--since` / `--limit`.
+
 ```bash
 cargo run --bin kengram -- tag --rerun --scope work
 cargo run --bin kengram -- tag --rerun --scope-prefix kengram. --since 2026-04-01T00:00:00Z
 cargo run --bin kengram -- tag --rerun --since 1970-01-01T00:00:00Z   # whole corpus
+cargo run --bin kengram -- tag --force --scope work                  # re-tag regardless of version (e.g. after a model swap)
 ```
 
 If you've pinned `model_version` in your local `~/.config/kengram/kengram.toml`, bump it manually. The new bundled default (currently 13) only applies when the field is absent from your TOML. The log line at startup reports the resolved value: look for `target_version=13`. If it says `target_version=N` with `N < 13`, your config still overrides; either update the line or delete it.
@@ -525,7 +528,7 @@ After bumping the tagger version (or the bundled default rolls forward and you w
    ```
    The drainer walks rows where `tags_extractor_version < target_version`. Bound it tighter if you only want a recent window — `--since 2026-04-01T00:00:00Z` or `--scope-prefix kengram.`.
 
-   **Cross-backend retag note.** If you're switching providers (e.g. flipping from `openai-compatible` v13 to `http` v1, or vice-versa), the version comparison no longer maps cleanly — a row stamped `tags_extractor_version = 13` from the LLM backend isn't "stale" relative to the deterministic sidecar's `model_version = 1`. To force a full re-tag under the new backend without bumping its `model_version`, use `--since` with an old date to walk by creation time instead of version: `--rerun --since 1970-01-01T00:00:00Z`. Alternatively, set the new backend's `model_version` to one above the highest existing version on the rows you want re-tagged.
+   **Cross-backend / model-swap retag note.** If you're switching providers or models (e.g. flipping from `openai-compatible` to `http`, or to a stronger model) without bumping the prompt version, the version comparison no longer marks the old rows as "stale" — a row stamped `tags_extractor_version = 13` isn't lower than the new backend's `model_version`, so `--rerun` skips it. Use `--force` to re-tag every matching thought regardless of version, bounded by `--scope` / `--scope-prefix` / `--since` / `--limit`: `kengram tag --force --since 1970-01-01T00:00:00Z` for the whole corpus. The refreshed `tags_extractor_model` records which backend did the re-tag.
 
 3. **Monitor the worker logs for failures.** The `kengram tag complete` line reports `n_candidates`, `tagged`, `failed`. Non-zero `failed` exits non-zero so cron / scripts can detect partial failures; per-row errors are logged at WARN with the `thought_id`.
 

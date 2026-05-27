@@ -58,7 +58,8 @@ impl ScopeVocab {
 }
 
 /// Single high-level classification a thought belongs to. `PersonNote`
-/// serializes as `"person_note"` per the snake_case rename.
+/// serializes as `"person_note"` and `DecisionRecord` as `"decision_record"`
+/// per the snake_case rename.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TagKind {
@@ -68,6 +69,10 @@ pub enum TagKind {
     Reference,
     PersonNote,
     Session,
+    /// A choice already made and recorded — past-tense indicative ("we
+    /// decided", "chose X over Y"). Distinct from `Task` (forward-looking
+    /// work) and `Idea` (a proposal not yet decided). Added in tagger v14.
+    DecisionRecord,
 }
 
 #[cfg(test)]
@@ -177,6 +182,10 @@ mod tests {
             serde_json::to_string(&TagKind::Session).unwrap(),
             "\"session\""
         );
+        assert_eq!(
+            serde_json::to_string(&TagKind::DecisionRecord).unwrap(),
+            "\"decision_record\""
+        );
     }
 
     #[test]
@@ -185,6 +194,8 @@ mod tests {
         assert_eq!(k, TagKind::PersonNote);
         let k: TagKind = serde_json::from_str("\"observation\"").unwrap();
         assert_eq!(k, TagKind::Observation);
+        let k: TagKind = serde_json::from_str("\"decision_record\"").unwrap();
+        assert_eq!(k, TagKind::DecisionRecord);
     }
 
     #[test]

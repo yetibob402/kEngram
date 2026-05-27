@@ -69,6 +69,13 @@ pub const PROTOTYPES: &[(TagKind, &str)] = &[
          with Priya on the auth rewrite — got through the token-storage piece. Sprint planning \
          meeting decided to defer the dashboard work to next iteration.",
     ),
+    (
+        TagKind::DecisionRecord,
+        "We decided to use pgvector over a dedicated vector database after benchmarking recall. \
+         The team chose Cap'n Proto for zero-copy reads. Settled on the HTTP sidecar approach \
+         instead of an in-tree backend. A choice already made and recorded, with its rationale — \
+         past tense, not a proposal and not future work.",
+    ),
 ];
 
 /// Pre-embedded prototype vectors, one per `TagKind`. Constructed once at
@@ -164,6 +171,7 @@ mod tests {
         assert!(has(TagKind::Reference));
         assert!(has(TagKind::PersonNote));
         assert!(has(TagKind::Session));
+        assert!(has(TagKind::DecisionRecord));
         // And no duplicates — if a variant appears twice the count grows.
         let unique_count = PROTOTYPES
             .iter()

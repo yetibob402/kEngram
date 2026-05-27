@@ -208,7 +208,7 @@ pub struct TaggerConfig {
     /// Conventionally `<vendor>/<model>`. Defaults to `"vllm/qwen2.5-7b-instruct"`.
     pub model_id: String,
     /// Schema-version for `thoughts.tags_extractor_version`. Default tracks
-    /// `kengram_extract::BUNDLED_TAGGER_VERSION` (currently 13 — seven
+    /// `kengram_extract::BUNDLED_TAGGER_VERSION` (currently 14 — eight
     /// post-M6.1 dogfood iterations: v6 rebalanced kind classification +
     /// added entity surface-only rule + tightened URL emission but
     /// repeated the v3→v4 backfire by listing adjectival phrases as
@@ -232,7 +232,11 @@ pub struct TaggerConfig {
     /// duplicate a people-array entry; v13 adds use-mention discipline
     /// to the prompt — a top-level USE-vs-MENTION section plus 6 worked
     /// examples — fixing the corpus-wide pollution of meta-content
-    /// thoughts that mention names as linguistic examples). Bump when
+    /// thoughts that mention names as linguistic examples; v14 adds a
+    /// decision_record kind + a past-tense decision-tree step, redefines
+    /// action_items as forward-looking only, and moves scope-identifier +
+    /// relationship-noun stripping plus a metadata.decision_type override
+    /// into the shared kengram-mcp::finalize seam). Bump when
     /// the prompt or schema changes such that prior tags shouldn't be
     /// considered comparable; `kengram tag --rerun --since
     /// 1970-01-01T00:00:00Z` then backfills.

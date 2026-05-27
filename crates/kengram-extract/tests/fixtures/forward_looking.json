@@ -1,0 +1,67 @@
+{
+  "fixtures": [
+    {
+      "name": "past-tense-decision",
+      "category": "decision",
+      "content": "Decided to switch from the ASUS ProArt X670E to the ASUS ProArt X870E for the AI inference build. The deciding factor was DDR5 memory-bandwidth headroom.",
+      "assertions": {
+        "kind_equals": "decision_record",
+        "action_items_must_not_contain_substring": [
+          "switch to the ASUS",
+          "X870E"
+        ]
+      }
+    },
+    {
+      "name": "decision-control-imperative-task",
+      "category": "decision_control",
+      "content": "Benchmark pgvector recall against a dedicated vector database before the migration freeze.",
+      "assertions": {
+        "kind_equals": "task",
+        "action_items_must_contain_substring": ["benchmark"]
+      }
+    },
+    {
+      "name": "habit-not-action",
+      "category": "habit",
+      "content": "Ron plays Wordle daily and uses SALET as his fixed opening word.",
+      "assertions": {
+        "people_must_contain": ["Ron"],
+        "action_items_must_not_contain_substring": [
+          "uses SALET",
+          "SALET",
+          "opening word"
+        ]
+      }
+    },
+    {
+      "name": "habit-control-real-task",
+      "category": "habit_control",
+      "content": "Ron needs to rebuild the search index before the next sprint.",
+      "assertions": {
+        "people_must_contain": ["Ron"],
+        "action_items_must_contain_substring": ["rebuild"]
+      }
+    },
+    {
+      "name": "meta-thought-quotes-others-todos",
+      "category": "meta_quote",
+      "content": "Post-mortem on the cloud tagger pass: it lifted three TODOs — 'disambiguate the naming collision', 'rename one of the two relations fields', and 'document the distinction'. This thought is analyzing that behavior, not committing to those items.",
+      "assertions": {
+        "action_items_must_not_contain_substring": [
+          "disambiguate the naming collision",
+          "rename one of the two relations",
+          "document the distinction"
+        ]
+      }
+    },
+    {
+      "name": "meta-thought-control-real-commitment",
+      "category": "meta_control",
+      "content": "Reviewing the tagger eval results — they look good. Add a fixture for the past-tense decision case before the next run.",
+      "assertions": {
+        "action_items_must_contain_substring": ["fixture"]
+      }
+    }
+  ]
+}

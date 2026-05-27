@@ -860,6 +860,17 @@ async fn run_tag(
     let mut failed = 0usize;
     let model_id = tagger.model_id().to_string();
 
+    // Corpus scope set, fetched once (mirrors the worker drainer) so the
+    // scope-identifier filter in `finalize` runs without a per-thought query.
+    let known_scopes = kengram_storage::list_scopes(&pool, None)
+        .await
+        .map(|s| {
+            s.into_iter()
+                .map(|x| x.scope.as_str().to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
     for t in candidates {
         let vocab = match scope_vocab_limit {
             Some(n) if n > 0 => {
@@ -885,7 +896,13 @@ async fn run_tag(
                 // drainer runs (topic-normalize + people/entities disjoint).
                 // This path previously skipped it, so CLI-tagged rows could
                 // diverge from worker-tagged rows for the same thought.
-                kengram_mcp::finalize::finalize_tags(&mut output.tags, vocab.as_ref());
+                kengram_mcp::finalize::finalize_tags(
+                    &mut output.tags,
+                    &t.metadata,
+                    &t.scope,
+                    vocab.as_ref(),
+                    &known_scopes,
+                );
                 if let Err(err) = kengram_storage::update_thought_tags(
                     &pool,
                     t.id,

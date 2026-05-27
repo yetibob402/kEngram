@@ -179,7 +179,31 @@ impl OpenAICompatibleConfig {
 /// pollution of meta-content thoughts (kengram.m3.dogfood scope,
 /// recommendation thoughts) that mention names as linguistic
 /// examples.
-pub const BUNDLED_TAGGER_VERSION: i32 = 13;
+/// **v14 (post-v13 dogfood findings)** addresses bugs that reproduced
+/// across multiple models (phi4:14b + gemma3:12b emitted them
+/// identically — a prompt/schema cause, not a model-capacity ceiling).
+/// (a) New `decision_record` kind + a past-tense-indicative tree step
+/// (inserted before `task`) so an already-made decision is no longer
+/// mis-read as a forward task and its content no longer lifted into
+/// action_items. (b) `action_items` field redefined as forward-looking
+/// only — habits, completed/past actions, settled decisions,
+/// preferences, and hypotheticals are explicitly NOT action_items.
+/// Both are structural/positive framing (no forbidden-phrase lists) to
+/// avoid the v3→v4 / v6→v7 backfire where models emitted listed phrases
+/// verbatim. (c) Two deterministic post-process filters now run in the
+/// shared `kengram_mcp::finalize` seam (so they cover every backend and
+/// the `kengram tag` path, not just the LLM/worker): scope-identifier
+/// stripping from entities/people (data-driven against known scopes —
+/// e.g. `rjf.personal` is never an entity) and a relationship-noun
+/// denylist for people (`buddy`, `colleague`, …). (d) A
+/// `metadata.decision_type` → `decision_record` override, also in
+/// `finalize`, authoritative regardless of model. Plus provenance
+/// binding in `OpenAICompatibleTagger::new` so this stamp can't drift
+/// from the prompt again. Out of scope (measured, not fixed): the
+/// residual quoted-span use-mention patterns (Bug 2 — capacity-bound per
+/// the parked notes) and gemma3's colon-truncation of entity strings
+/// (Bug 6 — a model artifact; the parse path has no colon logic).
+pub const BUNDLED_TAGGER_VERSION: i32 = 14;
 
 #[derive(Debug, Clone)]
 pub struct OpenAICompatibleTagger {
@@ -308,28 +332,31 @@ Apply this check FIRST. Then proceed to the field rules below.
 
   Before you emit: re-read the thought. Verify each entity in your output appears (by name or close paraphrase) in the prose. Remove any that don't.
 
-- kind: a single closed-enum classification of what the thought DOES. Pick exactly one of: observation | task | idea | reference | person_note | session | null. Walk this decision tree in order and pick the FIRST kind that fits — do NOT default to observation:
+- kind: a single closed-enum classification of what the thought DOES. Pick exactly one of: observation | task | idea | reference | person_note | session | decision_record | null. Walk this decision tree in order and pick the FIRST kind that fits — do NOT default to observation:
 
   1. Does the thought DEFINE or POINT AT a specific named thing (a project, paper, tool, term, organization)?
      - Yes, and the named thing is a person → person_note. (\"Sarah prefers async meetings.\")
      - Yes, otherwise → reference. (\"Hummingbird is our internal rollout coordinator.\" \"Cap'n Proto offers zero-copy reads.\")
 
-  2. Does the thought COMMIT TO or DESCRIBE an action to take?
+  2. Does the thought RECORD a decision ALREADY MADE — a settled choice in the past-tense indicative (\"we decided\", \"chose X over Y\", \"agreed to\", \"settled on\", \"went with\")?
+     - Yes → decision_record. The choice is already made, so its content is NOT future work — do not lift it into action_items. (\"Decided to switch to the ASUS X870E board for the memory-bandwidth headroom.\" \"We chose Cap'n Proto over Protobuf for zero-copy reads.\") Contrast with task (next step): a task is future work not yet done; a decision_record is the settled outcome of a choice.
+
+  3. Does the thought COMMIT TO or DESCRIBE a future action to take?
      - Yes → task. (\"Mission: test the kengram MCP toolset for accuracy.\" \"Fix the login bug.\")
 
-  3. Does the thought PROPOSE, HYPOTHESIZE, or REPORT a finding/conclusion?
+  4. Does the thought PROPOSE, HYPOTHESIZE, or REPORT a finding/conclusion?
      - Yes → idea. (\"We could use Bloom filters here.\" \"Probe 2 confirms that topics are phrase-driven.\" \"The reranker beat RRF-only by 7% on this fixture.\")
 
-  4. Is the thought NARRATING current-session activity (\"I just ran X\", \"the search returned Y\", \"this test passed\")?
+  5. Is the thought NARRATING current-session activity (\"I just ran X\", \"the search returned Y\", \"this test passed\")?
      - Yes → session. Session-shaped thoughts typically have otherwise-empty arrays.
 
-  5. Otherwise — a pure factual claim about the world with no commitment, no proposal, no definition, no narrative — observation. (\"Postgres autovacuum thresholds are tunable per-table.\" \"JSON parsing benefits from SIMD on documents over 1 MB.\")
+  6. Otherwise — a pure factual claim about the world with no commitment, no proposal, no definition, no narrative — observation. (\"Postgres autovacuum thresholds are tunable per-table.\" \"JSON parsing benefits from SIMD on documents over 1 MB.\")
 
   Anti-default: observation is the CATCHALL, not the default. When the thought arguably fits a more specific kind, prefer the more specific kind. A degenerate tagger that classifies every thought as observation is a failure mode v6 is designed to inverse.
 
   Kind is classified from the thought's intrinsic shape only — never from the scope's typical content, never from controlled-vocabulary hints below. The vocabulary section informs topic and entity term choice; it does NOT influence kind.
 
-- action_items: short imperative phrases describing tasks the thought commits to or implies (e.g., \"fix the login bug\", \"review the migration plan\"). Empty array if none. Distinct from kind=task: action_items is the per-thought list of items; kind=task is the thought's overall classification.
+- action_items: short imperative phrases naming work that is forward-looking and NOT yet done — a FUTURE action with an outcome still to be produced (e.g., \"fix the login bug\", \"review the migration plan\"). A description of an existing habit or routine (\"uses SALET as an opening word\"), an action already completed or reported in the past tense (\"confirmed the migration ran\"), a decision already made (\"decided to switch boards\"), a stated preference, or a hypothetical (\"we could try X\") is NOT an action_item — in each case there is nothing left to do. Empty array is correct, and expected, when the thought records only state, habit, history, preference, or a settled decision. Distinct from kind=task: action_items is the per-thought list of items; kind=task is the thought's overall classification.
 
 - topics: 1-3 short tag-like subject categories, lowercase, hyphen-separated, no punctuation. What broad SUBJECT AREA is this thought about? Topics map prose to canonical subject categories — they may be inferred from context when the subject is clear, even if the exact topic word doesn't appear in the thought. Two thoughts about the same subject (e.g. one mentioning \"trigram retrieval\", another mentioning \"vector similarity\") may share topics (\"information-retrieval\") even with disjoint surface vocabulary. This is concept-mapping behavior, not surface-lexeme lifting. Distinct from entities: a topic is a category the thought falls under; an entity is a specific named thing the thought mentions. A thought naming \"kengram\" and \"pgvector\" might have entities [\"kengram\", \"pgvector\"] and topics [\"memory-systems\", \"databases\"].
 
@@ -393,7 +420,7 @@ Key signal: if the prose explicitly says \"as examples,\" \"only as mentions,\" 
 
 # Before you emit — final pass
 
-1. Kind: did you walk the 5-step decision tree, or did you default to observation? Walk it now if not.
+1. Kind: did you walk the 6-step decision tree, or did you default to observation? Walk it now if not. If the choice is already made (past tense), it is decision_record, not task — and its content is not an action_item.
 2. Entities: re-read the thought. Does each entity in your output appear (by name or close paraphrase) in the prose? Remove any that don't.
 3. Relations: does each emission correspond to an explicit relational claim in the prose? Remove speculative ones. For url-kind relations: does `to_value` start with `http://` or `https://`? If not, drop or convert to entity.";
 
@@ -607,7 +634,7 @@ fn tags_response_format() -> serde_json::Value {
                     "dates_mentioned": { "type": "array", "items": { "type": "string" } },
                     "kind": {
                         "type": ["string", "null"],
-                        "enum": ["observation", "task", "idea", "reference", "person_note", "session", null]
+                        "enum": ["observation", "task", "idea", "reference", "person_note", "session", "decision_record", null]
                     },
                     "relations": {
                         "type": "array",
@@ -1156,6 +1183,7 @@ mod tests {
             "reference",
             "person_note",
             "session",
+            "decision_record",
         ] {
             assert!(p.contains(k), "v7 prompt must enumerate kind {k:?}");
         }
@@ -1221,7 +1249,7 @@ mod tests {
         );
 
         // Presets track BUNDLED_TAGGER_VERSION.
-        assert_eq!(BUNDLED_TAGGER_VERSION, 13);
+        assert_eq!(BUNDLED_TAGGER_VERSION, 14);
         let cfg = OpenAICompatibleConfig::vllm_local();
         assert_eq!(cfg.model_version, BUNDLED_TAGGER_VERSION);
         let cfg = OpenAICompatibleConfig::open_router("k".into(), "m".into());
@@ -1254,6 +1282,13 @@ mod tests {
         assert!(
             kind_type.as_array().unwrap().iter().any(|x| x == "null"),
             "kind must be nullable: {kind_type:?}"
+        );
+        // v14: the kind enum must include `decision_record` (else the LLM
+        // cannot emit the variant the prompt's tree step teaches).
+        let kind_enum = schema["properties"]["kind"]["enum"].as_array().unwrap();
+        assert!(
+            kind_enum.iter().any(|x| x == "decision_record"),
+            "kind enum must include decision_record: {kind_enum:?}"
         );
         // relations items pin to the closed vocabularies.
         let item_props = &schema["properties"]["relations"]["items"]["properties"];

@@ -11,6 +11,7 @@
 pub mod backfill;
 pub mod capture;
 pub mod drain;
+pub mod filters;
 pub mod finalize;
 pub mod link;
 mod normalize;

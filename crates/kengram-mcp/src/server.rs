@@ -97,7 +97,7 @@ pub struct SearchThoughtsArgs {
     pub candidate_pool: Option<usize>,
 
     #[schemars(
-        description = "Optional JSONB-containment filter applied to each thought's `tags` field. Tags are LLM-extracted metadata with shape: { people: string[], entities: string[] (named proper-noun-style identifiers — projects, products, libraries, tools, e.g. \"kengram\", \"pgvector\"), action_items: string[], topics: string[] (1-3 short lowercase subject categories — e.g. \"rust\", \"memory-systems\"), dates_mentioned: string[], kind: 'observation' | 'task' | 'idea' | 'reference' | 'person_note' | 'session' | null }. Distinguish `entities` (specific named things mentioned by name) from `topics` (broader subject categories the thought falls under). The `kind` enum is closed at the values listed; the array fields are open-vocabulary strings. Examples: {\"kind\": \"task\"} returns only thoughts the tagger classified as tasks; {\"people\": [\"Sarah\"]} returns thoughts whose people-tag contains Sarah; {\"entities\": [\"kengram\"]} returns thoughts mentioning kengram by name; {\"topics\": [\"rust\"], \"kind\": \"idea\"} combines both (top-level keys AND together; array values are subset-match). Empty object {} is a no-op. Filters compose with `scope` (or `scope_prefix`, whichever is set) via AND. Note: `entities` is LLM-extracted and best-effort — a known structural ceiling on adjectival-vs-name discrimination means the field may include descriptive phrases alongside legitimate names. Treat `tag_filter: {\"entities\": [...]}` as a positive signal rather than a strict membership claim. See `AGENTS.md` for the operator-correction workflow."
+        description = "Optional JSONB-containment filter applied to each thought's `tags` field. Tags are LLM-extracted metadata with shape: { people: string[], entities: string[] (named proper-noun-style identifiers — projects, products, libraries, tools, e.g. \"kengram\", \"pgvector\"), action_items: string[], topics: string[] (1-3 short lowercase subject categories — e.g. \"rust\", \"memory-systems\"), dates_mentioned: string[], kind: 'observation' | 'task' | 'idea' | 'reference' | 'person_note' | 'session' | 'decision_record' | null }. Distinguish `entities` (specific named things mentioned by name) from `topics` (broader subject categories the thought falls under). The `kind` enum is closed at the values listed; the array fields are open-vocabulary strings. Examples: {\"kind\": \"task\"} returns only thoughts the tagger classified as tasks; {\"people\": [\"Sarah\"]} returns thoughts whose people-tag contains Sarah; {\"entities\": [\"kengram\"]} returns thoughts mentioning kengram by name; {\"topics\": [\"rust\"], \"kind\": \"idea\"} combines both (top-level keys AND together; array values are subset-match). Empty object {} is a no-op. Filters compose with `scope` (or `scope_prefix`, whichever is set) via AND. Note: `entities` is LLM-extracted and best-effort — a known structural ceiling on adjectival-vs-name discrimination means the field may include descriptive phrases alongside legitimate names. Treat `tag_filter: {\"entities\": [...]}` as a positive signal rather than a strict membership claim. See `AGENTS.md` for the operator-correction workflow."
     )]
     // Map<String, Value> rather than Value: ensures the JSON schema renders
     // with a concrete `type: "object"` instead of (no type). claude.ai's MCP
@@ -892,7 +892,7 @@ Storage model: thoughts are the unit. Each thought has:
 `tags` shape (auto-extracted by the tagger, distinct from `metadata`):
   { people: string[], entities: string[], action_items: string[], topics: string[] (1-3 short lowercase tags),
     dates_mentioned: string[],
-    kind: 'observation' | 'task' | 'idea' | 'reference' | 'person_note' | 'session' | null }
+    kind: 'observation' | 'task' | 'idea' | 'reference' | 'person_note' | 'session' | 'decision_record' | null }
 `entities` (proper-noun-style identifiers — projects, products, libraries, tools mentioned by name, e.g. \"kengram\", \"pgvector\") is distinct from `topics` (broader subject categories the thought falls under, e.g. \"memory-systems\", \"databases\"). The `kind` enum is closed at those six values (plus null). Array fields are open-vocabulary strings.
 
 Use `tag_filter` on `search_thoughts` for JSONB-containment filtering. Examples:
@@ -1012,6 +1012,7 @@ mod tests {
             "reference",
             "person_note",
             "session",
+            "decision_record",
         ] {
             assert!(
                 s.contains(variant),

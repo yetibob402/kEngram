@@ -200,8 +200,23 @@ pub async fn drain_pending_tags(
         ..Default::default()
     };
 
+    // Corpus scope set, fetched once per batch (low cardinality, cheap) so the
+    // deterministic scope-identifier filter runs per job without a per-job
+    // query. A failure degrades to empty — the filter then strips only each
+    // thought's own scope.
+    let known_scopes = match kengram_storage::list_scopes(pool, None).await {
+        Ok(s) => s
+            .into_iter()
+            .map(|x| x.scope.as_str().to_string())
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::debug!(error = %e, "tag-drain: list_scopes failed; scope-id filter uses own-scope only");
+            Vec::new()
+        }
+    };
+
     for job in jobs {
-        match process_tag_job(pool, tagger, scope_vocab_limit, &job).await {
+        match process_tag_job(pool, tagger, scope_vocab_limit, &job, &known_scopes).await {
             TagJobOutcome::Completed => report.completed += 1,
             TagJobOutcome::Transient => report.failed_transient += 1,
             TagJobOutcome::Permanent => report.failed_permanent += 1,
@@ -222,6 +237,7 @@ async fn process_tag_job(
     tagger: &dyn Tagger,
     scope_vocab_limit: Option<i64>,
     job: &kengram_storage::PendingTagJob,
+    known_scopes: &[String],
 ) -> TagJobOutcome {
     // Fetch the thought's content.
     let thought = match kengram_storage::fetch_thought(pool, job.thought_id).await {
@@ -280,7 +296,13 @@ async fn process_tag_job(
             // (vocab-gated) + v12 people/entities disjointness. Extracted into
             // `finalize` so the one-shot `kengram tag` path runs the identical
             // steps instead of skipping them.
-            finalize::finalize_tags(&mut output.tags, vocab.as_ref());
+            finalize::finalize_tags(
+                &mut output.tags,
+                &thought.metadata,
+                &thought.scope,
+                vocab.as_ref(),
+                known_scopes,
+            );
             if let Err(e) = kengram_storage::update_thought_tags(
                 pool,
                 job.thought_id,

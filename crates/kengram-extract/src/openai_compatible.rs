@@ -213,21 +213,40 @@ impl OpenAICompatibleTagger {
             ));
         }
 
+        // Provenance binding (v14): the stamped `model_version` must reflect
+        // the resolved prompt's identity. With the bundled prompt the stamp
+        // MUST be BUNDLED_TAGGER_VERSION; with a custom prompt it must be
+        // something else. This makes `thoughts.tags_extractor_version`
+        // trustworthy — it can no longer silently drift from the prompt that
+        // produced a row. (A stale `model_version` override decoupled from the
+        // prompt text is what made a dogfood session misread
+        // constant-prompt/varying-model runs as varying-prompt.) `--force`
+        // covers the "retag regardless of version" use the override used to hack.
+        match (config.system_prompt.is_some(), config.model_version) {
+            (false, v) if v != BUNDLED_TAGGER_VERSION => {
+                return Err(TaggerError::Misconfigured(format!(
+                    "model_version={v} but no custom system_prompt is set; the bundled prompt is \
+                     version {BUNDLED_TAGGER_VERSION}. Remove the model_version override (it tracks \
+                     the bundled version by default) or set a custom system_prompt. The stamp must \
+                     not drift from the prompt; use `kengram tag --force` to retag regardless of version."
+                )));
+            }
+            (true, v) if v == BUNDLED_TAGGER_VERSION => {
+                return Err(TaggerError::Misconfigured(format!(
+                    "a custom system_prompt is set but model_version is still the bundled default \
+                     ({BUNDLED_TAGGER_VERSION}); set an explicit distinct model_version so \
+                     tags_extractor_version partitions custom-prompt tags from bundled-prompt tags."
+                )));
+            }
+            _ => {}
+        }
+
         // Resolve the system prompt: operator override wins; otherwise the
         // bundled default.
-        let (system_prompt, is_override) = match config.system_prompt {
-            Some(custom) => (custom, true),
-            None => (BUNDLED_TAGGER_PROMPT.to_string(), false),
+        let system_prompt = match config.system_prompt {
+            Some(custom) => custom,
+            None => BUNDLED_TAGGER_PROMPT.to_string(),
         };
-        if is_override {
-            tracing::warn!(
-                model_id = %config.model_id,
-                model_version = config.model_version,
-                "tagger: custom system_prompt in use; ensure model_version reflects this prompt's identity. \
-                 Past tags with the same tagger_version were produced under the bundled prompt; \
-                 tags produced under a custom prompt should bump model_version so provenance partitions cleanly."
-            );
-        }
 
         let client = Client::builder()
             .timeout(config.timeout)
@@ -659,7 +678,9 @@ mod tests {
             endpoint,
             model_name: "test-model".to_string(),
             model_id: "test/test-model".to_string(),
-            model_version: 1,
+            // Bundled prompt (system_prompt: None) requires the stamp to equal
+            // the bundled version under the v14 provenance binding.
+            model_version: BUNDLED_TAGGER_VERSION,
             api_key,
             timeout: Duration::from_secs(2),
             temperature: 0.0,
@@ -968,6 +989,46 @@ mod tests {
         assert!(matches!(err, TaggerError::Misconfigured(_)));
     }
 
+    // Provenance binding (v14): the stamped `model_version` must not be able
+    // to drift from the resolved prompt's identity. With the bundled prompt
+    // the stamp MUST be BUNDLED_TAGGER_VERSION; with a custom prompt it must
+    // be something else. Otherwise `thoughts.tags_extractor_version` lies
+    // about which prompt produced a row (the footgun that made a dogfood
+    // session's constant-prompt/varying-model runs look like varying-prompt).
+    #[test]
+    fn bundled_prompt_with_mismatched_version_is_misconfigured() {
+        let mut cfg = config_for("http://127.0.0.1:1/v1".to_string(), None);
+        cfg.system_prompt = None;
+        cfg.model_version = BUNDLED_TAGGER_VERSION + 1;
+        let err = OpenAICompatibleTagger::new(cfg).unwrap_err();
+        assert!(matches!(err, TaggerError::Misconfigured(_)));
+    }
+
+    #[test]
+    fn bundled_prompt_with_matching_version_is_ok() {
+        let mut cfg = config_for("http://127.0.0.1:1/v1".to_string(), None);
+        cfg.system_prompt = None;
+        cfg.model_version = BUNDLED_TAGGER_VERSION;
+        assert!(OpenAICompatibleTagger::new(cfg).is_ok());
+    }
+
+    #[test]
+    fn custom_prompt_with_bundled_version_is_misconfigured() {
+        let mut cfg = config_for("http://127.0.0.1:1/v1".to_string(), None);
+        cfg.system_prompt = Some("custom dogfood prompt".to_string());
+        cfg.model_version = BUNDLED_TAGGER_VERSION;
+        let err = OpenAICompatibleTagger::new(cfg).unwrap_err();
+        assert!(matches!(err, TaggerError::Misconfigured(_)));
+    }
+
+    #[test]
+    fn custom_prompt_with_distinct_version_is_ok() {
+        let mut cfg = config_for("http://127.0.0.1:1/v1".to_string(), None);
+        cfg.system_prompt = Some("custom dogfood prompt".to_string());
+        cfg.model_version = BUNDLED_TAGGER_VERSION + 1;
+        assert!(OpenAICompatibleTagger::new(cfg).is_ok());
+    }
+
     #[tokio::test]
     async fn custom_system_prompt_flows_into_request_body() {
         let server = MockServer::start().await;
@@ -985,6 +1046,8 @@ mod tests {
         let mut cfg = config_for(format!("{}/v1", server.uri()), None);
         cfg.system_prompt =
             Some("Custom prompt for the dogfood week. Return tags only.".to_string());
+        // A custom prompt requires a stamp distinct from the bundled version.
+        cfg.model_version = BUNDLED_TAGGER_VERSION + 1;
         let t = OpenAICompatibleTagger::new(cfg).unwrap();
         let _ = t.tag("x", None).await;
 

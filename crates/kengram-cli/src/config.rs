@@ -208,7 +208,7 @@ pub struct TaggerConfig {
     /// Conventionally `<vendor>/<model>`. Defaults to `"vllm/qwen2.5-7b-instruct"`.
     pub model_id: String,
     /// Schema-version for `thoughts.tags_extractor_version`. Default tracks
-    /// `kengram_extract::BUNDLED_TAGGER_VERSION` (currently 15 — nine
+    /// `kengram_extract::BUNDLED_TAGGER_VERSION` (currently 16 — ten
     /// post-M6.1 dogfood iterations: v6 rebalanced kind classification +
     /// added entity surface-only rule + tightened URL emission but
     /// repeated the v3→v4 backfire by listing adjectival phrases as
@@ -239,7 +239,9 @@ pub struct TaggerConfig {
     /// into the shared kengram-mcp::finalize seam; v15 raises the entities
     /// cap 3→8 and adds a relevance-ordering instruction after the v14
     /// staging audit showed a tight cap truncating real names from
-    /// entity-rich thoughts). Bump when
+    /// entity-rich thoughts; v16 raises that cap 8→15 after the v15 audit
+    /// showed ordering can't drive selection under a binding cap — the cap is
+    /// a pathology bound, not a selector). Bump when
     /// the prompt or schema changes such that prior tags shouldn't be
     /// considered comparable; `kengram tag --rerun --since
     /// 1970-01-01T00:00:00Z` then backfills.

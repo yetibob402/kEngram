@@ -216,7 +216,23 @@ impl OpenAICompatibleConfig {
 /// descriptive phrases) at the slot the v14 audit saw weak phrases like
 /// `workflow_run triggers` leak into — a separate NAME-vs-DESCRIBE precision
 /// residual, only partially addressed here.
-pub const BUNDLED_TAGGER_VERSION: i32 = 15;
+/// **v16 (post-v15 staging audit)** the v15 audit showed the relevance-
+/// ordering instruction does NOT drive selection: with `maxItems: 8` the
+/// model still emitted the first 8 names in source order (the production-
+/// stack thought dropped Temporal despite "newest addition" + version +
+/// use-case salience cues — it was simply last). The `maxItems` grammar
+/// truncates in emission order, and the model emits in reading order, so a
+/// soft "descending relevance" instruction can't reorder against it. Rather
+/// than chase salience selection, reframe the cap as a pathology bound and
+/// raise it 8→15 so it stops binding on realistic thoughts (a 12-name stack
+/// keeps everything, Temporal included). Verified safe re: hallucination —
+/// the v15 audit distribution showed the model emits by content, not by
+/// filling the cap (4 entity-poor thoughts emitted [] with 8 slots free; the
+/// CI/model thoughts emitted 5/3; only the genuine 12-name stack hit the
+/// ceiling; every emitted entity was prose-present). The surface-only rule,
+/// not the cap, is the anti-hallucination gate. The ordering clause stays
+/// (harmless, and "emit them all" is now achievable for ≤15-name thoughts).
+pub const BUNDLED_TAGGER_VERSION: i32 = 16;
 
 #[derive(Debug, Clone)]
 pub struct OpenAICompatibleTagger {
@@ -643,7 +659,7 @@ fn tags_response_format() -> serde_json::Value {
                 ],
                 "properties": {
                     "people": { "type": "array", "items": { "type": "string" } },
-                    "entities": { "type": "array", "items": { "type": "string" }, "maxItems": 8 },
+                    "entities": { "type": "array", "items": { "type": "string" }, "maxItems": 15 },
                     "action_items": { "type": "array", "items": { "type": "string" } },
                     "topics": { "type": "array", "items": { "type": "string" }, "maxItems": 3 },
                     "dates_mentioned": { "type": "array", "items": { "type": "string" } },
@@ -1269,7 +1285,7 @@ mod tests {
         );
 
         // Presets track BUNDLED_TAGGER_VERSION.
-        assert_eq!(BUNDLED_TAGGER_VERSION, 15);
+        assert_eq!(BUNDLED_TAGGER_VERSION, 16);
         let cfg = OpenAICompatibleConfig::vllm_local();
         assert_eq!(cfg.model_version, BUNDLED_TAGGER_VERSION);
         let cfg = OpenAICompatibleConfig::open_router("k".into(), "m".into());
@@ -1295,7 +1311,7 @@ mod tests {
             ]
         );
         assert_eq!(schema["properties"]["topics"]["maxItems"], 3);
-        assert_eq!(schema["properties"]["entities"]["maxItems"], 8);
+        assert_eq!(schema["properties"]["entities"]["maxItems"], 15);
         assert_eq!(schema["properties"]["relations"]["maxItems"], 5);
         // `kind` must allow null on the wire.
         let kind_type = &schema["properties"]["kind"]["type"];

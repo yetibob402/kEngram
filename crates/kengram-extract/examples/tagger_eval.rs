@@ -83,14 +83,25 @@ async fn main() -> ExitCode {
     let endpoint =
         env::var("OLLAMA_ENDPOINT").unwrap_or_else(|_| "http://localhost:11434/v1".to_string());
     let model = env::var("TAGGER_MODEL").unwrap_or_else(|_| "gemma3:12b".to_string());
+    // Optional bearer token so the sweep's cloud arm (OpenRouter / ollama-cloud
+    // / any authenticated OpenAI-compatible endpoint) can be exercised with the
+    // same harness. Unset → no auth (the local-Ollama default).
+    let api_key = env::var("TAGGER_API_KEY").ok().filter(|k| !k.is_empty());
+    // Per-request timeout (default 180s). Bump it for slow models — a cold 27B
+    // on modest hardware can exceed 180s and every fixture then "fails" as a
+    // timeout, which is a latency artifact, not a tag-quality signal.
+    let timeout_secs = env::var("TAGGER_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(180);
     let cfg = OpenAICompatibleConfig {
         endpoint: endpoint.clone(),
         model_name: model.clone(),
         model_id: format!("ollama/{model}"),
         model_version: BUNDLED_TAGGER_VERSION,
-        api_key: None,
+        api_key,
         temperature: 0.2,
-        timeout: Duration::from_secs(180),
+        timeout: Duration::from_secs(timeout_secs),
         system_prompt: None,
     };
     let tagger = match OpenAICompatibleTagger::new(cfg) {

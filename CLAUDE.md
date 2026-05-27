@@ -47,17 +47,20 @@ If you find yourself reasoning about a design choice that the design doc already
 ├── docs/
 │   └── milestones/         # one doc per milestone
 ├── crates/
-│   ├── kengram-core/        # domain types, Embedder trait, retrieval fusion (pure)
+│   ├── kengram-core/        # domain types, Embedder/Tagger/Reranker traits, retrieval fusion (pure)
 │   ├── kengram-storage/     # sqlx + migrations + repository functions
-│   ├── kengram-embed/       # Embedder impls: TEI, cloud (dev/test)
-│   ├── kengram-mcp/         # rmcp tool definitions and handlers
+│   ├── kengram-embed/       # Embedder + Reranker impls: TEI, cloud (dev/test)
+│   ├── kengram-extract/     # Tagger impls: OpenAI-compatible (vLLM/OpenRouter/Ollama) + HTTP-sidecar client
+│   ├── kengram-tagger-protocol/      # wire types for the HTTP tagger-sidecar contract
+│   ├── kengram-tagger-deterministic/ # reference non-LLM tagger sidecar (opt-in)
+│   ├── kengram-mcp/         # rmcp tools + the embed/tag drainers and finalize pipeline
 │   └── kengram-cli/         # the only binary; axum + transport, config, subcommands
 ├── migrations/             # sqlx migrations, numbered (0001_initial.sql, ...)
 └── config/
     └── kengram.example.toml
 ```
 
-Five crates in M1. `kengram-extract` joins at M2 when the facts pipeline lands. Library crates have no `main`. `kengram-cli` is the only binary. Each library crate exposes a small, well-named API surface; cross-crate calls go through trait abstractions where the design doc indicates (the `Embedder` trait being the primary one in M1).
+Eight crates. `kengram-cli` is the only binary; the rest are libraries with no `main`. Each library crate exposes a small, well-named API surface; cross-crate calls go through trait abstractions where the design doc indicates (`Embedder`, `Tagger`, `Reranker`). (The workspace started at five crates in M1; `kengram-extract` landed with the facts pipeline, and the two `kengram-tagger-*` crates with the pluggable-tagger work.)
 
 ## Conventions
 
@@ -67,7 +70,7 @@ Five crates in M1. `kengram-extract` joins at M2 when the facts pipeline lands. 
 - **Compile-time SQL.** Use `sqlx::query!` / `sqlx::query_as!`. Reserve string SQL for genuinely dynamic shapes (e.g., constructing the hybrid search query at runtime).
 - **No clever macros** unless they replace at least 50 lines of boilerplate they're not just hiding.
 - **No `Box<dyn Error>` in public APIs.** It eats type information.
-- **Trait objects for swappable backends** (`Embedder`, `Extractor`); concrete types everywhere else.
+- **Trait objects for swappable backends** (`Embedder`, `Tagger`, `Reranker`); concrete types everywhere else.
 - **Tests live next to the code** they test. Integration tests use `sqlx::test` against a real Postgres.
 - `cargo fmt` and `cargo clippy --all-targets -- -D warnings` pass before any commit.
 
@@ -95,8 +98,8 @@ sqlx migrate run
 # Run the server
 cargo run --bin kengram -- serve
 
-# (M2+) Run the worker (reflector + re-embed jobs)
-# cargo run --bin kengram -- worker
+# Run the worker (drains pending_embeddings + pending_tags on each tick)
+cargo run --bin kengram -- worker
 
 # Tests
 cargo test --workspace
@@ -105,24 +108,13 @@ cargo test --workspace --features integration  # requires running Postgres + TEI
 
 ## Current state
 
-- ✅ Design doc revised (v0.1) after milestone-roadmap brainstorm. See `DESIGN.md`.
-- ✅ Per-milestone documents drafted at `docs/milestones/m{0..5}-*.md`.
-- ✅ **M0 dev environment shipped.** `docker-compose.yml` at repo root for Postgres 16 + pgvector + pg_trgm + pgcrypto. `DEVELOPMENT.md` documents first-time setup. Dev-mode embedder is Ollama at `http://localhost:11434/v1/embeddings` (model `bge-m3`).
-- ⏳ **Current focus: M1 design.** Workspace, migration, capture/search, and MCP surface are all yet to be designed in detail.
-- ⏳ No Rust code written yet.
+- ✅ **M0–M6.1 shipped** (as of 2026-05-18). Eight-crate workspace; migrations `0001`–`0011`. Live: the capture/search MCP surface, hybrid retrieval (vector kNN + trigram, RRF fusion, cross-encoder rerank), thought retraction, the relational link graph (`thought_links`, M5/M6.1), and the LLM tagging sidecar (M4) with a worker that drains `pending_embeddings` + `pending_tags`.
+- ✅ **Tagger at prompt v16** (`BUNDLED_TAGGER_VERSION`). Post-M6.1 dogfood iteration added: the `decision_record` kind, forward-looking `action_items`, deterministic scope-identifier / relationship-noun filters + a `metadata.decision_type` override in the shared `kengram_mcp::finalize` seam (run by both the worker drainer and `kengram tag`), provenance binding (the version stamp can't drift from the prompt), and an entities cap of 15. An opt-in deterministic NER backend lives in `kengram-tagger-deterministic`. Iteration log: `docs/tagger-improvements.md`; cross-model eval harness: `./tagger-sweep.sh`.
+- ⏳ **M7 (operational maturity)** is the next milestone; day-to-day work right now is dogfooding the live corpus and refining the tagger.
 
 ## Next concrete step
 
-Plan M1 in detail. Read `docs/milestones/m1-capture-and-search.md` and the M1-tagged sections of the design doc, then start a fresh planning conversation that produces:
-
-1. The exact migration SQL (a file, not a description).
-2. The Cargo workspace skeleton — five crates per the layout above, plus `[workspace.dependencies]` with pinned versions for everything in the Stack table.
-3. The capture and search request/response types and handler shapes.
-4. The four M1 MCP tool signatures.
-
-Before starting that conversation, **bring up M0**: `docker compose up -d postgres` and `ollama pull bge-m3`. See `DEVELOPMENT.md`.
-
-That conversation produces another plan file and, after approval, becomes code. Subsequent milestones get their own planning conversations driven by their milestone documents.
+The shipped milestones (M0–M6.1) are done; the next is **M7 (operational maturity)** — read `docs/milestones/m7-operational-maturity.md` for its scope and success criteria. New milestone work follows the doc-driven flow: read the milestone doc, produce a plan file, get approval, then code (same discipline as *How to handle ambiguity* below). Between milestones, the active work is dogfooding the live corpus and refining the tagger (`docs/tagger-improvements.md` is the iteration log).
 
 ## How to handle ambiguity
 

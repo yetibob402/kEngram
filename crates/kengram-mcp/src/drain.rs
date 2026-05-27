@@ -13,7 +13,7 @@
 //! `insert_thought_embedding` and `mark_embedded`, the next tick re-claims
 //! the row, re-embeds, re-inserts (no-op), and marks embedded — clean.
 
-use crate::{normalize, validate};
+use crate::finalize;
 use kengram_core::{
     Embedder, EmbedderError, Embedding, EmbeddingError, ExtractedRelation, LinkSource, Tagger,
     ThoughtId,
@@ -276,24 +276,11 @@ async fn process_tag_job(
             // link graph; tags.relations is no longer persisted (migration
             // 0011 dropped the field from existing rows).
 
-            // v11 post-process topic normalization. Topics no longer flow
-            // into the LLM prompt (render_vocab_section is entities-only
-            // since v11). Instead, the drainer normalizes emitted topics
-            // against the scope vocab here, after the LLM has emitted them
-            // fresh from the prose. Separates emission (LLM's job) from
-            // canonical-form convergence (post-process). Pass-through when
-            // vocab is absent or has no topics to converge against.
-            if let Some(v) = vocab.as_ref()
-                && !v.topics.is_empty()
-            {
-                output.tags.topics = normalize::normalize_topics(&output.tags.topics, &v.topics);
-            }
-            // v12 structural-invariant enforcement. Removes any entries
-            // from `tags.entities` whose lowercased form duplicates a
-            // `tags.people` entry — the LLM sometimes routes the same
-            // name into both arrays (probe E saw "Sarah" in both). No
-            // vocab dependency; this is a pure-Tags property check.
-            validate::enforce_people_entities_disjoint(&mut output.tags);
+            // Deterministic post-tag pipeline: v11 topic normalization
+            // (vocab-gated) + v12 people/entities disjointness. Extracted into
+            // `finalize` so the one-shot `kengram tag` path runs the identical
+            // steps instead of skipping them.
+            finalize::finalize_tags(&mut output.tags, vocab.as_ref());
             if let Err(e) = kengram_storage::update_thought_tags(
                 pool,
                 job.thought_id,

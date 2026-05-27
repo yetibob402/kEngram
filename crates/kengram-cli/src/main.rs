@@ -880,7 +880,12 @@ async fn run_tag(
             _ => None,
         };
         match tagger.tag(&t.content, vocab.as_ref()).await {
-            Ok(output) => {
+            Ok(mut output) => {
+                // Apply the same deterministic post-tag pipeline the worker
+                // drainer runs (topic-normalize + people/entities disjoint).
+                // This path previously skipped it, so CLI-tagged rows could
+                // diverge from worker-tagged rows for the same thought.
+                kengram_mcp::finalize::finalize_tags(&mut output.tags, vocab.as_ref());
                 if let Err(err) = kengram_storage::update_thought_tags(
                     &pool,
                     t.id,

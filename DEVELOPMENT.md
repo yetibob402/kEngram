@@ -40,7 +40,7 @@ ollama pull qwen2.5:7b-instruct    # tagging (worker, on by default)
 | Script | What it does |
 |---|---|
 | `./start_stack.sh` | Brings up the backing containers (`postgres` + the `tei` reranker) and blocks until Postgres is ready. Pass `--tagger` to also start the opt-in deterministic tagger sidecar. Sets no env vars — service config lives in `docker-compose.yml`. |
-| `./start_server.sh` | Runs `kengram serve` in the foreground (MCP server on `127.0.0.1:8080`, endpoint `/mcp`). Reads its DB URL from `kengram.toml` / `KENGRAM_DATABASE__URL` / the built-in default. |
+| `./start_server.sh` | Runs `kengram serve` in the foreground (MCP server on `127.0.0.1:8081`, endpoint `/mcp`). Reads its DB URL from `kengram.toml` / `KENGRAM_DATABASE__URL` / the built-in default. |
 | `./start_worker.sh` | Runs `kengram worker` in the foreground — drains `pending_embeddings` and `pending_tags`. Honors your `[tagger]` config; with no config file it defaults to tagging via local Ollama. `off` forces embed-only. |
 | `./stop_stack.sh` | Stops the backing containers. Default keeps the containers and the Postgres data volume for a fast resume; `--down` removes the containers and network (the data volume is still preserved). |
 
@@ -144,10 +144,10 @@ docker compose ps tei
 Smoke:
 
 ```bash
-curl -s http://localhost:8080/health
+curl -s http://localhost:8081/health
 # expect: 200 (empty body is OK)
 
-curl -s http://localhost:8080/rerank \
+curl -s http://localhost:8081/rerank \
   -H 'Content-Type: application/json' \
   -d '{"query":"reproducibility","texts":["Nix is reproducible","Redis is fast","Bazel is powerful"]}' \
   | jq .
@@ -240,7 +240,7 @@ cargo build --workspace
 cargo test --workspace                       # unit + sqlx::test
 cargo test --workspace --features integration   # adds a live-Ollama round-trip test
 
-cargo run --bin kengram -- serve              # starts the MCP server on 127.0.0.1:8080
+cargo run --bin kengram -- serve              # starts the MCP server on 127.0.0.1:8081
 cargo run --bin kengram -- worker             # in a second shell — drains pending_embeddings + pending_tags
 cargo run --bin kengram -- stats              # corpus + storage telemetry; operator-facing snapshot
 cargo run --bin kengram -- audit migrations   # per-migration audit log
@@ -259,7 +259,7 @@ The `--all-targets --all-features` flags matter: they capture `query!` macros be
 
 CI (when it lands at M7) will enforce that `.sqlx/` is up to date.
 
-Point an MCP-capable client (Claude Code, Claude Desktop, `mcp-inspector`) at `http://127.0.0.1:8080/mcp` (streamable-HTTP transport, per the current MCP spec). Nine tools are exposed:
+Point an MCP-capable client (Claude Code, Claude Desktop, `mcp-inspector`) at `http://127.0.0.1:8081/mcp` (streamable-HTTP transport, per the current MCP spec). Nine tools are exposed:
 
 - `capture` — write a thought; returns `thought_id`, `embedding_status: "pending"`, and `is_duplicate`. Same content captured twice (SHA-256 fingerprint match) returns the existing `thought_id`.
 - `search_thoughts` — RRF-fused vector + trigram retrieval over thoughts; recency-boosted; optional cross-encoder rerank; optional `tag_filter` JSONB-containment filter (e.g. `{"kind": "task"}`); `scope` (exact) or `scope_prefix` (namespace) for scope filtering. Each hit carries its `tags` object.
@@ -347,7 +347,7 @@ Example `kengram.toml` (every knob spelled out — most can be omitted to take t
 
 ```toml
 [server]
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:8081"
 allowed_hosts = []                                      # see below
 
 [database]
@@ -365,7 +365,7 @@ timeout_seconds = 5
 
 [reranker]                                              # opt-in
 provider = "tei"                                        # "" = silent-disable
-endpoint = "http://localhost:8080"                      # no /v1 suffix; reranker appends /rerank
+endpoint = "http://localhost:8081"                      # no /v1 suffix; reranker appends /rerank
 model_id = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 timeout_seconds = 30
 
@@ -403,7 +403,7 @@ Env override examples: `KENGRAM_WORKER__TICK_INTERVAL_SECONDS=2 cargo run --bin 
 
 | knob | default | what it does |
 |---|---|---|
-| `bind` | `"127.0.0.1:8080"` | Listen address. Tier 0 (localhost) is the default. Tier 1 (Tailnet) is a non-loopback bind — set this to the Tailscale interface IP or `0.0.0.0:<port>`. No code change required. |
+| `bind` | `"127.0.0.1:8081"` | Listen address. Tier 0 (localhost) is the default. Tier 1 (Tailnet) is a non-loopback bind — set this to the Tailscale interface IP or `0.0.0.0:<port>`. No code change required. |
 | `allowed_hosts` | `[]` (use rmcp's safe default) | Host names / IPs the MCP server's DNS-rebinding protection accepts on the `Host` header. Empty = rmcp default (`localhost` / `127.0.0.1` / `::1`). A non-empty list REPLACES the default. |
 
 When binding non-loopback, include both the bare hostname AND `hostname:port` forms the client uses, plus IP and `ip:port` forms — the rmcp matcher checks both. Leaving this list empty when bind is non-loopback effectively rejects every non-localhost request; the symptom is "rejected request with disallowed Host header" warnings in the serve log. Bypass-all is intentionally not exposed — Tailnet ACLs plus an explicit allowlist is Tier 1 auth.
@@ -444,7 +444,7 @@ The reranker is the optional cross-encoder stage that re-scores the top `candida
 | knob | default | what it does |
 |---|---|---|
 | `provider` | `""` | `""` = disabled; `"tei"` = TEI sidecar (currently the only supported provider). |
-| `endpoint` | `"http://localhost:8080"` | Service root, no `/v1` suffix. The reranker client appends `/rerank`. |
+| `endpoint` | `"http://localhost:8081"` | Service root, no `/v1` suffix. The reranker client appends `/rerank`. |
 | `model_id` | `"BAAI/bge-reranker-v2-m3"` | Kengram-side stable identity. Dev override: `"cross-encoder/ms-marco-MiniLM-L-6-v2"` (matches the docker-compose pin). |
 | `timeout_seconds` | `30` | Per-request timeout. MiniLM is sub-100ms on Apple Silicon; BGE-v2-m3 on GPU is similar; ARM CPU runs of BGE-v2-m3 are minutes per call (don't). |
 
@@ -813,7 +813,7 @@ Dev (MiniLM, ARM CPU):
 ```toml
 [reranker]
 provider = "tei"
-endpoint = "http://localhost:8080"
+endpoint = "http://localhost:8081"
 model_id = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 timeout_seconds = 30
 ```
@@ -823,7 +823,7 @@ Production (BGE-reranker-v2-m3 on GPU host):
 ```toml
 [reranker]
 provider = "tei"
-endpoint = "http://tei-internal:8080"
+endpoint = "http://tei-internal:8081"
 model_id = "BAAI/bge-reranker-v2-m3"
 timeout_seconds = 30
 ```
@@ -844,7 +844,7 @@ This means `[tagger].provider` resolved to `""`. Set it to `"openai-compatible"`
 
 **Reranker timeout.** When the reranker is unreachable or slow, the pipeline silently degrades to RRF + recency. The response has `rerank_used: false`; results still come back. No error is raised. If reranks are systematically falling through, check the TEI container health and `[reranker].timeout_seconds`.
 
-**Port collisions on `:8080`.** docker-compose maps TEI to host `:8080`, and the kengram serve default is also `:8080`. When both run on the same machine, set `[server].bind` away from `:8080` (`127.0.0.1:8081` for local Tier 0, or `0.0.0.0:8081` + `allowed_hosts` for Tailnet Tier 1 — the M5.2 history). The other direction works too — remap TEI to a different host port in `docker-compose.yml` — but moving kengram is usually less disruptive.
+**Port collisions on `:8081`.** docker-compose maps TEI to host `:8081`, and the kengram serve default is also `:8081`. When both run on the same machine, set `[server].bind` away from `:8081` (`127.0.0.1:8082` for local Tier 0, or `0.0.0.0:8082` + `allowed_hosts` for Tailnet Tier 1 — the M5.2 history). The other direction works too — remap TEI to a different host port in `docker-compose.yml` — but moving kengram is usually less disruptive.
 
 **Tagger schema field stripped by claude.ai's MCP client.** The hosted claude.ai web client strips optional MCP tool fields whose JSON schema lacks a concrete `type`. The fix (M5.2) is to declare `tag_filter` and `metadata` on the relevant tools as `Option<Map<String, Value>>` rather than `Option<Value>`, so schemars renders `type: ["object", "null"]` (concrete) rather than letting `type` go missing. If a new tool field goes missing in the claude.ai client but works in `mcp-inspector`, check the field's Rust type — `serde_json::Value` is too lax, use a concrete container.
 
@@ -852,7 +852,7 @@ This means `[tagger].provider` resolved to `""`. Set it to `"openai-compatible"`
 
 ## Port conflicts
 
-If something else already binds `5432`, edit `docker-compose.yml` to map a different host port (e.g. `"5433:5432"`) and update `DATABASE_URL` accordingly. Same for `8080` — see the troubleshooting note above on the kengram-vs-TEI collision.
+If something else already binds `5432`, edit `docker-compose.yml` to map a different host port (e.g. `"5433:5432"`) and update `DATABASE_URL` accordingly. Same for `8081` — see the troubleshooting note above on the kengram-vs-TEI collision.
 
 ## Production note
 

@@ -101,7 +101,7 @@ The system is built in seven capability milestones (M1–M7), preceded by a smal
 
 ## 4. High-level architecture
 
-![Kengram architecture: MCP/HTTP surface, core service, and worker drainer inside the kengram binary; the binary calls out to Embedder/Reranker/Tagger sidecars (OpenAI-compatible / TEI) and to Postgres + pgvector, with the external vLLM endpoint hosted separately.](docs/images/mermaid-ai-diagram-2026-05-28-030504.svg)
+![Kengram architecture: MCP/HTTP surface, core service, and worker drainer inside the kengram binary; the binary calls out to Embedder/Reranker/Tagger sidecars (OpenAI-compatible / TEI) and to Postgres + pgvector, with the external vLLM endpoint hosted separately.](docs/images/architecture.svg)
 
 Kengram is a *client* of the local vLLM endpoint, not the operator of it. vLLM is presumed to be serving primary inference traffic to other Tailscale-connected devices anyway; Kengram piggybacks on that infrastructure. Three logical components, one binary:
 

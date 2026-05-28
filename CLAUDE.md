@@ -43,7 +43,6 @@ If you find yourself reasoning about a design choice that the design doc already
 ├── DESIGN.md               # the design doc (terminal state)
 ├── README.md
 ├── DEVELOPMENT.md          # operator setup + configuration reference
-├── AGENTS.md               # agent-facing usage preferences
 ├── docs/
 │   └── milestones/         # one doc per milestone
 ├── crates/

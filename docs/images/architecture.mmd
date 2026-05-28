@@ -1,0 +1,33 @@
+  %%{init: {'theme': 'dark'}}%%
+  flowchart LR
+   subgraph kengram["Kengram (single binary)"]
+      direction LR
+          mcpHttp["MCP/HTTP<br>surface"]
+          coreService["Core service<br>(capture, search,<br>retract, link graph)"]
+          worker["Worker<br>(drains pending_embeddings<br>+ pending_tags)"]
+          traits["Embedder · Reranker · Tagger<br>(traits)"]
+    end
+      clients["MCP clients<br>(Claude Code, Desktop,<br>opencode, claude.ai)<br>over loopback / Tailscale"] --> mcpHttp
+      mcpHttp --> coreService
+      coreService --> worker & traits & postgres
+      worker --> traits & postgres
+      traits -->|embedder + tagger| llm["OpenAI-compatible API<br>(vLLM / Ollama / OpenRouter)"]
+      traits -->|reranker| tei["TEI<br>(optional)"]
+      traits -.->|tagger, provider=http| sidecar["Tagger HTTP sidecar<br>(opt-in; reference impl is<br>kengram-tagger-deterministic)"]
+      postgres[("Postgres<br>thoughts + pgvector +<br>thought_links + pending_* queues")]
+
+  mcpHttp:::kengram
+  coreService:::kengram
+  worker:::kengram
+  traits:::kengram
+  
+       clients:::clients
+       llm:::compute
+       tei:::compute
+       sidecar:::compute
+       postgres:::storage
+      classDef clients fill:#082f49,stroke:#38bdf8
+      classDef kengram fill:#1e1b4b,stroke:#a78bfa
+      classDef compute fill:#431407,stroke:#fb923c
+      classDef storage fill:#052e16,stroke:#4ade80
+      classDef external fill:#2c0a0a,stroke:#f87171

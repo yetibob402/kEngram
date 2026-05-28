@@ -217,7 +217,7 @@ cargo run --bin kengram -- worker
 
 **To bring the sidecar down** without stopping the rest of the stack: `docker compose --profile tagger stop tagger-deterministic`. **To recreate after editing `topic-taxonomy.toml`**: `docker compose --profile tagger restart tagger-deterministic` (taxonomy is embedded once at startup, so a restart is required for new vectors to take effect). **To stop the whole stack and bring back only specific services**: `docker compose down` tears down everything regardless of profile; bring back with `docker compose --profile tagger up -d` (default-profile services + tagger) or omit the profile to leave the sidecar off.
 
-**Switching back to the LLM tagger** is the same shape: change `provider = "openai-compatible"`, restore the LLM `model_id` / `model_version` / `endpoint` / `model_name` fields, restart the worker. The `[tagger.http]` block can stay in the file; it's ignored when `provider != "http"`.
+**Switching back to the LLM tagger** is the same shape: change `provider = "openai-compatible"`, restore the LLM `model_id` / `endpoint` / `model_name` fields, restart the worker. The `[tagger.http]` block can stay in the file; it's ignored when `provider != "http"`.
 
 ### 4. Run migrations
 
@@ -316,7 +316,7 @@ cargo run --bin kengram -- tag --scope-prefix kengram. --limit 200
 
 ### Re-tag after tagger version bump
 
-Re-run the tagger over thoughts whose stored `tags_extractor_version` is below the configured current version. Use this after bumping `[tagger].model_version` (typically after a prompt or schema change). Tags are overwritten in place — no supersede semantics, no audit chain — so pass `--snapshot` to dump current tags to a JSON file first if you want a recoverable copy. Pair with `--since` to bound the rerun to recent thoughts; use `--since 1970-01-01T00:00:00Z` to re-tag the entire corpus.
+Re-run the tagger over thoughts whose stored `tags_extractor_version` is below the configured current version. Use this after a `BUNDLED_TAGGER_VERSION` bump (typically a prompt or schema change pulled in). Tags are overwritten in place — no supersede semantics, no audit chain — so pass `--snapshot` to dump current tags to a JSON file first if you want a recoverable copy. Pair with `--since` to bound the rerun to recent thoughts; use `--since 1970-01-01T00:00:00Z` to re-tag the entire corpus.
 
 If you **switched the tagger model** without bumping the prompt version, the stored version isn't actually lower, so `--rerun` skips those rows. Use `--force` to re-tag every matching thought regardless of version — it re-stamps the configured `model_version` and records the new `model_id`. Bound it with `--scope` / `--scope-prefix` / `--since` / `--limit`.
 
@@ -327,7 +327,7 @@ cargo run --bin kengram -- tag --snapshot --rerun --since 1970-01-01T00:00:00Z  
 cargo run --bin kengram -- tag --force --scope work                  # re-tag regardless of version (e.g. after a model swap)
 ```
 
-If you've pinned `model_version` in your local `~/.config/kengram/kengram.toml`, it must equal the bundled version (currently **16**) while you're on the bundled prompt — as of v14 the tagger **refuses to start** otherwise (the stamp is bound to prompt identity so it can't silently misrepresent which prompt produced a row). Simplest fix: delete the line and let it track the bundled default automatically. The startup log reports the resolved value: look for `target_version=16`.
+`model_version` is **not a tunable knob** under `[tagger]` with the bundled prompt — the stamp auto-tracks `BUNDLED_TAGGER_VERSION` (currently **16**), and pinning a value there refuses to start. If your toml has an inherited `model_version` line under `[tagger]` with `provider = "openai-compatible"` and no `system_prompt_file`, delete it. The startup log reports the resolved value: look for `target_version=16`. (`model_version` IS operator-set in two narrow cases — alongside a custom `system_prompt_file`, or under `provider = "http"` for the HTTP sidecar's own schema version — see the [Configuration reference](#configuration-reference).)
 
 For the procedural detail and the full v1→v16 changelog, see [Tagger version history and safe re-tag procedure](#tagger-version-history-and-safe-re-tag-procedure).
 
@@ -374,7 +374,6 @@ provider = "openai-compatible"                          # "" = silent-disable; "
 endpoint = "http://localhost:8000/v1"                   # vLLM default; ignored when provider = "http"
 model_name = "qwen2.5-7b-instruct"                      # the model the backend serves
 model_id = "vllm/qwen2.5-7b-instruct"                   # provenance written into thoughts.tags_extractor_model
-# model_version = 16                                     # omit to auto-track BUNDLED_TAGGER_VERSION (recommended); pinning a value != bundled refuses to start. See Tagger version history
 # api_key = ""
 timeout_seconds = 60
 temperature = 0.2
@@ -413,8 +412,7 @@ When binding non-loopback, include both the bare hostname AND `hostname:port` fo
 bind = "0.0.0.0:8081"
 allowed_hosts = [
     "localhost", "127.0.0.1", "::1",
-    "repromax", "repromax:8081",
-    "100.110.75.74", "100.110.75.74:8081",
+    "myserver", "myserver:8081",
 ]
 ```
 
@@ -460,7 +458,7 @@ The tagger is the per-thought metadata sidecar. Empty `provider` is the silent-d
 | `endpoint` | `"http://localhost:8000/v1"` | `/v1` base URL. vLLM default port. OpenRouter is `"https://openrouter.ai/api/v1"`. Ignored when `provider = "http"`. |
 | `model_name` | `"qwen2.5-7b-instruct"` | Model name as the backend understands it. For OpenRouter: a model slug like `"anthropic/claude-haiku-4.5"`. Ignored when `provider = "http"`. |
 | `model_id` | `"vllm/qwen2.5-7b-instruct"` | Kengram-side stable identity written into `thoughts.tags_extractor_model`. Conventionally `<vendor>/<model>`. Used by both LLM and HTTP-sidecar providers. |
-| `model_version` | `16` | Tracks `kengram_extract::BUNDLED_TAGGER_VERSION`. Written into `thoughts.tags_extractor_version`. As of v14 the stamp is **bound to prompt identity**: with the bundled prompt this must equal the bundled version (the tagger refuses to start otherwise) — omit the field to track it automatically. A `BUNDLED_TAGGER_VERSION` bump (prompt/schema change) is followed by `kengram tag --rerun`. See [Tagger version history](#tagger-version-history-and-safe-re-tag-procedure). |
+| `model_version` | *depends* | Stamped onto `thoughts.tags_extractor_version`. **Not a general knob.** With `provider = "openai-compatible"` + the bundled prompt: NOT operator-set — auto-tracks `BUNDLED_TAGGER_VERSION` (setting it refuses to start). With `provider = "openai-compatible"` + `system_prompt_file`: required, a value distinct from the bundled version (partitions custom-prompt tags in provenance). With `provider = "http"`: the operator declares the sidecar's own schema version. A `BUNDLED_TAGGER_VERSION` bump (prompt/schema change) is followed by `kengram tag --rerun`. See [Tagger version history](#tagger-version-history-and-safe-re-tag-procedure). |
 | `api_key` | `None` | Bearer token for hosted LLM endpoints. The HTTP sidecar provider has its own `[tagger.http].api_key`. |
 | `timeout_seconds` | `60` | Per-request timeout for the LLM provider. The HTTP sidecar provider has its own `[tagger.http].timeout_seconds`. |
 | `temperature` | `0.2` | Generation temperature. Lower = more deterministic. 0 makes some backends loop. LLM provider only. |
@@ -518,7 +516,7 @@ After bumping the tagger version (or the bundled default rolls forward and you w
    ```
    kengram tag starting ... target_version=16 ...
    ```
-   If `target_version` is lower than expected, your `~/.config/kengram/kengram.toml` is overriding the bundled default. Bump it manually or delete the `model_version` line so the bundled default takes over.
+   If `target_version` is lower than expected, your `~/.config/kengram/kengram.toml` has a `model_version` line under `[tagger]` overriding the bundled default — delete it so the stamp tracks the bundled version automatically (it's not a tunable knob with the bundled prompt; see the config reference for the two narrow cases where it IS operator-set).
 
 2. **Snapshot, then re-tag the corpus.** Re-tag overwrites `tags` in place with no history table, so capture a snapshot first — `--snapshot` writes every non-retracted row's current tags + provenance to a JSON file before tagging. Whole corpus:
    ```bash
@@ -758,7 +756,6 @@ provider = "openai-compatible"
 endpoint = "http://localhost:8000/v1"
 model_name = "qwen2.5-7b-instruct"
 model_id = "vllm/qwen2.5-7b-instruct"
-# model_version = 16    # omit to auto-track BUNDLED_TAGGER_VERSION; pinning a value != bundled refuses to start
 timeout_seconds = 60
 temperature = 0.2
 scope_vocab_enabled = true
@@ -793,7 +790,6 @@ provider = "openrouter"
 endpoint = "https://openrouter.ai/api/v1"
 model_name = "anthropic/claude-haiku-4.5"
 model_id = "openrouter/anthropic/claude-haiku-4.5"
-# model_version = 16    # omit to auto-track BUNDLED_TAGGER_VERSION; pinning a value != bundled refuses to start
 timeout_seconds = 30
 temperature = 0.2
 ```

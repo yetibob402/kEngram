@@ -62,9 +62,6 @@ provider = ""
 endpoint = "http://localhost:8000/v1"
 model_name = "qwen2.5-7b-instruct"
 model_id = "vllm/qwen2.5-7b-instruct"
-# Omit `model_version` to track the bundled prompt version automatically (recommended).
-# The stamp is bound to prompt identity: with the bundled prompt, a pinned value
-# must equal the bundled version or the tagger refuses to start.
 # api_key = "..."                 # e.g. an OpenRouter key (or use KENGRAM_TAGGER__API_KEY)
 timeout_seconds = 60
 temperature = 0.2

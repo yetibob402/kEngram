@@ -310,7 +310,7 @@ There is one write path. It terminates in a `thoughts` row plus an embedding plu
 
 3. **Write.** `UPDATE thoughts SET tags = $tags, tags_extractor_model = $model_id, tags_extractor_version = $version, tags_extracted_at = NOW() WHERE id = $thought_id`; then `DELETE FROM pending_tags WHERE thought_id = $thought_id`. The two statements run in one transaction. There is no supersede chain — the tags column is overwritten on every successful tagger pass.
 
-4. **(Optional) Re-tag.** `kengram tag --rerun [--since <RFC3339>] [--scope X] [--limit N]` walks thoughts whose `tags_extractor_version < current_tagger_version` (or `IS NULL`, for the first pass on a previously-untagged thought), calls the tagger, and overwrites. Use this after bumping `[tagger].model_version` on a prompt or schema change.
+4. **(Optional) Re-tag.** `kengram tag --rerun [--since <RFC3339>] [--scope X] [--limit N]` walks thoughts whose `tags_extractor_version < current_tagger_version` (or `IS NULL`, for the first pass on a previously-untagged thought), calls the tagger, and overwrites. Use this after a `BUNDLED_TAGGER_VERSION` bump (a prompt or schema change).
 
 **Concrete example.** A thought: *"Talked to Sarah today about the PR backlog. She wants migration #0042 fast-tracked because the mobile freeze starts Thursday."* The tagger returns:
 
@@ -561,7 +561,6 @@ provider        = "openai-compatible"           # alternatives: "openrouter", "h
 endpoint        = "http://localhost:8000/v1"    # vLLM default
 model_name      = "qwen2.5-7b-instruct"         # backend-side model name
 model_id        = "vllm/qwen2.5-7b-instruct"    # provenance label → thoughts.tags_extractor_model
-model_version   = 16                            # tracks BUNDLED_TAGGER_VERSION; omit to auto-track (bound to prompt identity — pinning != bundled refuses to start)
 scope_vocab_enabled = true                      # [M4.1] controlled-vocabulary hint per scope
 scope_vocab_size    = 50                        # [M4.1] top-N established terms per scope
 timeout_seconds = 60
@@ -588,7 +587,7 @@ The `[extractor]` and `[reflector]` sections that shipped in M2 were removed by 
 
 2. **Content-fingerprint dedup.** [M4] `thoughts.content_fingerprint` is SHA-256 of `content` with a `UNIQUE` constraint. Capture is `INSERT ... ON CONFLICT (content_fingerprint) DO NOTHING RETURNING id`; duplicate content from any source (same agent retrying, two agents capturing the same observation, an explicit re-capture) collapses to the existing `thought_id`. Agents see a stable id for a given content, and `is_duplicate: true` on the response so they can react to "I already told you this" if they care.
 
-3. **Derived signals are recomputable.** The `embeddings` table is per-model and per-version; a new embedding model is a new partial HNSW index + a re-embed pass — no data loss, no migration on `thoughts`. The `tags` column is overwritten in place by `kengram tag --rerun` whenever `[tagger].model_version` advances; no supersede chain to walk, no audit trail to reconcile, because tags are advisory metadata, not load-bearing.
+3. **Derived signals are recomputable.** The `embeddings` table is per-model and per-version; a new embedding model is a new partial HNSW index + a re-embed pass — no data loss, no migration on `thoughts`. The `tags` column is overwritten in place by `kengram tag --rerun` whenever `BUNDLED_TAGGER_VERSION` advances; no supersede chain to walk, no audit trail to reconcile, because tags are advisory metadata, not load-bearing.
 
 4. **Retraction is durable.** [M3] `retract_thought` sets `retracted_at` and `retracted_reason` on the row. Every retrieval path (`search_thoughts`, `recent_thoughts`) filters `WHERE retracted_at IS NULL`. `get_thought` is the audit path — it returns the row with retraction state visible. The row never leaves the database; the retracted-thought UX is "untrusted but inspectable."
 

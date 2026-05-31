@@ -78,6 +78,30 @@ services:
       retries: 30
       start_period: 120s
 
+  # Dedicated Ollama instance for embeddings (bge-m3). Sits on host port
+  # 11435 so it never competes with the host's GPU Ollama on :11434 (which
+  # serves the tagger model). On macOS Docker Desktop the container has no
+  # Metal/GPU access by design, so this instance is hard-pinned to CPU
+  # without needing OLLAMA_NUM_GPU. bge-m3 is small (~1.3 GB F16, 566M
+  # params); CPU-through-the-VM embedding of small inputs lands in 0.5–2 s,
+  # well inside the 30 s embedder timeout. The named volume holds the
+  # model cache so first-boot pull is one-time. start_stack.sh performs an
+  # idempotent `ollama pull bge-m3` after this container is healthy.
+  ollama-embed:
+    image: ollama/ollama:latest
+    container_name: kengram-ollama-embed
+    restart: unless-stopped
+    ports:
+      - "11435:11434"
+    volumes:
+      - kengram-ollama-embed-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
   # Reference HTTP-sidecar tagger (kengram-tagger-deterministic). Opt-in via
   # the `tagger` compose profile: `docker compose --profile tagger up -d`.
   # Default `docker compose up -d` does NOT start this service so dev
@@ -142,3 +166,4 @@ services:
 volumes:
   kengram-pg-data:
   kengram-tei-models:
+  kengram-ollama-embed-models:

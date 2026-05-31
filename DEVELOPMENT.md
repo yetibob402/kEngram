@@ -30,16 +30,15 @@ If you don't already have these, here's the canonical install for each:
 
 Four checked-in scripts at the repo root drive the dev stack with minimal typing. This is the recommended path; the step-by-step [Manual setup (advanced)](#manual-setup-advanced) below is the fallback when you need to run or customize an individual step.
 
-**One-time prerequisites** (see [Install prerequisites](#install-prerequisites)): Docker, the Rust toolchain, `sqlx-cli`, and Ollama installed and running. Pull the models the scripts use:
+**One-time prerequisites** (see [Install prerequisites](#install-prerequisites)): Docker, the Rust toolchain, `sqlx-cli`, and Ollama installed and running. Pull the tagger model into the host Ollama (the embedder runs in Docker — `start_stack.sh` pulls `bge-m3` into the `ollama-embed` container on first run, so you don't pull it on the host):
 
 ```bash
-ollama pull bge-m3                 # embeddings
 ollama pull qwen2.5:7b-instruct    # tagging (worker, on by default)
 ```
 
 | Script | What it does |
 |---|---|
-| `./start_stack.sh` | Brings up the backing containers (`postgres` + the `tei` reranker) and blocks until Postgres is ready. Pass `--tagger` to also start the opt-in deterministic tagger sidecar. Sets no env vars — service config lives in `docker-compose.yml`. |
+| `./start_stack.sh` | Brings up the backing containers (`postgres`, the `tei` reranker, and the dedicated CPU-only `ollama-embed` for embeddings) and blocks until Postgres + ollama-embed are ready, pulling `bge-m3` on first run. The embedder lives off the host GPU so it never contends with the host Ollama (which serves the tagger). Pass `--tagger` to also start the opt-in deterministic tagger sidecar. Sets no env vars — service config lives in `docker-compose.yml`. |
 | `./start_server.sh` | Runs `kengram serve` in the foreground (MCP server on `127.0.0.1:8081`, endpoint `/mcp`). Reads its DB URL from `kengram.toml` / `KENGRAM_DATABASE__URL` / the built-in default. |
 | `./start_worker.sh` | Runs `kengram worker` in the foreground — drains `pending_embeddings` and `pending_tags`. Honors your `[tagger]` config; with no config file it defaults to tagging via local Ollama. `off` forces embed-only. |
 | `./stop_stack.sh` | Stops the backing containers. Default keeps the containers and the Postgres data volume for a fast resume; `--down` removes the containers and network (the data volume is still preserved). |
@@ -108,18 +107,20 @@ Plain `DATABASE_URL` is read by `sqlx-cli` (for `sqlx migrate run` / `cargo sqlx
 
 ### 3. Pull the embedding model in Ollama
 
-Make sure the Ollama daemon is running (`ollama serve` if it isn't already; the macOS desktop app launches it automatically), then:
+The recommended dev setup runs `bge-m3` in a dedicated container — `ollama-embed`, published on host port `11435` — so the embedder is hard-isolated to CPU and never competes with the host Ollama that serves the tagger model. `./start_stack.sh` brings the container up and pulls `bge-m3` into it on first run, so most operators have nothing to do in this step.
+
+If you'd rather run the embedder against the host Ollama (single-Ollama setup, no Docker for embeddings), pull `bge-m3` to the host and point `[embedder].endpoint` at `http://localhost:11434/v1` in `~/.config/kengram/kengram.toml`:
 
 ```bash
 ollama pull bge-m3
 ```
 
-Kengram's dev-mode embedder talks to Ollama's OpenAI-compatible endpoint (`http://localhost:11434/v1/embeddings`) and uses `bge-m3` for 1024-dim embeddings.
+Either way, Kengram's embedder talks to an OpenAI-compatible `/v1/embeddings` endpoint and uses `bge-m3` for 1024-dim embeddings.
 
-Verify:
+Verify (against whichever endpoint your `[embedder]` config points at — `11435` for the container, `11434` for the host):
 
 ```bash
-curl http://localhost:11434/v1/embeddings \
+curl http://localhost:11435/v1/embeddings \
   -H 'Content-Type: application/json' \
   -d '{"model":"bge-m3","input":"hello"}' | jq '.data[0].embedding | length'
 # expect: 1024

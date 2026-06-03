@@ -521,6 +521,59 @@ all 3 even with the same Bob-in-people miss.
 **Status.** Bound to the Bob-as-verb issue. Likely resolves itself once that
 underlying ambiguity is addressed.
 
+### 3. Application-layer tools + carrier proper nouns under-extracted (qwen3-coder:30b, v16)
+
+**Symptom.** Dogfood capture `fcaa8637` (rjf.tech, since retracted in favor of
+`de071912`) — a note whose entire point is *"SSH into machines behind my home
+T-Mobile gateway freezes; use mosh"* — extracted `entities: [Tailscale,
+WireGuard, DERP, UDP, TCP, IPv6, UPnP, NAT-PMP]`. The three terms a human would
+actually filter on — **mosh** (the fix), **SSH** (the affected tool), and
+**T-Mobile** (the cause) — were all dropped. The tagger kept the wire-protocol
+soup and discarded the application-layer tools and the carrier name.
+
+**Diagnosis — two mechanisms.**
+
+- **Position falloff (known).** `mosh` appears only in paragraph 3 (it's the
+  fix). Tag-extraction probability falls off after the opening sentence, so the
+  single most important term never had a fair shot. This is the documented
+  opening-sentence-weighting behavior working as designed against a body that
+  buried its lede.
+- **Sentence framing, not a hard prior.** Initial read was that the
+  code-specialized fine-tune privileges protocol/library tokens (DERP,
+  WireGuard, UDP/TCP) over application tools and brand names — `SSH` and
+  `T-Mobile` were both in the *opening sentence* of `fcaa8637` and still
+  dropped. But the controlled re-author (below) **refutes the strong form** of
+  that claim: in the replacement `de071912`, `T-Mobile` sits in the *identical*
+  adjectival slot ("home T-Mobile gateway") and extracted cleanly, alongside
+  mosh and SSH. Same model, same prompt, same grammatical position → opposite
+  outcome. So the old miss is better explained by **sentence framing + LLM
+  run-to-run variance** than by a deterministic exclusionary prior. The old
+  opening led with `SSH` as a sentence-initial *verb* ("SSH into machines …")
+  and front-loaded a long Tailscale/WireGuard subordinate clause, which
+  plausibly locked emission onto the protocol nouns and starved the
+  application/brand terms; the new opening makes mosh/SSH the grammatical
+  objects ("Use mosh instead of SSH …"). Net: a real, reproducible *risk* on
+  this content shape, but framing-tractable rather than a fixed model ceiling.
+
+**Mitigation that worked (author-side, measured).** Re-authoring so the opening
+sentence leads with the subjects — *"Use mosh instead of SSH … behind my home
+T-Mobile gateway …"* — lifted the entity set from
+`[Tailscale, WireGuard, DERP, UDP, TCP, IPv6, UPnP, NAT-PMP]` to
+`[Tailscale, mosh, SSH, T-Mobile, UDP, TCP, IPv6, ULA, DERP]`. mosh/SSH/T-Mobile
+all present; the only losses (WireGuard, UPnP, NAT-PMP) are low-value tail terms
+that moved out of the opening. `kind` also flipped observation→idea (the
+imperative "Use mosh …" lead reads as a recommendation). This is a
+capture-discipline win, not a tagger change: **put the terms you'll filter on in
+the opening sentence, as grammatical subjects/objects, not as verbs or
+modifiers.**
+
+**Tagger-side (parked).** Because the strong-prior hypothesis didn't survive the
+re-author, there's nothing prompt-tractable to chase here yet. If the
+application-tool-as-sentence-initial-verb miss (`SSH into …` → not extracted)
+recurs across captures, that specific shape — protocol acronym used verbally at
+sentence start — is the one worth a fixture and a line in the next cross-model
+sweep (`tagger-sweep.sh`). Until there's repeat evidence, treat it as variance.
+
 ## Future model upgrades (post-3090 build)
 
 Once a 3090 (24GB VRAM) is available for the tagger:

@@ -46,5 +46,5 @@ thoughts in Postgres + pgvector and exposes them to any MCP-capable client.
 - No Prometheus metrics or eval suite yet (remaining M7 scope).
 - Tagger output quality varies by base model; tags are advisory only.
 
-[Unreleased]: https://github.com/muckers/kengram/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/muckers/kengram/releases/tag/v0.1.0
+[Unreleased]: https://github.com/muckers/kEngram/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/muckers/kEngram/releases/tag/v0.1.0

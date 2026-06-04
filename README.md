@@ -1,14 +1,14 @@
-# Kengram
+# kEngram
 
 Self-hosted, MCP-native memory service for AI agents. Single Rust binary; Postgres + pgvector backing store; vendor-neutral via an OpenAI-compatible embedding endpoint.
 
-> *Kengram* — **ken** (to know) + **-gram** (a recorded mark): a recorded unit of knowing. The name nods to the *engram*, the hypothetical trace a memory leaves in the brain.
+> *kEngram* — **ken** (to know) + **-gram** (a recorded mark): a recorded unit of knowing. The name nods to the *engram*, the hypothetical trace a memory leaves in the brain.
 
-## Why Kengram
+## Why kEngram
 
-Kengram gives any MCP-capable agent (Claude Code, Claude Desktop, opencode, Cline, …) a **shared, persistent memory** backed by your own Postgres. A thought captured from one client is searchable from any other — across sessions, models, and machines.
+kEngram gives any MCP-capable agent (Claude Code, Claude Desktop, opencode, Cline, …) a **shared, persistent memory** backed by your own Postgres. A thought captured from one client is searchable from any other — across sessions, models, and machines.
 
-Thoughts are the only thing Kengram stores. Retrieval is **hybrid** — vector kNN over BGE-M3 embeddings, lexical trigram search, fused via reciprocal rank fusion and (optionally) reranked by a cross-encoder. A small **tagging sidecar** reads each new thought and writes a JSONB metadata blob (people, entities, topics, action_items, dates_mentioned, kind) onto the same row, plus auto-emits relational edges into a `thought_links` graph. Tags are advisory — they don't gate retrieval — and duplicate captures (same content) collapse to the same `thought_id` via SHA-256 fingerprinting.
+Thoughts are the only thing kEngram stores (with optional tags). Retrieval is **hybrid** — vector kNN over BGE-M3 embeddings, lexical trigram search, fused via reciprocal rank fusion and (optionally) reranked by a cross-encoder. A small **tagging sidecar** reads each new thought and writes a JSONB metadata blob (people, entities, topics, action_items, dates_mentioned, kind) onto the same row, plus auto-emits relational edges into a `thought_links` graph. Tags are advisory — they don't gate retrieval — and duplicate captures (same content) collapse to the same `thought_id` via SHA-256 fingerprinting.
 
 The deployment is the `kengram` binary plus Postgres plus any OpenAI-compatible embedding endpoint (Ollama is the zero-config dev path). No SaaS, no per-seat fees — change LLM provider whenever you like; your memory comes with you.
 

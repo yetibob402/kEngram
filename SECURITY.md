@@ -10,7 +10,7 @@ recent tagged release only.
 Please report security issues **privately** — do not open a public issue for
 anything exploitable.
 
-- Preferred: open a [GitHub private security advisory](https://github.com/muckers/kengram/security/advisories/new).
+- Preferred: open a [GitHub private security advisory](https://github.com/muckers/kEngram/security/advisories/new).
 - Or email **ron.forrester@me.com** with `KENGRAM SECURITY` in the subject.
 
 Please include enough detail to reproduce (affected version/commit, configuration,

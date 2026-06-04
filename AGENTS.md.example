@@ -1,4 +1,4 @@
-# Kengram memory (always-on, all projects)
+# kEngram memory (always-on, all projects)
 
 I use the **kengram** MCP server as my persistent memory across all projects.
 Tools are `mcp__kengram__*` (capture, search_thoughts, recent_thoughts, get_thought,

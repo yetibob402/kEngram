@@ -1,5 +1,5 @@
 # Dev-only Postgres + TEI reranker (+ optional deterministic tagger sidecar)
-# for Kengram. Production deployment uses systemd-managed services (see
+# for kEngram. Production deployment uses systemd-managed services (see
 # DESIGN.md §11), not this file.
 #
 # The pgvector/pgvector:pg16 image bundles the `vector`, `pg_trgm`, and

@@ -12,7 +12,7 @@
 
 ## Goal
 
-Kengram ingests long-form content — PDFs, transcripts, code files, web pages — and unifies it with thoughts in a single search index. The operator can point kengram at existing material (past notes, agent transcripts, project documents) and have it become part of the same memory store thoughts live in.
+kEngram ingests long-form content — PDFs, transcripts, code files, web pages — and unifies it with thoughts in a single search index. The operator can point kengram at existing material (past notes, agent transcripts, project documents) and have it become part of the same memory store thoughts live in.
 
 This is the milestone that turns kengram from "memory of agent interactions" into "memory of everything the operator wants kengram to remember."
 

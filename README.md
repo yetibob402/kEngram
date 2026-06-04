@@ -140,11 +140,11 @@ Restart Claude Desktop after editing the config.
 
 ### claude.ai (web)
 
-claude.ai supports remote MCP servers as custom connectors. Kengram's tool schemas declare concrete JSON-Schema types on every object field, because claude.ai's MCP client silently strips fields without an explicit `type` annotation from outbound tool calls — so every tool argument (including `metadata` and `tag_filter`) round-trips correctly through the web client.
+claude.ai supports remote MCP servers as custom connectors. kEngram's tool schemas declare concrete JSON-Schema types on every object field, because claude.ai's MCP client silently strips fields without an explicit `type` annotation from outbound tool calls — so every tool argument (including `metadata` and `tag_filter`) round-trips correctly through the web client.
 
 ### opencode (Ollama-backed)
 
-Kengram doesn't host the chat — it just publishes the tool surface. To drive Kengram from a *local Ollama model*, [opencode](https://opencode.ai) is the most direct fit: a TUI coding agent with native streamable-HTTP MCP support and a built-in Ollama provider.
+kEngram doesn't host the chat — it just publishes the tool surface. To drive kEngram from a *local Ollama model*, [opencode](https://opencode.ai) is the most direct fit: a TUI coding agent with native streamable-HTTP MCP support and a built-in Ollama provider.
 
 Config lives at `opencode.json` (project root) or `~/.config/opencode/opencode.json`:
 
@@ -171,7 +171,7 @@ Config lives at `opencode.json` (project root) or `~/.config/opencode/opencode.j
 }
 ```
 
-In opencode, pick the model via `/models` (it appears as `ollama/qwen3:14b`); Kengram's nine tools become available alongside opencode's built-ins. **The model must be tool-capable** — `qwen3` family, `llama3.1+`, `gpt-oss` work; many smaller Llama variants silently no-op on tool calls. Kengram's default deployment is single-user localhost (Tier 0); LAN/Tailnet exposure is Tier 1. Tier 2 bearer auth is M7 ahead — see [Roadmap](#roadmap).
+In opencode, pick the model via `/models` (it appears as `ollama/qwen3:14b`); kEngram's nine tools become available alongside opencode's built-ins. **The model must be tool-capable** — `qwen3` family, `llama3.1+`, `gpt-oss` work; many smaller Llama variants silently no-op on tool calls. kEngram's default deployment is single-user localhost (Tier 0); LAN/Tailnet exposure is Tier 1. Tier 2 bearer auth is M7 ahead — see [Roadmap](#roadmap).
 
 ### Other MCP clients
 
@@ -226,7 +226,7 @@ Tagger-emitted relations land in `thought_links` (with `source='tagger'`), not i
 
 ## How relations work
 
-On top of the tagging sidecar, Kengram has a graph layer of edges in a closed vocabulary of seven relations:
+On top of the tagging sidecar, kEngram has a graph layer of edges in a closed vocabulary of seven relations:
 
 | relation | meaning |
 |---|---|
@@ -252,7 +252,7 @@ Deeper workflows (link audit, restore, bulk operations) live in [Relational data
 
 ## Configuration
 
-Kengram defaults wire up a working dev environment against `localhost` Postgres + Ollama. The minimum to override anything is a TOML file at `~/.config/kengram/kengram.toml`:
+kEngram defaults wire up a working dev environment against `localhost` Postgres + Ollama. The minimum to override anything is a TOML file at `~/.config/kengram/kengram.toml`:
 
 ```toml
 [database]

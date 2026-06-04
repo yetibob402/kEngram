@@ -2,7 +2,7 @@
 
 ## Goal
 
-Kengram derives structured facts from captured thoughts on a scheduled basis. The operator can search facts, correct wrong ones, and trust that the thoughts/facts split preserves provenance and supports re-extraction.
+kEngram derives structured facts from captured thoughts on a scheduled basis. The operator can search facts, correct wrong ones, and trust that the thoughts/facts split preserves provenance and supports re-extraction.
 
 This is the milestone that takes kengram beyond "search engine for thoughts" and toward "memory with structure." It also exercises the async-embedding seam designed (but not used) in M1.
 

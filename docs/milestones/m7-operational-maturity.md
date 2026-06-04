@@ -2,7 +2,7 @@
 
 ## Goal
 
-Kengram becomes production-shaped: observable, securable for non-Tailnet access, backed up, and continuously evaluated. After M6 the operator can confidently run kengram for years and — should they choose — share access with non-Tailnet clients (Claude Desktop, ChatGPT) without giving up on auth or audit.
+kEngram becomes production-shaped: observable, securable for non-Tailnet access, backed up, and continuously evaluated. After M6 the operator can confidently run kengram for years and — should they choose — share access with non-Tailnet clients (Claude Desktop, ChatGPT) without giving up on auth or audit.
 
 This milestone is omnibus by design. It bundles the operational concerns that earned their keep in M1–M5 but were deferred so the core loop could ship faster.
 
@@ -56,7 +56,7 @@ No other tool's signature changes; auth is enforced at the MCP-handler level and
 2. **Tier 2 auth enforced.** A request with a missing or invalid token gets a clean 401. A token with `scope: ["work.*"]` cannot read `personal.*` thoughts. The audit log shows one row per request.
 3. **Backup + restore round-trip.** A `pg_dump` taken yesterday, restored to a fresh Postgres, plus the kengram binary booted against that DB → all M1–M5 functionality works end-to-end. The operator has done this at least once and trusts the runbook.
 4. **Eval suite reproducible.** `kengram eval --suite capture-recall` produces the same JSON report on a clean checkout. Cross-model eval (re-embed with a different model, measure top-10 overlap) detects an obvious quality regression intentionally introduced for the test.
-5. **Operator dogfood.** Kengram has been running for a quarter; backups exist and have been restored at least once for verification; the eval suite has caught at least one real regression during development; the operator is comfortable enough to consider sharing it.
+5. **Operator dogfood.** kEngram has been running for a quarter; backups exist and have been restored at least once for verification; the eval suite has caught at least one real regression during development; the operator is comfortable enough to consider sharing it.
 
 ## Open questions
 

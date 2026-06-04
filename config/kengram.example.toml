@@ -1,6 +1,6 @@
-# Kengram example configuration.
+# kEngram example configuration.
 #
-# Copy this to one of the locations Kengram reads (later wins):
+# Copy this to one of the locations kEngram reads (later wins):
 #   1. ~/.config/kengram/kengram.toml          (auto-loaded if present)
 #   2. a path passed via `kengram --config <path> ...`
 # Every value can also be overridden by a `KENGRAM_*` environment variable,
@@ -30,7 +30,7 @@ max_connections = 10
 provider = "openai-compatible"
 endpoint = "http://localhost:11434/v1"
 model = "bge-m3"
-# Kengram-side model identity. Must match the HNSW partial index in Postgres.
+# kEngram-side model identity. Must match the HNSW partial index in Postgres.
 model_id = "bge-m3:1024"
 dimensions = 1024
 # api_key = "..."        # omit for Ollama / TEI; set for hosted endpoints

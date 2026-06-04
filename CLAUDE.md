@@ -1,8 +1,8 @@
-# Kengram — Claude Code Project Context
+# kEngram — Claude Code Project Context
 
 ## What this is
 
-Kengram is a self-hosted, MCP-native AI memory service. It stores agent "thoughts" and extracted facts in Postgres + pgvector, and exposes a small set of MCP tools (capture, search, etc.) so any MCP-capable client — Claude Code, opencode, Claude Desktop, ChatGPT — reads and writes the same persistent backing store.
+kEngram is a self-hosted, MCP-native AI memory service. It stores agent "thoughts" and extracted facts in Postgres + pgvector, and exposes a small set of MCP tools (capture, search, etc.) so any MCP-capable client — Claude Code, opencode, Claude Desktop, ChatGPT — reads and writes the same persistent backing store.
 
 The system is being built across seven capability milestones (M1 → M7), preceded by an environment milestone (M0). All milestones through M6.1 are shipped as of 2026-05-18, plus M7.0 (the `kengram backup` / `restore` surface); the rest of M7 (operational maturity) is the next focus. The terminal-state design lives in `DESIGN.md`; per-milestone scope and success criteria live in `docs/milestones/`.
 
@@ -32,7 +32,7 @@ If you find yourself reasoning about a design choice that the design doc already
 | Embedding sidecar | Hugging Face `text-embeddings-inference` (HTTP API, external process) |
 | Extraction backend | vLLM (OpenAI-compatible API at `/v1`, external process) |
 
-**Do not introduce Python, Node, or TypeScript dependencies.** The deployment is the Kengram binary plus pre-existing TEI and vLLM services. If you find yourself wanting a Python tool for something, check whether a Rust crate or `sqlx-cli` covers it first.
+**Do not introduce Python, Node, or TypeScript dependencies.** The deployment is the kEngram binary plus pre-existing TEI and vLLM services. If you find yourself wanting a Python tool for something, check whether a Rust crate or `sqlx-cli` covers it first.
 
 ## Repo layout
 
@@ -75,7 +75,7 @@ Eight crates. `kengram-cli` is the only binary; the rest are libraries with no `
 
 ## What NOT to do
 
-- Do not make Kengram operate vLLM or TEI. Those are external services with their own systemd units. Kengram only *consumes* their HTTP APIs.
+- Do not make kEngram operate vLLM or TEI. Those are external services with their own systemd units. kEngram only *consumes* their HTTP APIs.
 - Do not add a "hosted mode" or multi-tenant abstractions. Single user, single active session is a design assumption (§1 of the design doc).
 - Do not introduce an ORM (Diesel, SeaORM). `sqlx` is the choice and the reasons (compile-time checking, async-native, no macro magic) are intentional.
 - Do not implement a web UI in v0. Postgres + `psql` is the admin interface.

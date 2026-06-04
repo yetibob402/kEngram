@@ -117,7 +117,7 @@ it empty.
 
 ### `GET /health`
 
-Liveness probe. Kengram doesn't call this directly, but Docker
+Liveness probe. kEngram doesn't call this directly, but Docker
 healthchecks + operator scripts often do.
 
 **Response:**
@@ -135,7 +135,7 @@ liveness criteria — kengram doesn't depend on this endpoint.
 
 ## Error semantics
 
-Kengram's drainer treats responses according to HTTP status:
+kEngram's drainer treats responses according to HTTP status:
 
 | Status range | Drainer behavior |
 |---|---|

@@ -882,7 +882,7 @@ impl ServerHandler for KengramServer {
 /// alone (the schema admits any JSONB object; we want clients to know the
 /// closed `kind` enum and the open-vocabulary array fields).
 pub const SERVER_INSTRUCTIONS: &str = "\
-Kengram — self-hosted MCP-native memory service.
+kEngram — self-hosted MCP-native memory service.
 
 Storage model: thoughts are the unit. Each thought has:
 - scope: per-thought string label (exact-match filter; keep flat).

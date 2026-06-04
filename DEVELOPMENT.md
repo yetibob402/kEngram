@@ -1,6 +1,6 @@
 # Development setup
 
-The operator reference for Kengram: first-time setup, common operations, the full configuration knob list, tagger version history, the relational link graph, day-to-day workflows, and troubleshooting. README is the front-door pitch; everything operator-facing lives here.
+The operator reference for kEngram: first-time setup, common operations, the full configuration knob list, tagger version history, the relational link graph, day-to-day workflows, and troubleshooting. README is the front-door pitch; everything operator-facing lives here.
 
 Quick start assumes macOS with Docker, Rust (`rustc` 1.95+), `sqlx-cli`, and Ollama already installed.
 
@@ -22,7 +22,7 @@ If you don't already have these, here's the canonical install for each:
   cargo install sqlx-cli --no-default-features --features rustls,postgres
   ```
 
-  `--no-default-features` keeps MySQL/SQLite codepaths out; `rustls` matches the workspace's TLS choice; `postgres` is the only DB Kengram uses. This gives you the `sqlx migrate run` command used in step 4 below, plus `cargo sqlx prepare` for regenerating the committed `.sqlx/` offline-query metadata after changing any `sqlx::query!` macro (see step 5).
+  `--no-default-features` keeps MySQL/SQLite codepaths out; `rustls` matches the workspace's TLS choice; `postgres` is the only DB kEngram uses. This gives you the `sqlx migrate run` command used in step 4 below, plus `cargo sqlx prepare` for regenerating the committed `.sqlx/` offline-query metadata after changing any `sqlx::query!` macro (see step 5).
 
 - **Ollama** — `brew install ollama` on macOS (or download from [ollama.com](https://ollama.com/download)). The desktop app starts the daemon automatically; otherwise run `ollama serve`.
 
@@ -115,7 +115,7 @@ If you'd rather run the embedder against the host Ollama (single-Ollama setup, n
 ollama pull bge-m3
 ```
 
-Either way, Kengram's embedder talks to an OpenAI-compatible `/v1/embeddings` endpoint and uses `bge-m3` for 1024-dim embeddings.
+Either way, kEngram's embedder talks to an OpenAI-compatible `/v1/embeddings` endpoint and uses `bge-m3` for 1024-dim embeddings.
 
 Verify (against whichever endpoint your `[embedder]` config points at — `11435` for the container, `11434` for the host):
 
@@ -421,7 +421,7 @@ allowed_hosts = [
 
 | knob | default | what it does |
 |---|---|---|
-| `url` | `"postgres://kengram:kengram@localhost:5432/kengram"` | Postgres connection string. Single-tenant; one database per Kengram deployment. |
+| `url` | `"postgres://kengram:kengram@localhost:5432/kengram"` | Postgres connection string. Single-tenant; one database per kEngram deployment. |
 | `max_connections` | `10` | Size of the sqlx connection pool. Bump for high-tag-volume worker hosts; single-user dogfood is fine at 10. |
 
 ### `[embedder]`
@@ -431,7 +431,7 @@ allowed_hosts = [
 | `provider` | `"openai-compatible"` | Only provider in current builds. Covers Ollama, TEI, OpenAI, Voyage by varying `endpoint`/`model`. |
 | `endpoint` | `"http://localhost:11434/v1"` | `/v1` base URL. Ollama in dev; TEI in production. |
 | `model` | `"bge-m3"` | Backend model name as the server understands it. |
-| `model_id` | `"bge-m3:1024"` | Kengram-side stable identity. The `:NNNN` suffix is the embedding dimension — must match an HNSW partial index in Postgres. Change this only in lockstep with a migration. |
+| `model_id` | `"bge-m3:1024"` | kEngram-side stable identity. The `:NNNN` suffix is the embedding dimension — must match an HNSW partial index in Postgres. Change this only in lockstep with a migration. |
 | `dimensions` | `1024` | Embedding vector dimension. Must match the model's actual output dim AND the `:NNNN` suffix above. |
 | `api_key` | `None` | Bearer token for hosted endpoints. Omit for Ollama/TEI. |
 | `timeout_seconds` | `5` | Per-request timeout. Local Ollama is sub-100ms typical; bump for slower hosted endpoints. |
@@ -444,7 +444,7 @@ The reranker is the optional cross-encoder stage that re-scores the top `candida
 |---|---|---|
 | `provider` | `""` | `""` = disabled; `"tei"` = TEI sidecar (currently the only supported provider). |
 | `endpoint` | `"http://localhost:8081"` | Service root, no `/v1` suffix. The reranker client appends `/rerank`. |
-| `model_id` | `"BAAI/bge-reranker-v2-m3"` | Kengram-side stable identity. Dev override: `"cross-encoder/ms-marco-MiniLM-L-6-v2"` (matches the docker-compose pin). |
+| `model_id` | `"BAAI/bge-reranker-v2-m3"` | kEngram-side stable identity. Dev override: `"cross-encoder/ms-marco-MiniLM-L-6-v2"` (matches the docker-compose pin). |
 | `timeout_seconds` | `30` | Per-request timeout. MiniLM is sub-100ms on Apple Silicon; BGE-v2-m3 on GPU is similar; ARM CPU runs of BGE-v2-m3 are minutes per call (don't). |
 
 When the reranker times out or errors, the pipeline silently degrades to RRF + recency order and the response has `rerank_used: false`. Search still returns results.
@@ -458,7 +458,7 @@ The tagger is the per-thought metadata sidecar. Empty `provider` is the silent-d
 | `provider` | `""` | `""` = disabled; `"openai-compatible"` (vLLM, etc.), `"openrouter"`, or `"http"` (kengram-native sidecar — requires `[tagger.http]` below). |
 | `endpoint` | `"http://localhost:8000/v1"` | `/v1` base URL. vLLM default port. OpenRouter is `"https://openrouter.ai/api/v1"`. Ignored when `provider = "http"`. |
 | `model_name` | `"qwen3-coder:30b"` | Model name as the backend understands it. For OpenRouter: a model slug like `"anthropic/claude-haiku-4.5"`. Ignored when `provider = "http"`. |
-| `model_id` | `"vllm/qwen3-coder:30b"` | Kengram-side stable identity written into `thoughts.tags_extractor_model`. Conventionally `<vendor>/<model>`. Used by both LLM and HTTP-sidecar providers. |
+| `model_id` | `"vllm/qwen3-coder:30b"` | kEngram-side stable identity written into `thoughts.tags_extractor_model`. Conventionally `<vendor>/<model>`. Used by both LLM and HTTP-sidecar providers. |
 | `model_version` | *depends* | Stamped onto `thoughts.tags_extractor_version`. **Not a general knob.** With `provider = "openai-compatible"` + the bundled prompt: NOT operator-set — auto-tracks `BUNDLED_TAGGER_VERSION` (setting it refuses to start). With `provider = "openai-compatible"` + `system_prompt_file`: required, a value distinct from the bundled version (partitions custom-prompt tags in provenance). With `provider = "http"`: the operator declares the sidecar's own schema version. A `BUNDLED_TAGGER_VERSION` bump (prompt/schema change) is followed by `kengram tag --rerun`. See [Tagger version history](#tagger-version-history-and-safe-re-tag-procedure). |
 | `api_key` | `None` | Bearer token for hosted LLM endpoints. The HTTP sidecar provider has its own `[tagger.http].api_key`. |
 | `timeout_seconds` | `60` | Per-request timeout for the LLM provider. The HTTP sidecar provider has its own `[tagger.http].timeout_seconds`. |
@@ -469,7 +469,7 @@ The tagger is the per-thought metadata sidecar. Empty `provider` is the silent-d
 
 ### `[tagger.http]`
 
-Active only when `[tagger].provider = "http"`. Kengram POSTs `/tag` against the sidecar's `endpoint` using the [`kengram-tagger-protocol`](crates/kengram-tagger-protocol/) wire shape. Sidecars can be in any language; the reference implementation is [`kengram-tagger-deterministic`](crates/kengram-tagger-deterministic/) (a Rust-native zero-LLM tagger). See [`docs/tagger-sidecar-protocol.md`](docs/tagger-sidecar-protocol.md) for the wire contract.
+Active only when `[tagger].provider = "http"`. kEngram POSTs `/tag` against the sidecar's `endpoint` using the [`kengram-tagger-protocol`](crates/kengram-tagger-protocol/) wire shape. Sidecars can be in any language; the reference implementation is [`kengram-tagger-deterministic`](crates/kengram-tagger-deterministic/) (a Rust-native zero-LLM tagger). See [`docs/tagger-sidecar-protocol.md`](docs/tagger-sidecar-protocol.md) for the wire contract.
 
 | knob | default | what it does |
 |---|---|---|
@@ -841,7 +841,7 @@ model_id = "BAAI/bge-reranker-v2-m3"
 timeout_seconds = 30
 ```
 
-The reranker model is set in TEI itself (the `--model-id` arg to `text-embeddings-router`); `[reranker].model_id` is just the Kengram-side stable identity.
+The reranker model is set in TEI itself (the `--model-id` arg to `text-embeddings-router`); `[reranker].model_id` is just the kEngram-side stable identity.
 
 ### Troubleshooting
 

@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Kengram is pre-1.0. Security fixes are applied to the latest `main` and the most
+kEngram is pre-1.0. Security fixes are applied to the latest `main` and the most
 recent tagged release only.
 
 ## Reporting a vulnerability
@@ -19,7 +19,7 @@ project, fix timelines are best-effort; coordinated disclosure is appreciated.
 
 ## Deployment security model
 
-Kengram is **single-user and local-first** by design. Its trust tiers:
+kEngram is **single-user and local-first** by design. Its trust tiers:
 
 - **Tier 0 (default):** binds to `127.0.0.1` — only local processes can reach it.
 - **Tier 1:** exposure over a private mesh (e.g. Tailscale) via `[server].bind` +

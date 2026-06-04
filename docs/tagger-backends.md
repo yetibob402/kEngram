@@ -1,6 +1,6 @@
 # Tagger backends — pluggability contract
 
-Kengram's tagger is pluggable. Anyone who implements the `Tagger` trait
+kEngram's tagger is pluggable. Anyone who implements the `Tagger` trait
 in `kengram-core` can swap in their own implementation; the operator
 selects which one runs at config time. This document explains the
 contract and the recipe to register a new backend.
@@ -40,7 +40,7 @@ implementations*, not the contract itself.
 
 ## Two wires, both pluggable
 
-Kengram ships with two HTTP-tagger clients built in. Both implement the
+kEngram ships with two HTTP-tagger clients built in. Both implement the
 `Tagger` trait above and live in `kengram-extract`; they differ in the
 JSON shape they put on the wire:
 
@@ -120,7 +120,7 @@ it as an HTTP sidecar and point kengram at it via `provider = "http"`:
    timeout_seconds = 30
    ```
 
-3. Run your sidecar. Kengram's worker tags thoughts by calling your
+3. Run your sidecar. kEngram's worker tags thoughts by calling your
    endpoint; failures with 5xx + connection-level errors are treated as
    transient (retried next tick), 4xx + malformed responses are
    non-transient (logged + skipped).
@@ -133,7 +133,7 @@ The reference sidecar ships as a binary you can `docker run` or just
 The pluggability isn't bolted on — it's the natural shape of the
 abstraction. Two reasons it matters:
 
-1. **Single-user, on-prem.** Kengram doesn't run a SaaS tagger; the
+1. **Single-user, on-prem.** kEngram doesn't run a SaaS tagger; the
    operator's deployment IS the deployment. Different deployments may
    have different cost/latency/quality trade-offs (a 12B LLM on a
    workstation, a small NER pipeline in a Docker container, an external

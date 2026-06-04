@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the Kengram worker (foreground): drains pending_embeddings, and — when a
+# Run the kEngram worker (foreground): drains pending_embeddings, and — when a
 # tagger provider is configured — pending_tags. Run ./start_stack.sh first and
 # ./start_server.sh in another terminal.
 #

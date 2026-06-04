@@ -1,7 +1,7 @@
-# Kengram — Local Agent Memory Service
+# kEngram — Local Agent Memory Service
 
 **Status:** Draft v0.1 · for review
-**Name:** Kengram (renamed from "Engram" on 2026-05-25 — see revision history)
+**Name:** kEngram (renamed from "Engram" on 2026-05-25 — see revision history)
 **Author:** [you]
 **Reviewers:** [TBD]
 **Last updated:** 2026-05-18
@@ -10,7 +10,7 @@
 
 ## 1. Summary
 
-Kengram is a self-hosted, MCP-native memory service for AI agents. It runs alongside vLLM (or equivalent) on a personal headless inference server, reachable from the operator's devices over Tailscale wherever they happen to be. It provides a persistent, model-agnostic backing store that any MCP-capable client (Claude Code, Claude Desktop, opencode, ChatGPT, Cursor, Gemini CLI, custom Rust agents) can read from and write to.
+kEngram is a self-hosted, MCP-native memory service for AI agents. It runs alongside vLLM (or equivalent) on a personal headless inference server, reachable from the operator's devices over Tailscale wherever they happen to be. It provides a persistent, model-agnostic backing store that any MCP-capable client (Claude Code, Claude Desktop, opencode, ChatGPT, Cursor, Gemini CLI, custom Rust agents) can read from and write to.
 
 It is OB1's architectural shape — Postgres + pgvector + a thin MCP gateway — implemented as a single Rust binary, with the local vLLM endpoint serving as the embedding and extraction backend, designed so that swapping the underlying embedding or extraction model is a routine operation rather than a migration.
 
@@ -29,7 +29,7 @@ The system is built incrementally across seven capability milestones (M1–M7), 
 
 ## 3. Non-goals
 
-- Not an agent runtime (cf. Letta). Kengram stores and retrieves; agents live elsewhere.
+- Not an agent runtime (cf. Letta). kEngram stores and retrieves; agents live elsewhere.
 - Not a temporal knowledge graph (cf. Graphiti). Facts are timestamped and supersedable, but we do not model validity windows as first-class entities.
 - Not a vector database product. We use pgvector and we are happy.
 - Not multi-tenant SaaS. Single operator, optional shared with trusted humans.
@@ -101,9 +101,9 @@ The system is built in seven capability milestones (M1–M7), preceded by a smal
 
 ## 4. High-level architecture
 
-![Kengram architecture: MCP/HTTP surface, core service, and worker drainer inside the kengram binary; the binary calls out to Embedder/Reranker/Tagger sidecars (OpenAI-compatible / TEI) and to Postgres + pgvector, with the external vLLM endpoint hosted separately.](docs/images/architecture.svg)
+![kEngram architecture: MCP/HTTP surface, core service, and worker drainer inside the kengram binary; the binary calls out to Embedder/Reranker/Tagger sidecars (OpenAI-compatible / TEI) and to Postgres + pgvector, with the external vLLM endpoint hosted separately.](docs/images/architecture.svg)
 
-Kengram is a *client* of the local vLLM endpoint, not the operator of it. vLLM is presumed to be serving primary inference traffic to other Tailscale-connected devices anyway; Kengram piggybacks on that infrastructure. Three logical components, one binary:
+kEngram is a *client* of the local vLLM endpoint, not the operator of it. vLLM is presumed to be serving primary inference traffic to other Tailscale-connected devices anyway; kEngram piggybacks on that infrastructure. Three logical components, one binary:
 
 - **MCP/HTTP surface.** Streamable HTTP transport speaking MCP. Same binary also exposes an admin HTTP API.
 - **Core service.** Capture, search, retraction, scope management.
@@ -506,7 +506,7 @@ allowed_hosts = []                              # [M5.x] DNS-rebinding allowlist
 provider     = "openai-compatible"
 endpoint     = "http://localhost:11434/v1"      # Ollama in dev; TEI in production
 model        = "bge-m3"                         # backend-side model name
-model_id     = "bge-m3:1024"                    # Kengram-side identity; must match an HNSW index
+model_id     = "bge-m3:1024"                    # kEngram-side identity; must match an HNSW index
 dimensions   = 1024
 timeout_seconds = 5
 
@@ -541,13 +541,13 @@ timeout_seconds = 60
 
 The `[extractor]` and `[reflector]` sections that shipped in M2 were removed by M4. The tagger drainer is always-on when `[tagger].provider` is non-empty — no cron, no opt-in flag, no confidence-band routing. Valid `[tagger].provider` values are `"openai-compatible"`, `"openrouter"`, `"http"`, or `""` (disabled); `"openai-compatible"` and `"openrouter"` both select `OpenAICompatibleTagger`, while `"http"` selects the deterministic GLiNER+regex sidecar and requires a `[tagger.http]` block (endpoint default `http://localhost:8082`), which is otherwise ignored.
 
-**Embedder placement is a deployment-time choice, not a code change.** TEI ships CPU and CUDA builds with identical HTTP APIs (`ghcr.io/huggingface/text-embeddings-inference:cpu-1.x` vs `:1.x`). Switching is a systemd unit edit; the Kengram TOML doesn't change.
+**Embedder placement is a deployment-time choice, not a code change.** TEI ships CPU and CUDA builds with identical HTTP APIs (`ghcr.io/huggingface/text-embeddings-inference:cpu-1.x` vs `:1.x`). Switching is a systemd unit edit; the kEngram TOML doesn't change.
 
 ## 10. Operational shape — what makes the store honest
 
 §6.5 describes the tagging sidecar as a capability — what it produces and how. This section is the operational counterweight: what guarantees the store gives the operator, what it explicitly does *not* guarantee, and why the M4 architecture deliberately stops short of drift-defense ceremony that the M2 facts pipeline carried.
 
-**The five operational properties Kengram guarantees:**
+**The five operational properties kEngram guarantees:**
 
 1. **Raw thoughts are immutable.** Capture writes a `thoughts` row once and never updates the `content` column. The only mutations on `thoughts` are state flips — `retracted_at` (M3), the `tags` JSONB (M4), and the tagger provenance triplet — none of which touch content. If a derived signal (embedding, tag) drifts, the truth is recoverable: re-embed, re-tag.
 
@@ -576,9 +576,9 @@ This section is the design-level operational shape. Operator-facing runbooks (fi
 **Components:**
 
 - `kengram` — the single Rust binary; subcommands cover the server, the drainer worker, and operator utilities (current set in `DEVELOPMENT.md`).
-- Postgres 16+ with `pgvector` ≥ 0.7, `pg_trgm`, `pgcrypto`. Connection is configured by URL in the TOML (`[database].url`) or overridden at runtime via `KENGRAM_DATABASE__URL` (figment reads the `KENGRAM_` prefix with `__` for nesting). Note that the *running binary does not read plain `DATABASE_URL`* — that variable is honored only by `sqlx-cli` and the build-time `sqlx::query!` macros. Local Unix socket is the simplest deployment; remote TCP — same Tailnet, separate NAS or DB host, or anywhere reachable — is fully supported. **Extensions must be installed on the Postgres server**, not the Kengram host.
-- `text-embeddings-inference` HTTP server for the embedder, sidecar pattern. CPU and CUDA builds expose the same HTTP shape; choice is a deployment-time decision (no Kengram code or config change). From M3 onward, TEI also serves the cross-encoder reranker on the same HTTP shape (separate model).
-- vLLM (or any OpenAI-compatible chat-completions endpoint) serving an instruct model — required from M4 onward when the tagger is configured. **Operated independently of Kengram.** Kengram is a client; the operator manages vLLM's lifecycle, model choice, and serving config.
+- Postgres 16+ with `pgvector` ≥ 0.7, `pg_trgm`, `pgcrypto`. Connection is configured by URL in the TOML (`[database].url`) or overridden at runtime via `KENGRAM_DATABASE__URL` (figment reads the `KENGRAM_` prefix with `__` for nesting). Note that the *running binary does not read plain `DATABASE_URL`* — that variable is honored only by `sqlx-cli` and the build-time `sqlx::query!` macros. Local Unix socket is the simplest deployment; remote TCP — same Tailnet, separate NAS or DB host, or anywhere reachable — is fully supported. **Extensions must be installed on the Postgres server**, not the kEngram host.
+- `text-embeddings-inference` HTTP server for the embedder, sidecar pattern. CPU and CUDA builds expose the same HTTP shape; choice is a deployment-time decision (no kEngram code or config change). From M3 onward, TEI also serves the cross-encoder reranker on the same HTTP shape (separate model).
+- vLLM (or any OpenAI-compatible chat-completions endpoint) serving an instruct model — required from M4 onward when the tagger is configured. **Operated independently of kEngram.** kEngram is a client; the operator manages vLLM's lifecycle, model choice, and serving config.
 
 **Process model:** systemd units. `kengram-server.service` runs the MCP server; `kengram-worker.service` runs the drainer process and from M4 onward runs *two* drainer tasks inside one process: the embed drainer (always on, pulls jobs off `pending_embeddings`) and the tag drainer (M4; pulls off `pending_tags` when `[tagger].provider` is non-empty). The embedder sidecar and vLLM run as their own units, managed independently.
 
@@ -602,7 +602,7 @@ Three relevant tiers. They map to milestones, not to deployment options offered 
 
 A "Tier 3 — public + multi-user" option exists in principle but is **explicitly out of scope** for the current roadmap. It would require OAuth2, per-client tokens, and audit log; implementable later if the system is genuinely shared with another person, which is not a current requirement.
 
-**Tier 1 is the recommended endpoint for single-user deployment.** Kengram binds to the Tailnet interface and is reachable as `kengram.tailXXXX.ts.net` from every personal device, using the same MagicDNS pattern as vLLM. No code change vs. Tier 0; only the bind address.
+**Tier 1 is the recommended endpoint for single-user deployment.** kEngram binds to the Tailnet interface and is reachable as `kengram.tailXXXX.ts.net` from every personal device, using the same MagicDNS pattern as vLLM. No code change vs. Tier 0; only the bind address.
 
 **Auth at Tier 2** [M7]. Bearer token validated against a hashed allowlist in `kengram_tokens`. Tokens carry a scope-list — a token can be locked to `work.*` and not see `personal.*`. Audit log records `(token_id, tool, args_hash, ts)` for every call.
 
@@ -628,7 +628,7 @@ Resolved during the milestone-roadmap planning conversation (see Revision histor
 
 Carrying forward:
 
-5. ~~**Naming.**~~ Resolved (2026-05-25): renamed to **Kengram** after a collision cross-check — Engram, Engrain, and Pengram were all already taken in-niche. See revision history.
+5. ~~**Naming.**~~ Resolved (2026-05-25): renamed to **kEngram** after a collision cross-check — Engram, Engrain, and Pengram were all already taken in-niche. See revision history.
 6. **Sync.** Do we ever want multi-machine replication? Logical replication on Postgres is straightforward, but only worth doing if you'll actually use it. Defer.
 7. **Capture UX.** OB1's Slack capture is clever. Equivalents: a Telegram bot, a CLI `kengram capture`, a Raycast/Alfred extension, a browser extension. Out of scope until at least M6.
 8. **Embedding model default.** v0 commits to BGE-M3 (well-established, multilingual, runs in ~1.5 GB, supports rerank). A future milestone should bake off Qwen3-Embedding-4B and Qwen3-Embedding-8B against our own eval fixture before any production-scope re-embed. The embeddings table design (§5) makes this a routine swap rather than a migration.
@@ -640,7 +640,7 @@ Carrying forward:
 - Knowledge-graph reasoning (Cognee/Graphiti territory). Retired with the M4 collapse; structured `(S, P, O)` triples were the wrong abstraction for this use case.
 - Memory forgetting / TTL policies (everything is forever; pruning is a post-M6 conversation).
 - Multi-modal memory (images, audio).
-- Federated query across multiple Kengram instances.
+- Federated query across multiple kEngram instances.
 - A web UI. Postgres + `psql` is the admin interface.
 - Public + multi-user deployment ("Tier 3" in §12).
 
@@ -679,4 +679,4 @@ Carrying forward:
 
 - **2026-05-18** — **M7.0 ship: `engram backup` / `engram restore`.** First M7 surface to land. Two new `Command` variants in `engram-cli` wrap `pg_dump` / `pg_restore` with a `manifest.json` sidecar (engram version, schema head, embedder model, tagger version, corpus counts) packaged in a single `.tar.gz`. Restore validates the manifest against the target before any destructive action: numeric schema-head compare (refuses on mismatch — guards against the lex-compare bug that would flip `version 11` vs `version 9`), embedder/tagger drift surfaced as warnings (not refusals; restore is lossless and downstream `engram embed-backfill` / `engram tag --rerun` handle the mismatch), and `--force` is required only when the target's `thoughts` table is non-empty so first-time-on-new-machine restore is a one-liner. New module `crates/engram-cli/src/backup.rs` (~580 lines incl. tests); 10 unit tests covering manifest round-trip, schema-compat outcomes (including the two-digit regression case), and URL redaction; end-to-end smoke verified by round-tripping the live 12 MB corpus into a fresh `engram_test` database with exact-match row counts (42 live thoughts, 10 retracted, 52 embeddings, 96 links, 5 scopes). Postgres client tools (`pg_dump` + `pg_restore`) added as a runtime dependency on both source and target machines; documented in DEVELOPMENT.md "Migrating between machines." Doc updates: §3.5 M7 description gains a backup/restore bullet; §11 Backups paragraph points at the new subcommands as the one-shot machine-migration path (the nightly retention story stays separate). Decisions ratified before the ship: `--force` is conditional (empty target skips); no auto-migrate on restore (operator runs `sqlx migrate run` explicitly); embeddings included by default (`--skip-embeddings` is the opt-out for size-sensitive backups).
 
-- **2026-05-25** — **Renamed Engram → Kengram.** The 2026-05-18 entry above retained "Engram" as a working name while flagging 8+ colliding live AI-memory / MCP projects. A focused cross-check confirmed the collision is untenable: the `engram-core` / `engram-ai-core` crates already exist on crates.io, and `lamb356/engram` + `edg-l/engram-mcp` are near-identical Rust + MCP + agent-memory projects. Candidate alternatives were rejected on the same grounds — **Engrain** (a proptech company, a separate "Engrain AI" company, the `engrain-io` GitHub org, and the EnGRaiN OSS project) and **Pengram** (`penfieldlabs/pengram`, a live LLM knowledge-graph extractor with an overlapping typed-relation vocabulary). **Kengram** cleared a full sweep: crates.io and npm namespaces empty, no neighbouring AI/memory project; only a hobbyist GitHub username and an unrelated EdTech `.com`. Etymology: *ken* (to know) + *-gram* (a recorded mark) — "a recorded unit of knowing." The rename is mechanical and behaviour-preserving: all crates `engram-*` → `kengram-*`, binary `engram` → `kengram`, MCP server identity → `kengram` (tools become `mcp__kengram__*`), env-var prefix `ENGRAM_` → `KENGRAM_`, config path `~/.config/engram` → `~/.config/kengram`, and the Postgres database + Docker stack → `kengram`. Dated history (this revision log, the `m{1,2,3}-progress.md` docs, `docs/tagger-improvements.md`, and applied migration comments) is preserved verbatim — including the "Engram" references — so the record stays honest. No schema-shape or behavioural changes.
+- **2026-05-25** — **Renamed Engram → kEngram.** The 2026-05-18 entry above retained "Engram" as a working name while flagging 8+ colliding live AI-memory / MCP projects. A focused cross-check confirmed the collision is untenable: the `engram-core` / `engram-ai-core` crates already exist on crates.io, and `lamb356/engram` + `edg-l/engram-mcp` are near-identical Rust + MCP + agent-memory projects. Candidate alternatives were rejected on the same grounds — **Engrain** (a proptech company, a separate "Engrain AI" company, the `engrain-io` GitHub org, and the EnGRaiN OSS project) and **Pengram** (`penfieldlabs/pengram`, a live LLM knowledge-graph extractor with an overlapping typed-relation vocabulary). **kEngram** cleared a full sweep: crates.io and npm namespaces empty, no neighbouring AI/memory project; only a hobbyist GitHub username and an unrelated EdTech `.com`. Etymology: *ken* (to know) + *-gram* (a recorded mark) — "a recorded unit of knowing." The rename is mechanical and behaviour-preserving: all crates `engram-*` → `kengram-*`, binary `engram` → `kengram`, MCP server identity → `kengram` (tools become `mcp__kengram__*`), env-var prefix `ENGRAM_` → `KENGRAM_`, config path `~/.config/engram` → `~/.config/kengram`, and the Postgres database + Docker stack → `kengram`. Dated history (this revision log, the `m{1,2,3}-progress.md` docs, `docs/tagger-improvements.md`, and applied migration comments) is preserved verbatim — including the "Engram" references — so the record stays honest. No schema-shape or behavioural changes.

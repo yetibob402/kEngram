@@ -1,6 +1,6 @@
-# Kengram — rerank A/B bench runbook
+# kEngram — rerank A/B bench runbook
 
-End-to-end procedure for the operator to verify the `kengram bench rerank` harness against a live Kengram instance, and to use it to settle "does the cross-encoder reranker earn its latency on my actual corpus?" Shipped as M3 Phase B step 3 (closes M3 success criterion 1); post-M4 the harness operates on thoughts only (the facts pipeline was retired in M4 — see `docs/milestones/m4-collapse-to-thoughts.md`).
+End-to-end procedure for the operator to verify the `kengram bench rerank` harness against a live kEngram instance, and to use it to settle "does the cross-encoder reranker earn its latency on my actual corpus?" Shipped as M3 Phase B step 3 (closes M3 success criterion 1); post-M4 the harness operates on thoughts only (the facts pipeline was retired in M4 — see `docs/milestones/m4-collapse-to-thoughts.md`).
 
 ## Prerequisites
 
@@ -15,7 +15,7 @@ docker compose ps   # both should be "healthy"
 ollama serve &       # if not already running
 ollama list | grep bge-m3
 
-# Kengram server + worker
+# kEngram server + worker
 DATABASE_URL=... cargo run --bin kengram -- serve &
 DATABASE_URL=... cargo run --bin kengram -- worker &
 ```

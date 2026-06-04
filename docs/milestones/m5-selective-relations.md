@@ -307,7 +307,7 @@ This is the citation-chain pattern the M5 milestone was motivated by, now visibl
 
 - **Partial unique index for soft-delete idempotency.** `CREATE UNIQUE INDEX ... WHERE deleted_at IS NULL` lets a previously-soft-deleted edge sit inert while a fresh insert with the same triple succeeds. ON CONFLICT can target a partial unique index by `ON CONFLICT (cols) WHERE predicate` — works as expected; verified in `insert_after_soft_delete_creates_fresh_live_row` integration test.
 
-- **Free-text entities and persons (no first-class table).** Entities and persons are stored as strings on `thought_links.to_entity` / `to_person` rather than as FKs to dedicated tables. Kengram has no entity-resolution layer in v0; first-class entity tables would precede tagger-extracted relations (still M5.x), and over-engineering them now would block M5.2 ship. Free-text is consistent with how the tagger already represents entities (in the `tags.entities[]` array — free-form strings).
+- **Free-text entities and persons (no first-class table).** Entities and persons are stored as strings on `thought_links.to_entity` / `to_person` rather than as FKs to dedicated tables. kEngram has no entity-resolution layer in v0; first-class entity tables would precede tagger-extracted relations (still M5.x), and over-engineering them now would block M5.2 ship. Free-text is consistent with how the tagger already represents entities (in the `tags.entities[]` array — free-form strings).
 
 - **Three-way unlink status, not boolean discriminator.** `{ existed: bool, previously_removed: bool }` would work but composes awkwardly with future states (e.g., a `restored` status if `restore_link` ever ships). A tagged enum (`status`) leaves room for that without breaking the response shape further.
 

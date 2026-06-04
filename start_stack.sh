@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bring up Kengram's backing containers and wait until Postgres accepts
+# Bring up kEngram's backing containers and wait until Postgres accepts
 # connections. Postgres holds the corpus; the TEI container is the reranker
 # ([reranker] provider = "tei", :8080); the ollama-embed container is the
 # embedder ([embedder] points at :11435), kept off the host GPU so it never

@@ -6,7 +6,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.1.0] — 2026-05-25
+## [0.1.0] — 2026-06-03
 
 Initial public release. A self-hosted, MCP-native memory service: it stores agent
 thoughts in Postgres + pgvector and exposes them to any MCP-capable client.

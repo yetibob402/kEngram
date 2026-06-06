@@ -870,3 +870,5 @@ If something else already binds `5432`, edit `docker-compose.yml` to map a diffe
 ## Production note
 
 In production, Postgres runs as a systemd-managed service (not Docker), and the embedder is a TEI sidecar (also systemd-managed) rather than Ollama. Both deployment shapes are described in `DESIGN.md` §11. The dev setup here exists for ergonomics — the production setup is operator-managed and out of scope for this file.
+
+For a pragmatic middle ground — a headless single-server host that keeps the Docker backing services *and* runs the kEngram server and worker as systemd units so the whole stack survives a reboot — see [docs/linux-autostart.md](docs/linux-autostart.md). Ready-to-copy unit files ship in [`contrib/systemd/`](contrib/systemd/).

@@ -1,0 +1,24 @@
+[Unit]
+Description=kEngram backing services (docker compose: postgres, tei, ollama-embed)
+Documentation=https://github.com/muckers/kengram/blob/main/docs/linux-autostart.md
+# NOTE (user services): a user unit cannot order against the system-level
+# docker.service (cross-manager). On a normal host the docker daemon is up before
+# your lingered user manager. For a hard ordering edge use the system-service
+# variant (After=docker.service / Requires=docker.service) — see docs/linux-autostart.md.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=@@KENGRAM_REPO@@
+# start_stack.sh writes the arch-specific TEI tag to .env, brings up the stack,
+# waits for Postgres + ollama-embed health, and idempotently pulls bge-m3 — so
+# this oneshot does not report "active" until Postgres accepts connections,
+# giving dependents a real readiness gate.
+ExecStart=@@KENGRAM_REPO@@/start_stack.sh
+# Lighter alternative (assumes .env populated + bge-m3 already pulled, no readiness wait):
+#   ExecStart=/usr/bin/docker compose up -d postgres tei ollama-embed
+ExecStop=/usr/bin/docker compose stop
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

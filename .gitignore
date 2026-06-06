@@ -9,6 +9,9 @@
 .env.local
 .env.*.local
 
+# Local, host-specific Docker Compose overrides (DNS, mounts, etc.)
+docker-compose.override.yml
+
 # macOS
 .DS_Store
 **/.DS_Store

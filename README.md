@@ -65,6 +65,8 @@ A freshly-captured thought returns `embedding_status: "pending"` — that's norm
 
 Once the server is up, point an MCP client at `http://127.0.0.1:8081/mcp` — see [Connecting MCP clients](#connecting-mcp-clients).
 
+To make the stack, server, and worker start automatically on boot (Linux/systemd, headless single-server), see [docs/linux-autostart.md](docs/linux-autostart.md).
+
 ## Connecting MCP clients
 
 ### Claude Code
@@ -283,6 +285,7 @@ crates/
 migrations/                       # sqlx migrations (numbered)
 docs/                             # design doc + per-milestone scope/progress
 scripts/                          # operator-driven runbooks (bench-rerank.md, smoke.md)
+contrib/systemd/                  # example systemd units for boot autostart (see docs/linux-autostart.md)
 ```
 
 ## Roadmap

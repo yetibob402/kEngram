@@ -1,0 +1,20 @@
+[Unit]
+Description=kEngram worker (embed + tag drainers)
+Documentation=https://github.com/muckers/kengram/blob/main/docs/linux-autostart.md
+After=kengram-stack.service kengram-migrate.service kengram-server.service
+Wants=kengram-stack.service
+
+[Service]
+Type=exec
+WorkingDirectory=@@KENGRAM_REPO@@
+Environment=RUST_LOG=@@RUST_LOG@@
+# Honors [tagger]/[database] from the config. To force embed-only:
+#   Environment=KENGRAM_TAGGER__PROVIDER=
+ExecStart=@@KENGRAM_BIN@@ worker
+# System variant: ExecStart=@@KENGRAM_BIN@@ --config @@KENGRAM_CONFIG@@ worker
+#   + User=/Group=docker/Environment=HOME= as above
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

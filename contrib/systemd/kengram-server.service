@@ -1,0 +1,23 @@
+[Unit]
+Description=kEngram MCP server
+Documentation=https://github.com/muckers/kengram/blob/main/docs/linux-autostart.md
+After=kengram-stack.service kengram-migrate.service
+Wants=kengram-stack.service
+
+[Service]
+Type=exec
+WorkingDirectory=@@KENGRAM_REPO@@
+Environment=RUST_LOG=@@RUST_LOG@@
+# Prebuilt release binary (never `cargo run`). Reads ~/.config/kengram/kengram.toml
+# via XDG when run as your user.
+ExecStart=@@KENGRAM_BIN@@ serve
+# System variant: ExecStart=@@KENGRAM_BIN@@ --config @@KENGRAM_CONFIG@@ serve
+#   + User=@@KENGRAM_USER@@ / Group=docker / Environment=HOME=/home/@@KENGRAM_USER@@
+Restart=on-failure
+RestartSec=5
+# On cold boot the server may exit once or twice until Postgres accepts
+# connections; Restart=on-failure brings it back. The stack unit's readiness
+# wait (start_stack.sh) usually prevents this.
+
+[Install]
+WantedBy=default.target

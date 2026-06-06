@@ -1,0 +1,19 @@
+[Unit]
+Description=kEngram schema migrations (oneshot)
+Documentation=https://github.com/muckers/kengram/blob/main/docs/linux-autostart.md
+After=kengram-stack.service
+Wants=kengram-stack.service
+Before=kengram-server.service kengram-worker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=@@KENGRAM_REPO@@
+Environment=RUST_LOG=@@RUST_LOG@@
+# Uses [database].url from the config; does NOT need DATABASE_URL. Brief retry in
+# case Postgres is still warming.
+ExecStart=/bin/bash -c 'for i in $(seq 1 30); do @@KENGRAM_BIN@@ migrate && exit 0; sleep 2; done; exit 1'
+# System variant: insert "--config @@KENGRAM_CONFIG@@" before "migrate".
+
+[Install]
+WantedBy=default.target

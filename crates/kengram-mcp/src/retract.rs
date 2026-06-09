@@ -71,6 +71,7 @@ mod tests {
                 source: Source::new("test").unwrap(),
                 scope: Some(Scope::new("global").unwrap()),
                 metadata: None,
+                argus_source_event: None,
             },
         )
         .await

@@ -61,6 +61,26 @@ pub struct CaptureArgs {
     // typing this as Map<...> keeps it forwarded. Semantically a strict
     // tightening — metadata was always supposed to be an object.
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+
+    #[schemars(
+        description = "Optional Argus source-event idempotency gate. When present, capture is keyed by (namespace, source_ref) with payload_hash conflict detection before the thought row is written."
+    )]
+    pub argus_source_event: Option<ArgusSourceEventArgs>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ArgusSourceEventArgs {
+    #[schemars(description = "Argus source-event namespace, e.g. agents/trinity.")]
+    pub namespace: String,
+
+    #[schemars(description = "Producer-stable replay key inside namespace.")]
+    pub source_ref: String,
+
+    #[schemars(description = "Payload SHA-256 derived from canonicalJson(payload).")]
+    pub payload_hash: String,
+
+    #[schemars(description = "Optional metadata stored on argus_source_events.metadata.")]
+    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -309,6 +329,17 @@ impl KengramServer {
             source,
             scope,
             metadata,
+            argus_source_event: args.argus_source_event.map(|event| {
+                capture::ArgusSourceEventRequest {
+                    namespace: event.namespace,
+                    source_ref: event.source_ref,
+                    payload_hash: event.payload_hash,
+                    metadata: event
+                        .metadata
+                        .map(serde_json::Value::Object)
+                        .map(Metadata::from),
+                }
+            }),
         };
 
         let resp = capture::capture(
@@ -324,6 +355,16 @@ impl KengramServer {
             "thought_id": resp.thought_id.to_string(),
             "embedding_status": resp.embedding_status,
             "is_duplicate": resp.is_duplicate,
+            "argus_source_event": resp.argus_source_event.map(|event| {
+                serde_json::json!({
+                    "action": event.action,
+                    "namespace": event.namespace,
+                    "source_ref": event.source_ref,
+                    "payload_hash": event.payload_hash,
+                    "status": event.status,
+                    "thought_id": event.thought_id.map(|id| id.to_string()),
+                })
+            }),
         });
 
         serde_json::to_string(&body).map_err(|e| format!("response serialization error: {e}"))
@@ -627,6 +668,9 @@ fn map_capture_error(err: CaptureError) -> String {
         CaptureError::EmptyContent => "content must be non-empty".to_string(),
         CaptureError::ContentTooLong { got, max } => {
             format!("content too long: {got} bytes (max {max} = {MAX_CONTENT_LEN})")
+        }
+        CaptureError::InvalidArgusSourceEvent(reason) => {
+            format!("invalid argus_source_event: {reason}")
         }
         CaptureError::Storage(e) => {
             tracing::error!(error = %e, "capture storage error");
@@ -1093,6 +1137,7 @@ mod tests {
                 source: "test".into(),
                 scope: None,
                 metadata: None,
+                argus_source_event: None,
             }))
             .await
             .unwrap();
@@ -1111,6 +1156,7 @@ mod tests {
                 source: "test".into(),
                 scope: None,
                 metadata: None,
+                argus_source_event: None,
             }))
             .await
             .unwrap_err();
@@ -1126,6 +1172,7 @@ mod tests {
                 source: "test".into(),
                 scope: None,
                 metadata: None,
+                argus_source_event: None,
             }))
             .await
             .unwrap();
@@ -1138,6 +1185,7 @@ mod tests {
                 source: "test".into(),
                 scope: None,
                 metadata: None,
+                argus_source_event: None,
             }))
             .await
             .unwrap();
@@ -1154,6 +1202,7 @@ mod tests {
             source: "test".into(),
             scope: None,
             metadata: None,
+            argus_source_event: None,
         }))
         .await
         .unwrap();
@@ -1195,6 +1244,7 @@ mod tests {
                 source: "test".into(),
                 scope: None,
                 metadata: None,
+                argus_source_event: None,
             }))
             .await
             .unwrap();
@@ -1244,6 +1294,7 @@ mod tests {
                 source: "test".into(),
                 scope: None,
                 metadata: None,
+                argus_source_event: None,
             }))
             .await
             .unwrap();
@@ -1253,6 +1304,7 @@ mod tests {
                 source: "test".into(),
                 scope: None,
                 metadata: None,
+                argus_source_event: None,
             }))
             .await
             .unwrap();
@@ -1300,6 +1352,7 @@ mod tests {
             source: "test".into(),
             scope: None,
             metadata: None,
+            argus_source_event: None,
         }))
         .await
         .unwrap();
@@ -1336,6 +1389,7 @@ mod tests {
             source: "test".into(),
             scope: None,
             metadata: None,
+            argus_source_event: None,
         }))
         .await
         .unwrap();
@@ -1344,6 +1398,7 @@ mod tests {
             source: "test".into(),
             scope: None,
             metadata: None,
+            argus_source_event: None,
         }))
         .await
         .unwrap();
@@ -1370,6 +1425,7 @@ mod tests {
                 source: "test".into(),
                 scope: None,
                 metadata: None,
+                argus_source_event: None,
             }))
             .await
             .unwrap();
@@ -1403,6 +1459,7 @@ mod tests {
                 source: "test".into(),
                 scope: None,
                 metadata: None,
+                argus_source_event: None,
             }))
             .await
             .unwrap();
@@ -1456,6 +1513,7 @@ mod tests {
                 source: "test".into(),
                 scope: None,
                 metadata: None,
+                argus_source_event: None,
             }))
             .await
             .unwrap();
@@ -1495,6 +1553,7 @@ mod tests {
                 source: "test".into(),
                 scope: None,
                 metadata: None,
+                argus_source_event: None,
             }))
             .await
             .unwrap();
@@ -1542,6 +1601,7 @@ mod tests {
                 source: "test".into(),
                 scope: None,
                 metadata: None,
+                argus_source_event: None,
             }))
             .await
             .unwrap();
@@ -1572,6 +1632,7 @@ mod tests {
             source: "test".into(),
             scope: None,
             metadata: None,
+            argus_source_event: None,
         }))
         .await
         .unwrap();
@@ -1591,6 +1652,7 @@ mod tests {
             source: "test".into(),
             scope: None,
             metadata: None,
+            argus_source_event: None,
         }))
         .await
         .unwrap();

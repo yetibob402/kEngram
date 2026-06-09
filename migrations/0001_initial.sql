@@ -46,20 +46,22 @@ CREATE TABLE embeddings (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     target_kind     TEXT NOT NULL CHECK (target_kind IN ('thought','artifact_chunk','fact')),
     target_id       UUID NOT NULL,
-    model_id        TEXT NOT NULL,           -- e.g. 'bge-m3:1024'
+    model_id        TEXT NOT NULL,           -- e.g. 'qwen3-embedding'
     model_version   INT NOT NULL DEFAULT 1,
-    vector          vector(1024) NOT NULL,
+    vector          vector(4096) NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (target_kind, target_id, model_id, model_version)
 );
 
--- One HNSW partial index per active embedding model. M1 ships this one.
--- Adding a new model = a future migration adds a new partial index over
--- the same table; old rows stay; the active-model concept lives in config
--- (see design doc §9), not in a Postgres GUC.
-CREATE INDEX embeddings_bge_m3_hnsw
-    ON embeddings USING hnsw (vector vector_cosine_ops)
-    WHERE model_id = 'bge-m3:1024';
+-- Fast-path 4096-dim MVP note:
+-- pgvector 0.8.2 rejects HNSW/IVFFlat indexes on vector columns above 2000
+-- dimensions, and halfvec HNSW caps at 4000 dimensions. The first
+-- Telegram->kEngram flow keeps exact 4096 vectors unindexed and relies on
+-- model/status btree filters while corpus size is small. A production ANN
+-- path needs a deliberate follow-up: projection, lower-dim embedder,
+-- binary quantization, or query rewrite to a supported pgvector type.
+CREATE INDEX embeddings_model_target_idx
+    ON embeddings (model_id, target_kind, target_id);
 
 -- Reserved for M2.
 CREATE TABLE facts (

@@ -35,3 +35,9 @@ Thumbs.db
 /docs/goals/
 /scripts/smoke.md
 /AGENTS.md
+
+# Secrets — deploy-time, never commit (knox 2026-06-09)
+config/kengram.prod.toml
+config/*.knox-bak-*
+outpost/.env
+outpost/config/kengram.outpost.toml

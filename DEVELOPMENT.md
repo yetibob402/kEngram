@@ -640,45 +640,14 @@ See [Tagger version history and safe re-tag procedure](#tagger-version-history-a
 
 ### Tagger model evaluation (eval harness)
 
-`kengram eval tagger` compares candidate tagger models objectively against a golden corpus — per-field precision/recall/F1 (people, entities, topics, dates; fuzzy-matched action_items), kind accuracy with a full confusion matrix, optional stability measurement across repeated runs, and latency. Headline scores are computed on **finalized** output (after the same deterministic post-filters production persists), with a per-field `finalize_delta` showing what the filters bought.
-
-**The eval run never touches the database.** It reads a corpus file, calls tagger HTTP endpoints, and writes a JSON report — the corpus file carries the scope/vocab context the production pipeline would otherwise fetch from Postgres. You can point it at any model list while your production kengram keeps running untouched. (This is enforced structurally — the `eval tagger` code path never receives a database config — and pinned by a test.)
-
-The workflow:
+`kengram eval tagger` objectively compares candidate tagger models against a golden corpus — per-field P/R/F1, `kind` accuracy, optional stability, and latency, scored on **finalized** output and **never touching the database** — and `kengram eval export-corpus` drafts a golden corpus from live thoughts (read-only). Quick start:
 
 ```bash
-# 1. Draft a corpus from your live thoughts (READ-ONLY; writes only the JSON file).
-#    Items carry current production tags as draft labels, marked "reviewed": false.
-kengram eval export-corpus --out eval/corpora/mine.json --scope-prefix rjf. --limit 100
-
-# 2. Make the labels golden. Two ways:
-#    (a) Hand-review: correct each item's `golden` labels, set "reviewed": true.
-#    (b) Frontier-assisted (recommended; used for golden-v1): have a capable
-#        model BLIND-label each item from content/scope/metadata only (never
-#        showing it the drafts — avoids anchoring), bound to the v16-prompt +
-#        finalize-rules semantics; it flips reviewed:true on clear items and
-#        leaves genuinely bistable ones reviewed:false for you to adjudicate.
-#        Record the labeler in provenance, and NEVER score that model family
-#        as an arm against its own answer key. See
-#        eval/corpora/golden-v1-labeling-notes.md for the worked example.
-#    Either way: unreviewed items are skipped by default.
-
-# 3. Declare the model arms (committed example: eval/models.example.toml).
-cp eval/models.example.toml eval/models.toml   # then edit; gitignored
-
-# 4. Preview the cost, then run.
-kengram eval tagger --corpus eval/corpora/mine.json --dry-run
-kengram eval tagger --corpus eval/corpora/mine.json --repeats 3
-# → report JSON in eval/reports/, summary table on stdout
+cp eval/models.example.toml eval/models.toml                     # declare arms (gitignored)
+kengram eval tagger --corpus eval/corpora/mine.json --dry-run    # preview, then drop --dry-run to run
 ```
 
-Useful flags: `--arm NAME` (restrict to named arms), `--repeats N` (N≥2 adds kind-drift / per-field-Jaccard stability metrics), `--vocab on|off|both` (`both` runs each arm with and without scope-vocab injection), `--limit N` (quick runs), `--json` (report to stdout). The deterministic GLiNER sidecar participates as a `provider = "http"` arm. Prompt A/B: give an arm `system_prompt_file` + its own `model_version` (the production provenance binding applies).
-
-Built for long unattended runs: progress lines stream to stderr (`[arm 2/4 …] 120/348 done (3 failed), avg 13.8s/call, ETA 52m`); the report is **flushed to `--out` after every completed arm** (`"complete": false` until the final write), so a crash or Ctrl-C keeps every finished arm; and `--max-consecutive-failures N` (default 5, 0 disables) abandons an arm after N consecutive call failures — the guard against a looping model burning hours of timeouts. Aborted arms are marked in the report/table, their resolved calls still score, and the run exits 1.
-
-The report's `calls[]` array records every raw and finalized output per call, so every aggregate is re-derivable from the report alone. `eval/corpora/` (except the committed synthetic `example.json`), `eval/models.toml`, and `eval/reports/` are gitignored — personal thought content never lands in the repo.
-
-The older assertion-fixture lane (`cargo run --example tagger_eval`, `./tagger-sweep.sh`) remains the fast smoke check for prompt iteration; the eval harness is the measured multi-model comparison.
+**Full reference** — architecture and the no-DB invariant, golden-corpus format, model-arm config, the complete scoring methodology, report interpretation, and the operational lessons (temperature, reasoning-model failure modes, the `OLLAMA_MAX_LOADED_MODELS=1` multi-arm trap, vocab-vs-prod, residence/context) — lives in **[docs/tagger-eval-harness.md](docs/tagger-eval-harness.md)**. The older assertion-fixture lane (`cargo run --example tagger_eval`, `./tagger-sweep.sh`) remains the fast smoke check for prompt iteration.
 
 ### Migration audit
 

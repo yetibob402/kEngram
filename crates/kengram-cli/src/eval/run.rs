@@ -262,8 +262,13 @@ async fn run_arm_calls(
         if done % PROGRESS_EVERY == 0 || done == planned {
             let avg_s = latency_sum_ms / done as f64 / 1000.0;
             let eta_s = (planned - done) as f64 * avg_s / opts.concurrency.max(1) as f64;
+            let fail_pct = if done > 0 {
+                100.0 * failed_total as f64 / done as f64
+            } else {
+                0.0
+            };
             eprintln!(
-                "[{label}] {done}/{planned} done ({failed_total} failed), avg {avg_s:.1}s/call, ETA {}",
+                "[{label}] {done}/{planned} done · {failed_total} failed total ({fail_pct:.1}%) · avg {avg_s:.1}s/call · ETA {}",
                 fmt_eta(eta_s)
             );
         }

@@ -13,6 +13,12 @@
 # Prompt A/B: add `system_prompt_file = "prompts/v17.txt"` plus a
 # `model_version = 17` — the production provenance binding rejects a custom
 # prompt without its own version number.
+#
+# Multi-arm Ollama sweeps: launch with OLLAMA_MAX_LOADED_MODELS=1 (and/or
+# OLLAMA_KEEP_ALIVE=0) so each arm loads with the previous arm's model evicted.
+# Otherwise arm N+1 is placed while arm N is still resident, Ollama underestimates
+# free VRAM and strands layers on CPU (~2x slower), and never re-balances after
+# arm N later evicts. Single-arm runs and non-Ollama backends are unaffected.
 
 [[arm]]
 name = "gemma3-12b"

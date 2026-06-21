@@ -945,9 +945,17 @@ pub async fn search_trigram_bounded(
     timeout_ms: u64,
 ) -> Result<Vec<Hit>, StorageError> {
     let mut tx = pool.begin().await?;
-    set_statement_timeout(&mut tx, timeout_ms).await?;
+    if let Err(e) = set_statement_timeout(&mut tx, timeout_ms).await {
+        if let Err(rollback_err) = tx.rollback().await {
+            tracing::warn!(
+                error = %rollback_err,
+                "failed to roll back bounded trigram transaction after statement_timeout setup error",
+            );
+        }
+        return Err(e.into());
+    }
 
-    let rows = sqlx::query!(
+    let rows = match sqlx::query!(
         r#"
         SELECT id, scope, content, source, created_at, metadata,
                content_fingerprint, tags,
@@ -967,7 +975,19 @@ pub async fn search_trigram_bounded(
         limit,
     )
     .fetch_all(&mut *tx)
-    .await?;
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            if let Err(rollback_err) = tx.rollback().await {
+                tracing::warn!(
+                    error = %rollback_err,
+                    "failed to roll back bounded trigram transaction after query error",
+                );
+            }
+            return Err(e.into());
+        }
+    };
     tx.commit().await?;
 
     rows.into_iter()
@@ -2970,6 +2990,38 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_trigram_bounded_finds_exact_match(pool: PgPool) {
         insert_test_thought(&pool, "remembering tcgplayer integration", "work").await;
+
+        let hits = search_trigram_bounded(&pool, "tcgplayer", None, None, 10, 300)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].thought.content.contains("tcgplayer"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_trigram_bounded_rolls_back_after_statement_timeout(pool: PgPool) {
+        insert_test_thought(&pool, "remembering tcgplayer integration", "work").await;
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE thoughts IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let err = search_trigram_bounded(&pool, "tcgplayer", None, None, 10, 50)
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(800),
+            "statement_timeout should cancel the blocked trigram query promptly"
+        );
+        assert!(
+            err.is_query_canceled(),
+            "expected Postgres query-canceled error, got {err:?}"
+        );
+
+        blocker.rollback().await.unwrap();
 
         let hits = search_trigram_bounded(&pool, "tcgplayer", None, None, 10, 300)
             .await

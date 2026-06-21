@@ -6,9 +6,11 @@
 //! embedder is unreachable, the vector leg is skipped and
 //! `vector_search_available` flips to `false`. The trigram leg is bounded and
 //! opportunistic; timeout/errors soft-fail to an empty leg so the fast vector
-//! path can still return. If the reranker is unreachable or not configured, the
-//! rerank stage is skipped and `rerank_used` flips to `false`; available legs
-//! still come back.
+//! path can still return. That effectively makes trigram a temporary
+//! best-effort leg during the latency cutover until Phase-2 FTS replaces it as
+//! the real lexical path. If the reranker is unreachable or not configured,
+//! the rerank stage is skipped and `rerank_used` flips to `false`; available
+//! legs still come back.
 //!
 //! M4: SearchRequest carries an optional `tag_filter` JSONB-containment
 //! expression. The filter is applied post-fuse in Rust (mirroring Postgres'
@@ -18,7 +20,7 @@
 //! without a follow-up `get_thought`.
 
 use kengram_core::{
-    DEFAULT_RECENCY_HALF_LIFE_DAYS, DEFAULT_RRF_K, Embedder, EmbeddingModel, EmbeddingStatus,
+    DEFAULT_RECENCY_HALF_LIFE_DAYS, DEFAULT_RRF_K, Embedder, EmbeddingModel, EmbeddingStatus, Hit,
     Metadata, Scope, Source, Tags, Thought, ThoughtId, recency_boost, rrf_fuse,
 };
 use kengram_embed::Reranker;
@@ -28,14 +30,13 @@ use time::OffsetDateTime;
 pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 pub const MAX_SEARCH_LIMIT: usize = 100;
 pub const DEFAULT_TOP_K_PER_LEG: usize = 50;
-pub const DEFAULT_TRIGRAM_TOP_K: usize = 10;
+pub const DEFAULT_TRIGRAM_TOP_K: usize = DEFAULT_TOP_K_PER_LEG;
 pub const DEFAULT_TRIGRAM_STATEMENT_TIMEOUT_MS: u64 = 300;
-/// Default `candidate_pool` for the rerank stage: retrieve top-10 via RRF +
-/// recency, rerank those 10 to produce the final top-`limit`. The corpus-scale
-/// latency cutover validated this against the 18-query real-recall set: it
-/// preserves the approved vector recall while keeping end-to-end p50 below the
-/// 1.5s SLO on yeti.
-pub const DEFAULT_RERANK_CANDIDATE_POOL: usize = 10;
+/// Historical default `candidate_pool` for the rerank stage. The bounded
+/// trigram cutover deliberately does not narrow this default until the
+/// 100-query GOLD sensitivity matrix selects the largest pool that preserves
+/// recall while staying under the latency SLO.
+pub const DEFAULT_RERANK_CANDIDATE_POOL: usize = 32;
 
 #[derive(Debug, Clone)]
 pub struct SearchRequest {
@@ -173,6 +174,27 @@ pub async fn search_thoughts(
     reranker: Option<&dyn Reranker>,
     request: SearchRequest,
 ) -> Result<SearchResponse, ReadError> {
+    search_thoughts_with_tuning(
+        pool,
+        embedder,
+        reranker,
+        request,
+        DEFAULT_TRIGRAM_TOP_K,
+        DEFAULT_TRIGRAM_STATEMENT_TIMEOUT_MS,
+        DEFAULT_RERANK_CANDIDATE_POOL,
+    )
+    .await
+}
+
+async fn search_thoughts_with_tuning(
+    pool: &PgPool,
+    embedder: &dyn Embedder,
+    reranker: Option<&dyn Reranker>,
+    request: SearchRequest,
+    trigram_top_k: usize,
+    trigram_timeout_ms: u64,
+    default_candidate_pool: usize,
+) -> Result<SearchResponse, ReadError> {
     if request.query.is_empty() {
         return Err(ReadError::EmptyQuery);
     }
@@ -224,27 +246,15 @@ pub async fn search_thoughts(
     // Trigram leg: bounded and opportunistic. pg_trgm similarity over very
     // large blobs can be non-selective, so this leg must not break the SLO for
     // the already-fast vector + rerank path.
-    let trigram_hits = match kengram_storage::search_trigram_bounded(
+    let trigram_hits = bounded_trigram_hits(
         pool,
         &request.query,
         scope_filter,
         scope_prefix_filter,
-        DEFAULT_TRIGRAM_TOP_K as i64,
-        DEFAULT_TRIGRAM_STATEMENT_TIMEOUT_MS,
+        trigram_top_k,
+        trigram_timeout_ms,
     )
-    .await
-    {
-        Ok(hits) => hits,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                query_canceled = e.is_query_canceled(),
-                timeout_ms = DEFAULT_TRIGRAM_STATEMENT_TIMEOUT_MS,
-                "bounded trigram query failed; continuing with available search legs only",
-            );
-            vec![]
-        }
-    };
+    .await;
 
     // RRF fuse → recency boost.
     let mut fused = rrf_fuse(vec![vector_hits, trigram_hits], DEFAULT_RRF_K);
@@ -274,9 +284,7 @@ pub async fn search_thoughts(
 
     // Optional rerank stage.
     let rerank_enabled = request.rerank.unwrap_or(true);
-    let candidate_pool = request
-        .candidate_pool
-        .unwrap_or(DEFAULT_RERANK_CANDIDATE_POOL);
+    let candidate_pool = request.candidate_pool.unwrap_or(default_candidate_pool);
     let rerank_used = match (rerank_enabled, reranker) {
         (true, Some(rr)) => {
             apply_rerank_to_thought_hits(rr, &request.query, &mut fused, candidate_pool).await
@@ -307,6 +315,37 @@ pub async fn search_thoughts(
         vector_search_available,
         rerank_used,
     })
+}
+
+async fn bounded_trigram_hits(
+    pool: &PgPool,
+    query: &str,
+    scope_filter: Option<&str>,
+    scope_prefix_filter: Option<&str>,
+    trigram_top_k: usize,
+    trigram_timeout_ms: u64,
+) -> Vec<Hit> {
+    match kengram_storage::search_trigram_bounded(
+        pool,
+        query,
+        scope_filter,
+        scope_prefix_filter,
+        trigram_top_k as i64,
+        trigram_timeout_ms,
+    )
+    .await
+    {
+        Ok(hits) => hits,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                query_canceled = e.is_query_canceled(),
+                timeout_ms = trigram_timeout_ms,
+                "bounded trigram query failed; continuing with available search legs only",
+            );
+            vec![]
+        }
+    }
 }
 
 /// True when the supplied filter is a JSON object with no keys (i.e. `{}`)
@@ -566,6 +605,66 @@ mod tests {
         assert!(!resp.vector_search_available);
         assert_eq!(resp.results.len(), 1);
         assert_eq!(resp.results[0].thought_id, id);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_thoughts_soft_fails_timed_out_trigram_leg(pool: PgPool) {
+        let embedder = test_embedder();
+        let needle = "needle vector anchor";
+        let needle_id = cap_and_drain(&pool, &embedder, needle, "global").await;
+
+        for i in 0..512 {
+            cap(
+                &pool,
+                &format!(
+                    "bounded trigram load filler {i} {}",
+                    "surface-noise ".repeat(350)
+                ),
+                "load",
+            )
+            .await;
+        }
+
+        let started = std::time::Instant::now();
+        let trigram_hits =
+            bounded_trigram_hits(&pool, needle, None, None, DEFAULT_TRIGRAM_TOP_K, 1).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(800),
+            "timed-out trigram leg should return inside its budget"
+        );
+        assert!(
+            trigram_hits.is_empty(),
+            "timed-out trigram leg must soft-fail to an empty leg"
+        );
+
+        let resp = search_thoughts_with_tuning(
+            &pool,
+            &embedder,
+            None,
+            SearchRequest {
+                query: needle.to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(false),
+                candidate_pool: None,
+                tag_filter: None,
+            },
+            DEFAULT_TRIGRAM_TOP_K,
+            1,
+            DEFAULT_RERANK_CANDIDATE_POOL,
+        )
+        .await
+        .unwrap();
+
+        assert!(resp.vector_search_available);
+        assert!(
+            resp.results.iter().any(|hit| hit.thought_id == needle_id
+                && hit.vector_score.is_some()
+                && hit.trigram_score.is_none()),
+            "outer search should still return vector results when trigram times out"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]

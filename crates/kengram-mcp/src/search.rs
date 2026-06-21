@@ -1,14 +1,13 @@
 //! Read operations: `search_thoughts`, `recent_thoughts`, `get_thought`.
 //!
-//! `search_thoughts` is the hybrid retrieval path: vector kNN ∪ trigram
-//! similarity, fused by RRF, then recency-boosted, then optionally reranked
+//! `search_thoughts` is the hybrid retrieval path: vector kNN ∪ Postgres FTS,
+//! fused by RRF, then recency-boosted, then optionally reranked
 //! by a cross-encoder model over the top `candidate_pool` candidates. If the
 //! embedder is unreachable, the vector leg is skipped and
-//! `vector_search_available` flips to `false`. The trigram leg is bounded and
-//! opportunistic; timeout/errors soft-fail to an empty leg so the fast vector
-//! path can still return. That effectively makes trigram a temporary
-//! best-effort leg during the latency cutover until Phase-2 FTS replaces it as
-//! the real lexical path. If the reranker is unreachable or not configured,
+//! `vector_search_available` flips to `false`. The FTS lexical leg is backed
+//! by a GIN index and still bounded defensively; timeout/errors soft-fail to
+//! an empty leg so the fast vector path can still return. If the reranker is
+//! unreachable or not configured,
 //! the rerank stage is skipped and `rerank_used` flips to `false`; available
 //! legs still come back.
 //!
@@ -30,12 +29,11 @@ use time::OffsetDateTime;
 pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 pub const MAX_SEARCH_LIMIT: usize = 100;
 pub const DEFAULT_TOP_K_PER_LEG: usize = 50;
-pub const DEFAULT_TRIGRAM_TOP_K: usize = DEFAULT_TOP_K_PER_LEG;
-pub const DEFAULT_TRIGRAM_STATEMENT_TIMEOUT_MS: u64 = 300;
+pub const DEFAULT_LEXICAL_TOP_K: usize = DEFAULT_TOP_K_PER_LEG;
+pub const DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS: u64 = 300;
 /// Historical default `candidate_pool` for the rerank stage. The bounded
-/// trigram cutover deliberately does not narrow this default until the
-/// 100-query GOLD sensitivity matrix selects the largest pool that preserves
-/// recall while staying under the latency SLO.
+/// trigram matrix showed narrowing regressed recall; hold this value unless
+/// the GOLD eval explicitly supports a change.
 pub const DEFAULT_RERANK_CANDIDATE_POOL: usize = 32;
 
 #[derive(Debug, Clone)]
@@ -81,8 +79,10 @@ pub struct SearchHit {
     pub tags: Tags,
     /// Raw cosine similarity from the vector leg (`None` if not in that leg).
     pub vector_score: Option<f32>,
-    /// Raw `similarity` (pg_trgm symmetric n-gram Jaccard) from the trigram
-    /// leg (`None` if not in that leg).
+    /// Raw rank from the current lexical leg (`None` if not in that leg).
+    pub lexical_score: Option<f32>,
+    /// Legacy raw `similarity` from the old trigram leg. The current hybrid
+    /// path leaves this `None`; kept so existing clients don't break.
     pub trigram_score: Option<f32>,
     /// RRF aggregate (optionally adjusted by recency boost).
     pub rrf_score: Option<f32>,
@@ -179,8 +179,8 @@ pub async fn search_thoughts(
         embedder,
         reranker,
         request,
-        DEFAULT_TRIGRAM_TOP_K,
-        DEFAULT_TRIGRAM_STATEMENT_TIMEOUT_MS,
+        DEFAULT_LEXICAL_TOP_K,
+        DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS,
         DEFAULT_RERANK_CANDIDATE_POOL,
     )
     .await
@@ -191,8 +191,8 @@ async fn search_thoughts_with_tuning(
     embedder: &dyn Embedder,
     reranker: Option<&dyn Reranker>,
     request: SearchRequest,
-    trigram_top_k: usize,
-    trigram_timeout_ms: u64,
+    lexical_top_k: usize,
+    lexical_timeout_ms: u64,
     default_candidate_pool: usize,
 ) -> Result<SearchResponse, ReadError> {
     if request.query.is_empty() {
@@ -232,32 +232,32 @@ async fn search_thoughts_with_tuning(
             {
                 Ok(hits) => (hits, true),
                 Err(e) => {
-                    tracing::warn!(error = %e, "vector kNN query failed; falling back to trigram only");
+                    tracing::warn!(error = %e, "vector kNN query failed; falling back to lexical only");
                     (vec![], false)
                 }
             }
         }
         Err(e) => {
-            tracing::warn!(error = %e, "embedder failed to embed query; falling back to trigram only");
+            tracing::warn!(error = %e, "embedder failed to embed query; falling back to lexical only");
             (vec![], false)
         }
     };
 
-    // Trigram leg: bounded and opportunistic. pg_trgm similarity over very
-    // large blobs can be non-selective, so this leg must not break the SLO for
-    // the already-fast vector + rerank path.
-    let trigram_hits = bounded_trigram_hits(
+    // Lexical leg: FTS-backed and bounded. The GIN index should make this
+    // fast; the timeout is a defensive belt so lexical failures do not turn
+    // the whole hybrid search into a 5xx.
+    let lexical_hits = bounded_fts_hits(
         pool,
         &request.query,
         scope_filter,
         scope_prefix_filter,
-        trigram_top_k,
-        trigram_timeout_ms,
+        lexical_top_k,
+        lexical_timeout_ms,
     )
     .await;
 
     // RRF fuse → recency boost.
-    let mut fused = rrf_fuse(vec![vector_hits, trigram_hits], DEFAULT_RRF_K);
+    let mut fused = rrf_fuse(vec![vector_hits, lexical_hits], DEFAULT_RRF_K);
     let half_life = request
         .recency_half_life_days
         .unwrap_or(DEFAULT_RECENCY_HALF_LIFE_DAYS);
@@ -304,6 +304,7 @@ async fn search_thoughts_with_tuning(
             metadata: h.thought.metadata,
             tags: h.thought.tags,
             vector_score: h.vector_score,
+            lexical_score: h.lexical_score,
             trigram_score: h.trigram_score,
             rrf_score: h.rrf_score,
             rerank_score: h.rerank_score,
@@ -317,21 +318,21 @@ async fn search_thoughts_with_tuning(
     })
 }
 
-async fn bounded_trigram_hits(
+async fn bounded_fts_hits(
     pool: &PgPool,
     query: &str,
     scope_filter: Option<&str>,
     scope_prefix_filter: Option<&str>,
-    trigram_top_k: usize,
-    trigram_timeout_ms: u64,
+    lexical_top_k: usize,
+    lexical_timeout_ms: u64,
 ) -> Vec<Hit> {
-    match kengram_storage::search_trigram_bounded(
+    match kengram_storage::search_fts_bounded(
         pool,
         query,
         scope_filter,
         scope_prefix_filter,
-        trigram_top_k as i64,
-        trigram_timeout_ms,
+        lexical_top_k as i64,
+        lexical_timeout_ms,
     )
     .await
     {
@@ -340,8 +341,8 @@ async fn bounded_trigram_hits(
             tracing::warn!(
                 error = %e,
                 query_canceled = e.is_query_canceled(),
-                timeout_ms = trigram_timeout_ms,
-                "bounded trigram query failed; continuing with available search legs only",
+                timeout_ms = lexical_timeout_ms,
+                "bounded FTS query failed; continuing with available search legs only",
             );
             vec![]
         }
@@ -608,7 +609,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn search_thoughts_soft_fails_timed_out_trigram_leg(pool: PgPool) {
+    async fn search_thoughts_soft_fails_timed_out_fts_leg(pool: PgPool) {
         let embedder = test_embedder();
         let needle = "needle vector anchor";
         let needle_id = cap_and_drain(&pool, &embedder, needle, "global").await;
@@ -617,8 +618,8 @@ mod tests {
             cap(
                 &pool,
                 &format!(
-                    "bounded trigram load filler {i} {}",
-                    "surface-noise ".repeat(350)
+                    "bounded fts load filler {i} needle vector anchor {}",
+                    "surface noise ".repeat(350)
                 ),
                 "load",
             )
@@ -626,15 +627,15 @@ mod tests {
         }
 
         let started = std::time::Instant::now();
-        let trigram_hits =
-            bounded_trigram_hits(&pool, needle, None, None, DEFAULT_TRIGRAM_TOP_K, 1).await;
+        let lexical_hits =
+            bounded_fts_hits(&pool, needle, None, None, DEFAULT_LEXICAL_TOP_K, 1).await;
         assert!(
             started.elapsed() < std::time::Duration::from_millis(800),
-            "timed-out trigram leg should return inside its budget"
+            "timed-out FTS leg should return inside its budget"
         );
         assert!(
-            trigram_hits.is_empty(),
-            "timed-out trigram leg must soft-fail to an empty leg"
+            lexical_hits.is_empty(),
+            "timed-out FTS leg must soft-fail to an empty leg"
         );
 
         let resp = search_thoughts_with_tuning(
@@ -651,7 +652,7 @@ mod tests {
                 candidate_pool: None,
                 tag_filter: None,
             },
-            DEFAULT_TRIGRAM_TOP_K,
+            DEFAULT_LEXICAL_TOP_K,
             1,
             DEFAULT_RERANK_CANDIDATE_POOL,
         )
@@ -662,8 +663,9 @@ mod tests {
         assert!(
             resp.results.iter().any(|hit| hit.thought_id == needle_id
                 && hit.vector_score.is_some()
+                && hit.lexical_score.is_none()
                 && hit.trigram_score.is_none()),
-            "outer search should still return vector results when trigram times out"
+            "outer search should still return vector results when FTS times out"
         );
     }
 

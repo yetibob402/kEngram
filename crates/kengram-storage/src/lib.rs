@@ -933,10 +933,69 @@ pub async fn search_trigram(
         .collect()
 }
 
-/// Trigram search bounded by a transaction-local statement timeout. This is
-/// intended for opportunistic lexical contribution to hybrid search; callers
-/// should soft-fail timeout/budget errors when a faster leg has usable hits.
-pub async fn search_trigram_bounded(
+/// Full-text lexical search over `thoughts.content`, ranked by
+/// `ts_rank_cd`. This is the production lexical leg for hybrid search; it
+/// should use the `thoughts_content_fts_idx` GIN expression index from
+/// migration 0014.
+pub async fn search_fts(
+    pool: &PgPool,
+    query: &str,
+    scope: Option<&str>,
+    scope_prefix: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Hit>, StorageError> {
+    let rows = sqlx::query!(
+        r#"
+        WITH fts AS (
+            SELECT websearch_to_tsquery('english', $1) AS tsq
+        )
+        SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
+               t.content_fingerprint, t.tags,
+               t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at,
+               ts_rank_cd(to_tsvector('english', t.content), fts.tsq) AS "rank!: f32"
+        FROM thoughts t
+        CROSS JOIN fts
+        WHERE to_tsvector('english', t.content) @@ fts.tsq
+          AND ($2::text IS NULL OR t.scope = $2)
+          AND ($3::text IS NULL OR t.scope LIKE $3 || '%')
+          AND t.retracted_at IS NULL
+        ORDER BY ts_rank_cd(to_tsvector('english', t.content), fts.tsq) DESC,
+                 t.created_at DESC
+        LIMIT $4
+        "#,
+        query,
+        scope,
+        scope_prefix,
+        limit,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|r| {
+            let thought = Thought {
+                id: ThoughtId::from(r.id),
+                scope: Scope::new(r.scope)?,
+                content: r.content,
+                source: Source::new(r.source)?,
+                created_at: r.created_at,
+                metadata: Metadata::from(r.metadata),
+                content_fingerprint: fingerprint_from_bytes(r.content_fingerprint)?,
+                tags: tags_from_value(r.tags)?,
+                tags_extractor_model: r.tags_extractor_model,
+                tags_extractor_version: r.tags_extractor_version,
+                tags_extracted_at: r.tags_extracted_at,
+            };
+            Ok(Hit::from_lexical_leg(thought, r.rank))
+        })
+        .collect()
+}
+
+/// FTS lexical search bounded by a transaction-local statement timeout. This
+/// should be a belt over the indexed FTS path, not the main performance
+/// mechanism. Callers should soft-fail timeout/budget errors when a faster
+/// leg has usable hits.
+pub async fn search_fts_bounded(
     pool: &PgPool,
     query: &str,
     scope: Option<&str>,
@@ -949,7 +1008,7 @@ pub async fn search_trigram_bounded(
         if let Err(rollback_err) = tx.rollback().await {
             tracing::warn!(
                 error = %rollback_err,
-                "failed to roll back bounded trigram transaction after statement_timeout setup error",
+                "failed to roll back bounded FTS transaction after statement_timeout setup error",
             );
         }
         return Err(e.into());
@@ -957,16 +1016,21 @@ pub async fn search_trigram_bounded(
 
     let rows = match sqlx::query!(
         r#"
-        SELECT id, scope, content, source, created_at, metadata,
-               content_fingerprint, tags,
-               tags_extractor_model, tags_extractor_version, tags_extracted_at,
-               similarity(content, $1) AS "sim!: f32"
-        FROM thoughts
-        WHERE similarity(content, $1) > 0.1
-          AND ($2::text IS NULL OR scope = $2)
-          AND ($3::text IS NULL OR scope LIKE $3 || '%')
-          AND retracted_at IS NULL
-        ORDER BY similarity(content, $1) DESC
+        WITH fts AS (
+            SELECT websearch_to_tsquery('english', $1) AS tsq
+        )
+        SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
+               t.content_fingerprint, t.tags,
+               t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at,
+               ts_rank_cd(to_tsvector('english', t.content), fts.tsq) AS "rank!: f32"
+        FROM thoughts t
+        CROSS JOIN fts
+        WHERE to_tsvector('english', t.content) @@ fts.tsq
+          AND ($2::text IS NULL OR t.scope = $2)
+          AND ($3::text IS NULL OR t.scope LIKE $3 || '%')
+          AND t.retracted_at IS NULL
+        ORDER BY ts_rank_cd(to_tsvector('english', t.content), fts.tsq) DESC,
+                 t.created_at DESC
         LIMIT $4
         "#,
         query,
@@ -982,7 +1046,7 @@ pub async fn search_trigram_bounded(
             if let Err(rollback_err) = tx.rollback().await {
                 tracing::warn!(
                     error = %rollback_err,
-                    "failed to roll back bounded trigram transaction after query error",
+                    "failed to roll back bounded FTS transaction after query error",
                 );
             }
             return Err(e.into());
@@ -1005,7 +1069,7 @@ pub async fn search_trigram_bounded(
                 tags_extractor_version: r.tags_extractor_version,
                 tags_extracted_at: r.tags_extracted_at,
             };
-            Ok(Hit::from_trigram_leg(thought, r.sim))
+            Ok(Hit::from_lexical_leg(thought, r.rank))
         })
         .collect()
 }
@@ -1972,7 +2036,7 @@ pub struct RetractThoughtOutcome {
 }
 
 /// Mark a thought as retracted. Retracted thoughts are excluded from
-/// retrieval (`recent_thoughts`, `search_trigram`, `search_vector_knn`);
+/// retrieval (`recent_thoughts`, `search_fts`, `search_vector_knn`);
 /// `get_thought` is the audit path and continues to return the row.
 ///
 /// Idempotent on a row that's already retracted (`retracted: false`);
@@ -2974,7 +3038,42 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn search_trigram_bounded_sets_statement_timeout(pool: PgPool) {
+    async fn search_fts_finds_exact_match(pool: PgPool) {
+        insert_test_thought(&pool, "remembering tcgplayer integration", "work").await;
+        insert_test_thought(&pool, "weather is nice today", "personal").await;
+
+        let hits = search_fts(&pool, "tcgplayer", None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].thought.content.contains("tcgplayer"));
+        assert!(hits[0].lexical_score.unwrap() > 0.0);
+        assert_eq!(hits[0].trigram_score, None);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_fts_respects_scope(pool: PgPool) {
+        insert_test_thought(&pool, "tcgplayer info", "work").await;
+        insert_test_thought(&pool, "tcgplayer info two", "personal").await;
+
+        let hits = search_fts(&pool, "tcgplayer", Some("work"), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].thought.scope.as_str(), "work");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_fts_returns_empty_for_no_match(pool: PgPool) {
+        insert_test_thought(&pool, "completely unrelated text", "global").await;
+        let hits = search_fts(&pool, "xyzzyqwerty", None, None, 10)
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_fts_bounded_sets_statement_timeout(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
 
         set_statement_timeout(&mut tx, 300).await.unwrap();
@@ -2988,18 +3087,19 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn search_trigram_bounded_finds_exact_match(pool: PgPool) {
+    async fn search_fts_bounded_finds_exact_match(pool: PgPool) {
         insert_test_thought(&pool, "remembering tcgplayer integration", "work").await;
 
-        let hits = search_trigram_bounded(&pool, "tcgplayer", None, None, 10, 300)
+        let hits = search_fts_bounded(&pool, "tcgplayer", None, None, 10, 300)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].thought.content.contains("tcgplayer"));
+        assert!(hits[0].lexical_score.unwrap() > 0.0);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn search_trigram_bounded_rolls_back_after_statement_timeout(pool: PgPool) {
+    async fn search_fts_bounded_rolls_back_after_statement_timeout(pool: PgPool) {
         insert_test_thought(&pool, "remembering tcgplayer integration", "work").await;
 
         let mut blocker = pool.begin().await.unwrap();
@@ -3009,12 +3109,12 @@ mod tests {
             .unwrap();
 
         let started = std::time::Instant::now();
-        let err = search_trigram_bounded(&pool, "tcgplayer", None, None, 10, 50)
+        let err = search_fts_bounded(&pool, "tcgplayer", None, None, 10, 50)
             .await
             .unwrap_err();
         assert!(
             started.elapsed() < std::time::Duration::from_millis(800),
-            "statement_timeout should cancel the blocked trigram query promptly"
+            "statement_timeout should cancel the blocked FTS query promptly"
         );
         assert!(
             err.is_query_canceled(),
@@ -3023,7 +3123,7 @@ mod tests {
 
         blocker.rollback().await.unwrap();
 
-        let hits = search_trigram_bounded(&pool, "tcgplayer", None, None, 10, 300)
+        let hits = search_fts_bounded(&pool, "tcgplayer", None, None, 10, 300)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -4715,6 +4815,21 @@ mod tests {
         assert!(scopes.iter().all(|s| s.starts_with("rjf.")));
     }
 
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_fts_scope_prefix_matches_multiple_scopes(pool: PgPool) {
+        insert_test_thought(&pool, "uniquekeyword in rjf.a", "rjf.a").await;
+        insert_test_thought(&pool, "uniquekeyword in rjf.b", "rjf.b").await;
+        insert_test_thought(&pool, "uniquekeyword in other", "other").await;
+
+        let hits = search_fts(&pool, "uniquekeyword", None, Some("rjf."), 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        let scopes: Vec<&str> = hits.iter().map(|h| h.thought.scope.as_str()).collect();
+        assert!(scopes.iter().all(|s| s.starts_with("rjf.")));
+        assert!(hits.iter().all(|h| h.lexical_score.is_some()));
+    }
+
     // -- M4: retraction (simplified — no fact cascade) ----------------------
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -4772,6 +4887,19 @@ mod tests {
         retract_thought(&pool, retracted, None).await.unwrap();
 
         let hits = search_trigram(&pool, "unique_keyword", None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_ne!(hits[0].thought.id, retracted);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn retracted_thought_excluded_from_search_fts(pool: PgPool) {
+        let _active = insert_test_thought(&pool, "uniquekeyword active", "global").await;
+        let retracted = insert_test_thought(&pool, "uniquekeyword retracted", "global").await;
+        retract_thought(&pool, retracted, None).await.unwrap();
+
+        let hits = search_fts(&pool, "uniquekeyword", None, None, 10)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);

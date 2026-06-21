@@ -2,7 +2,7 @@
 //! live elsewhere.
 //!
 //! The hybrid retrieval pipeline is:
-//!   1. Each retrieval leg (vector kNN, trigram similarity) returns a
+//!   1. Each retrieval leg (vector kNN, lexical FTS) returns a
 //!      ranked `Vec<Hit>` of length ≤ top_k_per_leg.
 //!   2. [`rrf_fuse`] combines the rankings into a single ordering by
 //!      reciprocal rank fusion: `rrf_score(d) = Σ 1 / (k + rank_i(d))`.
@@ -13,7 +13,7 @@
 //! recency half-life is 30 days.
 //!
 //! As of M3 Phase C, `Hit` exposes only per-leg scores (`vector_score` /
-//! `trigram_score` / `rrf_score` / `rerank_score`) rather than a unified
+//! `lexical_score` / `trigram_score` / `rrf_score` / `rerank_score`) rather than a unified
 //! `score`. Result ordering reflects the post-pipeline stage; consumers
 //! who want a threshold-able scalar pick the load-bearing per-leg field
 //! (typically `rerank_score ?? rrf_score`).
@@ -31,7 +31,8 @@ pub const DEFAULT_RECENCY_HALF_LIFE_DAYS: f32 = 30.0;
 ///
 /// Per-leg fields capture each pipeline stage's signal:
 ///   - `vector_score`: raw cosine similarity from the vector kNN leg.
-///   - `trigram_score`: raw `similarity` from the trigram leg.
+///   - `lexical_score`: raw rank from the current lexical leg.
+///   - `trigram_score`: legacy raw `similarity` from the old trigram leg.
 ///   - `rrf_score`: RRF aggregate `Σ 1/(k + rank_i)` after fusion; updated
 ///     in-place by [`recency_boost`] (multiplied by the decay factor).
 ///   - `rerank_score`: calibrated absolute relevance from the cross-encoder,
@@ -45,11 +46,15 @@ pub const DEFAULT_RECENCY_HALF_LIFE_DAYS: f32 = 30.0;
 pub struct Hit {
     pub thought: Thought,
     /// Raw cosine similarity from the vector kNN leg. `None` when the hit
-    /// did not appear in the vector leg (trigram-only match or vector leg
+    /// did not appear in the vector leg (lexical-only match or vector leg
     /// unavailable).
     pub vector_score: Option<f32>,
+    /// Raw rank from the current lexical leg. Today this is Postgres FTS
+    /// `ts_rank_cd`; older trigram-only callers leave it unset.
+    pub lexical_score: Option<f32>,
     /// Raw `similarity` (pg_trgm symmetric n-gram Jaccard) from the trigram
-    /// leg. `None` when the hit did not appear in the trigram leg.
+    /// leg. Kept for wire compatibility with older clients; the production
+    /// hybrid lexical leg now uses `lexical_score`.
     pub trigram_score: Option<f32>,
     /// Reciprocal Rank Fusion aggregate, optionally adjusted by
     /// [`recency_boost`]. Set by [`rrf_fuse`]; `None` on raw leg hits
@@ -65,12 +70,27 @@ pub struct Hit {
 
 impl Hit {
     /// Construct a hit produced by the vector kNN leg. The raw cosine
-    /// similarity lands in `vector_score`; trigram + rerank + RRF fields
+    /// similarity lands in `vector_score`; lexical + rerank + RRF fields
     /// default to `None` (fusion fills `rrf_score` later).
     pub fn from_vector_leg(thought: Thought, cosine_similarity: f32) -> Self {
         Self {
             thought,
             vector_score: Some(cosine_similarity),
+            lexical_score: None,
+            trigram_score: None,
+            rrf_score: None,
+            rerank_score: None,
+        }
+    }
+
+    /// Construct a hit produced by the lexical FTS leg. The raw Postgres FTS
+    /// rank lands in `lexical_score`; vector + trigram + rerank + RRF fields
+    /// default to `None`.
+    pub fn from_lexical_leg(thought: Thought, rank: f32) -> Self {
+        Self {
+            thought,
+            vector_score: None,
+            lexical_score: Some(rank),
             trigram_score: None,
             rrf_score: None,
             rerank_score: None,
@@ -84,6 +104,7 @@ impl Hit {
         Self {
             thought,
             vector_score: None,
+            lexical_score: None,
             trigram_score: Some(similarity),
             rrf_score: None,
             rerank_score: None,
@@ -93,7 +114,7 @@ impl Hit {
 
 /// Reciprocal Rank Fusion. Each ranking is taken in the order given. The
 /// aggregate `Σ 1/(k + rank_i)` lands in each hit's `rrf_score`. Per-leg
-/// score fields (`vector_score`, `trigram_score`) are preserved across
+/// score fields (`vector_score`, `lexical_score`, `trigram_score`) are preserved across
 /// the fusion: when both rankings carry the same thought, the leg-specific
 /// scores from each input merge into the accumulator (an input's `Some(_)`
 /// always wins over an existing `None`). Output is sorted by descending
@@ -115,12 +136,16 @@ pub fn rrf_fuse(rankings: Vec<Vec<Hit>>, k: f32) -> Vec<Hit> {
                     if existing.trigram_score.is_none() {
                         existing.trigram_score = hit.trigram_score;
                     }
+                    if existing.lexical_score.is_none() {
+                        existing.lexical_score = hit.lexical_score;
+                    }
                 }
                 None => {
                     let id = hit.thought.id;
                     let merged = Hit {
                         thought: hit.thought,
                         vector_score: hit.vector_score,
+                        lexical_score: hit.lexical_score,
                         trigram_score: hit.trigram_score,
                         rrf_score: Some(contribution),
                         rerank_score: None,
@@ -234,34 +259,37 @@ mod tests {
 
     #[test]
     fn rrf_preserves_per_leg_scores_when_present() {
-        // Build a vector-leg hit and a trigram-leg hit for two different
+        // Build a vector-leg hit and a lexical-leg hit for two different
         // thoughts. After fusion, each hit should carry the per-leg score
         // from its origin (and None for the other leg).
         let v_hit = Hit::from_vector_leg(thought(1, "vec only", 0), 0.85);
-        let t_hit = Hit::from_trigram_leg(thought(2, "tri only", 0), 0.42);
-        let out = rrf_fuse(vec![vec![v_hit], vec![t_hit]], 60.0);
+        let l_hit = Hit::from_lexical_leg(thought(2, "lex only", 0), 0.42);
+        let out = rrf_fuse(vec![vec![v_hit], vec![l_hit]], 60.0);
         let by_content: std::collections::HashMap<String, Hit> = out
             .into_iter()
             .map(|h| (h.thought.content.clone(), h))
             .collect();
         let v = &by_content["vec only"];
         assert_eq!(v.vector_score, Some(0.85));
+        assert_eq!(v.lexical_score, None);
         assert_eq!(v.trigram_score, None);
-        let t = &by_content["tri only"];
-        assert_eq!(t.vector_score, None);
-        assert_eq!(t.trigram_score, Some(0.42));
+        let l = &by_content["lex only"];
+        assert_eq!(l.vector_score, None);
+        assert_eq!(l.lexical_score, Some(0.42));
+        assert_eq!(l.trigram_score, None);
     }
 
     #[test]
     fn rrf_merges_per_leg_scores_when_both_legs_match() {
-        // Same thought appears in both legs — vector_score AND trigram_score
+        // Same thought appears in both legs — vector_score AND lexical_score
         // should survive the fusion.
         let v_hit = Hit::from_vector_leg(thought(1, "both", 0), 0.91);
-        let t_hit = Hit::from_trigram_leg(thought(1, "both", 0), 0.33);
-        let out = rrf_fuse(vec![vec![v_hit], vec![t_hit]], 60.0);
+        let l_hit = Hit::from_lexical_leg(thought(1, "both", 0), 0.33);
+        let out = rrf_fuse(vec![vec![v_hit], vec![l_hit]], 60.0);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].vector_score, Some(0.91));
-        assert_eq!(out[0].trigram_score, Some(0.33));
+        assert_eq!(out[0].lexical_score, Some(0.33));
+        assert_eq!(out[0].trigram_score, None);
     }
 
     #[test]
@@ -298,6 +326,7 @@ mod tests {
         let mut hits = vec![Hit {
             thought: thought(1, "old", 30 * 86_400),
             vector_score: None,
+            lexical_score: None,
             trigram_score: None,
             rrf_score: Some(1.0),
             rerank_score: None,
@@ -312,6 +341,7 @@ mod tests {
         let mut hits = vec![Hit {
             thought: thought(1, "fresh", 0),
             vector_score: None,
+            lexical_score: None,
             trigram_score: None,
             rrf_score: Some(1.0),
             rerank_score: None,
@@ -329,6 +359,7 @@ mod tests {
             Hit {
                 thought: thought(1, "old", 30 * 86_400),
                 vector_score: None,
+                lexical_score: None,
                 trigram_score: None,
                 rrf_score: Some(0.8),
                 rerank_score: None,
@@ -336,6 +367,7 @@ mod tests {
             Hit {
                 thought: thought(2, "fresh", 0),
                 vector_score: None,
+                lexical_score: None,
                 trigram_score: None,
                 rrf_score: Some(0.5),
                 rerank_score: None,
@@ -352,6 +384,7 @@ mod tests {
         let mut hits = vec![Hit {
             thought: thought(1, "old", 30 * 86_400),
             vector_score: None,
+            lexical_score: None,
             trigram_score: None,
             rrf_score: Some(1.0),
             rerank_score: None,

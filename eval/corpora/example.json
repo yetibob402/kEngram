@@ -1,0 +1,156 @@
+{
+  "format_version": 1,
+  "kind": "tagger-golden-corpus",
+  "provenance": {
+    "exported_at": "2026-06-10T00:00:00Z",
+    "source": "hand-written synthetic example (committed; safe for OSS)",
+    "item_count": 9
+  },
+  "known_scopes": ["demo.eval", "demo.notes"],
+  "scope_vocab": {
+    "demo.eval": {
+      "topics": ["release-process", "embeddings", "tagging", "search"],
+      "entities": ["kengram", "BGE-M3", "RRF"]
+    }
+  },
+  "items": [
+    {
+      "id": "task-with-person-and-date",
+      "content": "Talked to Sarah today about the PR backlog. She wants migration #0042 fast-tracked because the mobile freeze starts Thursday.",
+      "scope": "demo.eval",
+      "metadata": {},
+      "reviewed": true,
+      "golden": {
+        "people": ["Sarah"],
+        "entities": ["migration #0042"],
+        "action_items": ["fast-track migration #0042"],
+        "topics": ["release-process"],
+        "dates_mentioned": ["Thursday"],
+        "kind": "task"
+      }
+    },
+    {
+      "id": "decision-record-with-metadata-override",
+      "content": "After comparing RRF against weighted score blends on the live corpus, we decided to keep RRF for hybrid fusion.",
+      "scope": "demo.eval",
+      "metadata": { "decision_type": "architecture" },
+      "reviewed": true,
+      "notes": "metadata.decision_type must force kind=decision_record through finalize_tags",
+      "golden": {
+        "people": [],
+        "entities": ["RRF"],
+        "action_items": [],
+        "topics": ["search"],
+        "dates_mentioned": [],
+        "kind": "decision_record"
+      }
+    },
+    {
+      "id": "reference-embedding-model",
+      "content": "BGE-M3 is a multilingual embedding model with an 8192-token input window; kengram consumes it through the TEI sidecar.",
+      "scope": "demo.eval",
+      "metadata": {},
+      "reviewed": true,
+      "golden": {
+        "people": [],
+        "entities": ["BGE-M3", "kengram", "TEI"],
+        "action_items": [],
+        "topics": ["embeddings"],
+        "dates_mentioned": [],
+        "kind": "reference"
+      }
+    },
+    {
+      "id": "idea-verification-pass",
+      "content": "What if the tagger ran a second verification pass that strips any entity not literally present in the prose? Cheap, deterministic, and it would kill the hallucination class outright.",
+      "scope": "demo.eval",
+      "metadata": {},
+      "reviewed": true,
+      "golden": {
+        "people": [],
+        "entities": [],
+        "action_items": [],
+        "topics": ["tagging"],
+        "dates_mentioned": [],
+        "kind": "idea"
+      }
+    },
+    {
+      "id": "observation-scope-identifier-bait",
+      "content": "The demo.eval scope keeps growing faster than expected — mostly short notes captured late at night.",
+      "scope": "demo.eval",
+      "metadata": {},
+      "reviewed": true,
+      "notes": "scope identifier appears in prose; golden excludes it (finalize_tags strips it if a weak tagger emits it)",
+      "golden": {
+        "people": [],
+        "entities": [],
+        "action_items": [],
+        "topics": [],
+        "dates_mentioned": [],
+        "kind": "observation"
+      }
+    },
+    {
+      "id": "person-note-maria",
+      "content": "Maria prefers async code reviews over meetings and is sharpest in the mornings; she works from UTC+2.",
+      "scope": "demo.notes",
+      "metadata": {},
+      "reviewed": true,
+      "golden": {
+        "people": ["Maria"],
+        "entities": [],
+        "action_items": [],
+        "topics": [],
+        "dates_mentioned": [],
+        "kind": "person_note"
+      }
+    },
+    {
+      "id": "session-harness-wiring",
+      "content": "Spent the afternoon wiring the eval harness CLI, then chased clippy warnings until the workspace was clean again.",
+      "scope": "demo.eval",
+      "metadata": {},
+      "reviewed": true,
+      "golden": {
+        "people": [],
+        "entities": [],
+        "action_items": [],
+        "topics": ["tagging"],
+        "dates_mentioned": [],
+        "kind": "session"
+      }
+    },
+    {
+      "id": "null-kind-fragment",
+      "content": "misc: blue notebook, third shelf, left box.",
+      "scope": "demo.notes",
+      "metadata": {},
+      "reviewed": true,
+      "notes": "deliberately unclassifiable fragment; golden kind is null",
+      "golden": {
+        "people": [],
+        "entities": [],
+        "action_items": [],
+        "topics": [],
+        "dates_mentioned": [],
+        "kind": null
+      }
+    },
+    {
+      "id": "task-renew-domain",
+      "content": "Renew the kengram.dev domain before 2026-08-01 or the demo links all go dark.",
+      "scope": "demo.eval",
+      "metadata": {},
+      "reviewed": true,
+      "golden": {
+        "people": [],
+        "entities": ["kengram.dev"],
+        "action_items": ["renew the kengram.dev domain before 2026-08-01"],
+        "topics": [],
+        "dates_mentioned": ["2026-08-01"],
+        "kind": "task"
+      }
+    }
+  ]
+}

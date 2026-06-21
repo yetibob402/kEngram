@@ -610,13 +610,14 @@ A "Tier 3 — public + multi-user" option exists in principle but is **explicitl
 
 [M7] — eval suite ships at the operational-maturity milestone. We don't ship without it because "did the model swap regress retrieval" is the kind of question we'll ask ourselves often.
 
-**Three suites, all reproducible from a fixture corpus:**
+**Four suites, all reproducible from a fixture corpus:**
 
-1. **Capture-recall.** Synthetic conversations seeded with target thoughts; check that subsequent semantically-relevant queries surface the right thoughts.
-2. **Cross-model retrieval consistency.** Re-embed the same fixture with a new embedder; measure overlap of top-10 results vs. baseline. Drop > 30% triggers a manual review before the swap is committed in production scopes.
-3. **LongMemEval-style.** Subset of the public benchmark adapted to our schema. Apples-to-apples comparison against published Mem0 / Zep / Letta numbers.
+1. **Tagger quality.** [Shipped M7.1] Multi-model tagger comparison against a hand-reviewed golden corpus: per-field P/R/F1, fuzzy-matched action_items, kind accuracy + confusion matrix, stability across repeats, raw-vs-finalized deltas. Database-free by construction — the corpus file carries the scope/vocab context, so eval runs can never touch the production corpus. Corpus drafting (`kengram eval export-corpus`) is the one read-only DB touchpoint.
+2. **Capture-recall.** Synthetic conversations seeded with target thoughts; check that subsequent semantically-relevant queries surface the right thoughts.
+3. **Cross-model retrieval consistency.** Re-embed the same fixture with a new embedder; measure overlap of top-10 results vs. baseline. Drop > 30% triggers a manual review before the swap is committed in production scopes.
+4. **LongMemEval-style.** Subset of the public benchmark adapted to our schema. Apples-to-apples comparison against published Mem0 / Zep / Letta numbers.
 
-Eval runs end-to-end in `kengram eval --suite <name>` and dumps a JSON report.
+Eval runs end-to-end as `kengram eval <suite> ...` subcommands (e.g. `kengram eval tagger --corpus <file>`) and dumps a JSON report. Operator runbook: DEVELOPMENT.md "Tagger model evaluation."
 
 ## 14. Open questions
 

@@ -5,6 +5,12 @@
 # them, with deterministic filters holding the floor where small models can't).
 # No new deps — just the existing example + env vars + jq for the summary.
 #
+# NOTE (M7.1): for measured multi-model comparison against a golden corpus
+# (per-field P/R/F1, kind confusion matrix, stability, finalize deltas), use
+# `kengram eval tagger` — see DEVELOPMENT.md "Tagger model evaluation". This
+# script remains the fast pass/fail assertion-fixture sweep for prompt
+# iteration; it may be retired once the eval harness fully covers its use.
+#
 # Usage:
 #   ./tagger-sweep.sh [fixture.json ...]
 #     (defaults to the forward_looking + use_mention fixtures)

@@ -1600,9 +1600,10 @@ dependencies = [
 
 [[package]]
 name = "kengram-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "clap",
  "figment",
@@ -1614,10 +1615,12 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "time",
  "tokio",
  "tokio-util",
+ "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -1625,7 +1628,7 @@ dependencies = [
 
 [[package]]
 name = "kengram-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1639,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "kengram-embed"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "kengram-core",
@@ -1654,7 +1657,7 @@ dependencies = [
 
 [[package]]
 name = "kengram-extract"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "kengram-core",
@@ -1671,7 +1674,7 @@ dependencies = [
 
 [[package]]
 name = "kengram-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "kengram-core",
@@ -1693,7 +1696,7 @@ dependencies = [
 
 [[package]]
 name = "kengram-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "kengram-core",
  "pgvector",
@@ -1709,7 +1712,7 @@ dependencies = [
 
 [[package]]
 name = "kengram-tagger-deterministic"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1731,7 +1734,7 @@ dependencies = [
 
 [[package]]
 name = "kengram-tagger-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "kengram-core",
  "serde",

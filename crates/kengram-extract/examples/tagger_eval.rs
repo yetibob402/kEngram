@@ -5,6 +5,13 @@
 //! per-fixture assertions declared in JSON, prints pass/fail. Designed
 //! for the prompt-iteration loop documented in `docs/goals/README.md`.
 //!
+//! NOTE (M7.1): this is the fast smoke lane (partial-label assertions,
+//! raw tagger output, seconds per run). For measured multi-model
+//! comparison against full golden labels — per-field P/R/F1, kind
+//! confusion matrix, stability, finalized-output scoring — use
+//! `kengram eval tagger` (crates/kengram-cli/src/eval/), documented in
+//! DEVELOPMENT.md "Tagger model evaluation".
+//!
 //! Defaults to `http://localhost:11434/v1` and `gemma3:12b`. Override
 //! via env vars `OLLAMA_ENDPOINT` and `TAGGER_MODEL`. Iterate against a
 //! remote Ollama (e.g., the iMac over Tailnet) by setting

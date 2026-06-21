@@ -638,6 +638,17 @@ A non-zero `pending_embeddings` count with on-disk-tables that match expectation
 
 See [Tagger version history and safe re-tag procedure](#tagger-version-history-and-safe-re-tag-procedure) for the procedure. Short version: verify `target_version` in the startup log, `kengram tag --rerun --since 1970-01-01T00:00:00Z`, watch the WARN logs for per-row failures, spot-check.
 
+### Tagger model evaluation (eval harness)
+
+`kengram eval tagger` objectively compares candidate tagger models against a golden corpus — per-field P/R/F1, `kind` accuracy, optional stability, and latency, scored on **finalized** output and **never touching the database** — and `kengram eval export-corpus` drafts a golden corpus from live thoughts (read-only). Quick start:
+
+```bash
+cp eval/models.example.toml eval/models.toml                     # declare arms (gitignored)
+kengram eval tagger --corpus eval/corpora/mine.json --dry-run    # preview, then drop --dry-run to run
+```
+
+**Full reference** — architecture and the no-DB invariant, golden-corpus format, model-arm config, the complete scoring methodology, report interpretation, and the operational lessons (temperature, reasoning-model failure modes, the `OLLAMA_MAX_LOADED_MODELS=1` multi-arm trap, vocab-vs-prod, residence/context) — lives in **[docs/tagger-eval-harness.md](docs/tagger-eval-harness.md)**. The older assertion-fixture lane (`cargo run --example tagger_eval`, `./tagger-sweep.sh`) remains the fast smoke check for prompt iteration.
+
 ### Migration audit
 
 ```bash

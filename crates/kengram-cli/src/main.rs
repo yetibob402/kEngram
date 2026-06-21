@@ -8,6 +8,7 @@
 mod backup;
 mod bench;
 mod config;
+mod eval;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
@@ -123,6 +124,14 @@ enum Command {
     Audit {
         #[command(subcommand)]
         resource: AuditResource,
+    },
+    /// Evaluation harness — offline quality measurement (first M7 eval
+    /// suite: multi-model tagger comparison). `eval tagger` NEVER touches
+    /// the database: it reads a corpus file, calls tagger HTTP endpoints,
+    /// and writes a report file.
+    Eval {
+        #[command(subcommand)]
+        action: eval::EvalAction,
     },
     /// Print corpus + storage telemetry: thought counts, embeddings,
     /// links, per-scope summary, per-table heap/index/total sizes.
@@ -1020,6 +1029,14 @@ async fn main() -> anyhow::Result<()> {
         Command::Audit { resource } => match resource {
             AuditResource::Migrations { since, limit } => {
                 run_audit_migrations(config, since, limit).await
+            }
+        },
+        Command::Eval { action } => match action {
+            // Deliberately does NOT receive `config`: `eval tagger` must
+            // never see a database URL, let alone connect (see eval/mod.rs).
+            eval::EvalAction::Tagger(args) => eval::run_tagger_cli(args).await,
+            eval::EvalAction::ExportCorpus(args) => {
+                eval::export::run_export_cli(config, args).await
             }
         },
         Command::Stats {

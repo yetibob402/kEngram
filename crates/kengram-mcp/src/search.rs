@@ -444,7 +444,14 @@ async fn search_thoughts_with_tuning(
     let rerank_started = Instant::now();
     let rerank_used = match (rerank_enabled, reranker) {
         (true, Some(rr)) => {
-            apply_rerank_to_thought_hits(rr, &query, &mut fused, candidate_pool).await
+            apply_rerank_to_thought_hits(
+                rr,
+                &query,
+                &mut fused,
+                candidate_pool,
+                chunk_serving_enabled,
+            )
+            .await
         }
         _ => false,
     };
@@ -919,6 +926,7 @@ async fn apply_rerank_to_thought_hits(
     query: &str,
     hits: &mut Vec<kengram_core::Hit>,
     candidate_pool: usize,
+    exact_identifier_boost_enabled: bool,
 ) -> bool {
     if hits.is_empty() {
         return false;
@@ -949,7 +957,9 @@ async fn apply_rerank_to_thought_hits(
             hit.rerank_score = Some(s.score);
         }
     }
-    apply_exact_identifier_boost(query, &mut hits[..pool_len]);
+    if exact_identifier_boost_enabled {
+        apply_exact_identifier_boost(query, &mut hits[..pool_len]);
+    }
     hits.truncate(pool_len);
     hits.sort_by(|a, b| {
         let av = a.rerank_score.unwrap_or(f32::MIN);
@@ -1154,7 +1164,7 @@ mod tests {
     use crate::capture::{CaptureRequest, capture};
     use crate::drain::drain_pending_embeddings;
     use kengram_core::{EmbeddingModel, TagKind, Tags};
-    use kengram_embed::{FakeBehavior, FakeEmbedder};
+    use kengram_embed::{FakeBehavior, FakeEmbedder, FakeReranker};
 
     const TEST_EMBEDDER_MODEL_ID: &str = "qwen3-embedding";
 
@@ -1164,6 +1174,52 @@ mod tests {
 
     fn test_embedder() -> FakeEmbedder {
         FakeEmbedder::with_model(test_embedding_model())
+    }
+
+    fn test_hit(content: &str) -> kengram_core::Hit {
+        kengram_core::Hit {
+            thought: Thought {
+                id: ThoughtId::new(),
+                scope: Scope::new("global").unwrap(),
+                content: content.to_string(),
+                source: Source::new("test").unwrap(),
+                created_at: OffsetDateTime::now_utc(),
+                metadata: Metadata::default(),
+                content_fingerprint: [0_u8; 32],
+                tags: Tags::default(),
+                tags_extractor_model: None,
+                tags_extractor_version: None,
+                tags_extracted_at: None,
+            },
+            vector_score: None,
+            lexical_score: None,
+            trigram_score: None,
+            rrf_score: Some(1.0),
+            rerank_score: None,
+            chunk: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_identifier_boost_is_chunk_serving_flag_gated() {
+        let reranker = FakeReranker::new();
+        let query = "which note explains KGR999";
+
+        let mut flag_off = vec![
+            test_hit("plain first candidate"),
+            test_hit("KGR999 exact id"),
+        ];
+        assert!(apply_rerank_to_thought_hits(&reranker, query, &mut flag_off, 2, false).await);
+        assert_eq!(flag_off[0].thought.content, "plain first candidate");
+        assert_eq!(flag_off[1].thought.content, "KGR999 exact id");
+
+        let mut flag_on = vec![
+            test_hit("plain first candidate"),
+            test_hit("KGR999 exact id"),
+        ];
+        assert!(apply_rerank_to_thought_hits(&reranker, query, &mut flag_on, 2, true).await);
+        assert_eq!(flag_on[0].thought.content, "KGR999 exact id");
+        assert_eq!(flag_on[1].thought.content, "plain first candidate");
     }
 
     /// Capture a thought — leaves it queued, not embedded.

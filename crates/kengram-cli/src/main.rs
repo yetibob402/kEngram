@@ -7,6 +7,7 @@
 
 mod backup;
 mod bench;
+mod chunk;
 mod config;
 mod eval;
 
@@ -132,6 +133,13 @@ enum Command {
     Eval {
         #[command(subcommand)]
         action: eval::EvalAction,
+    },
+    /// Batch chunking pipeline: dry-run, apply, and enqueue artifact chunks
+    /// for embedding. Corpus surgery is operator-gated and resumable; dry-run
+    /// first, apply only after sample audit.
+    Chunk {
+        #[command(subcommand)]
+        action: chunk::ChunkAction,
     },
     /// Print corpus + storage telemetry: thought counts, embeddings,
     /// links, per-scope summary, per-table heap/index/total sizes.
@@ -413,12 +421,15 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
     let embedder_for_factory = embedder.clone();
     let reranker_for_factory = reranker.clone();
     let tagger_model_id_for_factory = tagger_model_id.clone();
+    let chunk_serving_enabled = config.search.chunk_serving_enabled;
+    tracing::info!(chunk_serving_enabled, "search config resolved");
     let factory = move || {
         Ok(KengramServer::new(
             pool_for_factory.clone(),
             embedder_for_factory.clone(),
             reranker_for_factory.clone(),
             tagger_model_id_for_factory.clone(),
+            chunk_serving_enabled,
         ))
     };
 
@@ -1039,6 +1050,7 @@ async fn main() -> anyhow::Result<()> {
                 eval::export::run_export_cli(config, args).await
             }
         },
+        Command::Chunk { action } => chunk::run_chunk_cli(config, action).await,
         Command::Stats {
             scope_prefix,
             top_scopes,

@@ -20,11 +20,30 @@
 
 use std::collections::HashMap;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use crate::Thought;
 
 pub const DEFAULT_RRF_K: f32 = 60.0;
 pub const DEFAULT_RECENCY_HALF_LIFE_DAYS: f32 = 30.0;
+
+/// Provenance for a search hit whose ranking evidence came from an artifact
+/// chunk. The parent `Thought` remains the search identity; these fields keep
+/// the answer-bearing chunk visible to callers and evaluators.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkProvenance {
+    pub chunk_id: Uuid,
+    pub artifact_id: Uuid,
+    pub source_thought_id: crate::ThoughtId,
+    pub chunk_index: i32,
+    pub content: String,
+    pub chunker_id: String,
+    pub chunker_version: i32,
+    pub token_estimate: Option<i32>,
+    pub start_char: Option<i32>,
+    pub end_char: Option<i32>,
+    pub metadata: serde_json::Value,
+}
 
 /// A single retrieval hit. Storage layers return these from each leg; the
 /// fusion layer accumulates and re-orders them.
@@ -67,6 +86,9 @@ pub struct Hit {
     /// reranker. `None` when rerank was off, no reranker was configured,
     /// or the hit fell outside the reranked candidate pool.
     pub rerank_score: Option<f32>,
+    /// `Some(_)` when a chunk leg produced the hit. The parent thought stays
+    /// in `thought`; this carries the matched chunk evidence.
+    pub chunk: Option<ChunkProvenance>,
 }
 
 impl Hit {
@@ -81,6 +103,7 @@ impl Hit {
             trigram_score: None,
             rrf_score: None,
             rerank_score: None,
+            chunk: None,
         }
     }
 
@@ -95,6 +118,7 @@ impl Hit {
             trigram_score: Some(rank),
             rrf_score: None,
             rerank_score: None,
+            chunk: None,
         }
     }
 
@@ -109,7 +133,14 @@ impl Hit {
             trigram_score: Some(similarity),
             rrf_score: None,
             rerank_score: None,
+            chunk: None,
         }
+    }
+
+    /// Attach chunk provenance while preserving the parent-thought hit shape.
+    pub fn with_chunk_provenance(mut self, chunk: ChunkProvenance) -> Self {
+        self.chunk = Some(chunk);
+        self
     }
 }
 
@@ -140,6 +171,9 @@ pub fn rrf_fuse(rankings: Vec<Vec<Hit>>, k: f32) -> Vec<Hit> {
                     if existing.lexical_score.is_none() {
                         existing.lexical_score = hit.lexical_score;
                     }
+                    if existing.chunk.is_none() {
+                        existing.chunk = hit.chunk;
+                    }
                 }
                 None => {
                     let id = hit.thought.id;
@@ -150,6 +184,7 @@ pub fn rrf_fuse(rankings: Vec<Vec<Hit>>, k: f32) -> Vec<Hit> {
                         trigram_score: hit.trigram_score,
                         rrf_score: Some(contribution),
                         rerank_score: None,
+                        chunk: hit.chunk,
                     };
                     acc.insert(id, merged);
                 }
@@ -332,6 +367,7 @@ mod tests {
             trigram_score: None,
             rrf_score: Some(1.0),
             rerank_score: None,
+            chunk: None,
         }];
         recency_boost(&mut hits, 30.0, now);
         assert!((hits[0].rrf_score.unwrap() - 0.5).abs() < 1e-5);
@@ -347,6 +383,7 @@ mod tests {
             trigram_score: None,
             rrf_score: Some(1.0),
             rerank_score: None,
+            chunk: None,
         }];
         recency_boost(&mut hits, 30.0, now);
         assert!((hits[0].rrf_score.unwrap() - 1.0).abs() < 1e-5);
@@ -365,6 +402,7 @@ mod tests {
                 trigram_score: None,
                 rrf_score: Some(0.8),
                 rerank_score: None,
+                chunk: None,
             },
             Hit {
                 thought: thought(2, "fresh", 0),
@@ -373,6 +411,7 @@ mod tests {
                 trigram_score: None,
                 rrf_score: Some(0.5),
                 rerank_score: None,
+                chunk: None,
             },
         ];
         recency_boost(&mut hits, 30.0, now);
@@ -390,6 +429,7 @@ mod tests {
             trigram_score: None,
             rrf_score: Some(1.0),
             rerank_score: None,
+            chunk: None,
         }];
         recency_boost(&mut hits, 0.0, now);
         assert_eq!(hits[0].rrf_score.unwrap(), 1.0);

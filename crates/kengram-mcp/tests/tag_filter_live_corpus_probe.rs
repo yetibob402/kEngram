@@ -37,6 +37,8 @@ async fn dogfood_kind_task_filter_returns_zero_on_observation_only_corpus() {
             rerank: Some(false),
             candidate_pool: None,
             tag_filter: None,
+            chunk_serving_enabled: false,
+            include_profile: false,
         },
     )
     .await
@@ -56,6 +58,8 @@ async fn dogfood_kind_task_filter_returns_zero_on_observation_only_corpus() {
             rerank: Some(false),
             candidate_pool: None,
             tag_filter: Some(serde_json::json!({"kind": "task"})),
+            chunk_serving_enabled: false,
+            include_profile: false,
         },
     )
     .await
@@ -103,6 +107,8 @@ async fn dogfood_bogus_entity_filter_returns_zero() {
             tag_filter: Some(
                 serde_json::json!({"entities": ["DefinitelyNotARealEntityFooBarBaz"]}),
             ),
+            chunk_serving_enabled: false,
+            include_profile: false,
         },
     )
     .await

@@ -21,6 +21,7 @@ pub struct Config {
     pub database: DatabaseConfig,
     pub embedder: EmbedderConfig,
     pub worker: WorkerConfig,
+    pub search: SearchConfig,
     /// M4: renamed from `[extractor]`. The tagger is a metadata-tagging
     /// sidecar on the thoughts pipeline (people, action_items, topics,
     /// dates_mentioned, kind). Empty `provider` silent-disables — capture
@@ -28,6 +29,15 @@ pub struct Config {
     /// drainer task. Flip `provider = "openai-compatible"` to enable.
     pub tagger: TaggerConfig,
     pub reranker: RerankerConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SearchConfig {
+    /// Default-off gate for chunk dense + chunk FTS retrieval in
+    /// `search_thoughts`. Enable only on scratch/shadow endpoints until eval
+    /// and adversarial review pass.
+    pub chunk_serving_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

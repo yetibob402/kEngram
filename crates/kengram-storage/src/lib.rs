@@ -6,9 +6,9 @@
 //! the way of the macro (currently: only `insert_embedding`).
 
 use kengram_core::{
-    Embedding, EmbeddingModel, EmbeddingStatus, Hit, LinkDirection, LinkId, LinkSource, LinkTarget,
-    Metadata, RelationKind, Scope, ScopeError, ScopeVocab, Source, SourceError, Tags, Thought,
-    ThoughtId, UnknownLinkSource, UnknownRelationKind,
+    ChunkProvenance, Embedding, EmbeddingModel, EmbeddingStatus, Hit, LinkDirection, LinkId,
+    LinkSource, LinkTarget, Metadata, RelationKind, Scope, ScopeError, ScopeVocab, Source,
+    SourceError, Tags, Thought, ThoughtId, UnknownLinkSource, UnknownRelationKind,
 };
 use sqlx::{PgPool, PgTransaction};
 use time::OffsetDateTime;
@@ -40,6 +40,8 @@ mod bge {
     pub const HNSW_EF_SEARCH: i32 = 1000;
     pub const THOUGHT_TABLE: &str = "thought_embeddings_bge_m3";
     pub const THOUGHT_HNSW_INDEX: &str = "thought_embeddings_bge_m3_hnsw";
+    pub const CHUNK_TABLE: &str = "artifact_chunk_embeddings_bge_m3";
+    pub const CHUNK_HNSW_INDEX: &str = "artifact_chunk_embeddings_bge_m3_hnsw";
 }
 
 #[derive(Debug, Clone)]
@@ -250,7 +252,9 @@ pub enum StorageError {
         got: usize,
     },
 
-    #[error("bge-m3 sidecar only supports thought embeddings, got target_kind={0}")]
+    #[error(
+        "bge-m3 sidecar only supports thought and artifact_chunk embeddings, got target_kind={0}"
+    )]
     UnsupportedBgeTargetKind(String),
 
     #[error(
@@ -429,7 +433,7 @@ async fn insert_bge_embedding(
     model: &EmbeddingModel,
     vector: Vec<f32>,
 ) -> Result<(), StorageError> {
-    if target_kind != target::THOUGHT {
+    if target_kind != target::THOUGHT && target_kind != target::ARTIFACT_CHUNK {
         return Err(StorageError::UnsupportedBgeTargetKind(
             target_kind.to_string(),
         ));
@@ -442,32 +446,59 @@ async fn insert_bge_embedding(
         });
     }
 
-    let mut tx = pool.begin().await?;
     let pgv = pgvector::Vector::from(vector);
-    sqlx::query(
-        r#"
-        INSERT INTO thought_embeddings_bge_m3 (
-            thought_id,
-            model_id,
-            model_version,
-            dimensions,
-            embedding
+    let mut tx = pool.begin().await?;
+    if target_kind == target::THOUGHT {
+        sqlx::query(
+            r#"
+            INSERT INTO thought_embeddings_bge_m3 (
+                thought_id,
+                model_id,
+                model_version,
+                dimensions,
+                embedding
+            )
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (thought_id, model_id, model_version)
+            DO UPDATE SET
+                dimensions = EXCLUDED.dimensions,
+                embedding = EXCLUDED.embedding,
+                created_at = NOW()
+            "#,
         )
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (thought_id, model_id, model_version)
-        DO UPDATE SET
-            dimensions = EXCLUDED.dimensions,
-            embedding = EXCLUDED.embedding,
-            created_at = NOW()
-        "#,
-    )
-    .bind(target_id)
-    .bind(bge::MODEL_ID)
-    .bind(bge::MODEL_VERSION)
-    .bind(bge::DIMS_I32)
-    .bind(pgv)
-    .execute(&mut *tx)
-    .await?;
+        .bind(target_id)
+        .bind(bge::MODEL_ID)
+        .bind(bge::MODEL_VERSION)
+        .bind(bge::DIMS_I32)
+        .bind(pgv)
+        .execute(&mut *tx)
+        .await?;
+    } else {
+        sqlx::query(
+            r#"
+            INSERT INTO artifact_chunk_embeddings_bge_m3 (
+                chunk_id,
+                model_id,
+                model_version,
+                dimensions,
+                embedding
+            )
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (chunk_id, model_id, model_version)
+            DO UPDATE SET
+                dimensions = EXCLUDED.dimensions,
+                embedding = EXCLUDED.embedding,
+                created_at = NOW()
+            "#,
+        )
+        .bind(target_id)
+        .bind(bge::MODEL_ID)
+        .bind(bge::MODEL_VERSION)
+        .bind(bge::DIMS_I32)
+        .bind(pgv)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -769,6 +800,22 @@ pub async fn insert_thought_embedding(
     .await
 }
 
+/// Convenience: insert an embedding tied to an artifact chunk.
+pub async fn insert_artifact_chunk_embedding(
+    pool: &PgPool,
+    chunk_id: Uuid,
+    embedding: &Embedding,
+) -> Result<(), StorageError> {
+    insert_embedding(
+        pool,
+        target::ARTIFACT_CHUNK,
+        chunk_id,
+        &embedding.model,
+        embedding.vector.clone(),
+    )
+    .await
+}
+
 /// Look up a thought by id. Returns `None` if not found.
 pub async fn fetch_thought(pool: &PgPool, id: ThoughtId) -> Result<Option<Thought>, StorageError> {
     let row = sqlx::query!(
@@ -801,6 +848,27 @@ pub async fn fetch_thought(pool: &PgPool, id: ThoughtId) -> Result<Option<Though
         tags_extractor_version: r.tags_extractor_version,
         tags_extracted_at: r.tags_extracted_at,
     }))
+}
+
+/// Look up the text body for an artifact chunk. Returns `None` when the chunk
+/// is missing or retracted.
+pub async fn fetch_artifact_chunk_content(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Option<String>, StorageError> {
+    let row = sqlx::query_as::<_, (String,)>(
+        r#"
+        SELECT content
+        FROM artifact_chunks
+        WHERE id = $1
+          AND retracted_at IS NULL
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|r| r.0))
 }
 
 /// True if an embedding exists for the given thought under the given model.
@@ -1280,6 +1348,113 @@ pub async fn search_fts_bounded(
         .collect()
 }
 
+/// FTS lexical search over artifact chunks. Each result resolves to the
+/// source parent thought and carries the best matching chunk as provenance.
+pub async fn search_artifact_chunks_fts_bounded(
+    pool: &PgPool,
+    query: &str,
+    scope: Option<&str>,
+    scope_prefix: Option<&str>,
+    limit: i64,
+    timeout_ms: u64,
+) -> Result<Vec<Hit>, StorageError> {
+    let Some(query) = normalize_fts_query(query) else {
+        return Ok(Vec::new());
+    };
+    if !index_ready(pool, "artifact_chunks_content_fts_idx").await? {
+        return Err(StorageError::BgeSidecarIndexNotReady(
+            "artifact_chunks_content_fts_idx".to_string(),
+        ));
+    }
+
+    let mut tx = pool.begin().await?;
+    if let Err(e) = set_statement_timeout(&mut tx, timeout_ms).await {
+        if let Err(rollback_err) = tx.rollback().await {
+            tracing::warn!(
+                error = %rollback_err,
+                "failed to roll back bounded artifact-chunk FTS transaction after statement_timeout setup error",
+            );
+        }
+        return Err(e.into());
+    }
+
+    let rows: Vec<ChunkLexicalSearchRow> = match sqlx::query_as(
+        r#"
+        WITH fts AS (
+            SELECT websearch_to_tsquery('english', $1) AS tsq
+        ),
+        candidates AS (
+            SELECT t.id,
+                   t.scope,
+                   t.content AS parent_content,
+                   t.source,
+                   t.created_at,
+                   t.metadata AS parent_metadata,
+                   t.content_fingerprint,
+                   t.tags,
+                   t.tags_extractor_model,
+                   t.tags_extractor_version,
+                   t.tags_extracted_at,
+                   ac.id AS chunk_id,
+                   ac.artifact_id,
+                   ac.source_thought_id,
+                   ac.chunk_index,
+                   ac.content AS chunk_content,
+                   ac.chunker_id,
+                   ac.chunker_version,
+                   ac.token_estimate,
+                   ac.start_char,
+                   ac.end_char,
+                   ac.metadata AS chunk_metadata,
+                   ts_rank_cd(to_tsvector('english', ac.content), fts.tsq) AS rank
+            FROM artifact_chunks ac
+            JOIN thoughts t ON t.id = ac.source_thought_id
+            CROSS JOIN fts
+            WHERE to_tsvector('english', ac.content) @@ fts.tsq
+              AND ac.retracted_at IS NULL
+              AND ac.source_thought_id IS NOT NULL
+              AND t.retracted_at IS NULL
+              AND ($2::text IS NULL OR t.scope = $2)
+              AND ($3::text IS NULL OR t.scope LIKE $3 || '%')
+            ORDER BY ts_rank_cd(to_tsvector('english', ac.content), fts.tsq) DESC,
+                     t.created_at DESC,
+                     ac.chunk_index ASC
+            LIMIT GREATEST($4, $4 * 8)
+        ),
+        best_per_parent AS (
+            SELECT DISTINCT ON (id) *
+            FROM candidates
+            ORDER BY id, rank DESC, chunk_index ASC
+        )
+        SELECT *
+        FROM best_per_parent
+        ORDER BY rank DESC, created_at DESC, chunk_index ASC
+        LIMIT $4
+        "#,
+    )
+    .bind(&query)
+    .bind(scope)
+    .bind(scope_prefix)
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            if let Err(rollback_err) = tx.rollback().await {
+                tracing::warn!(
+                    error = %rollback_err,
+                    "failed to roll back bounded artifact-chunk FTS transaction after query error",
+                );
+            }
+            return Err(e.into());
+        }
+    };
+    tx.commit().await?;
+
+    chunk_lexical_rows_to_hits(rows)
+}
+
 /// Find thoughts that don't yet have an embedding row for the given model.
 /// Oldest first — backfill should clear the backlog FIFO.
 pub async fn find_unembedded_thoughts(
@@ -1511,6 +1686,78 @@ pub async fn enqueue_unembedded_thoughts(
         scope_prefix,
         limit,
     )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() as usize)
+}
+
+/// Heal-step companion to the worker: enqueue every unembedded artifact chunk.
+/// Scope filters apply through the source parent thought. Chunks without
+/// source_thought_id are skipped because they cannot resolve to a search hit.
+pub async fn enqueue_unembedded_artifact_chunks(
+    pool: &PgPool,
+    model_id: &str,
+    scope: Option<&str>,
+    scope_prefix: Option<&str>,
+    limit: i64,
+) -> Result<usize, StorageError> {
+    if model_id == bge::MODEL_ID {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO pending_embeddings (target_kind, target_id, model_id)
+            SELECT 'artifact_chunk', ac.id, $1
+            FROM artifact_chunks ac
+            JOIN thoughts t ON t.id = ac.source_thought_id
+            LEFT JOIN artifact_chunk_embeddings_bge_m3 b
+              ON b.chunk_id = ac.id
+             AND b.model_id = $1
+             AND b.model_version = $2
+            WHERE b.chunk_id IS NULL
+              AND ac.source_thought_id IS NOT NULL
+              AND ac.retracted_at IS NULL
+              AND t.retracted_at IS NULL
+              AND ($3::text IS NULL OR t.scope = $3)
+              AND ($4::text IS NULL OR t.scope LIKE $4 || '%')
+            ORDER BY ac.created_at ASC
+            LIMIT $5
+            ON CONFLICT (target_kind, target_id, model_id) DO NOTHING
+            "#,
+        )
+        .bind(model_id)
+        .bind(bge::MODEL_VERSION)
+        .bind(scope)
+        .bind(scope_prefix)
+        .bind(limit)
+        .execute(pool)
+        .await?;
+        return Ok(result.rows_affected() as usize);
+    }
+
+    let result = sqlx::query(
+        r#"
+        INSERT INTO pending_embeddings (target_kind, target_id, model_id)
+        SELECT 'artifact_chunk', ac.id, $1
+        FROM artifact_chunks ac
+        JOIN thoughts t ON t.id = ac.source_thought_id
+        LEFT JOIN embeddings e
+            ON e.target_kind = 'artifact_chunk'
+           AND e.target_id = ac.id
+           AND e.model_id = $1
+        WHERE e.id IS NULL
+          AND ac.source_thought_id IS NOT NULL
+          AND ac.retracted_at IS NULL
+          AND t.retracted_at IS NULL
+          AND ($2::text IS NULL OR t.scope = $2)
+          AND ($3::text IS NULL OR t.scope LIKE $3 || '%')
+        ORDER BY ac.created_at ASC
+        LIMIT $4
+        ON CONFLICT (target_kind, target_id, model_id) DO NOTHING
+        "#,
+    )
+    .bind(model_id)
+    .bind(scope)
+    .bind(scope_prefix)
+    .bind(limit)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() as usize)
@@ -2480,6 +2727,95 @@ async fn search_bge_vector_knn(
     vector_rows_to_hits(rows)
 }
 
+/// Vector kNN over BGE-M3 artifact chunk embeddings. Each hit resolves to its
+/// source parent thought and carries the best matching chunk as provenance.
+pub async fn search_artifact_chunks_vector_knn(
+    pool: &PgPool,
+    query_vector: Vec<f32>,
+    model: &EmbeddingModel,
+    scope: Option<&str>,
+    scope_prefix: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Hit>, StorageError> {
+    if !is_bge_m3_1024(model) {
+        return Ok(Vec::new());
+    }
+    if query_vector.len() != bge::DIMS {
+        return Err(StorageError::InvalidEmbeddingDimensions {
+            model_id: model.id.clone(),
+            expected: bge::DIMS,
+            got: query_vector.len(),
+        });
+    }
+
+    assert_bge_chunk_vector_search_ready(pool).await?;
+
+    let pgv = pgvector::Vector::from(query_vector);
+    let mut tx = pool.begin().await?;
+    set_bge_hnsw_ef_search(&mut tx).await?;
+    let rows: Vec<ChunkVectorSearchRow> = sqlx::query_as(
+        r#"
+        WITH candidates AS (
+            SELECT t.id,
+                   t.scope,
+                   t.content AS parent_content,
+                   t.source,
+                   t.created_at,
+                   t.metadata AS parent_metadata,
+                   t.content_fingerprint,
+                   t.tags,
+                   t.tags_extractor_model,
+                   t.tags_extractor_version,
+                   t.tags_extracted_at,
+                   ac.id AS chunk_id,
+                   ac.artifact_id,
+                   ac.source_thought_id,
+                   ac.chunk_index,
+                   ac.content AS chunk_content,
+                   ac.chunker_id,
+                   ac.chunker_version,
+                   ac.token_estimate,
+                   ac.start_char,
+                   ac.end_char,
+                   ac.metadata AS chunk_metadata,
+                   (b.embedding <=> $1::vector(1024)) AS distance
+            FROM artifact_chunk_embeddings_bge_m3 b
+            JOIN artifact_chunks ac ON ac.id = b.chunk_id
+            JOIN thoughts t ON t.id = ac.source_thought_id
+            WHERE b.model_id = $2
+              AND b.model_version = $3
+              AND ac.retracted_at IS NULL
+              AND ac.source_thought_id IS NOT NULL
+              AND t.retracted_at IS NULL
+              AND ($4::text IS NULL OR t.scope = $4)
+              AND ($5::text IS NULL OR t.scope LIKE $5 || '%')
+            ORDER BY b.embedding <=> $1::vector(1024)
+            LIMIT GREATEST($6, $6 * 8)
+        ),
+        best_per_parent AS (
+            SELECT DISTINCT ON (id) *
+            FROM candidates
+            ORDER BY id, distance ASC, chunk_index ASC
+        )
+        SELECT *
+        FROM best_per_parent
+        ORDER BY distance ASC, created_at DESC, chunk_index ASC
+        LIMIT $6
+        "#,
+    )
+    .bind(pgv)
+    .bind(bge::MODEL_ID)
+    .bind(bge::MODEL_VERSION)
+    .bind(scope)
+    .bind(scope_prefix)
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    chunk_vector_rows_to_hits(rows)
+}
+
 async fn ann_projection_search_ready(
     pool: &PgPool,
     projection_id: &str,
@@ -2565,6 +2901,125 @@ fn vector_rows_to_hits(rows: Vec<VectorSearchRow>) -> Result<Vec<Hit>, StorageEr
         .collect()
 }
 
+fn chunk_vector_rows_to_hits(rows: Vec<ChunkVectorSearchRow>) -> Result<Vec<Hit>, StorageError> {
+    rows.into_iter()
+        .map(|r| {
+            let score = (1.0 - r.distance) as f32;
+            let (thought, chunk) = chunk_row_parts_to_hit_parts(
+                r.id,
+                r.scope,
+                r.parent_content,
+                r.source,
+                r.created_at,
+                r.parent_metadata,
+                r.content_fingerprint,
+                r.tags,
+                r.tags_extractor_model,
+                r.tags_extractor_version,
+                r.tags_extracted_at,
+                r.chunk_id,
+                r.artifact_id,
+                r.source_thought_id,
+                r.chunk_index,
+                r.chunk_content,
+                r.chunker_id,
+                r.chunker_version,
+                r.token_estimate,
+                r.start_char,
+                r.end_char,
+                r.chunk_metadata,
+            )?;
+            Ok(Hit::from_vector_leg(thought, score).with_chunk_provenance(chunk))
+        })
+        .collect()
+}
+
+fn chunk_lexical_rows_to_hits(rows: Vec<ChunkLexicalSearchRow>) -> Result<Vec<Hit>, StorageError> {
+    rows.into_iter()
+        .map(|r| {
+            let (thought, chunk) = chunk_row_parts_to_hit_parts(
+                r.id,
+                r.scope,
+                r.parent_content,
+                r.source,
+                r.created_at,
+                r.parent_metadata,
+                r.content_fingerprint,
+                r.tags,
+                r.tags_extractor_model,
+                r.tags_extractor_version,
+                r.tags_extracted_at,
+                r.chunk_id,
+                r.artifact_id,
+                r.source_thought_id,
+                r.chunk_index,
+                r.chunk_content,
+                r.chunker_id,
+                r.chunker_version,
+                r.token_estimate,
+                r.start_char,
+                r.end_char,
+                r.chunk_metadata,
+            )?;
+            Ok(Hit::from_lexical_leg(thought, r.rank).with_chunk_provenance(chunk))
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chunk_row_parts_to_hit_parts(
+    id: Uuid,
+    scope: String,
+    parent_content: String,
+    source: String,
+    created_at: OffsetDateTime,
+    parent_metadata: serde_json::Value,
+    content_fingerprint: Vec<u8>,
+    tags: serde_json::Value,
+    tags_extractor_model: Option<String>,
+    tags_extractor_version: Option<i32>,
+    tags_extracted_at: Option<OffsetDateTime>,
+    chunk_id: Uuid,
+    artifact_id: Uuid,
+    source_thought_id: Uuid,
+    chunk_index: i32,
+    chunk_content: String,
+    chunker_id: String,
+    chunker_version: i32,
+    token_estimate: Option<i32>,
+    start_char: Option<i32>,
+    end_char: Option<i32>,
+    chunk_metadata: serde_json::Value,
+) -> Result<(Thought, ChunkProvenance), StorageError> {
+    let thought = Thought {
+        id: ThoughtId::from(id),
+        scope: Scope::new(scope)?,
+        content: parent_content,
+        source: Source::new(source)?,
+        created_at,
+        metadata: Metadata::from(parent_metadata),
+        content_fingerprint: fingerprint_from_bytes(content_fingerprint)?,
+        tags: tags_from_value(tags)?,
+        tags_extractor_model,
+        tags_extractor_version,
+        tags_extracted_at,
+    };
+    let chunk = ChunkProvenance {
+        chunk_id,
+        artifact_id,
+        source_thought_id: ThoughtId::from(source_thought_id),
+        chunk_index,
+        content: chunk_content,
+        chunker_id,
+        chunker_version,
+        token_estimate,
+        start_char,
+        end_char,
+        metadata: chunk_metadata,
+    };
+    Ok((thought, chunk))
+}
+
 /// Runtime guard against the exact regression that produced the 4096-dim
 /// seqscan path: when a model has a configured ANN projection, startup ensures
 /// a matching per-projection HNSW index exists. Migrations still create the
@@ -2609,10 +3064,10 @@ pub async fn ensure_ann_projection_index(
     let ready_before = ann_projection_index_ready_on_conn(&mut conn, &index_name).await;
 
     let mut create_error: Option<sqlx::Error> = None;
-    if matches!(ready_before, Ok((false,))) {
-        if let Err(err) = sqlx::query(&ddl).execute(&mut *conn).await {
-            create_error = Some(err);
-        }
+    if matches!(ready_before, Ok((false,)))
+        && let Err(err) = sqlx::query(&ddl).execute(&mut *conn).await
+    {
+        create_error = Some(err);
     }
 
     let ready_after: Result<(bool,), sqlx::Error> = if create_error.is_none() {
@@ -2700,6 +3155,22 @@ async fn assert_bge_vector_search_ready(pool: &PgPool) -> Result<(), StorageErro
     Ok(())
 }
 
+async fn assert_bge_chunk_vector_search_ready(pool: &PgPool) -> Result<(), StorageError> {
+    if !table_exists(pool, bge::CHUNK_TABLE).await? {
+        return Err(StorageError::BgeSidecarTableMissing(
+            bge::CHUNK_TABLE.to_string(),
+        ));
+    }
+
+    if !index_ready(pool, bge::CHUNK_HNSW_INDEX).await? {
+        return Err(StorageError::BgeSidecarIndexNotReady(
+            bge::CHUNK_HNSW_INDEX.to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 async fn table_exists(pool: &PgPool, table_name: &str) -> Result<bool, StorageError> {
     let (exists,): (bool,) = sqlx::query_as("SELECT to_regclass($1) IS NOT NULL")
         .bind(format!("public.{table_name}"))
@@ -2741,6 +3212,60 @@ struct VectorSearchRow {
     tags_extractor_version: Option<i32>,
     tags_extracted_at: Option<OffsetDateTime>,
     distance: f64,
+}
+
+#[derive(sqlx::FromRow)]
+struct ChunkVectorSearchRow {
+    id: Uuid,
+    scope: String,
+    parent_content: String,
+    source: String,
+    created_at: OffsetDateTime,
+    parent_metadata: serde_json::Value,
+    content_fingerprint: Vec<u8>,
+    tags: serde_json::Value,
+    tags_extractor_model: Option<String>,
+    tags_extractor_version: Option<i32>,
+    tags_extracted_at: Option<OffsetDateTime>,
+    chunk_id: Uuid,
+    artifact_id: Uuid,
+    source_thought_id: Uuid,
+    chunk_index: i32,
+    chunk_content: String,
+    chunker_id: String,
+    chunker_version: i32,
+    token_estimate: Option<i32>,
+    start_char: Option<i32>,
+    end_char: Option<i32>,
+    chunk_metadata: serde_json::Value,
+    distance: f64,
+}
+
+#[derive(sqlx::FromRow)]
+struct ChunkLexicalSearchRow {
+    id: Uuid,
+    scope: String,
+    parent_content: String,
+    source: String,
+    created_at: OffsetDateTime,
+    parent_metadata: serde_json::Value,
+    content_fingerprint: Vec<u8>,
+    tags: serde_json::Value,
+    tags_extractor_model: Option<String>,
+    tags_extractor_version: Option<i32>,
+    tags_extracted_at: Option<OffsetDateTime>,
+    chunk_id: Uuid,
+    artifact_id: Uuid,
+    source_thought_id: Uuid,
+    chunk_index: i32,
+    chunk_content: String,
+    chunker_id: String,
+    chunker_version: i32,
+    token_estimate: Option<i32>,
+    start_char: Option<i32>,
+    end_char: Option<i32>,
+    chunk_metadata: serde_json::Value,
+    rank: f32,
 }
 
 #[derive(sqlx::FromRow)]

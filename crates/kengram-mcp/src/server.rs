@@ -117,6 +117,11 @@ pub struct SearchThoughtsArgs {
     pub candidate_pool: Option<usize>,
 
     #[schemars(
+        description = "Include internal per-stage latency diagnostics in the response. Defaults false; intended for operator profiling, not normal recall clients."
+    )]
+    pub include_profile: Option<bool>,
+
+    #[schemars(
         description = "Optional JSONB-containment filter applied to each thought's `tags` field. Tags are LLM-extracted metadata with shape: { people: string[], entities: string[] (named proper-noun-style identifiers — projects, products, libraries, tools, e.g. \"kengram\", \"pgvector\"), action_items: string[], topics: string[] (1-3 short lowercase subject categories — e.g. \"rust\", \"memory-systems\"), dates_mentioned: string[], kind: 'observation' | 'task' | 'idea' | 'reference' | 'person_note' | 'session' | 'decision_record' | null }. Distinguish `entities` (specific named things mentioned by name) from `topics` (broader subject categories the thought falls under). The `kind` enum is closed at the values listed; the array fields are open-vocabulary strings. Examples: {\"kind\": \"task\"} returns only thoughts the tagger classified as tasks; {\"people\": [\"Sarah\"]} returns thoughts whose people-tag contains Sarah; {\"entities\": [\"kengram\"]} returns thoughts mentioning kengram by name; {\"topics\": [\"rust\"], \"kind\": \"idea\"} combines both (top-level keys AND together; array values are subset-match). Empty object {} is a no-op. Filters compose with `scope` (or `scope_prefix`, whichever is set) via AND. Note: `entities` is LLM-extracted and best-effort — a known structural ceiling on adjectival-vs-name discrimination means the field may include descriptive phrases alongside legitimate names. Treat `tag_filter: {\"entities\": [...]}` as a positive signal rather than a strict membership claim."
     )]
     // Map<String, Value> rather than Value: ensures the JSON schema renders
@@ -268,6 +273,9 @@ pub struct KengramServer {
     /// enqueue at capture time. `Some(model_id)` enqueues a `pending_tags`
     /// row per fresh capture; the worker's tag drainer picks it up.
     tagger_model_id: Option<String>,
+    /// Default-off gate for chunk-aware serving. Set by config/env at server
+    /// startup; not exposed as a per-call MCP argument.
+    chunk_serving_enabled: bool,
     tool_router: ToolRouter<Self>,
 }
 
@@ -277,12 +285,14 @@ impl KengramServer {
         embedder: Arc<dyn Embedder>,
         reranker: Option<Arc<dyn Reranker>>,
         tagger_model_id: Option<String>,
+        chunk_serving_enabled: bool,
     ) -> Self {
         Self {
             pool,
             embedder,
             reranker,
             tagger_model_id,
+            chunk_serving_enabled,
             tool_router: Self::tool_router(),
         }
     }
@@ -290,7 +300,7 @@ impl KengramServer {
     /// Convenience for tests that don't exercise the rerank stage or tagger.
     #[cfg(test)]
     pub fn new_without_reranker(pool: PgPool, embedder: Arc<dyn Embedder>) -> Self {
-        Self::new(pool, embedder, None, None)
+        Self::new(pool, embedder, None, None, false)
     }
 }
 
@@ -299,6 +309,7 @@ impl std::fmt::Debug for KengramServer {
         f.debug_struct("KengramServer")
             .field("model_id", &self.embedder.model().id)
             .field("tagger_model_id", &self.tagger_model_id)
+            .field("chunk_serving_enabled", &self.chunk_serving_enabled)
             .finish()
     }
 }
@@ -390,6 +401,8 @@ impl KengramServer {
             recency_half_life_days: args.recency_half_life_days,
             rerank: args.rerank,
             candidate_pool: args.candidate_pool,
+            chunk_serving_enabled: self.chunk_serving_enabled,
+            include_profile: args.include_profile.unwrap_or(false),
             // Map<String, Value> on the wire → Value::Object for the
             // orchestrator's filter logic. Keeps the schema concrete (so
             // claude.ai forwards the field) without changing the
@@ -808,14 +821,29 @@ fn search_response_json(resp: &SearchResponse) -> serde_json::Value {
                 "trigram_score": h.trigram_score,
                 "rrf_score": h.rrf_score,
                 "rerank_score": h.rerank_score,
+                "chunk_id": h.chunk_id.map(|id| id.to_string()),
+                "chunk_artifact_id": h.chunk_artifact_id.map(|id| id.to_string()),
+                "chunk_source_thought_id": h.chunk_source_thought_id.map(|id| id.to_string()),
+                "chunk_index": h.chunk_index,
+                "chunk_content": h.chunk_content,
+                "chunker_id": h.chunker_id,
+                "chunker_version": h.chunker_version,
+                "chunk_token_estimate": h.chunk_token_estimate,
+                "chunk_start_char": h.chunk_start_char,
+                "chunk_end_char": h.chunk_end_char,
+                "chunk_metadata": h.chunk_metadata,
             })
         })
         .collect();
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "results": results,
         "vector_search_available": resp.vector_search_available,
         "rerank_used": resp.rerank_used,
-    })
+    });
+    if let Some(profile) = resp.profile.as_ref() {
+        body["profile"] = serde_json::to_value(profile).unwrap_or(serde_json::Value::Null);
+    }
+    body
 }
 
 fn recent_response_json(resp: &RecentResponse) -> serde_json::Value {
@@ -974,7 +1002,7 @@ mod tests {
     }
 
     fn server(pool: PgPool) -> KengramServer {
-        KengramServer::new(pool, Arc::new(test_embedder()), None, None)
+        KengramServer::new(pool, Arc::new(test_embedder()), None, None, false)
     }
 
     /// Regression pin: the server-level instructions surface the `tags`
@@ -1132,6 +1160,7 @@ mod tests {
             Arc::new(test_embedder()),
             None,
             Some("fake/tagger".to_string()),
+            false,
         )
     }
 
@@ -1223,6 +1252,7 @@ mod tests {
                 recency_half_life_days: None,
                 rerank: None,
                 candidate_pool: None,
+                include_profile: None,
                 tag_filter: None,
             }))
             .await
@@ -1277,6 +1307,7 @@ mod tests {
                 recency_half_life_days: Some(0.0),
                 rerank: None,
                 candidate_pool: None,
+                include_profile: None,
                 tag_filter: None,
             }))
             .await
@@ -1340,6 +1371,7 @@ mod tests {
                 recency_half_life_days: Some(0.0),
                 rerank: None,
                 candidate_pool: None,
+                include_profile: None,
                 tag_filter: serde_json::json!({"kind": "task"}).as_object().cloned(),
             }))
             .await
@@ -1373,6 +1405,7 @@ mod tests {
                 recency_half_life_days: None,
                 rerank: None,
                 candidate_pool: None,
+                include_profile: None,
                 tag_filter: None,
             }))
             .await

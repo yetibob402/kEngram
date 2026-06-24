@@ -24,7 +24,9 @@ pub use relation::{
     UnknownLinkSource, UnknownRelationKind,
 };
 pub use scope::{Scope, ScopeError};
-pub use search::{DEFAULT_RECENCY_HALF_LIFE_DAYS, DEFAULT_RRF_K, Hit, recency_boost, rrf_fuse};
+pub use search::{
+    ChunkProvenance, DEFAULT_RECENCY_HALF_LIFE_DAYS, DEFAULT_RRF_K, Hit, recency_boost, rrf_fuse,
+};
 pub use source::{Source, SourceError};
 pub use tagger::{ExtractedRelation, ExtractedTarget, TagOutput, Tagger, TaggerError};
 pub use tags::{ScopeVocab, TagKind, Tags};

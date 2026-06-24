@@ -90,7 +90,7 @@ impl std::fmt::Display for EmbedJobError {
                 "job model_id={got} does not match active embedder model={expected}"
             ),
             Self::UnsupportedTargetKind(k) => write!(f, "unsupported target_kind: {k}"),
-            Self::SourceMissing => f.write_str("source thought no longer exists"),
+            Self::SourceMissing => f.write_str("embedding source no longer exists"),
             Self::Embedder(e) => write!(f, "embedder: {e}"),
             Self::Embedding(e) => write!(f, "embedding: {e}"),
             Self::Storage(e) => write!(f, "storage: {e}"),
@@ -112,7 +112,8 @@ async fn process_embed_job(
         });
     }
 
-    // M4: only thoughts are embeddable; facts are gone.
+    // Facts are gone; artifact chunks are now first-class embedding targets
+    // for the recall chunk-serving path.
     let text = match job.target_kind.as_str() {
         kengram_storage::target::THOUGHT => {
             let thought_id = ThoughtId::from(job.target_id);
@@ -121,6 +122,12 @@ async fn process_embed_job(
                 .map_err(EmbedJobError::Storage)?
                 .ok_or(EmbedJobError::SourceMissing)?;
             thought.content
+        }
+        kengram_storage::target::ARTIFACT_CHUNK => {
+            kengram_storage::fetch_artifact_chunk_content(pool, job.target_id)
+                .await
+                .map_err(EmbedJobError::Storage)?
+                .ok_or(EmbedJobError::SourceMissing)?
         }
         _ => {
             return Err(EmbedJobError::UnsupportedTargetKind(
@@ -138,9 +145,27 @@ async fn process_embed_job(
     let embedding =
         Embedding::new(embedder.model().clone(), vector).map_err(EmbedJobError::Embedding)?;
 
-    kengram_storage::insert_thought_embedding(pool, ThoughtId::from(job.target_id), &embedding)
-        .await
-        .map_err(EmbedJobError::Storage)?;
+    match job.target_kind.as_str() {
+        kengram_storage::target::THOUGHT => {
+            kengram_storage::insert_thought_embedding(
+                pool,
+                ThoughtId::from(job.target_id),
+                &embedding,
+            )
+            .await
+            .map_err(EmbedJobError::Storage)?;
+        }
+        kengram_storage::target::ARTIFACT_CHUNK => {
+            kengram_storage::insert_artifact_chunk_embedding(pool, job.target_id, &embedding)
+                .await
+                .map_err(EmbedJobError::Storage)?;
+        }
+        _ => {
+            return Err(EmbedJobError::UnsupportedTargetKind(
+                job.target_kind.clone(),
+            ));
+        }
+    }
 
     kengram_storage::mark_embedded(pool, job.id)
         .await

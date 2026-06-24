@@ -22,8 +22,9 @@ use kengram_core::{
     DEFAULT_RECENCY_HALF_LIFE_DAYS, DEFAULT_RRF_K, Embedder, EmbeddingModel, EmbeddingStatus, Hit,
     Metadata, Scope, Source, Tags, Thought, ThoughtId, recency_boost, rrf_fuse,
 };
-use kengram_embed::Reranker;
+use kengram_embed::{RerankScore, Reranker, RerankerError};
 use sqlx::PgPool;
+use std::time::Instant;
 use time::OffsetDateTime;
 
 pub const DEFAULT_SEARCH_LIMIT: usize = 10;
@@ -35,6 +36,9 @@ pub const DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS: u64 = 300;
 /// trigram matrix showed narrowing regressed recall; hold this value unless
 /// the GOLD eval explicitly supports a change.
 pub const DEFAULT_RERANK_CANDIDATE_POOL: usize = 32;
+const RERANK_BACKEND_MAX_BATCH: usize = 32;
+const PAIRWISE_MAX_SUBQUERIES: usize = 8;
+const PAIRWISE_PER_SUBQUERY_TOP_K: usize = 25;
 
 #[derive(Debug, Clone)]
 pub struct SearchRequest {
@@ -56,6 +60,12 @@ pub struct SearchRequest {
     /// Number of post-RRF candidates fed into the reranker. Ignored when
     /// rerank is off. Defaults to [`DEFAULT_RERANK_CANDIDATE_POOL`].
     pub candidate_pool: Option<usize>,
+    /// Enables chunk dense + chunk FTS retrieval legs when the server config
+    /// explicitly opts in. Defaults to false at the config/server layer.
+    pub chunk_serving_enabled: bool,
+    /// Include per-stage latency diagnostics in the response. Defaults false
+    /// so normal MCP callers do not receive internal timing metadata.
+    pub include_profile: bool,
     /// JSONB containment filter against `thoughts.tags`. Examples:
     /// - `{"kind": "task"}`
     /// - `{"people": ["Sarah"]}`
@@ -90,6 +100,20 @@ pub struct SearchHit {
     /// Calibrated absolute score from the reranker (`None` if rerank was
     /// off, unavailable, or this hit fell outside the candidate pool).
     pub rerank_score: Option<f32>,
+    /// Matched chunk provenance when a chunk leg supplied evidence for this
+    /// parent thought hit. `content` above remains the parent thought body for
+    /// backward compatibility.
+    pub chunk_id: Option<uuid::Uuid>,
+    pub chunk_artifact_id: Option<uuid::Uuid>,
+    pub chunk_source_thought_id: Option<ThoughtId>,
+    pub chunk_index: Option<i32>,
+    pub chunk_content: Option<String>,
+    pub chunker_id: Option<String>,
+    pub chunker_version: Option<i32>,
+    pub chunk_token_estimate: Option<i32>,
+    pub chunk_start_char: Option<i32>,
+    pub chunk_end_char: Option<i32>,
+    pub chunk_metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +121,33 @@ pub struct SearchResponse {
     pub results: Vec<SearchHit>,
     pub vector_search_available: bool,
     pub rerank_used: bool,
+    pub profile: Option<SearchProfile>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SearchProfile {
+    pub total_ms: f64,
+    pub query_embedding_ms: f64,
+    pub thought_vector_knn_ms: f64,
+    pub chunk_vector_knn_ms: f64,
+    pub thought_fts_ms: f64,
+    pub chunk_fts_ms: f64,
+    pub chunk_pairwise_fts_ms: f64,
+    pub rrf_fusion_ms: f64,
+    pub tag_filter_ms: f64,
+    pub rerank_ms: f64,
+    pub result_projection_ms: f64,
+    pub parent_resolution_ms: f64,
+    pub parent_resolution_mode: &'static str,
+    pub thought_vector_hits: usize,
+    pub chunk_vector_hits: usize,
+    pub thought_fts_hits: usize,
+    pub chunk_fts_hits: usize,
+    pub chunk_pairwise_fts_hits: usize,
+    pub chunk_pairwise_subqueries: usize,
+    pub fused_hit_count: usize,
+    pub rerank_candidate_count: usize,
+    pub result_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +247,12 @@ async fn search_thoughts_with_tuning(
     lexical_timeout_ms: u64,
     default_candidate_pool: usize,
 ) -> Result<SearchResponse, ReadError> {
+    let total_started = Instant::now();
+    let include_profile = request.include_profile;
+    let mut profile = SearchProfile {
+        parent_resolution_mode: "sql_join_in_retrieval_legs",
+        ..SearchProfile::default()
+    };
     let query = request.query.trim().to_string();
     if query.is_empty() {
         return Err(ReadError::EmptyQuery);
@@ -212,19 +269,30 @@ async fn search_thoughts_with_tuning(
     }
     let scope_filter = request.scope.as_ref().map(Scope::as_str);
     let scope_prefix_filter = request.scope_prefix.as_deref();
+    let chunk_serving_enabled = request.chunk_serving_enabled;
 
     // Vector leg (soft-fail to empty + flag).
-    let (vector_hits, vector_search_available) = match embedder
-        .embed(std::slice::from_ref(&query))
-        .await
-    {
-        Ok(mut vectors) => {
-            let v = vectors
+    let embedding_started = Instant::now();
+    let embedded_query = match embedder.embed(std::slice::from_ref(&query)).await {
+        Ok(mut vectors) => Some(
+            vectors
                 .pop()
-                .expect("non-empty input must yield at least one vector");
-            match kengram_storage::search_vector_knn(
+                .expect("non-empty input must yield at least one vector"),
+        ),
+        Err(e) => {
+            tracing::warn!(error = %e, "embedder failed to embed query; falling back to lexical only");
+            None
+        }
+    };
+    profile.query_embedding_ms = elapsed_ms(embedding_started);
+
+    let (vector_hits, chunk_vector_hits, vector_search_available) = match embedded_query {
+        Some(v) => {
+            let mut thought_vector_ok = false;
+            let thought_vector_started = Instant::now();
+            let vector_hits = match kengram_storage::search_vector_knn(
                 pool,
-                v,
+                v.clone(),
                 embedder.model(),
                 scope_filter,
                 scope_prefix_filter,
@@ -232,22 +300,55 @@ async fn search_thoughts_with_tuning(
             )
             .await
             {
-                Ok(hits) => (hits, true),
+                Ok(hits) => {
+                    thought_vector_ok = true;
+                    hits
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "vector kNN query failed; falling back to lexical only");
-                    (vec![], false)
+                    vec![]
                 }
-            }
+            };
+            profile.thought_vector_knn_ms = elapsed_ms(thought_vector_started);
+            let mut chunk_vector_ok = false;
+            let chunk_vector_hits = if chunk_serving_enabled {
+                let chunk_vector_started = Instant::now();
+                let hits = match kengram_storage::search_artifact_chunks_vector_knn(
+                    pool,
+                    v,
+                    embedder.model(),
+                    scope_filter,
+                    scope_prefix_filter,
+                    DEFAULT_TOP_K_PER_LEG as i64,
+                )
+                .await
+                {
+                    Ok(hits) => {
+                        chunk_vector_ok = true;
+                        hits
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "artifact-chunk vector kNN query failed; continuing without chunk vector hits");
+                        vec![]
+                    }
+                };
+                profile.chunk_vector_knn_ms = elapsed_ms(chunk_vector_started);
+                hits
+            } else {
+                vec![]
+            };
+            profile.thought_vector_hits = vector_hits.len();
+            profile.chunk_vector_hits = chunk_vector_hits.len();
+            let vector_available = thought_vector_ok || chunk_vector_ok;
+            (vector_hits, chunk_vector_hits, vector_available)
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "embedder failed to embed query; falling back to lexical only");
-            (vec![], false)
-        }
+        None => (vec![], vec![], false),
     };
 
     // Lexical leg: FTS-backed and bounded. The GIN index should make this
     // fast; the timeout is a defensive belt so lexical failures do not turn
     // the whole hybrid search into a 5xx.
+    let thought_fts_started = Instant::now();
     let lexical_hits = bounded_fts_hits(
         pool,
         &query,
@@ -257,18 +358,65 @@ async fn search_thoughts_with_tuning(
         lexical_timeout_ms,
     )
     .await;
+    profile.thought_fts_ms = elapsed_ms(thought_fts_started);
+    profile.thought_fts_hits = lexical_hits.len();
+    let chunk_lexical_hits = if chunk_serving_enabled {
+        let chunk_fts_started = Instant::now();
+        let hits = bounded_artifact_chunk_fts_hits(
+            pool,
+            &query,
+            scope_filter,
+            scope_prefix_filter,
+            lexical_top_k,
+            lexical_timeout_ms,
+        )
+        .await;
+        profile.chunk_fts_ms = elapsed_ms(chunk_fts_started);
+        hits
+    } else {
+        vec![]
+    };
+    profile.chunk_fts_hits = chunk_lexical_hits.len();
+    let chunk_pairwise_lexical_hits = if chunk_serving_enabled {
+        profile.chunk_pairwise_subqueries = pairwise_subqueries(&query).len();
+        let chunk_pairwise_started = Instant::now();
+        let hits = bounded_pairwise_artifact_chunk_fts_hits(
+            pool,
+            &query,
+            scope_filter,
+            scope_prefix_filter,
+            lexical_top_k,
+            lexical_timeout_ms,
+        )
+        .await;
+        profile.chunk_pairwise_fts_ms = elapsed_ms(chunk_pairwise_started);
+        hits
+    } else {
+        vec![]
+    };
+    profile.chunk_pairwise_fts_hits = chunk_pairwise_lexical_hits.len();
 
     // RRF fuse → recency boost.
-    let mut fused = rrf_fuse(vec![vector_hits, lexical_hits], DEFAULT_RRF_K);
+    let rrf_started = Instant::now();
+    let mut rankings = vec![vector_hits, lexical_hits];
+    if chunk_serving_enabled {
+        rankings.push(chunk_vector_hits);
+        rankings.push(chunk_lexical_hits);
+        rankings.push(chunk_pairwise_lexical_hits);
+    }
+    let mut fused = rrf_fuse(rankings, DEFAULT_RRF_K);
     let half_life = request
         .recency_half_life_days
         .unwrap_or(DEFAULT_RECENCY_HALF_LIFE_DAYS);
     recency_boost(&mut fused, half_life, OffsetDateTime::now_utc());
+    profile.rrf_fusion_ms = elapsed_ms(rrf_started);
+    profile.fused_hit_count = fused.len();
 
     // Apply tag_filter (post-fuse, Rust-side). Empty objects and `None`
     // are no-ops. We do this BEFORE rerank so the reranker's candidate
     // pool is drawn from the filtered set — matches operator intent
     // ("rerank the task-kind thoughts" should rerank only those).
+    let tag_filter_started = Instant::now();
     if let Some(filter) = request.tag_filter.as_ref()
         && !is_empty_filter(filter)
     {
@@ -283,41 +431,74 @@ async fn search_thoughts_with_tuning(
     } else if request.tag_filter.is_some() {
         tracing::debug!("search_thoughts: tag_filter present but empty-object — no-op");
     }
+    profile.tag_filter_ms = elapsed_ms(tag_filter_started);
 
     // Optional rerank stage.
     let rerank_enabled = request.rerank.unwrap_or(true);
     let candidate_pool = request.candidate_pool.unwrap_or(default_candidate_pool);
+    profile.rerank_candidate_count = if rerank_enabled && reranker.is_some() {
+        candidate_pool.min(fused.len())
+    } else {
+        0
+    };
+    let rerank_started = Instant::now();
     let rerank_used = match (rerank_enabled, reranker) {
         (true, Some(rr)) => {
             apply_rerank_to_thought_hits(rr, &query, &mut fused, candidate_pool).await
         }
         _ => false,
     };
+    profile.rerank_ms = elapsed_ms(rerank_started);
 
+    let projection_started = Instant::now();
     let results: Vec<SearchHit> = fused
         .into_iter()
         .take(limit)
-        .map(|h| SearchHit {
-            thought_id: h.thought.id,
-            content: h.thought.content,
-            scope: h.thought.scope,
-            source: h.thought.source,
-            created_at: h.thought.created_at,
-            metadata: h.thought.metadata,
-            tags: h.thought.tags,
-            vector_score: h.vector_score,
-            lexical_score: h.lexical_score,
-            trigram_score: h.trigram_score,
-            rrf_score: h.rrf_score,
-            rerank_score: h.rerank_score,
-        })
+        .map(search_hit_from_core_hit)
         .collect();
+    profile.result_projection_ms = elapsed_ms(projection_started);
+    profile.result_count = results.len();
+    profile.total_ms = elapsed_ms(total_started);
 
     Ok(SearchResponse {
         results,
         vector_search_available,
         rerank_used,
+        profile: include_profile.then_some(profile),
     })
+}
+
+fn elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
+}
+
+fn search_hit_from_core_hit(h: Hit) -> SearchHit {
+    let chunk = h.chunk;
+    SearchHit {
+        thought_id: h.thought.id,
+        content: h.thought.content,
+        scope: h.thought.scope,
+        source: h.thought.source,
+        created_at: h.thought.created_at,
+        metadata: h.thought.metadata,
+        tags: h.thought.tags,
+        vector_score: h.vector_score,
+        lexical_score: h.lexical_score,
+        trigram_score: h.trigram_score,
+        rrf_score: h.rrf_score,
+        rerank_score: h.rerank_score,
+        chunk_id: chunk.as_ref().map(|c| c.chunk_id),
+        chunk_artifact_id: chunk.as_ref().map(|c| c.artifact_id),
+        chunk_source_thought_id: chunk.as_ref().map(|c| c.source_thought_id),
+        chunk_index: chunk.as_ref().map(|c| c.chunk_index),
+        chunk_content: chunk.as_ref().map(|c| c.content.clone()),
+        chunker_id: chunk.as_ref().map(|c| c.chunker_id.clone()),
+        chunker_version: chunk.as_ref().map(|c| c.chunker_version),
+        chunk_token_estimate: chunk.as_ref().and_then(|c| c.token_estimate),
+        chunk_start_char: chunk.as_ref().and_then(|c| c.start_char),
+        chunk_end_char: chunk.as_ref().and_then(|c| c.end_char),
+        chunk_metadata: chunk.map(|c| c.metadata),
+    }
 }
 
 async fn bounded_fts_hits(
@@ -349,6 +530,334 @@ async fn bounded_fts_hits(
             vec![]
         }
     }
+}
+
+async fn bounded_artifact_chunk_fts_hits(
+    pool: &PgPool,
+    query: &str,
+    scope_filter: Option<&str>,
+    scope_prefix_filter: Option<&str>,
+    lexical_top_k: usize,
+    lexical_timeout_ms: u64,
+) -> Vec<Hit> {
+    match kengram_storage::search_artifact_chunks_fts_bounded(
+        pool,
+        query,
+        scope_filter,
+        scope_prefix_filter,
+        lexical_top_k as i64,
+        lexical_timeout_ms,
+    )
+    .await
+    {
+        Ok(hits) => hits,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                query_canceled = e.is_query_canceled(),
+                timeout_ms = lexical_timeout_ms,
+                "bounded artifact-chunk FTS query failed; continuing with available search legs only",
+            );
+            vec![]
+        }
+    }
+}
+
+async fn bounded_pairwise_artifact_chunk_fts_hits(
+    pool: &PgPool,
+    query: &str,
+    scope_filter: Option<&str>,
+    scope_prefix_filter: Option<&str>,
+    lexical_top_k: usize,
+    lexical_timeout_ms: u64,
+) -> Vec<Hit> {
+    let subqueries = pairwise_subqueries(query);
+    if subqueries.is_empty() {
+        return Vec::new();
+    }
+
+    let mut rankings = Vec::new();
+    for subquery in &subqueries {
+        let hits = bounded_artifact_chunk_fts_hits(
+            pool,
+            subquery,
+            scope_filter,
+            scope_prefix_filter,
+            PAIRWISE_PER_SUBQUERY_TOP_K,
+            lexical_timeout_ms,
+        )
+        .await;
+        if !hits.is_empty() {
+            rankings.push(hits);
+        }
+    }
+
+    if rankings.is_empty() {
+        return Vec::new();
+    }
+    tracing::debug!(
+        subquery_count = subqueries.len(),
+        rankings = rankings.len(),
+        "artifact-chunk pairwise FTS leg produced candidate rankings",
+    );
+    rrf_fuse(rankings, DEFAULT_RRF_K)
+        .into_iter()
+        .take(lexical_top_k)
+        .collect()
+}
+
+fn pairwise_subqueries(query: &str) -> Vec<String> {
+    let terms = lexical_terms(query);
+    let mut pairs = Vec::new();
+    for window in terms.windows(2) {
+        if window[0].eq_ignore_ascii_case(&window[1]) {
+            continue;
+        }
+        pairs.push(format!("{} {}", window[0], window[1]));
+    }
+    for ident in identifier_terms(query).into_iter().take(4) {
+        for term in terms.iter().take(8) {
+            if ident.eq_ignore_ascii_case(term) {
+                continue;
+            }
+            pairs.push(format!("{ident} {term}"));
+        }
+    }
+    dedupe_lowercase_limited(pairs, PAIRWISE_MAX_SUBQUERIES)
+}
+
+fn lexical_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in raw_pairwise_tokens(query) {
+        let token = clean_token(&raw);
+        if token.is_empty() {
+            continue;
+        }
+        let parts: Vec<String> = token
+            .split(['/', '_', '.', ':', '#', '-'])
+            .filter(|part| !part.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        let mut candidates = vec![token];
+        if parts.len() > 1 {
+            candidates.extend(parts);
+        }
+        for candidate in candidates {
+            let candidate = clean_token(&candidate);
+            if candidate.is_empty() {
+                continue;
+            }
+            let lower = candidate.to_ascii_lowercase();
+            if !is_identifier(&candidate) && (is_pairwise_stopword(&lower) || lower.len() < 3) {
+                continue;
+            }
+            if seen.insert(lower) {
+                terms.push(candidate);
+            }
+        }
+    }
+    for term in terms.clone() {
+        for alias in pairwise_aliases(&term.to_ascii_lowercase()) {
+            let lower = alias.to_ascii_lowercase();
+            if seen.insert(lower) {
+                terms.push(alias.to_string());
+            }
+        }
+    }
+    terms.truncate(18);
+    terms
+}
+
+fn identifier_terms(query: &str) -> Vec<String> {
+    let raws = raw_pairwise_tokens(query);
+    let mut terms = Vec::new();
+    for (idx, raw) in raws.iter().enumerate() {
+        let token = clean_token(raw);
+        if token.is_empty() {
+            continue;
+        }
+        if token.eq_ignore_ascii_case("pr")
+            && let Some(next) = raws.get(idx + 1).map(|s| clean_token(s))
+            && next
+                .trim_start_matches('#')
+                .chars()
+                .all(|ch| ch.is_ascii_digit())
+        {
+            terms.push(format!("PR {next}"));
+        }
+        if (token.starts_with('#') && token[1..].chars().all(|ch| ch.is_ascii_digit()))
+            || looks_like_hash(&token)
+            || looks_like_file_path(&token)
+            || looks_like_date(&token)
+        {
+            terms.push(token);
+        }
+    }
+    for token in lexical_terms(query) {
+        if is_identifier(&token) {
+            terms.push(token);
+        }
+    }
+    dedupe_lowercase_limited(terms, 12)
+}
+
+fn dedupe_lowercase_limited(values: Vec<String>, limit: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for value in values {
+        if seen.insert(value.to_ascii_lowercase()) {
+            out.push(value);
+        }
+        if out.len() == limit {
+            break;
+        }
+    }
+    out
+}
+
+fn raw_pairwise_tokens(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in query.chars() {
+        if current.is_empty() {
+            if ch.is_alphanumeric() || ch == '_' || ch == '#' {
+                current.push(ch);
+            }
+        } else if ch.is_alphanumeric() || matches!(ch, '_' | '.' | ':' | '/' | '#' | '-') {
+            current.push(ch);
+        } else {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn clean_token(token: &str) -> String {
+    token
+        .trim()
+        .trim_matches(|ch: char| "'\"`()[]{}<>.,;!?".contains(ch))
+        .to_string()
+}
+
+fn is_identifier(value: &str) -> bool {
+    let mut upper_count = 0;
+    let mut prev_lower = false;
+    let mut camel = false;
+    for ch in value.chars() {
+        if ch.is_uppercase() {
+            upper_count += 1;
+            if prev_lower {
+                camel = true;
+            }
+            prev_lower = false;
+        } else {
+            prev_lower = ch.is_lowercase();
+        }
+    }
+    value.chars().any(|ch| ch.is_ascii_digit())
+        || value.chars().any(|ch| "_/.:-#".contains(ch))
+        || upper_count >= 2
+        || camel
+}
+
+fn looks_like_hash(value: &str) -> bool {
+    (7..=40).contains(&value.len()) && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn looks_like_file_path(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        ".md", ".json", ".toml", ".rs", ".ts", ".tsx", ".py", ".sql", ".yaml", ".yml", ".sh",
+    ]
+    .iter()
+    .any(|suffix| lower.ends_with(suffix))
+        || value.split('/').filter(|part| !part.is_empty()).count() > 1
+}
+
+fn looks_like_date(value: &str) -> bool {
+    value.len() >= 10
+        && value.get(4..5) == Some("-")
+        && value.get(7..8) == Some("-")
+        && value[..4].chars().all(|ch| ch.is_ascii_digit())
+        && value[5..7].chars().all(|ch| ch.is_ascii_digit())
+        && value[8..10].chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn pairwise_aliases(value: &str) -> &'static [&'static str] {
+    match value {
+        "a2a" => &["agent comms", "agent communication", "AGENT_COMMS"],
+        "fts" => &["full text search", "lexical search", "lexical"],
+        "kengram" => &["kEngram", "memory", "search_thoughts"],
+        "mcp" => &["tools call", "tools list", "model context protocol"],
+        "pr" => &["pull request"],
+        "reranker" => &["cross encoder", "cross-encoder", "TEI"],
+        "smith" => &["agents/smith"],
+        _ => &[],
+    }
+}
+
+fn is_pairwise_stopword(lower: &str) -> bool {
+    matches!(
+        lower,
+        "a" | "about"
+            | "after"
+            | "all"
+            | "an"
+            | "and"
+            | "are"
+            | "as"
+            | "ask"
+            | "asked"
+            | "at"
+            | "be"
+            | "before"
+            | "by"
+            | "can"
+            | "could"
+            | "current"
+            | "did"
+            | "do"
+            | "does"
+            | "for"
+            | "from"
+            | "had"
+            | "has"
+            | "have"
+            | "how"
+            | "in"
+            | "into"
+            | "is"
+            | "it"
+            | "its"
+            | "me"
+            | "of"
+            | "on"
+            | "or"
+            | "right"
+            | "should"
+            | "so"
+            | "that"
+            | "the"
+            | "their"
+            | "there"
+            | "this"
+            | "to"
+            | "use"
+            | "used"
+            | "was"
+            | "were"
+            | "what"
+            | "when"
+            | "where"
+            | "which"
+            | "who"
+            | "why"
+            | "with"
+    )
 }
 
 /// True when the supplied filter is a JSON object with no keys (i.e. `{}`)
@@ -417,9 +926,14 @@ async fn apply_rerank_to_thought_hits(
     let pool_len = candidate_pool.min(hits.len());
     let candidates: Vec<&str> = hits[..pool_len]
         .iter()
-        .map(|h| h.thought.content.as_str())
+        .map(|h| {
+            h.chunk
+                .as_ref()
+                .map(|chunk| chunk.content.as_str())
+                .unwrap_or_else(|| h.thought.content.as_str())
+        })
         .collect();
-    let scores = match reranker.rerank(query, &candidates).await {
+    let scores = match rerank_candidates_batched(reranker, query, &candidates).await {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(
@@ -435,6 +949,7 @@ async fn apply_rerank_to_thought_hits(
             hit.rerank_score = Some(s.score);
         }
     }
+    apply_exact_identifier_boost(query, &mut hits[..pool_len]);
     hits.truncate(pool_len);
     hits.sort_by(|a, b| {
         let av = a.rerank_score.unwrap_or(f32::MIN);
@@ -442,6 +957,136 @@ async fn apply_rerank_to_thought_hits(
         bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
     });
     true
+}
+
+async fn rerank_candidates_batched(
+    reranker: &dyn Reranker,
+    query: &str,
+    candidates: &[&str],
+) -> Result<Vec<RerankScore>, RerankerError> {
+    let batches: Vec<(usize, &[&str])> = candidates
+        .chunks(RERANK_BACKEND_MAX_BATCH)
+        .enumerate()
+        .map(|(idx, batch)| (idx * RERANK_BACKEND_MAX_BATCH, batch))
+        .collect();
+
+    match batches.as_slice() {
+        [] => Ok(Vec::new()),
+        [(offset, batch)] => rerank_one_batch(reranker, query, batch, *offset).await,
+        [(offset_a, batch_a), (offset_b, batch_b)] => {
+            let (a, b) = tokio::join!(
+                rerank_one_batch(reranker, query, batch_a, *offset_a),
+                rerank_one_batch(reranker, query, batch_b, *offset_b),
+            );
+            let mut scores = Vec::with_capacity(candidates.len());
+            scores.extend(a?);
+            scores.extend(b?);
+            Ok(scores)
+        }
+        _ => {
+            let mut scores = Vec::with_capacity(candidates.len());
+            for (offset, batch) in batches {
+                scores.extend(rerank_one_batch(reranker, query, batch, offset).await?);
+            }
+            Ok(scores)
+        }
+    }
+}
+
+async fn rerank_one_batch(
+    reranker: &dyn Reranker,
+    query: &str,
+    batch: &[&str],
+    batch_offset: usize,
+) -> Result<Vec<RerankScore>, RerankerError> {
+    reranker.rerank(query, batch).await.map(|scores| {
+        scores
+            .into_iter()
+            .map(|s| RerankScore {
+                index: s.index + batch_offset,
+                score: s.score,
+            })
+            .collect()
+    })
+}
+
+fn apply_exact_identifier_boost(query: &str, hits: &mut [kengram_core::Hit]) {
+    let terms = exact_identifier_boost_terms(query);
+    if terms.is_empty() {
+        return;
+    }
+    for hit in hits {
+        let boost = exact_identifier_match_score(hit, &terms);
+        if boost > 0.0 {
+            hit.rerank_score = Some(hit.rerank_score.unwrap_or(0.0) + boost.min(0.75));
+        }
+    }
+}
+
+fn exact_identifier_match_score(hit: &kengram_core::Hit, terms: &[(String, f32)]) -> f32 {
+    let haystack = hit
+        .chunk
+        .as_ref()
+        .map(|chunk| chunk.content.as_str())
+        .unwrap_or_else(|| hit.thought.content.as_str())
+        .to_ascii_lowercase();
+    let mut boost = 0.0_f32;
+    for (term, weight) in terms {
+        if haystack.contains(term) {
+            boost += *weight;
+        }
+    }
+    boost
+}
+
+fn exact_identifier_boost_terms(query: &str) -> Vec<(String, f32)> {
+    let raw_tokens: Vec<String> = raw_pairwise_tokens(query)
+        .into_iter()
+        .map(|token| clean_token(&token))
+        .filter(|token| !token.is_empty())
+        .collect();
+    let mut terms = Vec::new();
+
+    for token in &raw_tokens {
+        if is_strong_identifier(token) {
+            terms.push((token.to_ascii_lowercase(), 0.55));
+        }
+    }
+    for window in raw_tokens.windows(2) {
+        let left = &window[0];
+        let right = &window[1];
+        if left.chars().any(|ch| ch.is_ascii_alphabetic())
+            && right.chars().any(|ch| ch.is_ascii_digit())
+        {
+            terms.push((format!("{left} {right}").to_ascii_lowercase(), 0.55));
+        }
+        if left.eq_ignore_ascii_case("pr")
+            && right
+                .trim_start_matches('#')
+                .chars()
+                .all(|ch| ch.is_ascii_digit())
+        {
+            terms.push((format!("PR {right}").to_ascii_lowercase(), 0.55));
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (term, weight) in terms {
+        if seen.insert(term.clone()) {
+            out.push((term, weight));
+        }
+    }
+    out
+}
+
+fn is_strong_identifier(value: &str) -> bool {
+    if value.len() < 3 {
+        return false;
+    }
+    let has_alpha = value.chars().any(|ch| ch.is_ascii_alphabetic());
+    let has_digit = value.chars().any(|ch| ch.is_ascii_digit());
+    (has_alpha && has_digit) || looks_like_hash(value) || looks_like_file_path(value)
 }
 
 pub async fn recent_thoughts(
@@ -553,6 +1198,26 @@ mod tests {
         id
     }
 
+    async fn ensure_test_chunk_schema(pool: &PgPool) {
+        for ddl in [
+            "ALTER TABLE artifact_chunks ADD COLUMN IF NOT EXISTS source_thought_id UUID REFERENCES thoughts(id) ON DELETE CASCADE",
+            "ALTER TABLE artifact_chunks ADD COLUMN IF NOT EXISTS content_fingerprint BYTEA",
+            "ALTER TABLE artifact_chunks ADD COLUMN IF NOT EXISTS chunker_id TEXT DEFAULT 'test'",
+            "ALTER TABLE artifact_chunks ADD COLUMN IF NOT EXISTS chunker_version INT DEFAULT 1",
+            "ALTER TABLE artifact_chunks ADD COLUMN IF NOT EXISTS token_estimate INT",
+            "ALTER TABLE artifact_chunks ADD COLUMN IF NOT EXISTS start_char INT",
+            "ALTER TABLE artifact_chunks ADD COLUMN IF NOT EXISTS end_char INT",
+            "ALTER TABLE artifact_chunks ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'",
+            "ALTER TABLE artifact_chunks ADD COLUMN IF NOT EXISTS pipeline_run_id UUID",
+            "ALTER TABLE artifact_chunks ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+            "ALTER TABLE artifact_chunks ADD COLUMN IF NOT EXISTS retracted_at TIMESTAMPTZ",
+            "ALTER TABLE artifact_chunks ADD COLUMN IF NOT EXISTS retracted_reason TEXT",
+            "CREATE INDEX IF NOT EXISTS artifact_chunks_content_fts_idx ON artifact_chunks USING gin (to_tsvector('english', content))",
+        ] {
+            sqlx::query(ddl).execute(pool).await.unwrap();
+        }
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_thoughts_round_trip_with_fake_embedder(pool: PgPool) {
         let embedder = test_embedder();
@@ -572,6 +1237,8 @@ mod tests {
                 rerank: None,
                 candidate_pool: None,
                 tag_filter: None,
+                chunk_serving_enabled: false,
+                include_profile: false,
             },
         )
         .await
@@ -600,6 +1267,8 @@ mod tests {
                 rerank: None,
                 candidate_pool: None,
                 tag_filter: None,
+                chunk_serving_enabled: false,
+                include_profile: false,
             },
         )
         .await
@@ -608,6 +1277,82 @@ mod tests {
         assert!(!resp.vector_search_available);
         assert_eq!(resp.results.len(), 1);
         assert_eq!(resp.results[0].thought_id, id);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn chunk_serving_flag_controls_chunk_fts_parent_hits(pool: PgPool) {
+        ensure_test_chunk_schema(&pool).await;
+        let parent_id = cap(&pool, "parent body deliberately lacks the marker", "global").await;
+        let artifact_id = uuid::Uuid::new_v4();
+        let chunk_id = uuid::Uuid::new_v4();
+
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (id, scope, kind, title, metadata)
+            VALUES ($1, 'global', 'thought_chunks', 'test artifact', '{}')
+            "#,
+        )
+        .bind(artifact_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO artifact_chunks (
+                id,
+                artifact_id,
+                source_thought_id,
+                chunk_index,
+                content,
+                content_fingerprint,
+                chunker_id,
+                chunker_version,
+                token_estimate,
+                start_char,
+                end_char,
+                metadata
+            )
+            VALUES ($1,$2,$3,0,'chunk-only-needle answer-bearing chunk',$4,'test-chunker',1,6,0,38,'{"fixture":true}')
+            "#,
+        )
+        .bind(chunk_id)
+        .bind(artifact_id)
+        .bind(parent_id.into_uuid())
+        .bind(vec![9_u8; 32])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
+        let mut request = SearchRequest {
+            query: "chunk-only-needle".to_string(),
+            scope: None,
+            scope_prefix: None,
+            limit: Some(10),
+            recency_half_life_days: Some(0.0),
+            rerank: Some(false),
+            candidate_pool: None,
+            tag_filter: None,
+            chunk_serving_enabled: false,
+            include_profile: false,
+        };
+        let off = search_thoughts(&pool, &bad, None, request.clone())
+            .await
+            .unwrap();
+        assert!(off.results.is_empty());
+
+        request.chunk_serving_enabled = true;
+        let on = search_thoughts(&pool, &bad, None, request).await.unwrap();
+        assert_eq!(on.results.len(), 1);
+        let hit = &on.results[0];
+        assert_eq!(hit.thought_id, parent_id);
+        assert_eq!(hit.content, "parent body deliberately lacks the marker");
+        assert_eq!(hit.chunk_id, Some(chunk_id));
+        assert_eq!(
+            hit.chunk_content.as_deref(),
+            Some("chunk-only-needle answer-bearing chunk")
+        );
+        assert_eq!(hit.chunk_index, Some(0));
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -653,6 +1398,8 @@ mod tests {
                 rerank: Some(false),
                 candidate_pool: None,
                 tag_filter: None,
+                chunk_serving_enabled: false,
+                include_profile: false,
             },
             DEFAULT_LEXICAL_TOP_K,
             1,
@@ -688,6 +1435,8 @@ mod tests {
                     rerank: None,
                     candidate_pool: None,
                     tag_filter: None,
+                    chunk_serving_enabled: false,
+                    include_profile: false,
                 },
             )
             .await
@@ -712,6 +1461,8 @@ mod tests {
                 rerank: None,
                 candidate_pool: None,
                 tag_filter: None,
+                chunk_serving_enabled: false,
+                include_profile: false,
             },
         )
         .await
@@ -738,6 +1489,8 @@ mod tests {
                 rerank: None,
                 candidate_pool: None,
                 tag_filter: None,
+                chunk_serving_enabled: false,
+                include_profile: false,
             },
         )
         .await
@@ -841,6 +1594,8 @@ mod tests {
                 rerank: None,
                 candidate_pool: None,
                 tag_filter: Some(serde_json::json!({"kind": "task"})),
+                chunk_serving_enabled: false,
+                include_profile: false,
             },
         )
         .await
@@ -886,6 +1641,8 @@ mod tests {
                 rerank: None,
                 candidate_pool: None,
                 tag_filter: Some(serde_json::json!({"people": ["Sarah"]})),
+                chunk_serving_enabled: false,
+                include_profile: false,
             },
         )
         .await
@@ -915,6 +1672,8 @@ mod tests {
                 rerank: None,
                 candidate_pool: None,
                 tag_filter: Some(serde_json::json!({})),
+                chunk_serving_enabled: false,
+                include_profile: false,
             },
         )
         .await
@@ -949,6 +1708,8 @@ mod tests {
                 rerank: None,
                 candidate_pool: None,
                 tag_filter: None,
+                chunk_serving_enabled: false,
+                include_profile: false,
             },
         )
         .await

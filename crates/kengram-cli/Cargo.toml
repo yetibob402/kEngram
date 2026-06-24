@@ -24,6 +24,7 @@ figment.workspace = true
 rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 sqlx.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["full"] }
@@ -35,4 +36,3 @@ uuid.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-sha2 = "0.10"

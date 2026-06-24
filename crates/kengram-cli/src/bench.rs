@@ -120,6 +120,8 @@ async fn run_pair(
         rerank: Some(rerank),
         candidate_pool: None,
         tag_filter: None,
+        chunk_serving_enabled: false,
+        include_profile: false,
     };
     let r_rrf = search::search_thoughts(pool, embedder, None, mk(false))
         .await

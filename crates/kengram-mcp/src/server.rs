@@ -419,7 +419,7 @@ impl KengramServer {
         .await
         .map_err(map_read_error)?;
 
-        serde_json::to_string(&search_response_json(&resp))
+        serde_json::to_string(&search_response_json(&resp, self.chunk_serving_enabled))
             .map_err(|e| format!("response serialization error: {e}"))
     }
 
@@ -803,12 +803,15 @@ fn related_thoughts_response_json(
     })
 }
 
-fn search_response_json(resp: &SearchResponse) -> serde_json::Value {
+fn search_response_json(
+    resp: &SearchResponse,
+    include_chunk_provenance: bool,
+) -> serde_json::Value {
     let results: Vec<serde_json::Value> = resp
         .results
         .iter()
         .map(|h| {
-            serde_json::json!({
+            let mut hit = serde_json::json!({
                 "thought_id": h.thought_id.to_string(),
                 "content": h.content,
                 "scope": h.scope.as_str(),
@@ -821,18 +824,61 @@ fn search_response_json(resp: &SearchResponse) -> serde_json::Value {
                 "trigram_score": h.trigram_score,
                 "rrf_score": h.rrf_score,
                 "rerank_score": h.rerank_score,
-                "chunk_id": h.chunk_id.map(|id| id.to_string()),
-                "chunk_artifact_id": h.chunk_artifact_id.map(|id| id.to_string()),
-                "chunk_source_thought_id": h.chunk_source_thought_id.map(|id| id.to_string()),
-                "chunk_index": h.chunk_index,
-                "chunk_content": h.chunk_content,
-                "chunker_id": h.chunker_id,
-                "chunker_version": h.chunker_version,
-                "chunk_token_estimate": h.chunk_token_estimate,
-                "chunk_start_char": h.chunk_start_char,
-                "chunk_end_char": h.chunk_end_char,
-                "chunk_metadata": h.chunk_metadata,
-            })
+            });
+            if include_chunk_provenance || h.chunk_id.is_some() {
+                let obj = hit
+                    .as_object_mut()
+                    .expect("search hit JSON is constructed as an object");
+                obj.insert(
+                    "chunk_id".into(),
+                    serde_json::to_value(h.chunk_id.map(|id| id.to_string()))
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                obj.insert(
+                    "chunk_artifact_id".into(),
+                    serde_json::to_value(h.chunk_artifact_id.map(|id| id.to_string()))
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                obj.insert(
+                    "chunk_source_thought_id".into(),
+                    serde_json::to_value(h.chunk_source_thought_id.map(|id| id.to_string()))
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                obj.insert(
+                    "chunk_index".into(),
+                    serde_json::to_value(h.chunk_index).unwrap_or(serde_json::Value::Null),
+                );
+                obj.insert(
+                    "chunk_content".into(),
+                    serde_json::to_value(&h.chunk_content).unwrap_or(serde_json::Value::Null),
+                );
+                obj.insert(
+                    "chunker_id".into(),
+                    serde_json::to_value(&h.chunker_id).unwrap_or(serde_json::Value::Null),
+                );
+                obj.insert(
+                    "chunker_version".into(),
+                    serde_json::to_value(h.chunker_version).unwrap_or(serde_json::Value::Null),
+                );
+                obj.insert(
+                    "chunk_token_estimate".into(),
+                    serde_json::to_value(h.chunk_token_estimate)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                obj.insert(
+                    "chunk_start_char".into(),
+                    serde_json::to_value(h.chunk_start_char).unwrap_or(serde_json::Value::Null),
+                );
+                obj.insert(
+                    "chunk_end_char".into(),
+                    serde_json::to_value(h.chunk_end_char).unwrap_or(serde_json::Value::Null),
+                );
+                obj.insert(
+                    "chunk_metadata".into(),
+                    serde_json::to_value(&h.chunk_metadata).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            hit
         })
         .collect();
     let mut body = serde_json::json!({
@@ -1162,6 +1208,92 @@ mod tests {
             Some("fake/tagger".to_string()),
             false,
         )
+    }
+
+    fn search_json_hit() -> search::SearchHit {
+        search::SearchHit {
+            thought_id: ThoughtId::new(),
+            content: "legacy search hit".to_string(),
+            scope: Scope::new("global").unwrap(),
+            source: Source::new("test").unwrap(),
+            created_at: time::OffsetDateTime::now_utc(),
+            metadata: Metadata::default(),
+            tags: Tags::default(),
+            vector_score: Some(0.9),
+            lexical_score: None,
+            trigram_score: None,
+            rrf_score: Some(0.5),
+            rerank_score: None,
+            chunk_id: None,
+            chunk_artifact_id: None,
+            chunk_source_thought_id: None,
+            chunk_index: None,
+            chunk_content: None,
+            chunker_id: None,
+            chunker_version: None,
+            chunk_token_estimate: None,
+            chunk_start_char: None,
+            chunk_end_char: None,
+            chunk_metadata: None,
+        }
+    }
+
+    fn search_json_response() -> SearchResponse {
+        SearchResponse {
+            results: vec![search_json_hit()],
+            vector_search_available: true,
+            rerank_used: false,
+            profile: None,
+        }
+    }
+
+    #[test]
+    fn search_response_json_omits_chunk_keys_when_flag_off_without_chunk_hit() {
+        let json = search_response_json(&search_json_response(), false);
+        let hit = json["results"][0].as_object().unwrap();
+        for key in [
+            "chunk_id",
+            "chunk_artifact_id",
+            "chunk_source_thought_id",
+            "chunk_index",
+            "chunk_content",
+            "chunker_id",
+            "chunker_version",
+            "chunk_token_estimate",
+            "chunk_start_char",
+            "chunk_end_char",
+            "chunk_metadata",
+        ] {
+            assert!(
+                !hit.contains_key(key),
+                "flag-off ordinary search hits must preserve legacy JSON shape; found `{key}`"
+            );
+        }
+    }
+
+    #[test]
+    fn search_response_json_includes_chunk_keys_when_flag_on() {
+        let json = search_response_json(&search_json_response(), true);
+        let hit = json["results"][0].as_object().unwrap();
+        for key in [
+            "chunk_id",
+            "chunk_artifact_id",
+            "chunk_source_thought_id",
+            "chunk_index",
+            "chunk_content",
+            "chunker_id",
+            "chunker_version",
+            "chunk_token_estimate",
+            "chunk_start_char",
+            "chunk_end_char",
+            "chunk_metadata",
+        ] {
+            assert!(
+                hit.contains_key(key),
+                "flag-on search hits should expose chunk provenance field `{key}`"
+            );
+        }
+        assert!(hit["chunk_id"].is_null());
     }
 
     #[sqlx::test(migrations = "../../migrations")]

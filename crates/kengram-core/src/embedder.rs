@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 
-use crate::EmbeddingModel;
+use crate::{EmbeddingModel, SparseEmbeddingModel, SparseLexicalVector};
 
 #[async_trait]
 pub trait Embedder: Send + Sync {
@@ -15,6 +15,21 @@ pub trait Embedder: Send + Sync {
     /// `self.model().dimensions`. The order of outputs matches the order of
     /// inputs.
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedderError>;
+}
+
+#[async_trait]
+pub trait SparseEmbedder: Send + Sync {
+    /// Sparse model identity. BGE-M3 lexical weights use the tokenizer
+    /// vocabulary size rather than the dense vector dimensionality.
+    fn sparse_model(&self) -> &SparseEmbeddingModel;
+
+    /// Encode a batch of texts into sparse lexical weights. This is separate
+    /// from [`Embedder::embed`] because OpenAI-compatible dense endpoints may
+    /// not expose sparse BGE-M3 weights.
+    async fn encode_sparse(
+        &self,
+        texts: &[String],
+    ) -> Result<Vec<SparseLexicalVector>, EmbedderError>;
 }
 
 #[derive(Debug, thiserror::Error)]

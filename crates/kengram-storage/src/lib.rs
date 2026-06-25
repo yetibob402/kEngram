@@ -8,7 +8,8 @@
 use kengram_core::{
     ChunkProvenance, Embedding, EmbeddingModel, EmbeddingStatus, Hit, LinkDirection, LinkId,
     LinkSource, LinkTarget, Metadata, RelationKind, Scope, ScopeError, ScopeVocab, Source,
-    SourceError, Tags, Thought, ThoughtId, UnknownLinkSource, UnknownRelationKind,
+    SourceError, SparseEmbeddingModel, SparseLexicalVector, Tags, Thought, ThoughtId,
+    UnknownLinkSource, UnknownRelationKind,
 };
 use sqlx::{PgPool, PgTransaction};
 use time::OffsetDateTime;
@@ -44,6 +45,14 @@ mod bge {
     pub const CHUNK_HNSW_INDEX: &str = "artifact_chunk_embeddings_bge_m3_hnsw";
 }
 
+mod bge_sparse {
+    pub const MODEL_ID: &str = "bge-m3:sparse";
+    pub const SOURCE_MODEL: &str = "BAAI/bge-m3";
+    pub const VOCAB_SIZE: usize = 250_002;
+    pub const VOCAB_SIZE_I32: i32 = 250_002;
+    pub const MODEL_VERSION: i32 = 1;
+}
+
 #[derive(Debug, Clone)]
 struct AnnProjection {
     projection_id: String,
@@ -62,6 +71,27 @@ pub struct AnnProjectionCoverage {
     pub status: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct SparseEmbeddingProvenance {
+    pub source_model: String,
+    pub generator: String,
+    pub generator_version: String,
+    pub pipeline_run_id: Option<Uuid>,
+    pub producer_metadata: serde_json::Value,
+}
+
+impl SparseEmbeddingProvenance {
+    pub fn bge_m3_flag_embedding(generator_version: impl Into<String>) -> Self {
+        Self {
+            source_model: bge_sparse::SOURCE_MODEL.to_string(),
+            generator: "FlagEmbedding.BGEM3FlagModel".to_string(),
+            generator_version: generator_version.into(),
+            pipeline_run_id: None,
+            producer_metadata: serde_json::json!({}),
+        }
+    }
+}
+
 fn ann_projection_for_model(model: &EmbeddingModel) -> Option<AnnProjection> {
     if is_bge_m3_1024(model) {
         return None;
@@ -78,6 +108,24 @@ fn ann_projection_for_model(model: &EmbeddingModel) -> Option<AnnProjection> {
 
 fn is_bge_m3_1024(model: &EmbeddingModel) -> bool {
     model.id == bge::MODEL_ID && model.dimensions == bge::DIMS
+}
+
+fn is_bge_m3_sparse(model: &SparseEmbeddingModel) -> bool {
+    model.id == bge_sparse::MODEL_ID
+        && model.version == bge_sparse::MODEL_VERSION
+        && model.vocab_size == bge_sparse::VOCAB_SIZE
+}
+
+fn validate_bge_m3_sparse(vector: &SparseLexicalVector) -> Result<(), StorageError> {
+    if is_bge_m3_sparse(&vector.model) {
+        Ok(())
+    } else {
+        Err(StorageError::InvalidSparseModel {
+            model_id: vector.model.id.clone(),
+            model_version: vector.model.version,
+            vocab_size: vector.model.vocab_size,
+        })
+    }
 }
 
 fn project_halfvec_3072(
@@ -267,6 +315,23 @@ pub enum StorageError {
         "bge-m3 sidecar only supports thought and artifact_chunk embeddings, got target_kind={0}"
     )]
     UnsupportedBgeTargetKind(String),
+
+    #[error(
+        "bge-m3 sparse sidecar only supports thought and artifact_chunk embeddings, got target_kind={0}"
+    )]
+    UnsupportedBgeSparseTargetKind(String),
+
+    #[error(
+        "invalid sparse model: id={model_id}, version={model_version}, vocab_size={vocab_size}"
+    )]
+    InvalidSparseModel {
+        model_id: String,
+        model_version: i32,
+        vocab_size: usize,
+    },
+
+    #[error("sparse source content length must be non-negative, got {0}")]
+    InvalidSparseSourceContentChars(i32),
 
     #[error(
         "ANN projection coverage mismatch for {projection_id}: embeddings={embedding_count}, projections={projection_count}, missing={missing_count}"
@@ -823,6 +888,179 @@ pub async fn insert_artifact_chunk_embedding(
         chunk_id,
         &embedding.model,
         embedding.vector.clone(),
+    )
+    .await
+}
+
+async fn insert_bge_sparse_embedding(
+    pool: &PgPool,
+    target_kind: &'static str,
+    target_id: Uuid,
+    content_fingerprint: [u8; 32],
+    source_content_chars: i32,
+    vector: &SparseLexicalVector,
+    provenance: &SparseEmbeddingProvenance,
+) -> Result<(), StorageError> {
+    if target_kind != target::THOUGHT && target_kind != target::ARTIFACT_CHUNK {
+        return Err(StorageError::UnsupportedBgeSparseTargetKind(
+            target_kind.to_string(),
+        ));
+    }
+    if source_content_chars < 0 {
+        return Err(StorageError::InvalidSparseSourceContentChars(
+            source_content_chars,
+        ));
+    }
+    validate_bge_m3_sparse(vector)?;
+
+    let sparsevec_literal = vector.sparsevec_literal();
+    let content_fingerprint = content_fingerprint.to_vec();
+    let nonzero_count = vector.nonzero_count() as i32;
+    if target_kind == target::THOUGHT {
+        sqlx::query(
+            r#"
+            INSERT INTO thought_sparse_embeddings_bge_m3 (
+                thought_id,
+                model_id,
+                model_version,
+                source_model,
+                vocab_size,
+                nonzero_count,
+                content_fingerprint,
+                source_content_chars,
+                generator,
+                generator_version,
+                pipeline_run_id,
+                producer_metadata,
+                embedding
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                $13::text::sparsevec
+            )
+            ON CONFLICT (thought_id, model_id, model_version)
+            DO UPDATE SET
+                source_model = EXCLUDED.source_model,
+                vocab_size = EXCLUDED.vocab_size,
+                nonzero_count = EXCLUDED.nonzero_count,
+                content_fingerprint = EXCLUDED.content_fingerprint,
+                source_content_chars = EXCLUDED.source_content_chars,
+                generator = EXCLUDED.generator,
+                generator_version = EXCLUDED.generator_version,
+                pipeline_run_id = EXCLUDED.pipeline_run_id,
+                producer_metadata = EXCLUDED.producer_metadata,
+                embedding = EXCLUDED.embedding,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(target_id)
+        .bind(bge_sparse::MODEL_ID)
+        .bind(bge_sparse::MODEL_VERSION)
+        .bind(&provenance.source_model)
+        .bind(bge_sparse::VOCAB_SIZE_I32)
+        .bind(nonzero_count)
+        .bind(&content_fingerprint)
+        .bind(source_content_chars)
+        .bind(&provenance.generator)
+        .bind(&provenance.generator_version)
+        .bind(provenance.pipeline_run_id)
+        .bind(&provenance.producer_metadata)
+        .bind(&sparsevec_literal)
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query(
+            r#"
+            INSERT INTO artifact_chunk_sparse_embeddings_bge_m3 (
+                chunk_id,
+                model_id,
+                model_version,
+                source_model,
+                vocab_size,
+                nonzero_count,
+                content_fingerprint,
+                source_content_chars,
+                generator,
+                generator_version,
+                pipeline_run_id,
+                producer_metadata,
+                embedding
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                $13::text::sparsevec
+            )
+            ON CONFLICT (chunk_id, model_id, model_version)
+            DO UPDATE SET
+                source_model = EXCLUDED.source_model,
+                vocab_size = EXCLUDED.vocab_size,
+                nonzero_count = EXCLUDED.nonzero_count,
+                content_fingerprint = EXCLUDED.content_fingerprint,
+                source_content_chars = EXCLUDED.source_content_chars,
+                generator = EXCLUDED.generator,
+                generator_version = EXCLUDED.generator_version,
+                pipeline_run_id = EXCLUDED.pipeline_run_id,
+                producer_metadata = EXCLUDED.producer_metadata,
+                embedding = EXCLUDED.embedding,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(target_id)
+        .bind(bge_sparse::MODEL_ID)
+        .bind(bge_sparse::MODEL_VERSION)
+        .bind(&provenance.source_model)
+        .bind(bge_sparse::VOCAB_SIZE_I32)
+        .bind(nonzero_count)
+        .bind(&content_fingerprint)
+        .bind(source_content_chars)
+        .bind(&provenance.generator)
+        .bind(&provenance.generator_version)
+        .bind(provenance.pipeline_run_id)
+        .bind(&provenance.producer_metadata)
+        .bind(&sparsevec_literal)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(())
+}
+
+pub async fn insert_thought_sparse_embedding(
+    pool: &PgPool,
+    thought_id: ThoughtId,
+    content_fingerprint: [u8; 32],
+    source_content_chars: i32,
+    vector: &SparseLexicalVector,
+    provenance: &SparseEmbeddingProvenance,
+) -> Result<(), StorageError> {
+    insert_bge_sparse_embedding(
+        pool,
+        target::THOUGHT,
+        thought_id.into_uuid(),
+        content_fingerprint,
+        source_content_chars,
+        vector,
+        provenance,
+    )
+    .await
+}
+
+pub async fn insert_artifact_chunk_sparse_embedding(
+    pool: &PgPool,
+    chunk_id: Uuid,
+    content_fingerprint: [u8; 32],
+    source_content_chars: i32,
+    vector: &SparseLexicalVector,
+    provenance: &SparseEmbeddingProvenance,
+) -> Result<(), StorageError> {
+    insert_bge_sparse_embedding(
+        pool,
+        target::ARTIFACT_CHUNK,
+        chunk_id,
+        content_fingerprint,
+        source_content_chars,
+        vector,
+        provenance,
     )
     .await
 }
@@ -3898,7 +4136,10 @@ pub async fn corpus_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kengram_core::{EmbeddingModel, LinkTarget, Metadata, Scope, Source, TagKind};
+    use kengram_core::{
+        EmbeddingModel, LinkTarget, Metadata, Scope, Source, SparseEmbeddingModel,
+        SparseLexicalVector, SparseWeight, TagKind,
+    };
     use serde_json::json;
     use sha2::{Digest, Sha256};
 
@@ -4243,6 +4484,126 @@ mod tests {
         .unwrap();
 
         chunk_id
+    }
+
+    fn test_sparse_vector(weights: Vec<(u32, f32)>) -> SparseLexicalVector {
+        SparseLexicalVector::new(
+            SparseEmbeddingModel::bge_m3_sparse(),
+            weights
+                .into_iter()
+                .map(|(token_id, weight)| SparseWeight::new(token_id, weight))
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn insert_thought_sparse_embedding_persists_sparsevec_row(pool: PgPool) {
+        let content = "stage3 sparse thought";
+        let thought_id = insert_test_thought(&pool, content, "global").await;
+        let vector = test_sparse_vector(vec![(0, 0.5), (2, 1.25)]);
+        let mut provenance =
+            SparseEmbeddingProvenance::bge_m3_flag_embedding("FlagEmbedding 1.0 test");
+        provenance.producer_metadata = json!({"device": "mps", "fixture": true});
+
+        insert_thought_sparse_embedding(
+            &pool,
+            thought_id,
+            sha256_of(content),
+            content.len() as i32,
+            &vector,
+            &provenance,
+        )
+        .await
+        .unwrap();
+
+        let row: (String, i32, String, serde_json::Value) = sqlx::query_as(
+            r#"
+            SELECT embedding::text, nonzero_count, generator, producer_metadata
+            FROM thought_sparse_embeddings_bge_m3
+            WHERE thought_id = $1
+            "#,
+        )
+        .bind(thought_id.into_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(row.0, "{1:0.5,3:1.25}/250002");
+        assert_eq!(row.1, 2);
+        assert_eq!(row.2, "FlagEmbedding.BGEM3FlagModel");
+        assert_eq!(row.3["device"], "mps");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn insert_artifact_chunk_sparse_embedding_updates_on_conflict(pool: PgPool) {
+        let parent = insert_test_thought(&pool, "sparse parent", "global").await;
+        let chunk_content = "stage3 sparse chunk";
+        let chunk_id = insert_test_chunk(&pool, parent, chunk_content).await;
+        let provenance = SparseEmbeddingProvenance::bge_m3_flag_embedding("FlagEmbedding 1.0 test");
+        let first = test_sparse_vector(vec![(0, 0.5)]);
+        let second = test_sparse_vector(vec![(1, 2.0), (250_001, 1.0)]);
+
+        insert_artifact_chunk_sparse_embedding(
+            &pool,
+            chunk_id,
+            sha256_of(chunk_content),
+            chunk_content.len() as i32,
+            &first,
+            &provenance,
+        )
+        .await
+        .unwrap();
+        insert_artifact_chunk_sparse_embedding(
+            &pool,
+            chunk_id,
+            sha256_of(chunk_content),
+            chunk_content.len() as i32,
+            &second,
+            &provenance,
+        )
+        .await
+        .unwrap();
+
+        let row: (i64, String, i32) = sqlx::query_as(
+            r#"
+            SELECT count(*)::bigint, max(embedding::text), max(nonzero_count)
+            FROM artifact_chunk_sparse_embeddings_bge_m3
+            WHERE chunk_id = $1
+            "#,
+        )
+        .bind(chunk_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(row.0, 1);
+        assert_eq!(row.1, "{2:2,250002:1}/250002");
+        assert_eq!(row.2, 2);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn insert_sparse_embedding_rejects_wrong_sparse_model(pool: PgPool) {
+        let thought_id = insert_test_thought(&pool, "wrong sparse model", "global").await;
+        let vector = SparseLexicalVector::new(
+            SparseEmbeddingModel::new("other:sparse", 1, 250_002),
+            vec![SparseWeight::new(0, 1.0)],
+        )
+        .unwrap();
+        let provenance = SparseEmbeddingProvenance::bge_m3_flag_embedding("FlagEmbedding 1.0 test");
+
+        let err = insert_thought_sparse_embedding(
+            &pool,
+            thought_id,
+            sha256_of("wrong sparse model"),
+            "wrong sparse model".len() as i32,
+            &vector,
+            &provenance,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, StorageError::InvalidSparseModel { .. }));
     }
 
     #[sqlx::test(migrations = "../../migrations")]

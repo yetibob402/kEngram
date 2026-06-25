@@ -424,10 +424,12 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
     let chunk_serving_enabled = config.search.chunk_serving_effective();
     let full_pipeline_enabled = config.search.full_pipeline_enabled;
     let tag_domain_routing_enabled = config.search.tag_domain_routing_effective();
+    let sparse_lexical_enabled = config.search.sparse_lexical_effective();
     tracing::info!(
         chunk_serving_enabled,
         full_pipeline_enabled,
         tag_domain_routing_enabled,
+        sparse_lexical_enabled,
         "search config resolved"
     );
     let factory = move || {

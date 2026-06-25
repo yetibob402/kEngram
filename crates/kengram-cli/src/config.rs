@@ -44,6 +44,9 @@ pub struct SearchConfig {
     /// Subordinate gate for inferred tag/domain routing. Takes effect only
     /// when `full_pipeline_enabled` is also true.
     pub tag_domain_routing_enabled: bool,
+    /// Subordinate gate for the BGE-M3 sparse lexical retrieval leg. The
+    /// data-prep sidecar can be populated while this remains ineffective.
+    pub sparse_lexical_enabled: bool,
 }
 
 impl SearchConfig {
@@ -53,6 +56,10 @@ impl SearchConfig {
 
     pub fn tag_domain_routing_effective(&self) -> bool {
         self.full_pipeline_enabled && self.tag_domain_routing_enabled
+    }
+
+    pub fn sparse_lexical_effective(&self) -> bool {
+        self.full_pipeline_enabled && self.sparse_lexical_enabled
     }
 }
 
@@ -447,8 +454,10 @@ mod tests {
         assert!(!c.search.chunk_serving_enabled);
         assert!(!c.search.full_pipeline_enabled);
         assert!(!c.search.tag_domain_routing_enabled);
+        assert!(!c.search.sparse_lexical_enabled);
         assert!(!c.search.chunk_serving_effective());
         assert!(!c.search.tag_domain_routing_effective());
+        assert!(!c.search.sparse_lexical_effective());
     }
 
     #[test]
@@ -483,6 +492,40 @@ mod tests {
         assert!(!c.search.full_pipeline_enabled);
         assert!(c.search.tag_domain_routing_enabled);
         assert!(!c.search.tag_domain_routing_effective());
+    }
+
+    #[test]
+    fn sparse_lexical_requires_full_pipeline_master_gate() {
+        let toml = r#"
+            [search]
+            full_pipeline_enabled = false
+            sparse_lexical_enabled = true
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert!(!c.search.full_pipeline_enabled);
+        assert!(c.search.sparse_lexical_enabled);
+        assert!(!c.search.sparse_lexical_effective());
+    }
+
+    #[test]
+    fn sparse_lexical_effective_when_both_gates_true() {
+        let toml = r#"
+            [search]
+            full_pipeline_enabled = true
+            sparse_lexical_enabled = true
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert!(c.search.full_pipeline_enabled);
+        assert!(c.search.sparse_lexical_enabled);
+        assert!(c.search.sparse_lexical_effective());
     }
 
     #[test]

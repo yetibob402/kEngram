@@ -11,11 +11,12 @@ pub mod relation;
 pub mod scope;
 pub mod search;
 pub mod source;
+pub mod sparse;
 pub mod tagger;
 pub mod tags;
 pub mod thought;
 
-pub use embedder::{Embedder, EmbedderError};
+pub use embedder::{Embedder, EmbedderError, SparseEmbedder};
 pub use embedding::{Embedding, EmbeddingError, EmbeddingModel, EmbeddingStatus};
 pub use metadata::Metadata;
 pub use metrics::{ndcg_at_k, reciprocal_rank};
@@ -28,6 +29,7 @@ pub use search::{
     ChunkProvenance, DEFAULT_RECENCY_HALF_LIFE_DAYS, DEFAULT_RRF_K, Hit, recency_boost, rrf_fuse,
 };
 pub use source::{Source, SourceError};
+pub use sparse::{SparseEmbeddingModel, SparseLexicalVector, SparseVectorError, SparseWeight};
 pub use tagger::{ExtractedRelation, ExtractedTarget, TagOutput, Tagger, TaggerError};
 pub use tags::{
     MAX_RETRIEVAL_ALIAS_LEN, MAX_RETRIEVAL_ALIASES, ScopeVocab, TagKind, Tags,

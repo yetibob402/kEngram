@@ -1,0 +1,94 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH fts AS (\n            SELECT websearch_to_tsquery('english', $1) AS tsq\n        )\n        SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,\n               t.content_fingerprint, t.tags,\n               t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at,\n               ts_rank_cd(to_tsvector('english', t.content), fts.tsq) AS \"rank!: f32\"\n        FROM thoughts t\n        CROSS JOIN fts\n        WHERE to_tsvector('english', t.content) @@ fts.tsq\n          AND ($2::text IS NULL OR t.scope = $2)\n          AND ($3::text IS NULL OR t.scope LIKE $3 || '%')\n          AND t.retracted_at IS NULL\n          AND t.id <> ALL($5::uuid[])\n          AND lower(coalesce(t.metadata->>'source_file', '')) !~ $6\n          AND t.content !~ $7\n        ORDER BY ts_rank_cd(to_tsvector('english', t.content), fts.tsq) DESC,\n                 t.created_at DESC\n        LIMIT $4\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "scope",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "content",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "source",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "metadata",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 6,
+        "name": "content_fingerprint",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 7,
+        "name": "tags",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 8,
+        "name": "tags_extractor_model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "tags_extractor_version",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 10,
+        "name": "tags_extracted_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "rank!: f32",
+        "type_info": "Float4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "UuidArray",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      null
+    ]
+  },
+  "hash": "97975bffcb89d2fa528df13edba4e5044ff172cfb4772ed406765e504b374980"
+}

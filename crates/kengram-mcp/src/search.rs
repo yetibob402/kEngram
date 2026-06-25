@@ -1306,6 +1306,71 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
+    async fn search_thoughts_excludes_eval_contamination_before_rerank_pool(pool: PgPool) {
+        let clean = cap(
+            &pool,
+            "clean answer marker tcgplayer canonical baseline",
+            "global",
+        )
+        .await;
+        let denied = cap(
+            &pool,
+            "KGR024 answer marker tcgplayer canonical baseline",
+            "global",
+        )
+        .await;
+        let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
+        let reranker = FakeReranker::new();
+
+        let resp = search_thoughts(
+            &pool,
+            &bad,
+            Some(&reranker),
+            SearchRequest {
+                query: "tcgplayer canonical".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(true),
+                candidate_pool: Some(10),
+                tag_filter: None,
+                chunk_serving_enabled: false,
+                include_profile: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(resp.rerank_used, "reranker must run for pre-pool proof");
+        let rerank_call = reranker
+            .last_call()
+            .expect("reranker should record the candidate pool");
+        assert!(
+            rerank_call
+                .candidates
+                .iter()
+                .any(|content| content.contains("clean answer marker")),
+            "clean control row should enter the rerank candidate pool"
+        );
+        assert!(
+            rerank_call
+                .candidates
+                .iter()
+                .all(|content| !content.contains("KGR024")),
+            "denied eval row must be absent from the pre-rerank candidate pool"
+        );
+
+        let returned_ids = resp
+            .results
+            .iter()
+            .map(|hit| hit.thought_id)
+            .collect::<Vec<_>>();
+        assert!(returned_ids.contains(&clean));
+        assert!(!returned_ids.contains(&denied));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
     async fn search_thoughts_degrades_when_embedder_fails(pool: PgPool) {
         let id = cap(&pool, "the tcgplayer integration was painful", "work").await;
 

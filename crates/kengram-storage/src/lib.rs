@@ -136,6 +136,17 @@ fn normalize_fts_query(query: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+// Phase0 eval-contamination fence: keep gold/eval/adjudication artifacts out
+// of retrieval candidate pools before RRF/rerank. This is intentionally
+// conservative and duplicated into SQL so every leg filters at source.
+const EVAL_CONTAMINATION_SOURCE_FILE_REGEX: &str = "(kengram-recall-97|kengram-gold|gold100|gold-100|miss-analysis|label-repair|adjudication|answer-key|retrieval-baseline)";
+const EVAL_CONTAMINATION_CONTENT_REGEX: &str = "KGR[0-9]{3}";
+const EVAL_CONTAMINATION_KNOWN_IDS: &[Uuid] = &[
+    uuid::uuid!("43ec4976-d33b-4292-bbf6-ce141f6418dd"),
+    uuid::uuid!("5853f4c5-afca-433b-9506-40c015646c23"),
+    uuid::uuid!("a58e47fa-e933-4f75-9af8-3f7873ab9f58"),
+];
+
 fn ann_projection_index_name(projection_id: &str) -> String {
     let mut sanitized = projection_id
         .chars()
@@ -1168,6 +1179,9 @@ pub async fn search_trigram(
           AND ($2::text IS NULL OR scope = $2)
           AND ($3::text IS NULL OR scope LIKE $3 || '%')
           AND retracted_at IS NULL
+          AND id <> ALL($5::uuid[])
+          AND lower(coalesce(metadata->>'source_file', '')) !~ $6
+          AND content !~ $7
         ORDER BY similarity(content, $1) DESC
         LIMIT $4
         "#,
@@ -1175,6 +1189,9 @@ pub async fn search_trigram(
         scope,
         scope_prefix,
         limit,
+        EVAL_CONTAMINATION_KNOWN_IDS,
+        EVAL_CONTAMINATION_SOURCE_FILE_REGEX,
+        EVAL_CONTAMINATION_CONTENT_REGEX,
     )
     .fetch_all(pool)
     .await?;
@@ -1229,6 +1246,9 @@ pub async fn search_fts(
           AND ($2::text IS NULL OR t.scope = $2)
           AND ($3::text IS NULL OR t.scope LIKE $3 || '%')
           AND t.retracted_at IS NULL
+          AND t.id <> ALL($5::uuid[])
+          AND lower(coalesce(t.metadata->>'source_file', '')) !~ $6
+          AND t.content !~ $7
         ORDER BY ts_rank_cd(to_tsvector('english', t.content), fts.tsq) DESC,
                  t.created_at DESC
         LIMIT $4
@@ -1237,6 +1257,9 @@ pub async fn search_fts(
         scope,
         scope_prefix,
         limit,
+        EVAL_CONTAMINATION_KNOWN_IDS,
+        EVAL_CONTAMINATION_SOURCE_FILE_REGEX,
+        EVAL_CONTAMINATION_CONTENT_REGEX,
     )
     .fetch_all(pool)
     .await?;
@@ -1303,6 +1326,9 @@ pub async fn search_fts_bounded(
           AND ($2::text IS NULL OR t.scope = $2)
           AND ($3::text IS NULL OR t.scope LIKE $3 || '%')
           AND t.retracted_at IS NULL
+          AND t.id <> ALL($5::uuid[])
+          AND lower(coalesce(t.metadata->>'source_file', '')) !~ $6
+          AND t.content !~ $7
         ORDER BY ts_rank_cd(to_tsvector('english', t.content), fts.tsq) DESC,
                  t.created_at DESC
         LIMIT $4
@@ -1311,6 +1337,9 @@ pub async fn search_fts_bounded(
         scope,
         scope_prefix,
         limit,
+        EVAL_CONTAMINATION_KNOWN_IDS,
+        EVAL_CONTAMINATION_SOURCE_FILE_REGEX,
+        EVAL_CONTAMINATION_CONTENT_REGEX,
     )
     .fetch_all(&mut *tx)
     .await
@@ -1416,6 +1445,9 @@ pub async fn search_artifact_chunks_fts_bounded(
               AND t.retracted_at IS NULL
               AND ($2::text IS NULL OR t.scope = $2)
               AND ($3::text IS NULL OR t.scope LIKE $3 || '%')
+              AND t.id <> ALL($5::uuid[])
+              AND lower(coalesce(t.metadata->>'source_file', '')) !~ $6
+              AND t.content !~ $7
             ORDER BY ts_rank_cd(to_tsvector('english', ac.content), fts.tsq) DESC,
                      t.created_at DESC,
                      ac.chunk_index ASC
@@ -1436,6 +1468,9 @@ pub async fn search_artifact_chunks_fts_bounded(
     .bind(scope)
     .bind(scope_prefix)
     .bind(limit)
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
     .fetch_all(&mut *tx)
     .await
     {
@@ -2625,6 +2660,9 @@ pub async fn search_vector_knn(
                   AND ($4::text IS NULL OR t.scope = $4)
                   AND ($5::text IS NULL OR t.scope LIKE $5 || '%')
                   AND t.retracted_at IS NULL
+                  AND t.id <> ALL($7::uuid[])
+                  AND lower(coalesce(t.metadata->>'source_file', '')) !~ $8
+                  AND t.content !~ $9
                 ORDER BY p.embedding <=> $1
                 LIMIT $6
                 "#,
@@ -2635,6 +2673,9 @@ pub async fn search_vector_knn(
                 .bind(scope)
                 .bind(scope_prefix)
                 .bind(limit)
+                .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+                .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+                .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
                 .fetch_all(&mut *tx)
                 .await?;
                 tx.commit().await?;
@@ -2662,6 +2703,9 @@ pub async fn search_vector_knn(
           AND ($3::text IS NULL OR t.scope = $3)
           AND ($4::text IS NULL OR t.scope LIKE $4 || '%')
           AND t.retracted_at IS NULL
+          AND t.id <> ALL($6::uuid[])
+          AND lower(coalesce(t.metadata->>'source_file', '')) !~ $7
+          AND t.content !~ $8
         ORDER BY e.vector <=> $1
         LIMIT $5
         "#,
@@ -2671,6 +2715,9 @@ pub async fn search_vector_knn(
     .bind(scope)
     .bind(scope_prefix)
     .bind(limit)
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
     .fetch_all(pool)
     .await?;
 
@@ -2710,6 +2757,9 @@ async fn search_bge_vector_knn(
           AND ($4::text IS NULL OR t.scope = $4)
           AND ($5::text IS NULL OR t.scope LIKE $5 || '%')
           AND t.retracted_at IS NULL
+          AND t.id <> ALL($7::uuid[])
+          AND lower(coalesce(t.metadata->>'source_file', '')) !~ $8
+          AND t.content !~ $9
         ORDER BY b.embedding <=> $1::vector(1024)
         LIMIT $6
         "#,
@@ -2720,6 +2770,9 @@ async fn search_bge_vector_knn(
     .bind(scope)
     .bind(scope_prefix)
     .bind(limit)
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -2789,6 +2842,9 @@ pub async fn search_artifact_chunks_vector_knn(
               AND t.retracted_at IS NULL
               AND ($4::text IS NULL OR t.scope = $4)
               AND ($5::text IS NULL OR t.scope LIKE $5 || '%')
+              AND t.id <> ALL($7::uuid[])
+              AND lower(coalesce(t.metadata->>'source_file', '')) !~ $8
+              AND t.content !~ $9
             ORDER BY b.embedding <=> $1::vector(1024)
             LIMIT GREATEST($6, $6 * 8)
         ),
@@ -2809,6 +2865,9 @@ pub async fn search_artifact_chunks_vector_knn(
     .bind(scope)
     .bind(scope_prefix)
     .bind(limit)
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -3897,6 +3956,20 @@ mod tests {
         inserted.id
     }
 
+    async fn insert_test_thought_with_metadata(
+        pool: &PgPool,
+        content: &str,
+        scope: &str,
+        metadata: Metadata,
+    ) -> ThoughtId {
+        let scope = Scope::new(scope).unwrap();
+        let source = Source::new("test").unwrap();
+        let (inserted, _) = insert_thought(pool, new_thought(&scope, &source, &metadata, content))
+            .await
+            .unwrap();
+        inserted.id
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn recent_thoughts_newest_first(pool: PgPool) {
         let _a = insert_test_thought(&pool, "first", "global").await;
@@ -3983,6 +4056,33 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
+    async fn search_fts_excludes_eval_contamination_candidates(pool: PgPool) {
+        let clean = insert_test_thought(
+            &pool,
+            "clean answer marker tcgplayer canonical baseline",
+            "global",
+        )
+        .await;
+        let denied = insert_test_thought(
+            &pool,
+            "KGR024 answer marker tcgplayer canonical baseline",
+            "global",
+        )
+        .await;
+
+        let hits = search_fts(&pool, "tcgplayer canonical", None, None, 10)
+            .await
+            .unwrap();
+        let hit_ids = hits.iter().map(|hit| hit.thought.id).collect::<Vec<_>>();
+
+        assert!(hit_ids.contains(&clean));
+        assert!(
+            !hit_ids.contains(&denied),
+            "KGR-labeled eval rows must be excluded before FTS candidate pooling"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
     async fn search_fts_respects_scope(pool: PgPool) {
         insert_test_thought(&pool, "tcgplayer info", "work").await;
         insert_test_thought(&pool, "tcgplayer info two", "personal").await;
@@ -4049,6 +4149,34 @@ mod tests {
         assert!(hits[0].thought.content.contains("tcgplayer"));
         assert!(hits[0].lexical_score.unwrap() > 0.0);
         assert_eq!(hits[0].trigram_score, hits[0].lexical_score);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_fts_bounded_excludes_eval_source_file_candidates(pool: PgPool) {
+        let clean = insert_test_thought(
+            &pool,
+            "clean retrieval baseline answer marker tcgplayer canonical",
+            "global",
+        )
+        .await;
+        let denied = insert_test_thought_with_metadata(
+            &pool,
+            "retrieval baseline answer marker tcgplayer canonical",
+            "global",
+            Metadata::from(json!({"source_file": "reports/kengram-gold-100-answer-key.md"})),
+        )
+        .await;
+
+        let hits = search_fts_bounded(&pool, "tcgplayer canonical", None, None, 10, 300)
+            .await
+            .unwrap();
+        let hit_ids = hits.iter().map(|hit| hit.thought.id).collect::<Vec<_>>();
+
+        assert!(hit_ids.contains(&clean));
+        assert!(
+            !hit_ids.contains(&denied),
+            "eval/gold source_file rows must be excluded before bounded FTS candidate pooling"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -4146,6 +4274,45 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].thought.id, id_a);
         assert!((hits[0].vector_score.unwrap() - 1.0).abs() < 1e-4);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_vector_knn_excludes_eval_contamination_candidates(pool: PgPool) {
+        let model = EmbeddingModel::new("test:4096", 4096);
+
+        let clean = insert_test_thought(&pool, "clean vector candidate", "global").await;
+        let denied = insert_test_thought(&pool, "KGR024 vector candidate", "global").await;
+
+        let query = unit_vector_4096(0);
+        let clean_vector = unit_vector_4096(1);
+
+        insert_thought_embedding(
+            &pool,
+            clean,
+            &Embedding::new(model.clone(), clean_vector).unwrap(),
+        )
+        .await
+        .unwrap();
+        insert_thought_embedding(
+            &pool,
+            denied,
+            &Embedding::new(model.clone(), query.clone()).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        reconcile_ann_projections(&pool, &model).await.unwrap();
+
+        let hits = search_vector_knn(&pool, query, &model, None, None, 10)
+            .await
+            .unwrap();
+        let hit_ids = hits.iter().map(|hit| hit.thought.id).collect::<Vec<_>>();
+
+        assert!(hit_ids.contains(&clean));
+        assert!(
+            !hit_ids.contains(&denied),
+            "KGR-labeled eval rows must be excluded before vector candidate pooling"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]

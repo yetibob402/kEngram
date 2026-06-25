@@ -122,7 +122,7 @@ pub struct SearchThoughtsArgs {
     pub include_profile: Option<bool>,
 
     #[schemars(
-        description = "Optional JSONB-containment filter applied to each thought's `tags` field. Tags are LLM-extracted metadata with shape: { people: string[], entities: string[] (named proper-noun-style identifiers — projects, products, libraries, tools, e.g. \"kengram\", \"pgvector\"), action_items: string[], topics: string[] (1-3 short lowercase subject categories — e.g. \"rust\", \"memory-systems\"), dates_mentioned: string[], kind: 'observation' | 'task' | 'idea' | 'reference' | 'person_note' | 'session' | 'decision_record' | null }. Distinguish `entities` (specific named things mentioned by name) from `topics` (broader subject categories the thought falls under). The `kind` enum is closed at the values listed; the array fields are open-vocabulary strings. Examples: {\"kind\": \"task\"} returns only thoughts the tagger classified as tasks; {\"people\": [\"Sarah\"]} returns thoughts whose people-tag contains Sarah; {\"entities\": [\"kengram\"]} returns thoughts mentioning kengram by name; {\"topics\": [\"rust\"], \"kind\": \"idea\"} combines both (top-level keys AND together; array values are subset-match). Empty object {} is a no-op. Filters compose with `scope` (or `scope_prefix`, whichever is set) via AND. Note: `entities` is LLM-extracted and best-effort — a known structural ceiling on adjectival-vs-name discrimination means the field may include descriptive phrases alongside legitimate names. Treat `tag_filter: {\"entities\": [...]}` as a positive signal rather than a strict membership claim."
+        description = "Optional JSONB-containment filter applied to each thought's `tags` field. Tags are LLM-extracted metadata with shape: { people: string[], entities: string[] (named proper-noun-style identifiers — projects, products, libraries, tools, e.g. \"kengram\", \"pgvector\"), retrieval_aliases: string[] (short advisory query aliases), domain_scope: string | null (normalized advisory routing domain), action_items: string[], topics: string[] (1-3 short lowercase subject categories — e.g. \"rust\", \"memory-systems\"), dates_mentioned: string[], kind: 'observation' | 'task' | 'idea' | 'reference' | 'person_note' | 'session' | 'decision_record' | null }. Distinguish `entities` (specific named things mentioned by name) from `topics` (broader subject categories the thought falls under). The `kind` enum is closed at the values listed; the array fields are open-vocabulary strings. Examples: {\"kind\": \"task\"} returns only thoughts the tagger classified as tasks; {\"people\": [\"Sarah\"]} returns thoughts whose people-tag contains Sarah; {\"entities\": [\"kengram\"]} returns thoughts mentioning kengram by name; {\"topics\": [\"rust\"], \"kind\": \"idea\"} combines both (top-level keys AND together; array values are subset-match). Empty object {} is a no-op. Filters compose with `scope` (or `scope_prefix`, whichever is set) via AND. Note: `entities`, `retrieval_aliases`, and `domain_scope` are LLM-extracted/advisory and best-effort unless explicitly supplied by metadata."
     )]
     // Map<String, Value> rather than Value: ensures the JSON schema renders
     // with a concrete `type: "object"` instead of (no type). claude.ai's MCP
@@ -276,6 +276,11 @@ pub struct KengramServer {
     /// Default-off gate for chunk-aware serving. Set by config/env at server
     /// startup; not exposed as a per-call MCP argument.
     chunk_serving_enabled: bool,
+    /// Master default-off gate for the composed full retrieval pipeline.
+    full_pipeline_enabled: bool,
+    /// Effective tag/domain routing gate. The CLI config only passes true
+    /// when both `full_pipeline_enabled` and the subordinate routing flag are true.
+    tag_domain_routing_enabled: bool,
     tool_router: ToolRouter<Self>,
 }
 
@@ -286,6 +291,8 @@ impl KengramServer {
         reranker: Option<Arc<dyn Reranker>>,
         tagger_model_id: Option<String>,
         chunk_serving_enabled: bool,
+        full_pipeline_enabled: bool,
+        tag_domain_routing_enabled: bool,
     ) -> Self {
         Self {
             pool,
@@ -293,6 +300,8 @@ impl KengramServer {
             reranker,
             tagger_model_id,
             chunk_serving_enabled,
+            full_pipeline_enabled,
+            tag_domain_routing_enabled,
             tool_router: Self::tool_router(),
         }
     }
@@ -300,7 +309,7 @@ impl KengramServer {
     /// Convenience for tests that don't exercise the rerank stage or tagger.
     #[cfg(test)]
     pub fn new_without_reranker(pool: PgPool, embedder: Arc<dyn Embedder>) -> Self {
-        Self::new(pool, embedder, None, None, false)
+        Self::new(pool, embedder, None, None, false, false, false)
     }
 }
 
@@ -310,6 +319,11 @@ impl std::fmt::Debug for KengramServer {
             .field("model_id", &self.embedder.model().id)
             .field("tagger_model_id", &self.tagger_model_id)
             .field("chunk_serving_enabled", &self.chunk_serving_enabled)
+            .field("full_pipeline_enabled", &self.full_pipeline_enabled)
+            .field(
+                "tag_domain_routing_enabled",
+                &self.tag_domain_routing_enabled,
+            )
             .finish()
     }
 }
@@ -402,6 +416,8 @@ impl KengramServer {
             rerank: args.rerank,
             candidate_pool: args.candidate_pool,
             chunk_serving_enabled: self.chunk_serving_enabled,
+            full_pipeline_enabled: self.full_pipeline_enabled,
+            tag_domain_routing_enabled: self.tag_domain_routing_enabled,
             include_profile: args.include_profile.unwrap_or(false),
             // Map<String, Value> on the wire → Value::Object for the
             // orchestrator's filter logic. Keeps the schema concrete (so
@@ -419,8 +435,12 @@ impl KengramServer {
         .await
         .map_err(map_read_error)?;
 
-        serde_json::to_string(&search_response_json(&resp, self.chunk_serving_enabled))
-            .map_err(|e| format!("response serialization error: {e}"))
+        serde_json::to_string(&search_response_json(
+            &resp,
+            self.chunk_serving_enabled,
+            self.full_pipeline_enabled,
+        ))
+        .map_err(|e| format!("response serialization error: {e}"))
     }
 
     #[tool(
@@ -806,11 +826,19 @@ fn related_thoughts_response_json(
 fn search_response_json(
     resp: &SearchResponse,
     include_chunk_provenance: bool,
+    include_full_pipeline_tags: bool,
 ) -> serde_json::Value {
     let results: Vec<serde_json::Value> = resp
         .results
         .iter()
         .map(|h| {
+            let mut tags = serde_json::to_value(&h.tags).unwrap_or_else(|_| serde_json::json!({}));
+            if !include_full_pipeline_tags {
+                if let Some(obj) = tags.as_object_mut() {
+                    obj.remove("retrieval_aliases");
+                    obj.remove("domain_scope");
+                }
+            }
             let mut hit = serde_json::json!({
                 "thought_id": h.thought_id.to_string(),
                 "content": h.content,
@@ -818,7 +846,7 @@ fn search_response_json(
                 "source": h.source.as_str(),
                 "created_at": h.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
                 "metadata": h.metadata.as_value(),
-                "tags": h.tags,
+                "tags": tags,
                 "vector_score": h.vector_score,
                 "lexical_score": h.lexical_score,
                 "trigram_score": h.trigram_score,
@@ -1009,7 +1037,9 @@ Storage model: thoughts are the unit. Each thought has:
 - tags: LLM-extracted metadata sidecar (advisory; advisory means consumers may filter or de-emphasize, but tags don't gate retrieval).
 
 `tags` shape (auto-extracted by the tagger, distinct from `metadata`):
-  { people: string[], entities: string[], action_items: string[], topics: string[] (1-3 short lowercase tags),
+  { people: string[], entities: string[], retrieval_aliases: string[],
+    domain_scope: string | null,
+    action_items: string[], topics: string[] (1-3 short lowercase tags),
     dates_mentioned: string[],
     kind: 'observation' | 'task' | 'idea' | 'reference' | 'person_note' | 'session' | 'decision_record' | null }
 `entities` (proper-noun-style identifiers — projects, products, libraries, tools mentioned by name, e.g. \"kengram\", \"pgvector\") is distinct from `topics` (broader subject categories the thought falls under, e.g. \"memory-systems\", \"databases\"). The `kind` enum is closed at those six values (plus null). Array fields are open-vocabulary strings.
@@ -1048,7 +1078,15 @@ mod tests {
     }
 
     fn server(pool: PgPool) -> KengramServer {
-        KengramServer::new(pool, Arc::new(test_embedder()), None, None, false)
+        KengramServer::new(
+            pool,
+            Arc::new(test_embedder()),
+            None,
+            None,
+            false,
+            false,
+            false,
+        )
     }
 
     /// Regression pin: the server-level instructions surface the `tags`
@@ -1121,6 +1159,8 @@ mod tests {
             s.contains("entities"),
             "instructions should name the `entities` field"
         );
+        assert!(s.contains("retrieval_aliases"));
+        assert!(s.contains("domain_scope"));
         assert!(s.contains("action_items"));
         assert!(s.contains("topics"));
         assert!(s.contains("dates_mentioned"));
@@ -1207,6 +1247,8 @@ mod tests {
             None,
             Some("fake/tagger".to_string()),
             false,
+            false,
+            false,
         )
     }
 
@@ -1249,7 +1291,7 @@ mod tests {
 
     #[test]
     fn search_response_json_omits_chunk_keys_when_flag_off_without_chunk_hit() {
-        let json = search_response_json(&search_json_response(), false);
+        let json = search_response_json(&search_json_response(), false, false);
         let hit = json["results"][0].as_object().unwrap();
         for key in [
             "chunk_id",
@@ -1273,7 +1315,7 @@ mod tests {
 
     #[test]
     fn search_response_json_includes_chunk_keys_when_flag_on() {
-        let json = search_response_json(&search_json_response(), true);
+        let json = search_response_json(&search_json_response(), true, false);
         let hit = json["results"][0].as_object().unwrap();
         for key in [
             "chunk_id",
@@ -1294,6 +1336,30 @@ mod tests {
             );
         }
         assert!(hit["chunk_id"].is_null());
+    }
+
+    #[test]
+    fn search_response_json_omits_full_pipeline_tag_keys_when_flag_off() {
+        let mut resp = search_json_response();
+        resp.results[0].tags.retrieval_aliases = vec!["memory search".to_string()];
+        resp.results[0].tags.domain_scope = Some("infra".to_string());
+
+        let json = search_response_json(&resp, false, false);
+        let tags = json["results"][0]["tags"].as_object().unwrap();
+        assert!(!tags.contains_key("retrieval_aliases"));
+        assert!(!tags.contains_key("domain_scope"));
+    }
+
+    #[test]
+    fn search_response_json_includes_full_pipeline_tag_keys_when_flag_on() {
+        let mut resp = search_json_response();
+        resp.results[0].tags.retrieval_aliases = vec!["memory search".to_string()];
+        resp.results[0].tags.domain_scope = Some("infra".to_string());
+
+        let json = search_response_json(&resp, false, true);
+        let tags = json["results"][0]["tags"].as_object().unwrap();
+        assert_eq!(tags["retrieval_aliases"], serde_json::json!(["memory search"]));
+        assert_eq!(tags["domain_scope"], serde_json::json!("infra"));
     }
 
     #[sqlx::test(migrations = "../../migrations")]

@@ -38,6 +38,18 @@ pub struct SearchConfig {
     /// `search_thoughts`. Enable only on scratch/shadow endpoints until eval
     /// and adversarial review pass.
     pub chunk_serving_enabled: bool,
+    /// Master gate for the composed full retrieval pipeline. When false, all
+    /// subordinate experimental/default-retrieval legs must be ineffective.
+    pub full_pipeline_enabled: bool,
+    /// Subordinate gate for inferred tag/domain routing. Takes effect only
+    /// when `full_pipeline_enabled` is also true.
+    pub tag_domain_routing_enabled: bool,
+}
+
+impl SearchConfig {
+    pub fn tag_domain_routing_effective(&self) -> bool {
+        self.full_pipeline_enabled && self.tag_domain_routing_enabled
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -423,6 +435,49 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.worker.tick_interval_seconds, 5);
         assert_eq!(c.worker.batch_size, 16);
+    }
+
+    #[test]
+    fn default_search_flags_are_off() {
+        let c = Config::default();
+        assert!(!c.search.chunk_serving_enabled);
+        assert!(!c.search.full_pipeline_enabled);
+        assert!(!c.search.tag_domain_routing_enabled);
+        assert!(!c.search.tag_domain_routing_effective());
+    }
+
+    #[test]
+    fn tag_domain_routing_requires_full_pipeline_master_gate() {
+        let toml = r#"
+            [search]
+            full_pipeline_enabled = false
+            tag_domain_routing_enabled = true
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert!(!c.search.full_pipeline_enabled);
+        assert!(c.search.tag_domain_routing_enabled);
+        assert!(!c.search.tag_domain_routing_effective());
+    }
+
+    #[test]
+    fn tag_domain_routing_effective_when_both_gates_true() {
+        let toml = r#"
+            [search]
+            full_pipeline_enabled = true
+            tag_domain_routing_enabled = true
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert!(c.search.full_pipeline_enabled);
+        assert!(c.search.tag_domain_routing_enabled);
+        assert!(c.search.tag_domain_routing_effective());
     }
 
     /// M4: tagger defaults to silent-disabled (empty `provider`). The

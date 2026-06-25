@@ -29,5 +29,9 @@ pub use search::{
 };
 pub use source::{Source, SourceError};
 pub use tagger::{ExtractedRelation, ExtractedTarget, TagOutput, Tagger, TaggerError};
-pub use tags::{ScopeVocab, TagKind, Tags};
+pub use tags::{
+    MAX_RETRIEVAL_ALIAS_LEN, MAX_RETRIEVAL_ALIASES, ScopeVocab, TagKind, Tags,
+    apply_metadata_domain_override, normalize_domain_scope, normalize_retrieval_alias,
+    normalize_retrieval_aliases, normalize_routing_fields,
+};
 pub use thought::{Thought, ThoughtId};

@@ -189,6 +189,7 @@ mod tests {
             topics: vec!["rust".to_string()],
             dates_mentioned: vec!["next Thursday".to_string()],
             kind: Some(TagKind::Task),
+            ..Default::default()
         }
     }
 

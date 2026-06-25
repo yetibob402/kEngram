@@ -528,6 +528,7 @@ mod tests {
             topics: v(&["release-process"]),
             dates_mentioned: v(&["Thursday"]),
             kind: Some(TagKind::Task),
+            ..Default::default()
         };
         let predicted = Tags {
             people: v(&["sarah"]),                           // norm match
@@ -536,6 +537,7 @@ mod tests {
             topics: v(&[]),                                  // 1 FN
             dates_mentioned: v(&["thursday"]),               // match
             kind: Some(TagKind::Task),
+            ..Default::default()
         };
         let s = score_tags(&predicted, &golden);
         assert_eq!((s.people.tp, s.people.fp, s.people.fn_count), (1, 0, 0));

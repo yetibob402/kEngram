@@ -9,7 +9,9 @@
 //! is also where the v14 model-agnostic filters live, so they apply to every
 //! tagger backend rather than only the LLM prompt.
 
-use kengram_core::{Metadata, Scope, ScopeVocab, Tags};
+use kengram_core::{
+    Metadata, Scope, ScopeVocab, Tags, apply_metadata_domain_override, normalize_routing_fields,
+};
 
 /// Apply the deterministic post-tag pipeline in one place.
 ///
@@ -20,6 +22,7 @@ use kengram_core::{Metadata, Scope, ScopeVocab, Tags};
 /// 3. scope-identifier stripping from entities/people (v14)
 /// 4. relationship-noun stripping from people (v14)
 /// 5. `metadata.decision_type` → `decision_record` kind override (v14)
+/// 6. retrieval alias/domain normalization and metadata domain override
 ///
 /// `known_scopes` is the corpus's set of scope strings (from
 /// `kengram_storage::list_scopes`), fetched once per batch by the caller.
@@ -39,6 +42,8 @@ pub fn finalize_tags(
     crate::filters::strip_scope_identifiers(tags, own_scope, known_scopes);
     crate::filters::strip_relationship_nouns(tags);
     crate::filters::apply_decision_type_override(tags, metadata);
+    normalize_routing_fields(tags);
+    apply_metadata_domain_override(tags, metadata);
 }
 
 #[cfg(test)]
@@ -124,5 +129,27 @@ mod tests {
         assert_eq!(t.people, vec!["Ron".to_string()]);
         assert_eq!(t.entities, vec!["pgvector".to_string()]);
         assert_eq!(t.kind, Some(TagKind::DecisionRecord));
+    }
+
+    #[test]
+    fn normalizes_routing_fields_and_metadata_domain_override() {
+        let mut t = Tags {
+            retrieval_aliases: vec![
+                "  Memory Search  ".to_string(),
+                "memory search".to_string(),
+                "/api/search".to_string(),
+            ],
+            domain_scope: Some("agents/knox".to_string()),
+            ..Default::default()
+        };
+        finalize_tags(
+            &mut t,
+            &Metadata::from(json!({"project": "MLA A360"})),
+            &scope("work"),
+            None,
+            &[],
+        );
+        assert_eq!(t.retrieval_aliases, vec!["Memory Search".to_string()]);
+        assert_eq!(t.domain_scope.as_deref(), Some("apps/mla-a360"));
     }
 }

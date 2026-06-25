@@ -1377,6 +1377,197 @@ pub async fn search_fts_bounded(
         .collect()
 }
 
+/// Soft domain routing leg for the full-pipeline canary path. This never
+/// filters baseline candidates; callers fuse it with dense/FTS legs via RRF.
+pub async fn search_domain_scope_aliases_bounded(
+    pool: &PgPool,
+    domains: &[String],
+    scope: Option<&str>,
+    scope_prefix: Option<&str>,
+    limit: i64,
+    timeout_ms: u64,
+) -> Result<Vec<Hit>, StorageError> {
+    if domains.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut tx = pool.begin().await?;
+    if let Err(e) = set_statement_timeout(&mut tx, timeout_ms).await {
+        if let Err(rollback_err) = tx.rollback().await {
+            tracing::warn!(
+                error = %rollback_err,
+                "failed to roll back bounded domain-scope transaction after statement_timeout setup error",
+            );
+        }
+        return Err(e.into());
+    }
+
+    let rows = match sqlx::query_as::<_, LexicalSearchRow>(
+        r#"
+        SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
+               t.content_fingerprint, t.tags,
+               t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at,
+               GREATEST(COALESCE(MAX(tsa.confidence), 0.0), 0.5)::real AS rank
+        FROM thoughts t
+        LEFT JOIN thought_scope_aliases tsa
+          ON tsa.thought_id = t.id
+         AND tsa.axis = 'domain'
+         AND tsa.retracted_at IS NULL
+         AND tsa.scope = ANY($1::text[])
+        WHERE t.retracted_at IS NULL
+          AND ($2::text IS NULL OR t.scope = $2)
+          AND ($3::text IS NULL OR t.scope LIKE $3 || '%')
+          AND (
+              tsa.thought_id IS NOT NULL
+              OR (
+                  jsonb_typeof(t.tags->'domain_scope') = 'string'
+                  AND t.tags->>'domain_scope' = ANY($1::text[])
+              )
+          )
+          AND t.id <> ALL($5::uuid[])
+          AND lower(coalesce(t.metadata->>'source_file', '')) !~ $6
+          AND t.content !~ $7
+        GROUP BY t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
+                 t.content_fingerprint, t.tags,
+                 t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at
+        ORDER BY rank DESC, t.created_at DESC
+        LIMIT $4
+        "#,
+    )
+    .bind(domains)
+    .bind(scope)
+    .bind(scope_prefix)
+    .bind(limit)
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .fetch_all(&mut *tx)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            if let Err(rollback_err) = tx.rollback().await {
+                tracing::warn!(
+                    error = %rollback_err,
+                    "failed to roll back bounded domain-scope transaction after query error",
+                );
+            }
+            return Err(e.into());
+        }
+    };
+    tx.commit().await?;
+    lexical_rows_to_hits(rows)
+}
+
+/// Soft tag/retrieval-alias leg for the full-pipeline canary path.
+pub async fn search_tag_facets_bounded(
+    pool: &PgPool,
+    terms: &[String],
+    scope: Option<&str>,
+    scope_prefix: Option<&str>,
+    limit: i64,
+    timeout_ms: u64,
+) -> Result<Vec<Hit>, StorageError> {
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut tx = pool.begin().await?;
+    if let Err(e) = set_statement_timeout(&mut tx, timeout_ms).await {
+        if let Err(rollback_err) = tx.rollback().await {
+            tracing::warn!(
+                error = %rollback_err,
+                "failed to roll back bounded tag-facet transaction after statement_timeout setup error",
+            );
+        }
+        return Err(e.into());
+    }
+
+    let rows = match sqlx::query_as::<_, LexicalSearchRow>(
+        r#"
+        WITH wanted AS (
+            SELECT lower(unnest($1::text[])) AS term
+        ),
+        matched AS (
+            SELECT t.id, count(*)::real AS rank
+            FROM thoughts t
+            JOIN wanted w ON
+                EXISTS (
+                    SELECT 1 FROM jsonb_array_elements_text(
+                        CASE WHEN jsonb_typeof(t.tags->'retrieval_aliases') = 'array'
+                             THEN t.tags->'retrieval_aliases'
+                             ELSE '[]'::jsonb END
+                    ) AS alias(value)
+                    WHERE lower(alias.value) = w.term
+                )
+                OR EXISTS (
+                    SELECT 1 FROM jsonb_array_elements_text(
+                        CASE WHEN jsonb_typeof(t.tags->'topics') = 'array'
+                             THEN t.tags->'topics'
+                             ELSE '[]'::jsonb END
+                    ) AS topic(value)
+                    WHERE lower(topic.value) = w.term
+                )
+                OR EXISTS (
+                    SELECT 1 FROM jsonb_array_elements_text(
+                        CASE WHEN jsonb_typeof(t.tags->'entities') = 'array'
+                             THEN t.tags->'entities'
+                             ELSE '[]'::jsonb END
+                    ) AS entity(value)
+                    WHERE lower(entity.value) = w.term
+                )
+                OR EXISTS (
+                    SELECT 1 FROM jsonb_array_elements_text(
+                        CASE WHEN jsonb_typeof(t.tags->'people') = 'array'
+                             THEN t.tags->'people'
+                             ELSE '[]'::jsonb END
+                    ) AS person(value)
+                    WHERE lower(person.value) = w.term
+                )
+                OR lower(t.tags->>'kind') = w.term
+            WHERE t.retracted_at IS NULL
+              AND ($2::text IS NULL OR t.scope = $2)
+              AND ($3::text IS NULL OR t.scope LIKE $3 || '%')
+              AND t.id <> ALL($5::uuid[])
+              AND lower(coalesce(t.metadata->>'source_file', '')) !~ $6
+              AND t.content !~ $7
+            GROUP BY t.id
+        )
+        SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
+               t.content_fingerprint, t.tags,
+               t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at,
+               matched.rank AS rank
+        FROM matched
+        JOIN thoughts t ON t.id = matched.id
+        ORDER BY matched.rank DESC, t.created_at DESC
+        LIMIT $4
+        "#,
+    )
+    .bind(terms)
+    .bind(scope)
+    .bind(scope_prefix)
+    .bind(limit)
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .fetch_all(&mut *tx)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            if let Err(rollback_err) = tx.rollback().await {
+                tracing::warn!(
+                    error = %rollback_err,
+                    "failed to roll back bounded tag-facet transaction after query error",
+                );
+            }
+            return Err(e.into());
+        }
+    };
+    tx.commit().await?;
+    lexical_rows_to_hits(rows)
+}
+
 /// FTS lexical search over artifact chunks. Each result resolves to the
 /// source parent thought and carries the best matching chunk as provenance.
 pub async fn search_artifact_chunks_fts_bounded(
@@ -3342,6 +3533,22 @@ struct ThoughtRow {
     tags_extracted_at: Option<OffsetDateTime>,
 }
 
+#[derive(sqlx::FromRow)]
+struct LexicalSearchRow {
+    id: Uuid,
+    scope: String,
+    content: String,
+    source: String,
+    created_at: OffsetDateTime,
+    metadata: serde_json::Value,
+    content_fingerprint: Vec<u8>,
+    tags: serde_json::Value,
+    tags_extractor_model: Option<String>,
+    tags_extractor_version: Option<i32>,
+    tags_extracted_at: Option<OffsetDateTime>,
+    rank: f32,
+}
+
 fn thought_row_to_thought(r: ThoughtRow) -> Result<Thought, StorageError> {
     Ok(Thought {
         id: ThoughtId::from(r.id),
@@ -3356,6 +3563,27 @@ fn thought_row_to_thought(r: ThoughtRow) -> Result<Thought, StorageError> {
         tags_extractor_version: r.tags_extractor_version,
         tags_extracted_at: r.tags_extracted_at,
     })
+}
+
+fn lexical_rows_to_hits(rows: Vec<LexicalSearchRow>) -> Result<Vec<Hit>, StorageError> {
+    rows.into_iter()
+        .map(|r| {
+            let thought = Thought {
+                id: ThoughtId::from(r.id),
+                scope: Scope::new(r.scope)?,
+                content: r.content,
+                source: Source::new(r.source)?,
+                created_at: r.created_at,
+                metadata: Metadata::from(r.metadata),
+                content_fingerprint: fingerprint_from_bytes(r.content_fingerprint)?,
+                tags: tags_from_value(r.tags)?,
+                tags_extractor_model: r.tags_extractor_model,
+                tags_extractor_version: r.tags_extractor_version,
+                tags_extracted_at: r.tags_extracted_at,
+            };
+            Ok(Hit::from_lexical_leg(thought, r.rank))
+        })
+        .collect()
 }
 
 // -- M6.0: corpus stats (operator-facing telemetry) ---------------------
@@ -4884,6 +5112,7 @@ mod tests {
             topics: vec!["meetings".into()],
             dates_mentioned: vec!["Thursday".into()],
             kind: Some(TagKind::Task),
+            ..Default::default()
         };
         update_thought_tags(&pool, id, &tags, "vllm/qwen3-coder:30b", 1)
             .await

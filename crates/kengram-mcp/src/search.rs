@@ -20,7 +20,8 @@
 
 use kengram_core::{
     DEFAULT_RECENCY_HALF_LIFE_DAYS, DEFAULT_RRF_K, Embedder, EmbeddingModel, EmbeddingStatus, Hit,
-    Metadata, Scope, Source, Tags, Thought, ThoughtId, recency_boost, rrf_fuse,
+    Metadata, Scope, Source, Tags, Thought, ThoughtId, normalize_domain_scope,
+    normalize_retrieval_alias, recency_boost, rrf_fuse,
 };
 use kengram_embed::{RerankScore, Reranker, RerankerError};
 use sqlx::PgPool;
@@ -63,6 +64,11 @@ pub struct SearchRequest {
     /// Enables chunk dense + chunk FTS retrieval legs when the server config
     /// explicitly opts in. Defaults to false at the config/server layer.
     pub chunk_serving_enabled: bool,
+    /// Master default-off gate for the composed full retrieval pipeline.
+    pub full_pipeline_enabled: bool,
+    /// Effective tag/domain routing gate supplied by server config. This must
+    /// remain false when `full_pipeline_enabled` is false.
+    pub tag_domain_routing_enabled: bool,
     /// Include per-stage latency diagnostics in the response. Defaults false
     /// so normal MCP callers do not receive internal timing metadata.
     pub include_profile: bool,
@@ -133,17 +139,26 @@ pub struct SearchProfile {
     pub thought_fts_ms: f64,
     pub chunk_fts_ms: f64,
     pub chunk_pairwise_fts_ms: f64,
+    pub domain_scope_ms: f64,
+    pub tag_facet_ms: f64,
     pub rrf_fusion_ms: f64,
     pub tag_filter_ms: f64,
     pub rerank_ms: f64,
     pub result_projection_ms: f64,
     pub parent_resolution_ms: f64,
     pub parent_resolution_mode: &'static str,
+    pub full_pipeline_enabled: bool,
+    pub tag_domain_routing_enabled: bool,
+    pub planner_route: &'static str,
+    pub planner_inferred_domains: Vec<String>,
+    pub planner_tag_terms: Vec<String>,
     pub thought_vector_hits: usize,
     pub chunk_vector_hits: usize,
     pub thought_fts_hits: usize,
     pub chunk_fts_hits: usize,
     pub chunk_pairwise_fts_hits: usize,
+    pub domain_scope_hits: usize,
+    pub tag_facet_hits: usize,
     pub chunk_pairwise_subqueries: usize,
     pub fused_hit_count: usize,
     pub rerank_candidate_count: usize,
@@ -270,6 +285,15 @@ async fn search_thoughts_with_tuning(
     let scope_filter = request.scope.as_ref().map(Scope::as_str);
     let scope_prefix_filter = request.scope_prefix.as_deref();
     let chunk_serving_enabled = request.chunk_serving_enabled;
+    let tag_domain_routing_enabled =
+        request.full_pipeline_enabled && request.tag_domain_routing_enabled;
+    profile.full_pipeline_enabled = request.full_pipeline_enabled;
+    profile.tag_domain_routing_enabled = tag_domain_routing_enabled;
+    profile.planner_route = if tag_domain_routing_enabled {
+        "tag_domain_routing_v0"
+    } else {
+        "baseline"
+    };
 
     // Vector leg (soft-fail to empty + flag).
     let embedding_started = Instant::now();
@@ -396,6 +420,40 @@ async fn search_thoughts_with_tuning(
     };
     profile.chunk_pairwise_fts_hits = chunk_pairwise_lexical_hits.len();
 
+    let (domain_scope_hits, tag_facet_hits) = if tag_domain_routing_enabled {
+        profile.planner_inferred_domains = domain_candidates(&query);
+        profile.planner_tag_terms = tag_facet_terms(&query);
+
+        let domain_started = Instant::now();
+        let domain_hits = bounded_domain_scope_hits(
+            pool,
+            &profile.planner_inferred_domains,
+            scope_filter,
+            scope_prefix_filter,
+            lexical_top_k,
+            lexical_timeout_ms,
+        )
+        .await;
+        profile.domain_scope_ms = elapsed_ms(domain_started);
+        profile.domain_scope_hits = domain_hits.len();
+
+        let tag_started = Instant::now();
+        let tag_hits = bounded_tag_facet_hits(
+            pool,
+            &profile.planner_tag_terms,
+            scope_filter,
+            scope_prefix_filter,
+            lexical_top_k,
+            lexical_timeout_ms,
+        )
+        .await;
+        profile.tag_facet_ms = elapsed_ms(tag_started);
+        profile.tag_facet_hits = tag_hits.len();
+        (domain_hits, tag_hits)
+    } else {
+        (vec![], vec![])
+    };
+
     // RRF fuse → recency boost.
     let rrf_started = Instant::now();
     let mut rankings = vec![vector_hits, lexical_hits];
@@ -403,6 +461,10 @@ async fn search_thoughts_with_tuning(
         rankings.push(chunk_vector_hits);
         rankings.push(chunk_lexical_hits);
         rankings.push(chunk_pairwise_lexical_hits);
+    }
+    if tag_domain_routing_enabled {
+        rankings.push(domain_scope_hits);
+        rankings.push(tag_facet_hits);
     }
     let mut fused = rrf_fuse(rankings, DEFAULT_RRF_K);
     let half_life = request
@@ -539,6 +601,68 @@ async fn bounded_fts_hits(
     }
 }
 
+async fn bounded_domain_scope_hits(
+    pool: &PgPool,
+    domains: &[String],
+    scope_filter: Option<&str>,
+    scope_prefix_filter: Option<&str>,
+    lexical_top_k: usize,
+    lexical_timeout_ms: u64,
+) -> Vec<Hit> {
+    match kengram_storage::search_domain_scope_aliases_bounded(
+        pool,
+        domains,
+        scope_filter,
+        scope_prefix_filter,
+        lexical_top_k as i64,
+        lexical_timeout_ms,
+    )
+    .await
+    {
+        Ok(hits) => hits,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                query_canceled = e.is_query_canceled(),
+                timeout_ms = lexical_timeout_ms,
+                "bounded domain-scope candidate leg failed; continuing with baseline search legs",
+            );
+            vec![]
+        }
+    }
+}
+
+async fn bounded_tag_facet_hits(
+    pool: &PgPool,
+    terms: &[String],
+    scope_filter: Option<&str>,
+    scope_prefix_filter: Option<&str>,
+    lexical_top_k: usize,
+    lexical_timeout_ms: u64,
+) -> Vec<Hit> {
+    match kengram_storage::search_tag_facets_bounded(
+        pool,
+        terms,
+        scope_filter,
+        scope_prefix_filter,
+        lexical_top_k as i64,
+        lexical_timeout_ms,
+    )
+    .await
+    {
+        Ok(hits) => hits,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                query_canceled = e.is_query_canceled(),
+                timeout_ms = lexical_timeout_ms,
+                "bounded tag-facet candidate leg failed; continuing with baseline search legs",
+            );
+            vec![]
+        }
+    }
+}
+
 async fn bounded_artifact_chunk_fts_hits(
     pool: &PgPool,
     query: &str,
@@ -631,6 +755,28 @@ fn pairwise_subqueries(query: &str) -> Vec<String> {
         }
     }
     dedupe_lowercase_limited(pairs, PAIRWISE_MAX_SUBQUERIES)
+}
+
+fn domain_candidates(query: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(domain) = normalize_domain_scope(query) {
+        candidates.push(domain);
+    }
+    for term in lexical_terms(query) {
+        if let Some(domain) = normalize_domain_scope(&term) {
+            candidates.push(domain);
+        }
+    }
+    dedupe_lowercase_limited(candidates, 8)
+}
+
+fn tag_facet_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    if let Some(alias) = normalize_retrieval_alias(query) {
+        terms.push(alias);
+    }
+    terms.extend(lexical_terms(query));
+    dedupe_lowercase_limited(terms, 16)
 }
 
 fn lexical_terms(query: &str) -> Vec<String> {
@@ -1294,6 +1440,8 @@ mod tests {
                 candidate_pool: None,
                 tag_filter: None,
                 chunk_serving_enabled: false,
+                full_pipeline_enabled: false,
+                tag_domain_routing_enabled: false,
                 include_profile: false,
             },
         )
@@ -1336,6 +1484,8 @@ mod tests {
                 candidate_pool: Some(10),
                 tag_filter: None,
                 chunk_serving_enabled: false,
+                full_pipeline_enabled: false,
+                tag_domain_routing_enabled: false,
                 include_profile: true,
             },
         )
@@ -1389,6 +1539,8 @@ mod tests {
                 candidate_pool: None,
                 tag_filter: None,
                 chunk_serving_enabled: false,
+                full_pipeline_enabled: false,
+                tag_domain_routing_enabled: false,
                 include_profile: false,
             },
         )
@@ -1455,6 +1607,8 @@ mod tests {
             candidate_pool: None,
             tag_filter: None,
             chunk_serving_enabled: false,
+            full_pipeline_enabled: false,
+            tag_domain_routing_enabled: false,
             include_profile: false,
         };
         let off = search_thoughts(&pool, &bad, None, request.clone())
@@ -1520,6 +1674,8 @@ mod tests {
                 candidate_pool: None,
                 tag_filter: None,
                 chunk_serving_enabled: false,
+                full_pipeline_enabled: false,
+                tag_domain_routing_enabled: false,
                 include_profile: false,
             },
             DEFAULT_LEXICAL_TOP_K,
@@ -1557,6 +1713,8 @@ mod tests {
                     candidate_pool: None,
                     tag_filter: None,
                     chunk_serving_enabled: false,
+                    full_pipeline_enabled: false,
+                    tag_domain_routing_enabled: false,
                     include_profile: false,
                 },
             )
@@ -1583,6 +1741,8 @@ mod tests {
                 candidate_pool: None,
                 tag_filter: None,
                 chunk_serving_enabled: false,
+                full_pipeline_enabled: false,
+                tag_domain_routing_enabled: false,
                 include_profile: false,
             },
         )
@@ -1611,6 +1771,8 @@ mod tests {
                 candidate_pool: None,
                 tag_filter: None,
                 chunk_serving_enabled: false,
+                full_pipeline_enabled: false,
+                tag_domain_routing_enabled: false,
                 include_profile: false,
             },
         )
@@ -1716,6 +1878,8 @@ mod tests {
                 candidate_pool: None,
                 tag_filter: Some(serde_json::json!({"kind": "task"})),
                 chunk_serving_enabled: false,
+                full_pipeline_enabled: false,
+                tag_domain_routing_enabled: false,
                 include_profile: false,
             },
         )
@@ -1763,6 +1927,8 @@ mod tests {
                 candidate_pool: None,
                 tag_filter: Some(serde_json::json!({"people": ["Sarah"]})),
                 chunk_serving_enabled: false,
+                full_pipeline_enabled: false,
+                tag_domain_routing_enabled: false,
                 include_profile: false,
             },
         )
@@ -1794,6 +1960,8 @@ mod tests {
                 candidate_pool: None,
                 tag_filter: Some(serde_json::json!({})),
                 chunk_serving_enabled: false,
+                full_pipeline_enabled: false,
+                tag_domain_routing_enabled: false,
                 include_profile: false,
             },
         )
@@ -1801,6 +1969,179 @@ mod tests {
         .unwrap();
 
         assert_eq!(resp.results.len(), 2);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn subordinate_tag_domain_flag_is_ineffective_when_master_gate_off(pool: PgPool) {
+        let embedder = test_embedder();
+        cap(&pool, "pipeline flag keyword alpha", "global").await;
+        cap(&pool, "pipeline flag keyword beta", "global").await;
+
+        let base_request = SearchRequest {
+            query: "pipeline flag keyword".to_string(),
+            scope: None,
+            scope_prefix: None,
+            limit: Some(10),
+            recency_half_life_days: Some(0.0),
+            rerank: Some(false),
+            candidate_pool: None,
+            tag_filter: None,
+            chunk_serving_enabled: false,
+            full_pipeline_enabled: false,
+            tag_domain_routing_enabled: false,
+            include_profile: true,
+        };
+        let mut subordinate_only = base_request.clone();
+        subordinate_only.tag_domain_routing_enabled = true;
+
+        let base = search_thoughts(&pool, &embedder, None, base_request)
+            .await
+            .unwrap();
+        let subordinate = search_thoughts(&pool, &embedder, None, subordinate_only)
+            .await
+            .unwrap();
+        let base_ids: Vec<ThoughtId> = base.results.iter().map(|r| r.thought_id).collect();
+        let subordinate_ids: Vec<ThoughtId> =
+            subordinate.results.iter().map(|r| r.thought_id).collect();
+        assert_eq!(subordinate_ids, base_ids);
+        let profile = subordinate
+            .profile
+            .expect("include_profile should emit profile");
+        assert!(!profile.full_pipeline_enabled);
+        assert!(!profile.tag_domain_routing_enabled);
+        assert_eq!(profile.planner_route, "baseline");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn flag_true_adds_tag_candidates_without_dropping_baseline(pool: PgPool) {
+        let embedder = test_embedder();
+        let baseline_id = cap(&pool, "memory search baseline lexical hit", "global").await;
+        let alias_id = cap_with_tags(
+            &pool,
+            "unrelated body that only matches through tags",
+            Tags {
+                retrieval_aliases: vec!["memory search".to_string()],
+                domain_scope: Some("infra".to_string()),
+                ..Tags::default()
+            },
+        )
+        .await;
+
+        let flag_off = search_thoughts(
+            &pool,
+            &embedder,
+            None,
+            SearchRequest {
+                query: "memory search".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(false),
+                candidate_pool: None,
+                tag_filter: None,
+                chunk_serving_enabled: false,
+                full_pipeline_enabled: false,
+                tag_domain_routing_enabled: false,
+                include_profile: true,
+            },
+        )
+        .await
+        .unwrap();
+        let flag_on = search_thoughts(
+            &pool,
+            &embedder,
+            None,
+            SearchRequest {
+                query: "memory search".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(false),
+                candidate_pool: None,
+                tag_filter: None,
+                chunk_serving_enabled: false,
+                full_pipeline_enabled: true,
+                tag_domain_routing_enabled: true,
+                include_profile: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let flag_off_ids: Vec<ThoughtId> = flag_off.results.iter().map(|r| r.thought_id).collect();
+        let flag_on_ids: Vec<ThoughtId> = flag_on.results.iter().map(|r| r.thought_id).collect();
+        assert!(flag_off_ids.contains(&baseline_id));
+        assert!(!flag_off_ids.contains(&alias_id));
+        assert!(
+            flag_on_ids.contains(&baseline_id),
+            "baseline lexical hit must not be dropped by soft tag/domain routing"
+        );
+        assert!(flag_on_ids.contains(&alias_id));
+        let profile = flag_on
+            .profile
+            .expect("include_profile should emit profile");
+        assert!(profile.full_pipeline_enabled);
+        assert!(profile.tag_domain_routing_enabled);
+        assert_eq!(profile.planner_route, "tag_domain_routing_v0");
+        assert!(profile.tag_facet_hits >= 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn thought_scope_aliases_prevent_duplicate_active_aliases(pool: PgPool) {
+        let id = cap(&pool, "alias duplicate guard", "global").await;
+        let alias_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO thought_scope_aliases
+                (id, thought_id, axis, scope, confidence, source, evidence)
+            VALUES
+                ($1, $2, 'domain', 'infra', 1.0, 'test', '{}'::jsonb)
+            "#,
+        )
+        .bind(alias_id)
+        .bind(id.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let duplicate = sqlx::query(
+            r#"
+            INSERT INTO thought_scope_aliases
+                (id, thought_id, axis, scope, confidence, source, evidence)
+            VALUES
+                ($1, $2, 'domain', 'infra', 1.0, 'test', '{}'::jsonb)
+            "#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(id.0)
+        .execute(&pool)
+        .await;
+        assert!(
+            duplicate.is_err(),
+            "active partial unique index must reject duplicate active aliases"
+        );
+
+        sqlx::query("UPDATE thought_scope_aliases SET retracted_at = now() WHERE id = $1")
+            .bind(alias_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO thought_scope_aliases
+                (id, thought_id, axis, scope, confidence, source, evidence)
+            VALUES
+                ($1, $2, 'domain', 'infra', 1.0, 'test', '{}'::jsonb)
+            "#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(id.0)
+        .execute(&pool)
+        .await
+        .unwrap();
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -1830,6 +2171,8 @@ mod tests {
                 candidate_pool: None,
                 tag_filter: None,
                 chunk_serving_enabled: false,
+                full_pipeline_enabled: false,
+                tag_domain_routing_enabled: false,
                 include_profile: false,
             },
         )

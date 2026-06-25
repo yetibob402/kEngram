@@ -1639,6 +1639,7 @@ pub async fn search_artifact_chunks_fts_bounded(
               AND t.id <> ALL($5::uuid[])
               AND lower(coalesce(t.metadata->>'source_file', '')) !~ $6
               AND t.content !~ $7
+              AND ac.content !~ $7
             ORDER BY ts_rank_cd(to_tsvector('english', ac.content), fts.tsq) DESC,
                      t.created_at DESC,
                      ac.chunk_index ASC
@@ -3036,6 +3037,7 @@ pub async fn search_artifact_chunks_vector_knn(
               AND t.id <> ALL($7::uuid[])
               AND lower(coalesce(t.metadata->>'source_file', '')) !~ $8
               AND t.content !~ $9
+              AND ac.content !~ $9
             ORDER BY b.embedding <=> $1::vector(1024)
             LIMIT GREATEST($6, $6 * 8)
         ),
@@ -4198,6 +4200,51 @@ mod tests {
         inserted.id
     }
 
+    async fn insert_test_chunk(pool: &PgPool, parent_id: ThoughtId, content: &str) -> Uuid {
+        let artifact_id = Uuid::new_v4();
+        let chunk_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (id, scope, kind, title, metadata)
+            VALUES ($1, 'global', 'thought_chunks', 'test artifact', '{}')
+            "#,
+        )
+        .bind(artifact_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO artifact_chunks (
+                id,
+                artifact_id,
+                source_thought_id,
+                chunk_index,
+                content,
+                content_fingerprint,
+                chunker_id,
+                chunker_version,
+                token_estimate,
+                start_char,
+                end_char,
+                metadata
+            )
+            VALUES ($1,$2,$3,0,$4,$5,'test-chunker',1,6,0,$6,'{"fixture":true}')
+            "#,
+        )
+        .bind(chunk_id)
+        .bind(artifact_id)
+        .bind(parent_id.into_uuid())
+        .bind(content)
+        .bind(sha256_of(content).to_vec())
+        .bind(content.len() as i32)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        chunk_id
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn recent_thoughts_newest_first(pool: PgPool) {
         let _a = insert_test_thought(&pool, "first", "global").await;
@@ -4408,6 +4455,36 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
+    async fn artifact_chunk_fts_excludes_eval_contamination_in_chunk_content(pool: PgPool) {
+        let clean = insert_test_thought(&pool, "clean parent row", "global").await;
+        let denied = insert_test_thought(&pool, "also clean parent row", "global").await;
+        insert_test_chunk(
+            &pool,
+            clean,
+            "clean answer marker tcgplayer canonical chunk body",
+        )
+        .await;
+        insert_test_chunk(
+            &pool,
+            denied,
+            "KGR024 answer marker tcgplayer canonical chunk body",
+        )
+        .await;
+
+        let hits =
+            search_artifact_chunks_fts_bounded(&pool, "tcgplayer canonical", None, None, 10, 300)
+                .await
+                .unwrap();
+        let hit_ids = hits.iter().map(|hit| hit.thought.id).collect::<Vec<_>>();
+
+        assert!(hit_ids.contains(&clean));
+        assert!(
+            !hit_ids.contains(&denied),
+            "KGR-labeled chunk content must be excluded before chunk FTS candidate pooling"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
     async fn search_fts_bounded_rolls_back_after_statement_timeout(pool: PgPool) {
         insert_test_thought(&pool, "remembering tcgplayer integration", "work").await;
 
@@ -4540,6 +4617,42 @@ mod tests {
         assert!(
             !hit_ids.contains(&denied),
             "KGR-labeled eval rows must be excluded before vector candidate pooling"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn artifact_chunk_vector_excludes_eval_contamination_in_chunk_content(pool: PgPool) {
+        let model = EmbeddingModel::bge_m3();
+        let clean = insert_test_thought(&pool, "clean parent vector row", "global").await;
+        let denied = insert_test_thought(&pool, "also clean parent vector row", "global").await;
+        let clean_chunk = insert_test_chunk(&pool, clean, "clean chunk vector candidate").await;
+        let denied_chunk = insert_test_chunk(&pool, denied, "KGR024 chunk vector candidate").await;
+
+        let query = unit_vector_1024(0);
+        insert_artifact_chunk_embedding(
+            &pool,
+            denied_chunk,
+            &Embedding::new(model.clone(), query.clone()).unwrap(),
+        )
+        .await
+        .unwrap();
+        insert_artifact_chunk_embedding(
+            &pool,
+            clean_chunk,
+            &Embedding::new(model.clone(), unit_vector_1024(1)).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let hits = search_artifact_chunks_vector_knn(&pool, query, &model, None, None, 10)
+            .await
+            .unwrap();
+        let hit_ids = hits.iter().map(|hit| hit.thought.id).collect::<Vec<_>>();
+
+        assert!(hit_ids.contains(&clean));
+        assert!(
+            !hit_ids.contains(&denied),
+            "KGR-labeled chunk content must be excluded before chunk vector candidate pooling"
         );
     }
 

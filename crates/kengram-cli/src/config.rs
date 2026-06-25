@@ -47,6 +47,10 @@ pub struct SearchConfig {
 }
 
 impl SearchConfig {
+    pub fn chunk_serving_effective(&self) -> bool {
+        self.full_pipeline_enabled && self.chunk_serving_enabled
+    }
+
     pub fn tag_domain_routing_effective(&self) -> bool {
         self.full_pipeline_enabled && self.tag_domain_routing_enabled
     }
@@ -443,7 +447,25 @@ mod tests {
         assert!(!c.search.chunk_serving_enabled);
         assert!(!c.search.full_pipeline_enabled);
         assert!(!c.search.tag_domain_routing_enabled);
+        assert!(!c.search.chunk_serving_effective());
         assert!(!c.search.tag_domain_routing_effective());
+    }
+
+    #[test]
+    fn chunk_serving_requires_full_pipeline_master_gate() {
+        let toml = r#"
+            [search]
+            full_pipeline_enabled = false
+            chunk_serving_enabled = true
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert!(!c.search.full_pipeline_enabled);
+        assert!(c.search.chunk_serving_enabled);
+        assert!(!c.search.chunk_serving_effective());
     }
 
     #[test]

@@ -421,7 +421,7 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
     let embedder_for_factory = embedder.clone();
     let reranker_for_factory = reranker.clone();
     let tagger_model_id_for_factory = tagger_model_id.clone();
-    let chunk_serving_enabled = config.search.chunk_serving_enabled;
+    let chunk_serving_enabled = config.search.chunk_serving_effective();
     let full_pipeline_enabled = config.search.full_pipeline_enabled;
     let tag_domain_routing_enabled = config.search.tag_domain_routing_effective();
     tracing::info!(

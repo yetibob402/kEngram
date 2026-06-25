@@ -61,8 +61,9 @@ pub struct SearchRequest {
     /// Number of post-RRF candidates fed into the reranker. Ignored when
     /// rerank is off. Defaults to [`DEFAULT_RERANK_CANDIDATE_POOL`].
     pub candidate_pool: Option<usize>,
-    /// Enables chunk dense + chunk FTS retrieval legs when the server config
-    /// explicitly opts in. Defaults to false at the config/server layer.
+    /// Enables chunk dense + chunk FTS retrieval legs only when the server
+    /// config explicitly opts in and `full_pipeline_enabled` is also true.
+    /// Defaults to false at the config/server layer.
     pub chunk_serving_enabled: bool,
     /// Master default-off gate for the composed full retrieval pipeline.
     pub full_pipeline_enabled: bool,
@@ -148,6 +149,7 @@ pub struct SearchProfile {
     pub parent_resolution_ms: f64,
     pub parent_resolution_mode: &'static str,
     pub full_pipeline_enabled: bool,
+    pub chunk_serving_enabled: bool,
     pub tag_domain_routing_enabled: bool,
     pub planner_route: &'static str,
     pub planner_inferred_domains: Vec<String>,
@@ -284,10 +286,11 @@ async fn search_thoughts_with_tuning(
     }
     let scope_filter = request.scope.as_ref().map(Scope::as_str);
     let scope_prefix_filter = request.scope_prefix.as_deref();
-    let chunk_serving_enabled = request.chunk_serving_enabled;
+    let chunk_serving_enabled = request.full_pipeline_enabled && request.chunk_serving_enabled;
     let tag_domain_routing_enabled =
         request.full_pipeline_enabled && request.tag_domain_routing_enabled;
     profile.full_pipeline_enabled = request.full_pipeline_enabled;
+    profile.chunk_serving_enabled = chunk_serving_enabled;
     profile.tag_domain_routing_enabled = tag_domain_routing_enabled;
     profile.planner_route = if tag_domain_routing_enabled {
         "tag_domain_routing_v0"
@@ -1609,16 +1612,34 @@ mod tests {
             chunk_serving_enabled: false,
             full_pipeline_enabled: false,
             tag_domain_routing_enabled: false,
-            include_profile: false,
+            include_profile: true,
         };
         let off = search_thoughts(&pool, &bad, None, request.clone())
             .await
             .unwrap();
         assert!(off.results.is_empty());
+        let off_profile = off.profile.expect("profile requested");
+        assert!(!off_profile.full_pipeline_enabled);
+        assert!(!off_profile.chunk_serving_enabled);
+        assert_eq!(off_profile.chunk_fts_hits, 0);
 
         request.chunk_serving_enabled = true;
+        let subordinate_only = search_thoughts(&pool, &bad, None, request.clone())
+            .await
+            .unwrap();
+        assert!(subordinate_only.results.is_empty());
+        let subordinate_profile = subordinate_only.profile.expect("profile requested");
+        assert!(!subordinate_profile.full_pipeline_enabled);
+        assert!(!subordinate_profile.chunk_serving_enabled);
+        assert_eq!(subordinate_profile.chunk_fts_hits, 0);
+
+        request.full_pipeline_enabled = true;
         let on = search_thoughts(&pool, &bad, None, request).await.unwrap();
         assert_eq!(on.results.len(), 1);
+        let on_profile = on.profile.as_ref().expect("profile requested");
+        assert!(on_profile.full_pipeline_enabled);
+        assert!(on_profile.chunk_serving_enabled);
+        assert_eq!(on_profile.chunk_fts_hits, 1);
         let hit = &on.results[0];
         assert_eq!(hit.thought_id, parent_id);
         assert_eq!(hit.content, "parent body deliberately lacks the marker");

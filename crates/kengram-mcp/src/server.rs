@@ -273,13 +273,13 @@ pub struct KengramServer {
     /// enqueue at capture time. `Some(model_id)` enqueues a `pending_tags`
     /// row per fresh capture; the worker's tag drainer picks it up.
     tagger_model_id: Option<String>,
-    /// Default-off gate for chunk-aware serving. Set by config/env at server
-    /// startup; not exposed as a per-call MCP argument.
+    /// Effective default-off gate for chunk-aware serving. Set by config/env
+    /// at server startup; not exposed as a per-call MCP argument.
     chunk_serving_enabled: bool,
     /// Master default-off gate for the composed full retrieval pipeline.
     full_pipeline_enabled: bool,
-    /// Effective tag/domain routing gate. The CLI config only passes true
-    /// when both `full_pipeline_enabled` and the subordinate routing flag are true.
+    /// Effective tag/domain routing gate. Stored true only when both
+    /// `full_pipeline_enabled` and the subordinate routing flag are true.
     tag_domain_routing_enabled: bool,
     tool_router: ToolRouter<Self>,
 }
@@ -294,6 +294,8 @@ impl KengramServer {
         full_pipeline_enabled: bool,
         tag_domain_routing_enabled: bool,
     ) -> Self {
+        let chunk_serving_enabled = full_pipeline_enabled && chunk_serving_enabled;
+        let tag_domain_routing_enabled = full_pipeline_enabled && tag_domain_routing_enabled;
         Self {
             pool,
             embedder,
@@ -1358,7 +1360,10 @@ mod tests {
 
         let json = search_response_json(&resp, false, true);
         let tags = json["results"][0]["tags"].as_object().unwrap();
-        assert_eq!(tags["retrieval_aliases"], serde_json::json!(["memory search"]));
+        assert_eq!(
+            tags["retrieval_aliases"],
+            serde_json::json!(["memory search"])
+        );
         assert_eq!(tags["domain_scope"], serde_json::json!("infra"));
     }
 

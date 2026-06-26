@@ -19,6 +19,10 @@ use std::path::{Path, PathBuf};
 
 // PathBuf is referenced from TaggerConfig::system_prompt_file below.
 
+const DEFAULT_CONTEXTUAL_GENERATION_PROMPT_VERSION: &str = "kengram-contextual-retrieval-v1";
+const DEFAULT_CONTEXTUAL_GENERATION_MAX_CONTEXT_CHARS: usize = 1_200;
+const DEFAULT_CONTEXTUAL_GENERATION_MAX_PROMPT_CHARS: usize = 12_000;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -55,6 +59,30 @@ pub struct SearchConfig {
     /// Subordinate gate for Stage-5 graph augmentation. Takes effect only
     /// when `full_pipeline_enabled` is also true.
     pub graph_augmentation_enabled: bool,
+    /// Explicit operator gate for Stage-6 contextual-retrieval data prep.
+    /// Serving never generates context implicitly; operators invoke the
+    /// data-prep command while this is true.
+    pub contextual_generation_enabled: bool,
+    /// `""` disables provider calls and makes the operator command fail
+    /// closed. Supported provider: `"openai-compatible"`.
+    pub contextual_generation_provider: String,
+    pub contextual_generation_endpoint: String,
+    pub contextual_generation_model_name: String,
+    pub contextual_generation_model_id: String,
+    pub contextual_generation_api_key: Option<String>,
+    pub contextual_generation_temperature: f32,
+    pub contextual_generation_timeout_seconds: u64,
+    pub contextual_generation_prompt_version: String,
+    pub contextual_generation_version: i32,
+    pub contextual_generation_max_context_chars: usize,
+    pub contextual_generation_max_prompt_chars: usize,
+    /// Subordinate gate for Stage-6 contextual sidecar retrieval. Takes
+    /// effect only when full pipeline + chunk serving are both effective.
+    pub contextual_retrieval_enabled: bool,
+    /// Subordinate gate for contextual BGE-M3 sidecar vector retrieval.
+    pub contextual_chunk_vector_enabled: bool,
+    /// Subordinate gate for contextual lexical/FTS retrieval.
+    pub contextual_chunk_fts_enabled: bool,
     pub graph_seed_count: usize,
     pub graph_per_seed_cap: usize,
     pub graph_total_cap: usize,
@@ -98,6 +126,20 @@ impl SearchConfig {
         self.full_pipeline_enabled && self.graph_augmentation_enabled
     }
 
+    pub fn contextual_retrieval_effective(&self) -> bool {
+        self.full_pipeline_enabled
+            && self.chunk_serving_enabled
+            && self.contextual_retrieval_enabled
+    }
+
+    pub fn contextual_chunk_vector_effective(&self) -> bool {
+        self.contextual_retrieval_effective() && self.contextual_chunk_vector_enabled
+    }
+
+    pub fn contextual_chunk_fts_effective(&self) -> bool {
+        self.contextual_retrieval_effective() && self.contextual_chunk_fts_enabled
+    }
+
     pub fn query_expansion_effective(&self) -> bool {
         self.full_pipeline_enabled && self.query_expansion_enabled
     }
@@ -115,6 +157,23 @@ impl Default for SearchConfig {
             tag_domain_routing_enabled: false,
             sparse_lexical_enabled: false,
             graph_augmentation_enabled: false,
+            contextual_generation_enabled: false,
+            contextual_generation_provider: String::new(),
+            contextual_generation_endpoint: "http://localhost:8000/v1".to_string(),
+            contextual_generation_model_name: "qwen3-coder:30b".to_string(),
+            contextual_generation_model_id: "vllm/qwen3-coder:30b".to_string(),
+            contextual_generation_api_key: None,
+            contextual_generation_temperature: 0.0,
+            contextual_generation_timeout_seconds: 30,
+            contextual_generation_prompt_version: DEFAULT_CONTEXTUAL_GENERATION_PROMPT_VERSION
+                .to_string(),
+            contextual_generation_version: 1,
+            contextual_generation_max_context_chars:
+                DEFAULT_CONTEXTUAL_GENERATION_MAX_CONTEXT_CHARS,
+            contextual_generation_max_prompt_chars: DEFAULT_CONTEXTUAL_GENERATION_MAX_PROMPT_CHARS,
+            contextual_retrieval_enabled: false,
+            contextual_chunk_vector_enabled: false,
+            contextual_chunk_fts_enabled: false,
             graph_seed_count: DEFAULT_GRAPH_SEED_COUNT,
             graph_per_seed_cap: DEFAULT_GRAPH_PER_SEED_CAP,
             graph_total_cap: DEFAULT_GRAPH_TOTAL_CAP,
@@ -566,6 +625,23 @@ mod tests {
         assert!(!c.search.tag_domain_routing_effective());
         assert!(!c.search.sparse_lexical_effective());
         assert!(!c.search.graph_augmentation_effective());
+        assert!(!c.search.contextual_generation_enabled);
+        assert_eq!(c.search.contextual_generation_provider, "");
+        assert_eq!(
+            c.search.contextual_generation_prompt_version,
+            DEFAULT_CONTEXTUAL_GENERATION_PROMPT_VERSION
+        );
+        assert_eq!(
+            c.search.contextual_generation_max_context_chars,
+            DEFAULT_CONTEXTUAL_GENERATION_MAX_CONTEXT_CHARS
+        );
+        assert_eq!(
+            c.search.contextual_generation_max_prompt_chars,
+            DEFAULT_CONTEXTUAL_GENERATION_MAX_PROMPT_CHARS
+        );
+        assert!(!c.search.contextual_retrieval_effective());
+        assert!(!c.search.contextual_chunk_vector_effective());
+        assert!(!c.search.contextual_chunk_fts_effective());
         assert!(!c.search.query_expansion_effective());
         assert!(!c.search.hyde_effective());
     }
@@ -683,6 +759,73 @@ mod tests {
         assert!(c.search.full_pipeline_enabled);
         assert!(c.search.graph_augmentation_enabled);
         assert!(c.search.graph_augmentation_effective());
+    }
+
+    #[test]
+    fn contextual_retrieval_requires_full_pipeline_and_chunk_serving() {
+        let toml = r#"
+            [search]
+            full_pipeline_enabled = false
+            chunk_serving_enabled = false
+            contextual_generation_enabled = true
+            contextual_generation_provider = "openai-compatible"
+            contextual_generation_endpoint = "http://localhost:9000/v1"
+            contextual_generation_model_name = "context-model"
+            contextual_generation_model_id = "local/context-model"
+            contextual_generation_prompt_version = "context-v2"
+            contextual_generation_version = 7
+            contextual_generation_max_context_chars = 900
+            contextual_generation_max_prompt_chars = 8000
+            contextual_retrieval_enabled = true
+            contextual_chunk_vector_enabled = true
+            contextual_chunk_fts_enabled = true
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert!(c.search.contextual_generation_enabled);
+        assert_eq!(c.search.contextual_generation_provider, "openai-compatible");
+        assert_eq!(
+            c.search.contextual_generation_endpoint,
+            "http://localhost:9000/v1"
+        );
+        assert_eq!(c.search.contextual_generation_model_name, "context-model");
+        assert_eq!(
+            c.search.contextual_generation_model_id,
+            "local/context-model"
+        );
+        assert_eq!(c.search.contextual_generation_prompt_version, "context-v2");
+        assert_eq!(c.search.contextual_generation_version, 7);
+        assert_eq!(c.search.contextual_generation_max_context_chars, 900);
+        assert_eq!(c.search.contextual_generation_max_prompt_chars, 8000);
+        assert!(c.search.contextual_retrieval_enabled);
+        assert!(!c.search.contextual_retrieval_effective());
+        assert!(!c.search.contextual_chunk_vector_effective());
+        assert!(!c.search.contextual_chunk_fts_effective());
+    }
+
+    #[test]
+    fn contextual_retrieval_effective_when_all_serving_gates_true() {
+        let toml = r#"
+            [search]
+            full_pipeline_enabled = true
+            chunk_serving_enabled = true
+            contextual_retrieval_enabled = true
+            contextual_chunk_vector_enabled = true
+            contextual_chunk_fts_enabled = true
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert!(c.search.full_pipeline_enabled);
+        assert!(c.search.chunk_serving_enabled);
+        assert!(c.search.contextual_retrieval_effective());
+        assert!(c.search.contextual_chunk_vector_effective());
+        assert!(c.search.contextual_chunk_fts_effective());
     }
 
     #[test]

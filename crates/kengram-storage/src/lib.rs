@@ -43,6 +43,8 @@ mod bge {
     pub const THOUGHT_HNSW_INDEX: &str = "thought_embeddings_bge_m3_hnsw";
     pub const CHUNK_TABLE: &str = "artifact_chunk_embeddings_bge_m3";
     pub const CHUNK_HNSW_INDEX: &str = "artifact_chunk_embeddings_bge_m3_hnsw";
+    pub const CONTEXT_TABLE: &str = "artifact_chunk_context_embeddings_bge_m3";
+    pub const CONTEXT_HNSW_INDEX: &str = "artifact_chunk_context_embeddings_bge_m3_hnsw";
 }
 
 mod bge_sparse {
@@ -90,6 +92,44 @@ impl SparseEmbeddingProvenance {
             producer_metadata: serde_json::json!({}),
         }
     }
+}
+
+pub const CONTEXTUAL_CONTAMINATION_FILTER_VERSION: &str = "eval-contamination-v1";
+
+#[derive(Debug, Clone)]
+pub struct ContextGenerationSource {
+    pub chunk_id: Uuid,
+    pub source_thought_id: ThoughtId,
+    pub scope: Scope,
+    pub parent_source: Source,
+    pub parent_created_at: OffsetDateTime,
+    pub parent_metadata: Metadata,
+    pub parent_content: String,
+    pub chunk_index: i32,
+    pub chunk_content: String,
+    pub chunk_metadata: serde_json::Value,
+    pub raw_chunk_fingerprint: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+pub struct ArtifactChunkContextInsert {
+    pub chunk_id: Uuid,
+    pub context_text: String,
+    pub generator_id: String,
+    pub generator_version: i32,
+    pub prompt_version: String,
+    pub prompt_hash: String,
+    pub model_id: String,
+    pub model_version: String,
+    pub pipeline_run_id: Option<Uuid>,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactChunkContextOutcome {
+    pub context_id: Uuid,
+    pub status: String,
+    pub rejection_reason: Option<String>,
 }
 
 fn ann_projection_for_model(model: &EmbeddingModel) -> Option<AnnProjection> {
@@ -194,6 +234,68 @@ const EVAL_CONTAMINATION_KNOWN_IDS: &[Uuid] = &[
     uuid::uuid!("5853f4c5-afca-433b-9506-40c015646c23"),
     uuid::uuid!("a58e47fa-e933-4f75-9af8-3f7873ab9f58"),
 ];
+const MAX_CONTEXTUAL_CONTEXT_CHARS: usize = 1_200;
+
+fn text_trips_eval_contamination(text: &str) -> bool {
+    let upper = text.to_ascii_uppercase();
+    let bytes = upper.as_bytes();
+    if bytes.len() < 6 {
+        return false;
+    }
+    bytes.windows(6).any(|window| {
+        window[0] == b'K'
+            && window[1] == b'G'
+            && window[2] == b'R'
+            && window[3].is_ascii_digit()
+            && window[4].is_ascii_digit()
+            && window[5].is_ascii_digit()
+    })
+}
+
+fn source_file_trips_eval_contamination(metadata: &serde_json::Value) -> bool {
+    let Some(source_file) = metadata.get("source_file").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let lower = source_file.to_ascii_lowercase();
+    [
+        "kengram-recall-97",
+        "kengram-gold",
+        "gold100",
+        "gold-100",
+        "miss-analysis",
+        "label-repair",
+        "adjudication",
+        "answer-key",
+        "retrieval-baseline",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn known_eval_thought_id(id: ThoughtId) -> bool {
+    EVAL_CONTAMINATION_KNOWN_IDS.contains(&id.into_uuid())
+}
+
+fn contamination_rejection_reason(
+    source_thought_id: ThoughtId,
+    parent_metadata: &serde_json::Value,
+    parent_content: &str,
+    chunk_content: &str,
+) -> Option<String> {
+    if known_eval_thought_id(source_thought_id) {
+        return Some("known_eval_thought_id".to_string());
+    }
+    if source_file_trips_eval_contamination(parent_metadata) {
+        return Some("eval_source_file".to_string());
+    }
+    if text_trips_eval_contamination(parent_content) {
+        return Some("parent_eval_marker".to_string());
+    }
+    if text_trips_eval_contamination(chunk_content) {
+        return Some("raw_chunk_eval_marker".to_string());
+    }
+    None
+}
 
 fn ann_projection_index_name(projection_id: &str) -> String {
     let mut sanitized = projection_id
@@ -890,6 +992,272 @@ pub async fn insert_artifact_chunk_embedding(
         embedding.vector.clone(),
     )
     .await
+}
+
+pub async fn select_artifact_chunk_context_generation_sources(
+    pool: &PgPool,
+    scope: Option<&str>,
+    scope_prefix: Option<&str>,
+    generator_id: &str,
+    generator_version: i32,
+    prompt_hash: &str,
+    limit: i64,
+) -> Result<Vec<ContextGenerationSource>, StorageError> {
+    if limit <= 0 {
+        return Ok(Vec::new());
+    }
+
+    let rows: Vec<ContextGenerationSourceRow> = sqlx::query_as(
+        r#"
+        SELECT ac.id AS chunk_id,
+               ac.source_thought_id,
+               t.scope,
+               t.source AS parent_source,
+               t.created_at AS parent_created_at,
+               t.metadata AS parent_metadata,
+               t.content AS parent_content,
+               ac.chunk_index,
+               ac.content AS chunk_content,
+               ac.metadata AS chunk_metadata,
+               ac.content_fingerprint AS raw_chunk_fingerprint
+        FROM artifact_chunks ac
+        JOIN thoughts t ON t.id = ac.source_thought_id
+        WHERE ac.retracted_at IS NULL
+          AND ac.source_thought_id IS NOT NULL
+          AND t.retracted_at IS NULL
+          AND ($1::text IS NULL OR t.scope = $1)
+          AND ($2::text IS NULL OR t.scope LIKE $2 || '%')
+          AND t.id <> ALL($6::uuid[])
+          AND lower(coalesce(t.metadata->>'source_file', '')) !~ $7
+          AND t.content !~ $8
+          AND ac.content !~ $8
+          AND NOT EXISTS (
+              SELECT 1
+              FROM artifact_chunk_contexts c
+              WHERE c.chunk_id = ac.id
+                AND c.generator_id = $3
+                AND c.generator_version = $4
+                AND c.prompt_hash = $5
+                AND c.raw_chunk_fingerprint = ac.content_fingerprint
+                AND c.retracted_at IS NULL
+          )
+        ORDER BY t.created_at ASC, ac.chunk_index ASC
+        LIMIT $9
+        "#,
+    )
+    .bind(scope)
+    .bind(scope_prefix)
+    .bind(generator_id)
+    .bind(generator_version)
+    .bind(prompt_hash)
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(context_generation_source_from_row)
+        .collect()
+}
+
+pub async fn insert_artifact_chunk_context(
+    pool: &PgPool,
+    input: ArtifactChunkContextInsert,
+) -> Result<ArtifactChunkContextOutcome, StorageError> {
+    let row: ContextGenerationSourceRow = sqlx::query_as(
+        r#"
+        SELECT ac.id AS chunk_id,
+               ac.source_thought_id,
+               t.scope,
+               t.source AS parent_source,
+               t.created_at AS parent_created_at,
+               t.metadata AS parent_metadata,
+               t.content AS parent_content,
+               ac.chunk_index,
+               ac.content AS chunk_content,
+               ac.metadata AS chunk_metadata,
+               ac.content_fingerprint AS raw_chunk_fingerprint
+        FROM artifact_chunks ac
+        JOIN thoughts t ON t.id = ac.source_thought_id
+        WHERE ac.id = $1
+          AND ac.retracted_at IS NULL
+          AND ac.source_thought_id IS NOT NULL
+          AND t.retracted_at IS NULL
+        "#,
+    )
+    .bind(input.chunk_id)
+    .fetch_one(pool)
+    .await?;
+    let source = context_generation_source_from_row(row)?;
+
+    let mut rejection_reason = contamination_rejection_reason(
+        source.source_thought_id,
+        source.parent_metadata.as_value(),
+        &source.parent_content,
+        &source.chunk_content,
+    );
+    if rejection_reason.is_none() && text_trips_eval_contamination(&input.context_text) {
+        rejection_reason = Some("generated_context_eval_marker".to_string());
+    }
+    let trimmed_context = input.context_text.trim();
+    if rejection_reason.is_none() && trimmed_context.is_empty() {
+        rejection_reason = Some("empty_generated_context".to_string());
+    }
+    if rejection_reason.is_none() && trimmed_context.chars().count() > MAX_CONTEXTUAL_CONTEXT_CHARS
+    {
+        rejection_reason = Some("overlong_generated_context".to_string());
+    }
+
+    let (status, context_text, contextual_content, rejection_reason) =
+        if let Some(reason) = rejection_reason {
+            ("rejected", String::new(), String::new(), Some(reason))
+        } else {
+            let context_text = trimmed_context.to_string();
+            let contextual_content = format!("{context_text}\n\n{}", source.chunk_content);
+            ("ready", context_text, contextual_content, None)
+        };
+
+    let row: (Uuid, String, Option<String>) = sqlx::query_as(
+        r#"
+        INSERT INTO artifact_chunk_contexts (
+            chunk_id,
+            source_thought_id,
+            context_text,
+            contextual_content,
+            raw_chunk_fingerprint,
+            contextual_content_fingerprint,
+            generator_id,
+            generator_version,
+            prompt_version,
+            prompt_hash,
+            model_id,
+            model_version,
+            contamination_filter_version,
+            pipeline_run_id,
+            status,
+            rejection_reason,
+            metadata
+        )
+        VALUES (
+            $1, $2, $3, $4, $5, digest($4, 'sha256'), $6, $7, $8, $9, $10, $11,
+            $12, $13, $14, $15, $16
+        )
+        ON CONFLICT (
+            chunk_id,
+            generator_id,
+            generator_version,
+            prompt_hash,
+            raw_chunk_fingerprint
+        )
+        WHERE retracted_at IS NULL
+        DO UPDATE SET
+            context_text = EXCLUDED.context_text,
+            contextual_content = EXCLUDED.contextual_content,
+            contextual_content_fingerprint = EXCLUDED.contextual_content_fingerprint,
+            prompt_version = EXCLUDED.prompt_version,
+            model_id = EXCLUDED.model_id,
+            model_version = EXCLUDED.model_version,
+            contamination_filter_version = EXCLUDED.contamination_filter_version,
+            pipeline_run_id = EXCLUDED.pipeline_run_id,
+            status = EXCLUDED.status,
+            rejection_reason = EXCLUDED.rejection_reason,
+            metadata = EXCLUDED.metadata,
+            updated_at = NOW()
+        RETURNING id, status, rejection_reason
+        "#,
+    )
+    .bind(source.chunk_id)
+    .bind(source.source_thought_id.into_uuid())
+    .bind(&context_text)
+    .bind(&contextual_content)
+    .bind(source.raw_chunk_fingerprint.to_vec())
+    .bind(&input.generator_id)
+    .bind(input.generator_version)
+    .bind(&input.prompt_version)
+    .bind(&input.prompt_hash)
+    .bind(&input.model_id)
+    .bind(&input.model_version)
+    .bind(CONTEXTUAL_CONTAMINATION_FILTER_VERSION)
+    .bind(input.pipeline_run_id)
+    .bind(status)
+    .bind(&rejection_reason)
+    .bind(&input.metadata)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(ArtifactChunkContextOutcome {
+        context_id: row.0,
+        status: row.1,
+        rejection_reason: row.2,
+    })
+}
+
+pub async fn insert_artifact_chunk_context_embedding(
+    pool: &PgPool,
+    context_id: Uuid,
+    embedding: &Embedding,
+) -> Result<bool, StorageError> {
+    if !is_bge_m3_1024(&embedding.model) {
+        return Err(StorageError::InvalidEmbeddingDimensions {
+            model_id: embedding.model.id.clone(),
+            expected: bge::DIMS,
+            got: embedding.model.dimensions,
+        });
+    }
+    if embedding.vector.len() != bge::DIMS {
+        return Err(StorageError::InvalidEmbeddingDimensions {
+            model_id: embedding.model.id.clone(),
+            expected: bge::DIMS,
+            got: embedding.vector.len(),
+        });
+    }
+
+    let pgv = pgvector::Vector::from(embedding.vector.clone());
+    let result = sqlx::query(
+        r#"
+        INSERT INTO artifact_chunk_context_embeddings_bge_m3 (
+            context_id,
+            model_id,
+            model_version,
+            dimensions,
+            embedding
+        )
+        SELECT c.id, $2, $3, $4, $5
+        FROM artifact_chunk_contexts c
+        JOIN artifact_chunks ac ON ac.id = c.chunk_id
+        JOIN thoughts t ON t.id = c.source_thought_id
+        WHERE c.id = $1
+          AND c.status = 'ready'
+          AND c.retracted_at IS NULL
+          AND ac.retracted_at IS NULL
+          AND t.retracted_at IS NULL
+          AND t.id <> ALL($6::uuid[])
+          AND lower(coalesce(t.metadata->>'source_file', '')) !~ $7
+          AND t.content !~ $8
+          AND ac.content !~ $8
+          AND c.context_text !~ $8
+          AND c.contextual_content !~ $8
+        ON CONFLICT (context_id, model_id, model_version)
+        DO UPDATE SET
+            dimensions = EXCLUDED.dimensions,
+            embedding = EXCLUDED.embedding,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(context_id)
+    .bind(bge::MODEL_ID)
+    .bind(bge::MODEL_VERSION)
+    .bind(bge::DIMS_I32)
+    .bind(pgv)
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
 }
 
 async fn insert_bge_sparse_embedding(
@@ -1910,6 +2278,137 @@ pub async fn search_artifact_chunks_fts_bounded(
                 tracing::warn!(
                     error = %rollback_err,
                     "failed to roll back bounded artifact-chunk FTS transaction after query error",
+                );
+            }
+            return Err(e.into());
+        }
+    };
+    tx.commit().await?;
+
+    chunk_lexical_rows_to_hits(rows)
+}
+
+/// FTS lexical search over generated contextual chunk documents. Resolves to
+/// parent thoughts like raw chunk search, but uses the immutable contextual
+/// sidecar as ranking evidence and never exposes rejected context rows.
+pub async fn search_artifact_chunk_contexts_fts_bounded(
+    pool: &PgPool,
+    query: &str,
+    scope: Option<&str>,
+    scope_prefix: Option<&str>,
+    limit: i64,
+    timeout_ms: u64,
+) -> Result<Vec<Hit>, StorageError> {
+    let Some(query) = normalize_fts_query(query) else {
+        return Ok(Vec::new());
+    };
+    if !index_ready(pool, "artifact_chunk_contexts_ready_fts_idx").await? {
+        return Err(StorageError::BgeSidecarIndexNotReady(
+            "artifact_chunk_contexts_ready_fts_idx".to_string(),
+        ));
+    }
+
+    let mut tx = pool.begin().await?;
+    if let Err(e) = set_statement_timeout(&mut tx, timeout_ms).await {
+        if let Err(rollback_err) = tx.rollback().await {
+            tracing::warn!(
+                error = %rollback_err,
+                "failed to roll back bounded contextual-chunk FTS transaction after statement_timeout setup error",
+            );
+        }
+        return Err(e.into());
+    }
+
+    let rows: Vec<ChunkLexicalSearchRow> = match sqlx::query_as(
+        r#"
+        WITH fts AS (
+            SELECT websearch_to_tsquery('english', $1) AS tsq
+        ),
+        candidates AS (
+            SELECT t.id,
+                   t.scope,
+                   t.content AS parent_content,
+                   t.source,
+                   t.created_at,
+                   t.metadata AS parent_metadata,
+                   t.content_fingerprint,
+                   t.tags,
+                   t.tags_extractor_model,
+                   t.tags_extractor_version,
+                   t.tags_extracted_at,
+                   ac.id AS chunk_id,
+                   ac.artifact_id,
+                   ac.source_thought_id,
+                   ac.chunk_index,
+                   ac.content AS chunk_content,
+                   ac.chunker_id,
+                   ac.chunker_version,
+                   ac.token_estimate,
+                   ac.start_char,
+                   ac.end_char,
+                   jsonb_set(
+                       ac.metadata,
+                       '{contextual_retrieval}',
+                       jsonb_build_object(
+                           'context_id', c.id::text,
+                           'generator_id', c.generator_id,
+                           'generator_version', c.generator_version,
+                           'prompt_version', c.prompt_version,
+                           'contextual', true
+                       ),
+                       true
+                   ) AS chunk_metadata,
+                   ts_rank_cd(to_tsvector('english', c.contextual_content), fts.tsq) AS rank
+            FROM artifact_chunk_contexts c
+            JOIN artifact_chunks ac ON ac.id = c.chunk_id
+            JOIN thoughts t ON t.id = c.source_thought_id
+            CROSS JOIN fts
+            WHERE to_tsvector('english', c.contextual_content) @@ fts.tsq
+              AND c.status = 'ready'
+              AND c.retracted_at IS NULL
+              AND ac.retracted_at IS NULL
+              AND ac.source_thought_id IS NOT NULL
+              AND t.retracted_at IS NULL
+              AND ($2::text IS NULL OR t.scope = $2)
+              AND ($3::text IS NULL OR t.scope LIKE $3 || '%')
+              AND t.id <> ALL($5::uuid[])
+              AND lower(coalesce(t.metadata->>'source_file', '')) !~ $6
+              AND t.content !~ $7
+              AND ac.content !~ $7
+              AND c.context_text !~ $7
+              AND c.contextual_content !~ $7
+            ORDER BY ts_rank_cd(to_tsvector('english', c.contextual_content), fts.tsq) DESC,
+                     t.created_at DESC,
+                     ac.chunk_index ASC
+            LIMIT GREATEST($4, $4 * 8)
+        ),
+        best_per_parent AS (
+            SELECT DISTINCT ON (id) *
+            FROM candidates
+            ORDER BY id, rank DESC, chunk_index ASC
+        )
+        SELECT *
+        FROM best_per_parent
+        ORDER BY rank DESC, created_at DESC, chunk_index ASC
+        LIMIT $4
+        "#,
+    )
+    .bind(&query)
+    .bind(scope)
+    .bind(scope_prefix)
+    .bind(limit)
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .fetch_all(&mut *tx)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            if let Err(rollback_err) = tx.rollback().await {
+                tracing::warn!(
+                    error = %rollback_err,
+                    "failed to roll back bounded contextual-chunk FTS transaction after query error",
                 );
             }
             return Err(e.into());
@@ -3557,6 +4056,118 @@ pub async fn search_artifact_chunks_vector_knn(
     chunk_vector_rows_to_hits(rows)
 }
 
+/// Vector kNN over generated contextual chunk documents. This reads only the
+/// contextual sidecar embedding table; raw chunk embeddings remain untouched.
+pub async fn search_artifact_chunk_contexts_vector_knn(
+    pool: &PgPool,
+    query_vector: Vec<f32>,
+    model: &EmbeddingModel,
+    scope: Option<&str>,
+    scope_prefix: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Hit>, StorageError> {
+    if !is_bge_m3_1024(model) {
+        return Ok(Vec::new());
+    }
+    if query_vector.len() != bge::DIMS {
+        return Err(StorageError::InvalidEmbeddingDimensions {
+            model_id: model.id.clone(),
+            expected: bge::DIMS,
+            got: query_vector.len(),
+        });
+    }
+
+    assert_bge_context_vector_search_ready(pool).await?;
+
+    let pgv = pgvector::Vector::from(query_vector);
+    let mut tx = pool.begin().await?;
+    set_bge_hnsw_ef_search(&mut tx).await?;
+    let rows: Vec<ChunkVectorSearchRow> = sqlx::query_as(
+        r#"
+        WITH candidates AS (
+            SELECT t.id,
+                   t.scope,
+                   t.content AS parent_content,
+                   t.source,
+                   t.created_at,
+                   t.metadata AS parent_metadata,
+                   t.content_fingerprint,
+                   t.tags,
+                   t.tags_extractor_model,
+                   t.tags_extractor_version,
+                   t.tags_extracted_at,
+                   ac.id AS chunk_id,
+                   ac.artifact_id,
+                   ac.source_thought_id,
+                   ac.chunk_index,
+                   ac.content AS chunk_content,
+                   ac.chunker_id,
+                   ac.chunker_version,
+                   ac.token_estimate,
+                   ac.start_char,
+                   ac.end_char,
+                   jsonb_set(
+                       ac.metadata,
+                       '{contextual_retrieval}',
+                       jsonb_build_object(
+                           'context_id', c.id::text,
+                           'generator_id', c.generator_id,
+                           'generator_version', c.generator_version,
+                           'prompt_version', c.prompt_version,
+                           'contextual', true
+                       ),
+                       true
+                   ) AS chunk_metadata,
+                   (b.embedding <=> $1::vector(1024)) AS distance
+            FROM artifact_chunk_context_embeddings_bge_m3 b
+            JOIN artifact_chunk_contexts c ON c.id = b.context_id
+            JOIN artifact_chunks ac ON ac.id = c.chunk_id
+            JOIN thoughts t ON t.id = c.source_thought_id
+            WHERE b.model_id = $2
+              AND b.model_version = $3
+              AND c.status = 'ready'
+              AND c.retracted_at IS NULL
+              AND ac.retracted_at IS NULL
+              AND ac.source_thought_id IS NOT NULL
+              AND t.retracted_at IS NULL
+              AND ($4::text IS NULL OR t.scope = $4)
+              AND ($5::text IS NULL OR t.scope LIKE $5 || '%')
+              AND t.id <> ALL($7::uuid[])
+              AND lower(coalesce(t.metadata->>'source_file', '')) !~ $8
+              AND t.content !~ $9
+              AND ac.content !~ $9
+              AND c.context_text !~ $9
+              AND c.contextual_content !~ $9
+            ORDER BY b.embedding <=> $1::vector(1024)
+            LIMIT GREATEST($6, $6 * 8)
+        ),
+        best_per_parent AS (
+            SELECT DISTINCT ON (id) *
+            FROM candidates
+            ORDER BY id, distance ASC, chunk_index ASC
+        )
+        SELECT *
+        FROM best_per_parent
+        ORDER BY distance ASC, created_at DESC, chunk_index ASC
+        LIMIT $6
+        "#,
+    )
+    .bind(pgv)
+    .bind(bge::MODEL_ID)
+    .bind(bge::MODEL_VERSION)
+    .bind(scope)
+    .bind(scope_prefix)
+    .bind(limit)
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    chunk_vector_rows_to_hits(rows)
+}
+
 async fn ann_projection_search_ready(
     pool: &PgPool,
     projection_id: &str,
@@ -3912,6 +4523,22 @@ async fn assert_bge_chunk_vector_search_ready(pool: &PgPool) -> Result<(), Stora
     Ok(())
 }
 
+async fn assert_bge_context_vector_search_ready(pool: &PgPool) -> Result<(), StorageError> {
+    if !table_exists(pool, bge::CONTEXT_TABLE).await? {
+        return Err(StorageError::BgeSidecarTableMissing(
+            bge::CONTEXT_TABLE.to_string(),
+        ));
+    }
+
+    if !index_ready(pool, bge::CONTEXT_HNSW_INDEX).await? {
+        return Err(StorageError::BgeSidecarIndexNotReady(
+            bge::CONTEXT_HNSW_INDEX.to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 async fn table_exists(pool: &PgPool, table_name: &str) -> Result<bool, StorageError> {
     let (exists,): (bool,) = sqlx::query_as("SELECT to_regclass($1) IS NOT NULL")
         .bind(format!("public.{table_name}"))
@@ -4010,6 +4637,21 @@ struct ChunkLexicalSearchRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct ContextGenerationSourceRow {
+    chunk_id: Uuid,
+    source_thought_id: Uuid,
+    scope: String,
+    parent_source: String,
+    parent_created_at: OffsetDateTime,
+    parent_metadata: serde_json::Value,
+    parent_content: String,
+    chunk_index: i32,
+    chunk_content: String,
+    chunk_metadata: serde_json::Value,
+    raw_chunk_fingerprint: Vec<u8>,
+}
+
+#[derive(sqlx::FromRow)]
 struct ThoughtRow {
     id: Uuid,
     scope: String,
@@ -4038,6 +4680,24 @@ struct LexicalSearchRow {
     tags_extractor_version: Option<i32>,
     tags_extracted_at: Option<OffsetDateTime>,
     rank: f32,
+}
+
+fn context_generation_source_from_row(
+    r: ContextGenerationSourceRow,
+) -> Result<ContextGenerationSource, StorageError> {
+    Ok(ContextGenerationSource {
+        chunk_id: r.chunk_id,
+        source_thought_id: ThoughtId::from(r.source_thought_id),
+        scope: Scope::new(r.scope)?,
+        parent_source: Source::new(r.parent_source)?,
+        parent_created_at: r.parent_created_at,
+        parent_metadata: Metadata::from(r.parent_metadata),
+        parent_content: r.parent_content,
+        chunk_index: r.chunk_index,
+        chunk_content: r.chunk_content,
+        chunk_metadata: r.chunk_metadata,
+        raw_chunk_fingerprint: fingerprint_from_bytes(r.raw_chunk_fingerprint)?,
+    })
 }
 
 fn thought_row_to_thought(r: ThoughtRow) -> Result<Thought, StorageError> {
@@ -4735,6 +5395,257 @@ mod tests {
         .unwrap();
 
         chunk_id
+    }
+
+    fn test_context_insert(chunk_id: Uuid, context_text: &str) -> ArtifactChunkContextInsert {
+        ArtifactChunkContextInsert {
+            chunk_id,
+            context_text: context_text.to_string(),
+            generator_id: "test-context-generator".to_string(),
+            generator_version: 1,
+            prompt_version: "test-prompt-v1".to_string(),
+            prompt_hash: "test-prompt-hash".to_string(),
+            model_id: "test-context-model".to_string(),
+            model_version: "1".to_string(),
+            pipeline_run_id: None,
+            metadata: json!({"fixture": true}),
+        }
+    }
+
+    fn test_bge_embedding(seed: f32) -> Embedding {
+        Embedding::new(EmbeddingModel::bge_m3(), vec![seed; bge::DIMS]).unwrap()
+    }
+
+    async fn insert_ready_context_direct(
+        pool: &PgPool,
+        parent_id: ThoughtId,
+        chunk_id: Uuid,
+        context_text: &str,
+        contextual_content: &str,
+    ) -> Uuid {
+        let (raw_fingerprint,): (Vec<u8>,) =
+            sqlx::query_as("SELECT content_fingerprint FROM artifact_chunks WHERE id = $1")
+                .bind(chunk_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let context_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO artifact_chunk_contexts (
+                id,
+                chunk_id,
+                source_thought_id,
+                context_text,
+                contextual_content,
+                raw_chunk_fingerprint,
+                contextual_content_fingerprint,
+                generator_id,
+                generator_version,
+                prompt_version,
+                prompt_hash,
+                model_id,
+                model_version,
+                contamination_filter_version,
+                status,
+                metadata
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, $6, digest($5, 'sha256'),
+                'direct-test-generator', 1, 'direct-test-prompt', $7,
+                'direct-test-model', '1', $8, 'ready', '{"direct":true}'
+            )
+            "#,
+        )
+        .bind(context_id)
+        .bind(chunk_id)
+        .bind(parent_id.into_uuid())
+        .bind(context_text)
+        .bind(contextual_content)
+        .bind(raw_fingerprint)
+        .bind(format!("direct-{}", Uuid::new_v4()))
+        .bind(CONTEXTUAL_CONTAMINATION_FILTER_VERSION)
+        .execute(pool)
+        .await
+        .unwrap();
+        context_id
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn contextual_generation_sources_skip_gold_source_file_before_generation(pool: PgPool) {
+        let clean_parent =
+            insert_test_thought(&pool, "clean parent for contextual generation", "global").await;
+        let clean_chunk = insert_test_chunk(&pool, clean_parent, "clean raw chunk").await;
+        let gold_parent = insert_test_thought_with_metadata(
+            &pool,
+            "gold parent should never be prompted",
+            "global",
+            Metadata::from(json!({"source_file": "eval/gold/kengram-gold-100-answer-key.md"})),
+        )
+        .await;
+        let gold_chunk = insert_test_chunk(&pool, gold_parent, "gold raw chunk").await;
+
+        let sources = select_artifact_chunk_context_generation_sources(
+            &pool,
+            None,
+            None,
+            "test-context-generator",
+            1,
+            "test-prompt-hash",
+            10,
+        )
+        .await
+        .unwrap();
+        let ids = sources
+            .iter()
+            .map(|source| source.chunk_id)
+            .collect::<Vec<_>>();
+
+        assert!(ids.contains(&clean_chunk));
+        assert!(!ids.contains(&gold_chunk));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn generated_kgr_context_rejected_before_embedding_and_pool(pool: PgPool) {
+        let parent =
+            insert_test_thought(&pool, "clean parent contextual rejection", "global").await;
+        let chunk = insert_test_chunk(&pool, parent, "clean raw chunk for context").await;
+
+        let outcome = insert_artifact_chunk_context(
+            &pool,
+            test_context_insert(
+                chunk,
+                "Generated context mentions KGR024 answer-key material.",
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.status, "rejected");
+        assert_eq!(
+            outcome.rejection_reason.as_deref(),
+            Some("generated_context_eval_marker")
+        );
+        let stored: (String, String, String, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT status, context_text, contextual_content, rejection_reason
+            FROM artifact_chunk_contexts
+            WHERE id = $1
+            "#,
+        )
+        .bind(outcome.context_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.0, "rejected");
+        assert!(stored.1.is_empty());
+        assert!(stored.2.is_empty());
+        assert_eq!(stored.3.as_deref(), Some("generated_context_eval_marker"));
+
+        let embedded = insert_artifact_chunk_context_embedding(
+            &pool,
+            outcome.context_id,
+            &test_bge_embedding(0.2),
+        )
+        .await
+        .unwrap();
+        assert!(!embedded);
+        let embedding_count: (i64,) = sqlx::query_as(
+            "SELECT count(*)::bigint FROM artifact_chunk_context_embeddings_bge_m3 WHERE context_id = $1",
+        )
+        .bind(outcome.context_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(embedding_count.0, 0);
+
+        let hits =
+            search_artifact_chunk_contexts_fts_bounded(&pool, "KGR024", None, None, 10, 1_000)
+                .await
+                .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn contextual_insert_does_not_mutate_raw_chunk_content(pool: PgPool) {
+        let parent = insert_test_thought(&pool, "parent for raw immutability", "global").await;
+        let raw = "original raw artifact chunk";
+        let chunk = insert_test_chunk(&pool, parent, raw).await;
+
+        let outcome = insert_artifact_chunk_context(
+            &pool,
+            test_context_insert(chunk, "Helpful local generated context."),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.status, "ready");
+
+        let stored_raw: (String,) =
+            sqlx::query_as("SELECT content FROM artifact_chunks WHERE id = $1")
+                .bind(chunk)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored_raw.0, raw);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn contextual_fts_and_vector_filter_forced_bad_ready_context(pool: PgPool) {
+        let bad_parent =
+            insert_test_thought(&pool, "clean parent for forced bad context", "global").await;
+        let bad_chunk = insert_test_chunk(&pool, bad_parent, "clean raw forced bad chunk").await;
+        let bad_context = insert_ready_context_direct(
+            &pool,
+            bad_parent,
+            bad_chunk,
+            "KGR024 forced bad generated context",
+            "KGR024 forced bad generated context\n\nclean raw forced bad chunk",
+        )
+        .await;
+        sqlx::query(
+            r#"
+            INSERT INTO artifact_chunk_context_embeddings_bge_m3 (
+                context_id,
+                model_id,
+                model_version,
+                dimensions,
+                embedding
+            )
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+        )
+        .bind(bad_context)
+        .bind(bge::MODEL_ID)
+        .bind(bge::MODEL_VERSION)
+        .bind(bge::DIMS_I32)
+        .bind(pgvector::Vector::from(vec![0.3_f32; bge::DIMS]))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let fts_hits = search_artifact_chunk_contexts_fts_bounded(
+            &pool,
+            "KGR024 forced bad",
+            None,
+            None,
+            10,
+            1_000,
+        )
+        .await
+        .unwrap();
+        assert!(fts_hits.iter().all(|hit| hit.thought.id != bad_parent));
+
+        let vector_hits = search_artifact_chunk_contexts_vector_knn(
+            &pool,
+            vec![0.3_f32; bge::DIMS],
+            &EmbeddingModel::bge_m3(),
+            None,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        assert!(vector_hits.iter().all(|hit| hit.thought.id != bad_parent));
     }
 
     fn test_sparse_vector(weights: Vec<(u32, f32)>) -> SparseLexicalVector {

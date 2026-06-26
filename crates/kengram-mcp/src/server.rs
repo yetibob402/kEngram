@@ -334,6 +334,14 @@ impl KengramServer {
                 && query_expansion_runtime.hyde_enabled,
             graph_augmentation_enabled: full_pipeline_enabled
                 && query_expansion_runtime.graph_augmentation_enabled,
+            contextual_retrieval_enabled: chunk_serving_enabled
+                && query_expansion_runtime.contextual_retrieval_enabled,
+            contextual_chunk_vector_enabled: chunk_serving_enabled
+                && query_expansion_runtime.contextual_retrieval_enabled
+                && query_expansion_runtime.contextual_chunk_vector_enabled,
+            contextual_chunk_fts_enabled: chunk_serving_enabled
+                && query_expansion_runtime.contextual_retrieval_enabled
+                && query_expansion_runtime.contextual_chunk_fts_enabled,
             ..query_expansion_runtime
         };
         Self {
@@ -376,6 +384,18 @@ impl std::fmt::Debug for KengramServer {
             .field(
                 "graph_augmentation_enabled",
                 &self.query_expansion_runtime.graph_augmentation_enabled,
+            )
+            .field(
+                "contextual_retrieval_enabled",
+                &self.query_expansion_runtime.contextual_retrieval_enabled,
+            )
+            .field(
+                "contextual_chunk_vector_enabled",
+                &self.query_expansion_runtime.contextual_chunk_vector_enabled,
+            )
+            .field(
+                "contextual_chunk_fts_enabled",
+                &self.query_expansion_runtime.contextual_chunk_fts_enabled,
             )
             .finish()
     }

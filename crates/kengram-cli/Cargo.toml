@@ -22,6 +22,7 @@ axum.workspace = true
 clap.workspace = true
 figment.workspace = true
 rmcp.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"

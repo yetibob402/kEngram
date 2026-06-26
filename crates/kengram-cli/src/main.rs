@@ -9,6 +9,7 @@ mod backup;
 mod bench;
 mod chunk;
 mod config;
+mod contextual;
 mod eval;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
@@ -145,6 +146,12 @@ enum Command {
     Chunk {
         #[command(subcommand)]
         action: chunk::ChunkAction,
+    },
+    /// Operator-only contextual retrieval data prep. Generation is explicit,
+    /// bounded, idempotent, and never triggered by serving flags.
+    Contextual {
+        #[command(subcommand)]
+        action: contextual::ContextualAction,
     },
     /// Print corpus + storage telemetry: thought counts, embeddings,
     /// links, per-scope summary, per-table heap/index/total sizes.
@@ -514,6 +521,9 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
     let tag_domain_routing_enabled = config.search.tag_domain_routing_effective();
     let sparse_lexical_enabled = config.search.sparse_lexical_effective();
     let graph_augmentation_enabled = config.search.graph_augmentation_effective();
+    let contextual_retrieval_enabled = config.search.contextual_retrieval_effective();
+    let contextual_chunk_vector_enabled = config.search.contextual_chunk_vector_effective();
+    let contextual_chunk_fts_enabled = config.search.contextual_chunk_fts_effective();
     let (graph_relations, graph_direction) = parse_graph_runtime_config(&config.search)?;
     let query_expansion_runtime = SearchRuntimeOptions {
         query_expansion_enabled: config.search.query_expansion_effective(),
@@ -526,6 +536,9 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
         graph_total_cap: config.search.graph_total_cap,
         graph_relations: graph_relations.clone(),
         graph_direction,
+        contextual_retrieval_enabled,
+        contextual_chunk_vector_enabled,
+        contextual_chunk_fts_enabled,
     };
     tracing::info!(
         chunk_serving_enabled,
@@ -533,6 +546,10 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
         tag_domain_routing_enabled,
         sparse_lexical_enabled,
         graph_augmentation_enabled,
+        contextual_generation_enabled = config.search.contextual_generation_enabled,
+        contextual_retrieval_enabled,
+        contextual_chunk_vector_enabled,
+        contextual_chunk_fts_enabled,
         graph_seed_count = query_expansion_runtime.graph_seed_count,
         graph_per_seed_cap = query_expansion_runtime.graph_per_seed_cap,
         graph_total_cap = query_expansion_runtime.graph_total_cap,
@@ -1176,6 +1193,7 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Command::Chunk { action } => chunk::run_chunk_cli(config, action).await,
+        Command::Contextual { action } => contextual::run_contextual_cli(config, action).await,
         Command::Stats {
             scope_prefix,
             top_scopes,

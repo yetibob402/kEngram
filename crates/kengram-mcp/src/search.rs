@@ -75,6 +75,9 @@ pub struct SearchRuntimeOptions {
     pub graph_total_cap: usize,
     pub graph_relations: Vec<RelationKind>,
     pub graph_direction: LinkDirection,
+    pub contextual_retrieval_enabled: bool,
+    pub contextual_chunk_vector_enabled: bool,
+    pub contextual_chunk_fts_enabled: bool,
 }
 
 impl Default for SearchRuntimeOptions {
@@ -90,6 +93,9 @@ impl Default for SearchRuntimeOptions {
             graph_total_cap: DEFAULT_GRAPH_TOTAL_CAP,
             graph_relations: default_graph_relations(),
             graph_direction: LinkDirection::Both,
+            contextual_retrieval_enabled: false,
+            contextual_chunk_vector_enabled: false,
+            contextual_chunk_fts_enabled: false,
         }
     }
 }
@@ -223,8 +229,10 @@ pub struct SearchProfile {
     pub query_embedding_ms: f64,
     pub thought_vector_knn_ms: f64,
     pub chunk_vector_knn_ms: f64,
+    pub contextual_chunk_vector_knn_ms: f64,
     pub thought_fts_ms: f64,
     pub chunk_fts_ms: f64,
+    pub contextual_chunk_fts_ms: f64,
     pub chunk_pairwise_fts_ms: f64,
     pub domain_scope_ms: f64,
     pub tag_facet_ms: f64,
@@ -243,6 +251,9 @@ pub struct SearchProfile {
     pub query_expansion_enabled: bool,
     pub hyde_enabled: bool,
     pub graph_augmentation_enabled: bool,
+    pub contextual_retrieval_enabled: bool,
+    pub contextual_chunk_vector_enabled: bool,
+    pub contextual_chunk_fts_enabled: bool,
     pub query_expansion_provider: Option<String>,
     pub query_expansion_model_id: Option<String>,
     pub query_expansion_prompt_version: Option<String>,
@@ -254,8 +265,10 @@ pub struct SearchProfile {
     pub planner_tag_terms: Vec<String>,
     pub thought_vector_hits: usize,
     pub chunk_vector_hits: usize,
+    pub contextual_chunk_vector_hits: usize,
     pub thought_fts_hits: usize,
     pub chunk_fts_hits: usize,
+    pub contextual_chunk_fts_hits: usize,
     pub chunk_pairwise_fts_hits: usize,
     pub domain_scope_hits: usize,
     pub tag_facet_hits: usize,
@@ -276,6 +289,7 @@ pub struct SearchProfile {
     pub graph_candidates_before_dedupe: usize,
     pub graph_candidates_after_dedupe: usize,
     pub graph_candidates_retained_after_filters: usize,
+    pub contextual_candidates_retained_after_filters: usize,
     pub graph_merged_provenance_count: usize,
     pub graph_entity_provenance_count: i64,
     pub graph_person_provenance_count: i64,
@@ -436,12 +450,21 @@ async fn search_thoughts_with_tuning(
     let hyde_enabled = query_expansion_enabled && runtime.hyde_enabled;
     let graph_augmentation_enabled =
         request.full_pipeline_enabled && runtime.graph_augmentation_enabled;
+    let contextual_retrieval_enabled =
+        chunk_serving_enabled && runtime.contextual_retrieval_enabled;
+    let contextual_chunk_vector_enabled =
+        contextual_retrieval_enabled && runtime.contextual_chunk_vector_enabled;
+    let contextual_chunk_fts_enabled =
+        contextual_retrieval_enabled && runtime.contextual_chunk_fts_enabled;
     profile.full_pipeline_enabled = request.full_pipeline_enabled;
     profile.chunk_serving_enabled = chunk_serving_enabled;
     profile.tag_domain_routing_enabled = tag_domain_routing_enabled;
     profile.query_expansion_enabled = query_expansion_enabled;
     profile.hyde_enabled = hyde_enabled;
     profile.graph_augmentation_enabled = graph_augmentation_enabled;
+    profile.contextual_retrieval_enabled = contextual_retrieval_enabled;
+    profile.contextual_chunk_vector_enabled = contextual_chunk_vector_enabled;
+    profile.contextual_chunk_fts_enabled = contextual_chunk_fts_enabled;
     profile.graph_seed_count = runtime.graph_seed_count.min(MAX_GRAPH_SEED_COUNT);
     profile.graph_per_seed_cap = runtime.graph_per_seed_cap.min(MAX_GRAPH_PER_SEED_CAP);
     profile.graph_total_cap = runtime.graph_total_cap.min(MAX_GRAPH_TOTAL_CAP);
@@ -481,36 +504,14 @@ async fn search_thoughts_with_tuning(
     };
     profile.query_embedding_ms = elapsed_ms(embedding_started);
 
-    let (vector_hits, chunk_vector_hits, vector_search_available) = match embedded_query {
-        Some(v) => {
-            let mut thought_vector_ok = false;
-            let thought_vector_started = Instant::now();
-            let vector_hits = match kengram_storage::search_vector_knn(
-                pool,
-                v.clone(),
-                embedder.model(),
-                scope_filter,
-                scope_prefix_filter,
-                DEFAULT_TOP_K_PER_LEG as i64,
-            )
-            .await
-            {
-                Ok(hits) => {
-                    thought_vector_ok = true;
-                    hits
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "vector kNN query failed; falling back to lexical only");
-                    vec![]
-                }
-            };
-            profile.thought_vector_knn_ms = elapsed_ms(thought_vector_started);
-            let mut chunk_vector_ok = false;
-            let chunk_vector_hits = if chunk_serving_enabled {
-                let chunk_vector_started = Instant::now();
-                let hits = match kengram_storage::search_artifact_chunks_vector_knn(
+    let (vector_hits, chunk_vector_hits, contextual_chunk_vector_hits, vector_search_available) =
+        match embedded_query {
+            Some(v) => {
+                let mut thought_vector_ok = false;
+                let thought_vector_started = Instant::now();
+                let vector_hits = match kengram_storage::search_vector_knn(
                     pool,
-                    v,
+                    v.clone(),
                     embedder.model(),
                     scope_filter,
                     scope_prefix_filter,
@@ -519,26 +520,83 @@ async fn search_thoughts_with_tuning(
                 .await
                 {
                     Ok(hits) => {
-                        chunk_vector_ok = true;
+                        thought_vector_ok = true;
                         hits
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "artifact-chunk vector kNN query failed; continuing without chunk vector hits");
+                        tracing::warn!(error = %e, "vector kNN query failed; falling back to lexical only");
                         vec![]
                     }
                 };
-                profile.chunk_vector_knn_ms = elapsed_ms(chunk_vector_started);
-                hits
-            } else {
-                vec![]
-            };
-            profile.thought_vector_hits = vector_hits.len();
-            profile.chunk_vector_hits = chunk_vector_hits.len();
-            let vector_available = thought_vector_ok || chunk_vector_ok;
-            (vector_hits, chunk_vector_hits, vector_available)
-        }
-        None => (vec![], vec![], false),
-    };
+                profile.thought_vector_knn_ms = elapsed_ms(thought_vector_started);
+                let mut chunk_vector_ok = false;
+                let chunk_vector_hits = if chunk_serving_enabled {
+                    let chunk_vector_started = Instant::now();
+                    let hits = match kengram_storage::search_artifact_chunks_vector_knn(
+                        pool,
+                        v.clone(),
+                        embedder.model(),
+                        scope_filter,
+                        scope_prefix_filter,
+                        DEFAULT_TOP_K_PER_LEG as i64,
+                    )
+                    .await
+                    {
+                        Ok(hits) => {
+                            chunk_vector_ok = true;
+                            hits
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "artifact-chunk vector kNN query failed; continuing without chunk vector hits");
+                            vec![]
+                        }
+                    };
+                    profile.chunk_vector_knn_ms = elapsed_ms(chunk_vector_started);
+                    hits
+                } else {
+                    vec![]
+                };
+                let mut contextual_chunk_vector_ok = false;
+                let contextual_chunk_vector_hits = if contextual_chunk_vector_enabled {
+                    let contextual_vector_started = Instant::now();
+                    let hits = match kengram_storage::search_artifact_chunk_contexts_vector_knn(
+                        pool,
+                        v,
+                        embedder.model(),
+                        scope_filter,
+                        scope_prefix_filter,
+                        DEFAULT_TOP_K_PER_LEG as i64,
+                    )
+                    .await
+                    {
+                        Ok(hits) => {
+                            contextual_chunk_vector_ok = true;
+                            hits
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "contextual-chunk vector kNN query failed; continuing without contextual vector hits");
+                            vec![]
+                        }
+                    };
+                    profile.contextual_chunk_vector_knn_ms = elapsed_ms(contextual_vector_started);
+                    hits
+                } else {
+                    vec![]
+                };
+                profile.thought_vector_hits = vector_hits.len();
+                profile.chunk_vector_hits = chunk_vector_hits.len();
+                profile.contextual_chunk_vector_hits = contextual_chunk_vector_hits.len();
+                let vector_available =
+                    thought_vector_ok || chunk_vector_ok || contextual_chunk_vector_ok;
+                (
+                    vector_hits,
+                    chunk_vector_hits,
+                    contextual_chunk_vector_hits,
+                    vector_available,
+                )
+            }
+            None => (vec![], vec![], vec![], false),
+        };
 
     // Lexical leg: FTS-backed and bounded. The GIN index should make this
     // fast; the timeout is a defensive belt so lexical failures do not turn
@@ -572,6 +630,23 @@ async fn search_thoughts_with_tuning(
         vec![]
     };
     profile.chunk_fts_hits = chunk_lexical_hits.len();
+    let contextual_chunk_lexical_hits = if contextual_chunk_fts_enabled {
+        let contextual_fts_started = Instant::now();
+        let hits = bounded_artifact_chunk_context_fts_hits(
+            pool,
+            &query,
+            scope_filter,
+            scope_prefix_filter,
+            lexical_top_k,
+            lexical_timeout_ms,
+        )
+        .await;
+        profile.contextual_chunk_fts_ms = elapsed_ms(contextual_fts_started);
+        hits
+    } else {
+        vec![]
+    };
+    profile.contextual_chunk_fts_hits = contextual_chunk_lexical_hits.len();
     let chunk_pairwise_lexical_hits = if chunk_serving_enabled {
         profile.chunk_pairwise_subqueries = pairwise_subqueries(&query).len();
         let chunk_pairwise_started = Instant::now();
@@ -647,11 +722,22 @@ async fn search_thoughts_with_tuning(
 
     // RRF fuse → recency boost.
     let rrf_started = Instant::now();
+    let contextual_candidate_ids = contextual_chunk_vector_hits
+        .iter()
+        .chain(contextual_chunk_lexical_hits.iter())
+        .map(|hit| hit.thought.id)
+        .collect::<HashSet<_>>();
     let mut rankings = vec![vector_hits, lexical_hits];
     if chunk_serving_enabled {
         rankings.push(chunk_vector_hits);
         rankings.push(chunk_lexical_hits);
         rankings.push(chunk_pairwise_lexical_hits);
+    }
+    if contextual_chunk_vector_enabled {
+        rankings.push(contextual_chunk_vector_hits);
+    }
+    if contextual_chunk_fts_enabled {
+        rankings.push(contextual_chunk_lexical_hits);
     }
     if tag_domain_routing_enabled {
         rankings.push(domain_scope_hits);
@@ -705,17 +791,22 @@ async fn search_thoughts_with_tuning(
         .iter()
         .filter(|hit| graph_expansion.provenance.contains_key(&hit.thought.id))
         .count();
+    profile.contextual_candidates_retained_after_filters = fused
+        .iter()
+        .filter(|hit| contextual_candidate_ids.contains(&hit.thought.id))
+        .count();
     profile.tag_filter_ms = elapsed_ms(tag_filter_started);
 
     // Optional rerank stage.
     let rerank_enabled = request.rerank.unwrap_or(true);
     let candidate_pool = request.candidate_pool.unwrap_or(default_candidate_pool);
-    // Graph expansion is additive to the rerank pool. Keep the configured
-    // baseline candidate_pool intact, then allow retained graph candidates to
-    // add capacity so a graph-only hit cannot evict a baseline hit before the
-    // cross-encoder sees it.
-    let effective_candidate_pool =
-        candidate_pool.saturating_add(profile.graph_candidates_retained_after_filters);
+    // Expansion legs are additive to the rerank pool. Keep the configured
+    // baseline candidate_pool intact, then allow retained graph/contextual
+    // candidates to add capacity so an expansion-only hit cannot evict a
+    // baseline hit before the cross-encoder sees it.
+    let effective_candidate_pool = candidate_pool
+        .saturating_add(profile.graph_candidates_retained_after_filters)
+        .saturating_add(profile.contextual_candidates_retained_after_filters);
     profile.rerank_candidate_count = if rerank_enabled && reranker.is_some() {
         effective_candidate_pool.min(fused.len())
     } else {
@@ -1261,6 +1352,37 @@ async fn bounded_artifact_chunk_fts_hits(
                 query_canceled = e.is_query_canceled(),
                 timeout_ms = lexical_timeout_ms,
                 "bounded artifact-chunk FTS query failed; continuing with available search legs only",
+            );
+            vec![]
+        }
+    }
+}
+
+async fn bounded_artifact_chunk_context_fts_hits(
+    pool: &PgPool,
+    query: &str,
+    scope_filter: Option<&str>,
+    scope_prefix_filter: Option<&str>,
+    lexical_top_k: usize,
+    lexical_timeout_ms: u64,
+) -> Vec<Hit> {
+    match kengram_storage::search_artifact_chunk_contexts_fts_bounded(
+        pool,
+        query,
+        scope_filter,
+        scope_prefix_filter,
+        lexical_top_k as i64,
+        lexical_timeout_ms,
+    )
+    .await
+    {
+        Ok(hits) => hits,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                query_canceled = e.is_query_canceled(),
+                timeout_ms = lexical_timeout_ms,
+                "bounded contextual-chunk FTS query failed; continuing with available search legs only",
             );
             vec![]
         }
@@ -2025,6 +2147,75 @@ mod tests {
         }
     }
 
+    async fn insert_contextual_chunk_for_test(
+        pool: &PgPool,
+        parent_id: ThoughtId,
+        raw_chunk_content: &str,
+        context_text: &str,
+    ) -> uuid::Uuid {
+        ensure_test_chunk_schema(pool).await;
+        let artifact_id = uuid::Uuid::new_v4();
+        let chunk_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (id, scope, kind, title, metadata)
+            VALUES ($1, 'global', 'thought_chunks', 'contextual test artifact', '{}')
+            "#,
+        )
+        .bind(artifact_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO artifact_chunks (
+                id,
+                artifact_id,
+                source_thought_id,
+                chunk_index,
+                content,
+                content_fingerprint,
+                chunker_id,
+                chunker_version,
+                token_estimate,
+                start_char,
+                end_char,
+                metadata
+            )
+            VALUES ($1,$2,$3,0,$4,$5,'test-chunker',1,6,0,$6,'{"fixture":true}')
+            "#,
+        )
+        .bind(chunk_id)
+        .bind(artifact_id)
+        .bind(parent_id.into_uuid())
+        .bind(raw_chunk_content)
+        .bind(vec![11_u8; 32])
+        .bind(raw_chunk_content.len() as i32)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let outcome = kengram_storage::insert_artifact_chunk_context(
+            pool,
+            kengram_storage::ArtifactChunkContextInsert {
+                chunk_id,
+                context_text: context_text.to_string(),
+                generator_id: "mcp-test-context-generator".to_string(),
+                generator_version: 1,
+                prompt_version: "mcp-test-prompt-v1".to_string(),
+                prompt_hash: format!("mcp-test-{}", uuid::Uuid::new_v4()),
+                model_id: "mcp-test-context-model".to_string(),
+                model_version: "1".to_string(),
+                pipeline_run_id: None,
+                metadata: serde_json::json!({"fixture": true}),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.status, "ready");
+        chunk_id
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_thoughts_round_trip_with_fake_embedder(pool: PgPool) {
         let embedder = test_embedder();
@@ -2496,6 +2687,215 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn contextual_retrieval_default_off_does_not_change_results(pool: PgPool) {
+        let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
+        let parent_id = cap(
+            &pool,
+            "parent body deliberately lacks contextual-only marker",
+            "global",
+        )
+        .await;
+        insert_contextual_chunk_for_test(
+            &pool,
+            parent_id,
+            "raw chunk also lacks the marker",
+            "contextual-only-needle lives only in generated sidecar context",
+        )
+        .await;
+
+        let resp = search_thoughts_with_runtime(
+            &pool,
+            &bad,
+            None,
+            None,
+            SearchRuntimeOptions::default(),
+            SearchRequest {
+                query: "contextual-only-needle".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(false),
+                candidate_pool: None,
+                tag_filter: None,
+                chunk_serving_enabled: true,
+                full_pipeline_enabled: true,
+                tag_domain_routing_enabled: false,
+                include_profile: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(resp.results.is_empty());
+        let profile = resp.profile.expect("profile requested");
+        assert!(profile.full_pipeline_enabled);
+        assert!(profile.chunk_serving_enabled);
+        assert!(!profile.contextual_retrieval_enabled);
+        assert_eq!(profile.contextual_chunk_fts_hits, 0);
+        assert_eq!(profile.contextual_chunk_vector_hits, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn contextual_fts_flag_true_surfaces_context_only_parent(pool: PgPool) {
+        let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
+        let parent_id = cap(
+            &pool,
+            "contextual parent without the generated-only token",
+            "global",
+        )
+        .await;
+        let raw_chunk = "raw chunk remains the exposed provenance";
+        insert_contextual_chunk_for_test(
+            &pool,
+            parent_id,
+            raw_chunk,
+            "contextual-only-needle is generated sidecar evidence",
+        )
+        .await;
+
+        let resp = search_thoughts_with_runtime(
+            &pool,
+            &bad,
+            None,
+            None,
+            SearchRuntimeOptions {
+                contextual_retrieval_enabled: true,
+                contextual_chunk_fts_enabled: true,
+                ..SearchRuntimeOptions::default()
+            },
+            SearchRequest {
+                query: "contextual-only-needle".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(false),
+                candidate_pool: None,
+                tag_filter: None,
+                chunk_serving_enabled: true,
+                full_pipeline_enabled: true,
+                tag_domain_routing_enabled: false,
+                include_profile: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.results.len(), 1);
+        assert_eq!(resp.results[0].thought_id, parent_id);
+        assert_eq!(resp.results[0].chunk_content.as_deref(), Some(raw_chunk));
+        assert_eq!(
+            resp.results[0]
+                .chunk_metadata
+                .as_ref()
+                .and_then(|metadata| {
+                    metadata
+                        .get("contextual_retrieval")
+                        .and_then(|value| value.get("contextual"))
+                        .and_then(serde_json::Value::as_bool)
+                }),
+            Some(true)
+        );
+        let profile = resp.profile.expect("profile requested");
+        assert!(profile.contextual_retrieval_enabled);
+        assert!(profile.contextual_chunk_fts_enabled);
+        assert_eq!(profile.contextual_chunk_fts_hits, 1);
+        assert_eq!(profile.contextual_candidates_retained_after_filters, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn contextual_tag_filter_remains_hard_before_rerank(pool: PgPool) {
+        let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
+        let reranker = FakeReranker::new();
+        let task_parent = cap_with_tags_in_scope(
+            &pool,
+            "task parent contextual tag-filter control",
+            "global",
+            Tags {
+                kind: Some(TagKind::Task),
+                ..Tags::default()
+            },
+        )
+        .await;
+        let idea_parent = cap_with_tags_in_scope(
+            &pool,
+            "idea parent contextual tag-filter should be excluded",
+            "global",
+            Tags {
+                kind: Some(TagKind::Idea),
+                ..Tags::default()
+            },
+        )
+        .await;
+        insert_contextual_chunk_for_test(
+            &pool,
+            task_parent,
+            "task raw contextual chunk",
+            "shared-contextual-filter-needle generated context",
+        )
+        .await;
+        insert_contextual_chunk_for_test(
+            &pool,
+            idea_parent,
+            "idea raw contextual chunk",
+            "shared-contextual-filter-needle generated context",
+        )
+        .await;
+
+        let resp = search_thoughts_with_runtime(
+            &pool,
+            &bad,
+            Some(&reranker),
+            None,
+            SearchRuntimeOptions {
+                contextual_retrieval_enabled: true,
+                contextual_chunk_fts_enabled: true,
+                ..SearchRuntimeOptions::default()
+            },
+            SearchRequest {
+                query: "shared-contextual-filter-needle".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(true),
+                candidate_pool: Some(10),
+                tag_filter: Some(serde_json::json!({"kind": "task"})),
+                chunk_serving_enabled: true,
+                full_pipeline_enabled: true,
+                tag_domain_routing_enabled: false,
+                include_profile: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(resp.rerank_used);
+        let rerank_call = reranker
+            .last_call()
+            .expect("reranker should record filtered candidate pool");
+        assert_eq!(rerank_call.candidates.len(), 1);
+        assert!(
+            rerank_call
+                .candidates
+                .iter()
+                .all(|candidate| !candidate.contains("idea raw contextual chunk"))
+        );
+        let ids = resp
+            .results
+            .iter()
+            .map(|hit| hit.thought_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![task_parent]);
+        assert!(!ids.contains(&idea_parent));
+        let profile = resp.profile.expect("profile requested");
+        assert_eq!(profile.contextual_chunk_fts_hits, 2);
+        assert_eq!(profile.contextual_candidates_retained_after_filters, 1);
+        assert_eq!(profile.rerank_candidate_count, 1);
     }
 
     #[sqlx::test(migrations = "../../migrations")]

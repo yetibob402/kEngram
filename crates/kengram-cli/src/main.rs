@@ -158,6 +158,23 @@ enum Command {
         #[command(subcommand)]
         action: contextual::ContextualAction,
     },
+    /// Stage-7 ingest hygiene report/apply. Dry-run is read-only; `--apply`
+    /// requires full_pipeline + ingest_hygiene + repair config gates.
+    IngestHygiene {
+        /// Apply bounded repair. Omit for read-only dry-run/report mode.
+        #[arg(long)]
+        apply: bool,
+        /// Maximum queue rows to mutate in this run. Defaults to
+        /// [search].ingest_hygiene_max_rows.
+        #[arg(long)]
+        max_rows: Option<i64>,
+        /// Pending rows with prior failures older than this age are stale.
+        #[arg(long, default_value_t = kengram_storage::DEFAULT_INGEST_HYGIENE_STALE_AFTER_HOURS)]
+        stale_after_hours: i64,
+        /// Pending rows at or above this attempts count are stale failures.
+        #[arg(long, default_value_t = kengram_storage::DEFAULT_INGEST_HYGIENE_MAX_FAILED_ATTEMPTS)]
+        max_failed_attempts: i32,
+    },
     /// Print corpus + storage telemetry: thought counts, embeddings,
     /// links, per-scope summary, per-table heap/index/total sizes.
     /// Operator-facing snapshot of "how much am I storing?" without psql.
@@ -738,6 +755,7 @@ async fn run_worker(config: Config) -> anyhow::Result<()> {
         batch_size,
     } = config.worker;
     let interval = Duration::from_secs(tick_interval_seconds);
+    let ingest_hygiene_enabled = config.search.ingest_hygiene_effective();
 
     let drain_pool = pool.clone();
     let drain_embedder = embedder.clone();
@@ -748,6 +766,7 @@ async fn run_worker(config: Config) -> anyhow::Result<()> {
             drain_embedder,
             interval,
             batch_size,
+            ingest_hygiene_enabled,
             drain_cancel,
         )
         .await;
@@ -797,6 +816,7 @@ async fn run_worker(config: Config) -> anyhow::Result<()> {
         tagger = %tagger_summary,
         tagger_model_id = ?tagger_model_id,
         scope_vocab_limit = ?scope_vocab_limit,
+        ingest_hygiene_enabled,
         "kengram worker started"
     );
 
@@ -826,6 +846,7 @@ async fn embed_drainer_loop(
     embedder: std::sync::Arc<dyn Embedder>,
     interval: Duration,
     batch_size: i64,
+    ingest_hygiene_enabled: bool,
     cancel: CancellationToken,
 ) {
     let mut ticker = tokio::time::interval(interval);
@@ -842,10 +863,16 @@ async fn embed_drainer_loop(
                 return;
             }
             _ = ticker.tick() => {
-                match kengram_mcp::drain_pending_embeddings(&pool, embedder.as_ref(), batch_size).await {
+                match kengram_mcp::drain_pending_embeddings_with_hygiene(
+                    &pool,
+                    embedder.as_ref(),
+                    batch_size,
+                    ingest_hygiene_enabled,
+                ).await {
                     Ok(report) if report.found > 0 => tracing::info!(
                         found = report.found,
                         embedded = report.embedded,
+                        skipped = report.skipped,
                         failed = report.failed,
                         "embed drain tick",
                     ),
@@ -1248,6 +1275,21 @@ async fn main() -> anyhow::Result<()> {
         },
         Command::Chunk { action } => chunk::run_chunk_cli(config, action).await,
         Command::Contextual { action } => contextual::run_contextual_cli(config, action).await,
+        Command::IngestHygiene {
+            apply,
+            max_rows,
+            stale_after_hours,
+            max_failed_attempts,
+        } => {
+            run_ingest_hygiene(
+                config,
+                apply,
+                max_rows,
+                stale_after_hours,
+                max_failed_attempts,
+            )
+            .await
+        }
         Command::Stats {
             scope_prefix,
             top_scopes,
@@ -1309,6 +1351,43 @@ async fn run_audit_migrations(
             println!("    {notes}");
         }
     }
+    Ok(())
+}
+
+async fn run_ingest_hygiene(
+    config: Config,
+    apply: bool,
+    max_rows: Option<i64>,
+    stale_after_hours: i64,
+    max_failed_attempts: i32,
+) -> anyhow::Result<()> {
+    if apply && !config.search.ingest_hygiene_repair_effective() {
+        anyhow::bail!(
+            "`kengram ingest-hygiene --apply` requires [search].full_pipeline_enabled=true, ingest_hygiene_enabled=true, and ingest_hygiene_repair_enabled=true"
+        );
+    }
+    let configured_max = config.search.ingest_hygiene_max_rows.max(1);
+    let max_rows = max_rows
+        .unwrap_or(configured_max)
+        .min(configured_max)
+        .max(1);
+    let pool = PgPoolOptions::new()
+        .max_connections(config.database.max_connections)
+        .connect(&config.database.url)
+        .await
+        .with_context(|| format!("connecting to {}", config.database.url))?;
+    let report = kengram_storage::run_ingest_hygiene(
+        &pool,
+        kengram_storage::IngestHygieneOptions {
+            apply,
+            max_rows,
+            stale_after_hours,
+            max_failed_attempts,
+        },
+    )
+    .await
+    .context("running ingest hygiene")?;
+    println!("{}", serde_json::to_string_pretty(&report.to_json())?);
     Ok(())
 }
 

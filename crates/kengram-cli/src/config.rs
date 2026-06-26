@@ -86,6 +86,16 @@ pub struct SearchConfig {
     pub contextual_chunk_vector_enabled: bool,
     /// Subordinate gate for contextual lexical/FTS retrieval.
     pub contextual_chunk_fts_enabled: bool,
+    /// Subordinate gate for Stage-7 ingest hygiene enforcement in worker
+    /// drains. Read-only operator checks can run without this; repair/apply
+    /// requires this plus `ingest_hygiene_repair_enabled`.
+    pub ingest_hygiene_enabled: bool,
+    /// Destructive operator repair gate. Takes effect only when
+    /// full_pipeline_enabled + ingest_hygiene_enabled are both true and the
+    /// CLI call also passes `--apply`.
+    pub ingest_hygiene_repair_enabled: bool,
+    /// Bounded max rows per repair run. The CLI may choose a smaller cap.
+    pub ingest_hygiene_max_rows: i64,
     pub graph_seed_count: usize,
     pub graph_per_seed_cap: usize,
     pub graph_total_cap: usize,
@@ -143,6 +153,14 @@ impl SearchConfig {
         self.contextual_retrieval_effective() && self.contextual_chunk_fts_enabled
     }
 
+    pub fn ingest_hygiene_effective(&self) -> bool {
+        self.full_pipeline_enabled && self.ingest_hygiene_enabled
+    }
+
+    pub fn ingest_hygiene_repair_effective(&self) -> bool {
+        self.ingest_hygiene_effective() && self.ingest_hygiene_repair_enabled
+    }
+
     pub fn query_expansion_effective(&self) -> bool {
         self.full_pipeline_enabled && self.query_expansion_enabled
     }
@@ -177,6 +195,9 @@ impl Default for SearchConfig {
             contextual_retrieval_enabled: false,
             contextual_chunk_vector_enabled: false,
             contextual_chunk_fts_enabled: false,
+            ingest_hygiene_enabled: false,
+            ingest_hygiene_repair_enabled: false,
+            ingest_hygiene_max_rows: 100,
             graph_seed_count: DEFAULT_GRAPH_SEED_COUNT,
             graph_per_seed_cap: DEFAULT_GRAPH_PER_SEED_CAP,
             graph_total_cap: DEFAULT_GRAPH_TOTAL_CAP,
@@ -687,6 +708,11 @@ mod tests {
         assert!(!c.search.contextual_retrieval_effective());
         assert!(!c.search.contextual_chunk_vector_effective());
         assert!(!c.search.contextual_chunk_fts_effective());
+        assert!(!c.search.ingest_hygiene_enabled);
+        assert!(!c.search.ingest_hygiene_repair_enabled);
+        assert_eq!(c.search.ingest_hygiene_max_rows, 100);
+        assert!(!c.search.ingest_hygiene_effective());
+        assert!(!c.search.ingest_hygiene_repair_effective());
         assert!(!c.search.query_expansion_effective());
         assert!(!c.search.hyde_effective());
     }
@@ -871,6 +897,45 @@ mod tests {
         assert!(c.search.contextual_retrieval_effective());
         assert!(c.search.contextual_chunk_vector_effective());
         assert!(c.search.contextual_chunk_fts_effective());
+    }
+
+    #[test]
+    fn ingest_hygiene_requires_full_pipeline_master_gate() {
+        let toml = r#"
+            [search]
+            full_pipeline_enabled = false
+            ingest_hygiene_enabled = true
+            ingest_hygiene_repair_enabled = true
+            ingest_hygiene_max_rows = 7
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert!(!c.search.full_pipeline_enabled);
+        assert!(c.search.ingest_hygiene_enabled);
+        assert!(c.search.ingest_hygiene_repair_enabled);
+        assert_eq!(c.search.ingest_hygiene_max_rows, 7);
+        assert!(!c.search.ingest_hygiene_effective());
+        assert!(!c.search.ingest_hygiene_repair_effective());
+    }
+
+    #[test]
+    fn ingest_hygiene_repair_effective_when_all_gates_true() {
+        let toml = r#"
+            [search]
+            full_pipeline_enabled = true
+            ingest_hygiene_enabled = true
+            ingest_hygiene_repair_enabled = true
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert!(c.search.ingest_hygiene_effective());
+        assert!(c.search.ingest_hygiene_repair_effective());
     }
 
     #[test]

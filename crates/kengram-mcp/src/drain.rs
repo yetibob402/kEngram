@@ -26,6 +26,8 @@ pub struct DrainReport {
     pub found: usize,
     /// Number that successfully embedded + persisted + marked.
     pub embedded: usize,
+    /// Number permanently skipped and dequeued by the ingest hygiene fence.
+    pub skipped: usize,
     /// Number that failed embed/persist.
     pub failed: usize,
 }
@@ -44,6 +46,18 @@ pub async fn drain_pending_embeddings(
     embedder: &dyn Embedder,
     batch_size: i64,
 ) -> Result<DrainReport, DrainError> {
+    drain_pending_embeddings_with_hygiene(pool, embedder, batch_size, false).await
+}
+
+/// Drain pending embeddings with optional Stage-7 ingest hygiene enforcement.
+/// When enabled, retrieval-denied targets are dequeued without calling the
+/// embedder, so they cannot become retrieval-bearing sidecars.
+pub async fn drain_pending_embeddings_with_hygiene(
+    pool: &PgPool,
+    embedder: &dyn Embedder,
+    batch_size: i64,
+    hygiene_enabled: bool,
+) -> Result<DrainReport, DrainError> {
     let jobs = kengram_storage::claim_pending(pool, batch_size).await?;
     let mut report = DrainReport {
         found: jobs.len(),
@@ -51,8 +65,18 @@ pub async fn drain_pending_embeddings(
     };
 
     for job in jobs {
-        match process_embed_job(pool, embedder, &job).await {
-            Ok(()) => report.embedded += 1,
+        match process_embed_job(pool, embedder, &job, hygiene_enabled).await {
+            Ok(EmbedJobOutcome::Embedded) => report.embedded += 1,
+            Ok(EmbedJobOutcome::Skipped { reason }) => {
+                tracing::info!(
+                    pending_id = %job.id,
+                    target_kind = %job.target_kind,
+                    target_id = %job.target_id,
+                    reason,
+                    "embed-drain: skipped retrieval-denied target",
+                );
+                report.skipped += 1;
+            }
             Err(err) => {
                 tracing::warn!(
                     pending_id = %job.id,
@@ -69,6 +93,12 @@ pub async fn drain_pending_embeddings(
     }
 
     Ok(report)
+}
+
+#[derive(Debug)]
+enum EmbedJobOutcome {
+    Embedded,
+    Skipped { reason: String },
 }
 
 #[derive(Debug)]
@@ -103,7 +133,8 @@ async fn process_embed_job(
     pool: &PgPool,
     embedder: &dyn Embedder,
     job: &kengram_storage::PendingJob,
-) -> Result<(), EmbedJobError> {
+    hygiene_enabled: bool,
+) -> Result<EmbedJobOutcome, EmbedJobError> {
     let active_model = &embedder.model().id;
     if &job.model_id != active_model {
         return Err(EmbedJobError::ModelMismatch {
@@ -114,25 +145,48 @@ async fn process_embed_job(
 
     // Facts are gone; artifact chunks are now first-class embedding targets
     // for the recall chunk-serving path.
-    let text = match job.target_kind.as_str() {
-        kengram_storage::target::THOUGHT => {
-            let thought_id = ThoughtId::from(job.target_id);
-            let thought = kengram_storage::fetch_thought(pool, thought_id)
-                .await
-                .map_err(EmbedJobError::Storage)?
-                .ok_or(EmbedJobError::SourceMissing)?;
-            thought.content
+    let text = if hygiene_enabled {
+        match kengram_storage::fetch_embedding_index_source(pool, &job.target_kind, job.target_id)
+            .await
+            .map_err(EmbedJobError::Storage)?
+        {
+            kengram_storage::EmbeddingIndexSourceStatus::Ready(source) => source.content,
+            kengram_storage::EmbeddingIndexSourceStatus::Denied { reason } => {
+                kengram_storage::mark_embedded(pool, job.id)
+                    .await
+                    .map_err(EmbedJobError::Storage)?;
+                return Ok(EmbedJobOutcome::Skipped { reason });
+            }
+            kengram_storage::EmbeddingIndexSourceStatus::Missing => {
+                kengram_storage::mark_embedded(pool, job.id)
+                    .await
+                    .map_err(EmbedJobError::Storage)?;
+                return Ok(EmbedJobOutcome::Skipped {
+                    reason: "source_missing".to_string(),
+                });
+            }
         }
-        kengram_storage::target::ARTIFACT_CHUNK => {
-            kengram_storage::fetch_artifact_chunk_content(pool, job.target_id)
-                .await
-                .map_err(EmbedJobError::Storage)?
-                .ok_or(EmbedJobError::SourceMissing)?
-        }
-        _ => {
-            return Err(EmbedJobError::UnsupportedTargetKind(
-                job.target_kind.clone(),
-            ));
+    } else {
+        match job.target_kind.as_str() {
+            kengram_storage::target::THOUGHT => {
+                let thought_id = ThoughtId::from(job.target_id);
+                let thought = kengram_storage::fetch_thought(pool, thought_id)
+                    .await
+                    .map_err(EmbedJobError::Storage)?
+                    .ok_or(EmbedJobError::SourceMissing)?;
+                thought.content
+            }
+            kengram_storage::target::ARTIFACT_CHUNK => {
+                kengram_storage::fetch_artifact_chunk_content(pool, job.target_id)
+                    .await
+                    .map_err(EmbedJobError::Storage)?
+                    .ok_or(EmbedJobError::SourceMissing)?
+            }
+            _ => {
+                return Err(EmbedJobError::UnsupportedTargetKind(
+                    job.target_kind.clone(),
+                ));
+            }
         }
     };
 
@@ -171,7 +225,7 @@ async fn process_embed_job(
         .await
         .map_err(EmbedJobError::Storage)?;
 
-    Ok(())
+    Ok(EmbedJobOutcome::Embedded)
 }
 
 // -- tag drainer ------------------------------------------------------------
@@ -590,7 +644,30 @@ mod tests {
         let report = drain_pending_embeddings(&pool, &good, 10).await.unwrap();
         assert_eq!(report.found, 0);
         assert_eq!(report.embedded, 0);
+        assert_eq!(report.skipped, 0);
         assert_eq!(report.failed, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drain_hygiene_skips_kgr_target_before_embedding(pool: PgPool) {
+        let id = capture_one(&pool, "KGR024 should never be indexed").await;
+        assert_eq!(kengram_storage::count_pending(&pool).await.unwrap(), 1);
+
+        let good = test_embedder();
+        let report = drain_pending_embeddings_with_hygiene(&pool, &good, 10, true)
+            .await
+            .unwrap();
+        assert_eq!(report.found, 1);
+        assert_eq!(report.embedded, 0);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.failed, 0);
+        assert_eq!(kengram_storage::count_pending(&pool).await.unwrap(), 0);
+        assert!(
+            !kengram_storage::thought_has_embedding(&pool, id, &test_embedding_model())
+                .await
+                .unwrap(),
+            "hygiene skip must not write an embedding sidecar"
+        );
     }
 
     // -- tag drainer ----------------------------------------------------------

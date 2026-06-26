@@ -11,7 +11,7 @@ use kengram_core::{
     SourceError, SparseEmbeddingModel, SparseLexicalVector, Tags, Thought, ThoughtId,
     UnknownLinkSource, UnknownRelationKind,
 };
-use sqlx::{PgPool, PgTransaction};
+use sqlx::{PgPool, PgTransaction, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -99,6 +99,121 @@ impl SparseEmbeddingProvenance {
 }
 
 pub const CONTEXTUAL_CONTAMINATION_FILTER_VERSION: &str = "eval-contamination-v1";
+
+pub const DEFAULT_INGEST_HYGIENE_MAX_ROWS: i64 = 100;
+pub const DEFAULT_INGEST_HYGIENE_STALE_AFTER_HOURS: i64 = 24;
+pub const DEFAULT_INGEST_HYGIENE_MAX_FAILED_ATTEMPTS: i32 = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngestHygieneOptions {
+    pub apply: bool,
+    pub max_rows: i64,
+    pub stale_after_hours: i64,
+    pub max_failed_attempts: i32,
+}
+
+impl Default for IngestHygieneOptions {
+    fn default() -> Self {
+        Self {
+            apply: false,
+            max_rows: DEFAULT_INGEST_HYGIENE_MAX_ROWS,
+            stale_after_hours: DEFAULT_INGEST_HYGIENE_STALE_AFTER_HOURS,
+            max_failed_attempts: DEFAULT_INGEST_HYGIENE_MAX_FAILED_ATTEMPTS,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct IngestHygieneCounts {
+    pub pending_embeddings_total: i64,
+    pub pending_tags_total: i64,
+    pub pending_embeddings_failed: i64,
+    pub pending_embeddings_repeated_failures: i64,
+    pub pending_tags_repeated_failures: i64,
+    pub pending_embeddings_denied_targets: i64,
+    pub pending_tags_denied_targets: i64,
+    pub thought_duplicate_fingerprint_groups: i64,
+    pub thought_empty_content: i64,
+    pub thought_oversize_content: i64,
+    pub thought_fingerprint_drift: i64,
+    pub artifact_chunk_fingerprint_drift: i64,
+    pub sidecar_fingerprint_drift: i64,
+    pub retracted_or_denied_sidecars: i64,
+    pub eval_markers_in_retrieval_sidecars: i64,
+    pub contextual_fingerprint_drift: i64,
+    pub contextual_denied_ready_rows: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestHygieneMutation {
+    pub mutation_kind: String,
+    pub target_table: String,
+    pub target_kind: Option<String>,
+    pub target_id: Option<Uuid>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestHygieneReport {
+    pub mode: String,
+    pub run_id: Option<Uuid>,
+    pub options: IngestHygieneOptions,
+    pub counts: IngestHygieneCounts,
+    pub mutations: Vec<IngestHygieneMutation>,
+}
+
+impl IngestHygieneReport {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "mode": self.mode,
+            "run_id": self.run_id,
+            "options": {
+                "apply": self.options.apply,
+                "max_rows": self.options.max_rows,
+                "stale_after_hours": self.options.stale_after_hours,
+                "max_failed_attempts": self.options.max_failed_attempts,
+            },
+            "counts": {
+                "pending_embeddings_total": self.counts.pending_embeddings_total,
+                "pending_tags_total": self.counts.pending_tags_total,
+                "pending_embeddings_failed": self.counts.pending_embeddings_failed,
+                "pending_embeddings_repeated_failures": self.counts.pending_embeddings_repeated_failures,
+                "pending_tags_repeated_failures": self.counts.pending_tags_repeated_failures,
+                "pending_embeddings_denied_targets": self.counts.pending_embeddings_denied_targets,
+                "pending_tags_denied_targets": self.counts.pending_tags_denied_targets,
+                "thought_duplicate_fingerprint_groups": self.counts.thought_duplicate_fingerprint_groups,
+                "thought_empty_content": self.counts.thought_empty_content,
+                "thought_oversize_content": self.counts.thought_oversize_content,
+                "thought_fingerprint_drift": self.counts.thought_fingerprint_drift,
+                "artifact_chunk_fingerprint_drift": self.counts.artifact_chunk_fingerprint_drift,
+                "sidecar_fingerprint_drift": self.counts.sidecar_fingerprint_drift,
+                "retracted_or_denied_sidecars": self.counts.retracted_or_denied_sidecars,
+                "eval_markers_in_retrieval_sidecars": self.counts.eval_markers_in_retrieval_sidecars,
+                "contextual_fingerprint_drift": self.counts.contextual_fingerprint_drift,
+                "contextual_denied_ready_rows": self.counts.contextual_denied_ready_rows,
+            },
+            "mutations": self.mutations.iter().map(|m| serde_json::json!({
+                "mutation_kind": m.mutation_kind,
+                "target_table": m.target_table,
+                "target_kind": m.target_kind,
+                "target_id": m.target_id,
+                "reason": m.reason,
+            })).collect::<Vec<_>>(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingIndexSource {
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbeddingIndexSourceStatus {
+    Ready(EmbeddingIndexSource),
+    Denied { reason: String },
+    Missing,
+}
 
 #[derive(Debug, Clone)]
 pub struct ContextGenerationSource {
@@ -301,6 +416,159 @@ fn contamination_rejection_reason(
     None
 }
 
+fn thought_index_denial_reason(
+    thought_id: ThoughtId,
+    scope: &str,
+    metadata: &serde_json::Value,
+    content: &str,
+    retracted_at: Option<OffsetDateTime>,
+) -> Option<String> {
+    if retracted_at.is_some() {
+        return Some("thought_retracted".to_string());
+    }
+    if scope.starts_with("archive.") {
+        return Some("archive_scope".to_string());
+    }
+    if known_eval_thought_id(thought_id) {
+        return Some("known_eval_thought_id".to_string());
+    }
+    if source_file_trips_eval_contamination(metadata) {
+        return Some("eval_source_file".to_string());
+    }
+    if text_trips_eval_contamination(content) {
+        return Some("thought_eval_marker".to_string());
+    }
+    None
+}
+
+fn chunk_index_denial_reason(
+    parent_id: Option<ThoughtId>,
+    parent_scope: Option<&str>,
+    parent_metadata: Option<&serde_json::Value>,
+    parent_content: Option<&str>,
+    parent_retracted_at: Option<OffsetDateTime>,
+    chunk_content: &str,
+    chunk_retracted_at: Option<OffsetDateTime>,
+) -> Option<String> {
+    let Some(parent_id) = parent_id else {
+        return Some("missing_parent_thought".to_string());
+    };
+    let Some(parent_scope) = parent_scope else {
+        return Some("missing_parent_thought".to_string());
+    };
+    let Some(parent_metadata) = parent_metadata else {
+        return Some("missing_parent_thought".to_string());
+    };
+    let Some(parent_content) = parent_content else {
+        return Some("missing_parent_thought".to_string());
+    };
+    if chunk_retracted_at.is_some() {
+        return Some("chunk_retracted".to_string());
+    }
+    thought_index_denial_reason(
+        parent_id,
+        parent_scope,
+        parent_metadata,
+        parent_content,
+        parent_retracted_at,
+    )
+    .or_else(|| {
+        if text_trips_eval_contamination(chunk_content) {
+            Some("raw_chunk_eval_marker".to_string())
+        } else {
+            None
+        }
+    })
+}
+
+pub async fn fetch_embedding_index_source(
+    pool: &PgPool,
+    target_kind: &str,
+    target_id: Uuid,
+) -> Result<EmbeddingIndexSourceStatus, StorageError> {
+    match target_kind {
+        target::THOUGHT => {
+            let row = sqlx::query(
+                r#"
+                SELECT id, scope, content, metadata, retracted_at
+                FROM thoughts
+                WHERE id = $1
+                "#,
+            )
+            .bind(target_id)
+            .fetch_optional(pool)
+            .await?;
+            let Some(row) = row else {
+                return Ok(EmbeddingIndexSourceStatus::Missing);
+            };
+            let thought_id: Uuid = row.try_get("id")?;
+            let scope: String = row.try_get("scope")?;
+            let content: String = row.try_get("content")?;
+            let metadata: serde_json::Value = row.try_get("metadata")?;
+            let retracted_at: Option<OffsetDateTime> = row.try_get("retracted_at")?;
+            if let Some(reason) = thought_index_denial_reason(
+                ThoughtId::from(thought_id),
+                &scope,
+                &metadata,
+                &content,
+                retracted_at,
+            ) {
+                return Ok(EmbeddingIndexSourceStatus::Denied { reason });
+            }
+            Ok(EmbeddingIndexSourceStatus::Ready(EmbeddingIndexSource {
+                content,
+            }))
+        }
+        target::ARTIFACT_CHUNK => {
+            let row = sqlx::query(
+                r#"
+                SELECT ac.id,
+                       ac.content AS chunk_content,
+                       ac.retracted_at AS chunk_retracted_at,
+                       t.id AS parent_id,
+                       t.scope AS parent_scope,
+                       t.content AS parent_content,
+                       t.metadata AS parent_metadata,
+                       t.retracted_at AS parent_retracted_at
+                FROM artifact_chunks ac
+                LEFT JOIN thoughts t ON t.id = ac.source_thought_id
+                WHERE ac.id = $1
+                "#,
+            )
+            .bind(target_id)
+            .fetch_optional(pool)
+            .await?;
+            let Some(row) = row else {
+                return Ok(EmbeddingIndexSourceStatus::Missing);
+            };
+            let chunk_content: String = row.try_get("chunk_content")?;
+            let chunk_retracted_at: Option<OffsetDateTime> = row.try_get("chunk_retracted_at")?;
+            let parent_id: Option<Uuid> = row.try_get("parent_id")?;
+            let parent_scope: Option<String> = row.try_get("parent_scope")?;
+            let parent_content: Option<String> = row.try_get("parent_content")?;
+            let parent_metadata: Option<serde_json::Value> = row.try_get("parent_metadata")?;
+            let parent_retracted_at: Option<OffsetDateTime> = row.try_get("parent_retracted_at")?;
+            if let Some(reason) = chunk_index_denial_reason(
+                parent_id.map(ThoughtId::from),
+                parent_scope.as_deref(),
+                parent_metadata.as_ref(),
+                parent_content.as_deref(),
+                parent_retracted_at,
+                &chunk_content,
+                chunk_retracted_at,
+            ) {
+                return Ok(EmbeddingIndexSourceStatus::Denied { reason });
+            }
+            Ok(EmbeddingIndexSourceStatus::Ready(EmbeddingIndexSource {
+                content: chunk_content,
+            }))
+        }
+        other => Err(StorageError::UnsupportedEmbeddingTargetKind(
+            other.to_string(),
+        )),
+    }
+}
+
 fn ann_projection_index_name(projection_id: &str) -> String {
     let mut sanitized = projection_id
         .chars()
@@ -421,6 +689,11 @@ pub enum StorageError {
         "bge-m3 sidecar only supports thought and artifact_chunk embeddings, got target_kind={0}"
     )]
     UnsupportedBgeTargetKind(String),
+
+    #[error(
+        "embedding queue only supports thought and artifact_chunk targets, got target_kind={0}"
+    )]
+    UnsupportedEmbeddingTargetKind(String),
 
     #[error(
         "bge-m3 sparse sidecar only supports thought and artifact_chunk embeddings, got target_kind={0}"
@@ -2617,8 +2890,12 @@ pub async fn enqueue_unembedded_thoughts(
               AND ($3::text IS NULL OR t.scope = $3)
               AND ($4::text IS NULL OR t.scope LIKE $4 || '%')
               AND t.retracted_at IS NULL
+              AND t.scope NOT LIKE 'archive.%'
+              AND t.id <> ALL($5::uuid[])
+              AND lower(coalesce(t.metadata->>'source_file', '')) !~ $6
+              AND t.content !~ $7
             ORDER BY t.created_at ASC
-            LIMIT $5
+            LIMIT $8
             ON CONFLICT (target_kind, target_id, model_id) DO NOTHING
             "#,
         )
@@ -2626,13 +2903,16 @@ pub async fn enqueue_unembedded_thoughts(
         .bind(bge::MODEL_VERSION)
         .bind(scope)
         .bind(scope_prefix)
+        .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+        .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+        .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
         .bind(limit)
         .execute(pool)
         .await?;
         return Ok(result.rows_affected() as usize);
     }
 
-    let result = sqlx::query!(
+    let result = sqlx::query(
         r#"
         INSERT INTO pending_embeddings (target_kind, target_id, model_id)
         SELECT 'thought', t.id, $1
@@ -2645,15 +2925,22 @@ pub async fn enqueue_unembedded_thoughts(
           AND ($2::text IS NULL OR t.scope = $2)
           AND ($3::text IS NULL OR t.scope LIKE $3 || '%')
           AND t.retracted_at IS NULL
+          AND t.scope NOT LIKE 'archive.%'
+          AND t.id <> ALL($4::uuid[])
+          AND lower(coalesce(t.metadata->>'source_file', '')) !~ $5
+          AND t.content !~ $6
         ORDER BY t.created_at ASC
-        LIMIT $4
+        LIMIT $7
         ON CONFLICT (target_kind, target_id, model_id) DO NOTHING
         "#,
-        model_id,
-        scope,
-        scope_prefix,
-        limit,
     )
+    .bind(model_id)
+    .bind(scope)
+    .bind(scope_prefix)
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .bind(limit)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() as usize)
@@ -2686,8 +2973,13 @@ pub async fn enqueue_unembedded_artifact_chunks(
               AND t.retracted_at IS NULL
               AND ($3::text IS NULL OR t.scope = $3)
               AND ($4::text IS NULL OR t.scope LIKE $4 || '%')
+              AND t.scope NOT LIKE 'archive.%'
+              AND t.id <> ALL($5::uuid[])
+              AND lower(coalesce(t.metadata->>'source_file', '')) !~ $6
+              AND t.content !~ $7
+              AND ac.content !~ $7
             ORDER BY ac.created_at ASC
-            LIMIT $5
+            LIMIT $8
             ON CONFLICT (target_kind, target_id, model_id) DO NOTHING
             "#,
         )
@@ -2695,6 +2987,9 @@ pub async fn enqueue_unembedded_artifact_chunks(
         .bind(bge::MODEL_VERSION)
         .bind(scope)
         .bind(scope_prefix)
+        .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+        .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+        .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
         .bind(limit)
         .execute(pool)
         .await?;
@@ -2717,14 +3012,22 @@ pub async fn enqueue_unembedded_artifact_chunks(
           AND t.retracted_at IS NULL
           AND ($2::text IS NULL OR t.scope = $2)
           AND ($3::text IS NULL OR t.scope LIKE $3 || '%')
+          AND t.scope NOT LIKE 'archive.%'
+          AND t.id <> ALL($4::uuid[])
+          AND lower(coalesce(t.metadata->>'source_file', '')) !~ $5
+          AND t.content !~ $6
+          AND ac.content !~ $6
         ORDER BY ac.created_at ASC
-        LIMIT $4
+        LIMIT $7
         ON CONFLICT (target_kind, target_id, model_id) DO NOTHING
         "#,
     )
     .bind(model_id)
     .bind(scope)
     .bind(scope_prefix)
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
     .bind(limit)
     .execute(pool)
     .await?;
@@ -2738,6 +3041,1252 @@ pub async fn count_pending(pool: &PgPool) -> Result<i64, StorageError> {
         .fetch_one(pool)
         .await?;
     Ok(row.count)
+}
+
+async fn count_i64(pool: &PgPool, query: &str) -> Result<i64, StorageError> {
+    let (count,): (i64,) = sqlx::query_as(query).fetch_one(pool).await?;
+    Ok(count)
+}
+
+async fn collect_ingest_hygiene_counts(
+    pool: &PgPool,
+    options: IngestHygieneOptions,
+) -> Result<IngestHygieneCounts, StorageError> {
+    let pending_embeddings_total =
+        count_i64(pool, "SELECT COUNT(*)::bigint FROM pending_embeddings").await?;
+    let pending_tags_total = count_i64(pool, "SELECT COUNT(*)::bigint FROM pending_tags").await?;
+    let pending_embeddings_failed = count_i64(
+        pool,
+        "SELECT COUNT(*)::bigint FROM pending_embeddings WHERE last_error IS NOT NULL",
+    )
+    .await?;
+    let (pending_embeddings_repeated_failures,): (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM pending_embeddings
+        WHERE attempts >= $1
+           OR (
+               last_error IS NOT NULL
+               AND enqueued_at < NOW() - ($2 * INTERVAL '1 hour')
+           )
+        "#,
+    )
+    .bind(options.max_failed_attempts)
+    .bind(options.stale_after_hours)
+    .fetch_one(pool)
+    .await?;
+    let (pending_tags_repeated_failures,): (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM pending_tags
+        WHERE attempts >= $1
+           OR enqueued_at < NOW() - ($2 * INTERVAL '1 hour')
+        "#,
+    )
+    .bind(options.max_failed_attempts)
+    .bind(options.stale_after_hours)
+    .fetch_one(pool)
+    .await?;
+
+    let pending_embeddings_denied_targets = count_denied_pending_embeddings(pool).await?;
+    let pending_tags_denied_targets = count_denied_pending_tags(pool).await?;
+
+    let thought_duplicate_fingerprint_groups = count_i64(
+        pool,
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM (
+            SELECT content_fingerprint
+            FROM thoughts
+            WHERE retracted_at IS NULL
+            GROUP BY content_fingerprint
+            HAVING COUNT(*) > 1
+        ) dupes
+        "#,
+    )
+    .await?;
+    let thought_empty_content = count_i64(
+        pool,
+        "SELECT COUNT(*)::bigint FROM thoughts WHERE retracted_at IS NULL AND content = ''",
+    )
+    .await?;
+    let thought_oversize_content = count_i64(
+        pool,
+        "SELECT COUNT(*)::bigint FROM thoughts WHERE retracted_at IS NULL AND length(content) > 1048576",
+    )
+    .await?;
+    let thought_fingerprint_drift = count_i64(
+        pool,
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM thoughts
+        WHERE content_fingerprint IS DISTINCT FROM digest(content, 'sha256')
+        "#,
+    )
+    .await?;
+    let artifact_chunk_fingerprint_drift = count_i64(
+        pool,
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM artifact_chunks
+        WHERE content_fingerprint IS NOT NULL
+          AND content_fingerprint IS DISTINCT FROM digest(content, 'sha256')
+        "#,
+    )
+    .await?;
+
+    let thought_sparse_drift = count_i64(
+        pool,
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM thought_sparse_embeddings_bge_m3 s
+        JOIN thoughts t ON t.id = s.thought_id
+        WHERE s.content_fingerprint IS DISTINCT FROM t.content_fingerprint
+        "#,
+    )
+    .await?;
+    let chunk_sparse_drift = count_i64(
+        pool,
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM artifact_chunk_sparse_embeddings_bge_m3 s
+        JOIN artifact_chunks ac ON ac.id = s.chunk_id
+        WHERE ac.content_fingerprint IS NOT NULL
+          AND s.content_fingerprint IS DISTINCT FROM ac.content_fingerprint
+        "#,
+    )
+    .await?;
+    let contextual_fingerprint_drift = if table_exists(pool, "artifact_chunk_contexts").await? {
+        count_i64(
+            pool,
+            r#"
+            SELECT COUNT(*)::bigint
+            FROM artifact_chunk_contexts c
+            JOIN artifact_chunks ac ON ac.id = c.chunk_id
+            WHERE c.retracted_at IS NULL
+              AND (
+                  c.raw_chunk_fingerprint IS DISTINCT FROM ac.content_fingerprint
+                  OR (
+                      c.status = 'ready'
+                      AND c.contextual_content_fingerprint
+                          IS DISTINCT FROM digest(c.contextual_content, 'sha256')
+                  )
+              )
+            "#,
+        )
+        .await?
+    } else {
+        0
+    };
+
+    let retracted_or_denied_sidecars = count_retracted_or_denied_sidecars(pool).await?;
+    let eval_markers_in_retrieval_sidecars = count_eval_markers_in_sidecars(pool).await?;
+    let contextual_denied_ready_rows = if table_exists(pool, "artifact_chunk_contexts").await? {
+        let (count,): (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*)::bigint
+            FROM artifact_chunk_contexts c
+            JOIN artifact_chunks ac ON ac.id = c.chunk_id
+            JOIN thoughts t ON t.id = c.source_thought_id
+            WHERE c.status = 'ready'
+              AND c.retracted_at IS NULL
+              AND (
+                  t.retracted_at IS NOT NULL
+                  OR ac.retracted_at IS NOT NULL
+                  OR t.scope LIKE 'archive.%'
+                  OR t.id = ANY($1::uuid[])
+                  OR lower(coalesce(t.metadata->>'source_file', '')) ~ $2
+                  OR t.content ~ $3
+                  OR ac.content ~ $3
+                  OR c.context_text ~ $3
+                  OR c.contextual_content ~ $3
+              )
+            "#,
+        )
+        .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+        .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+        .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+        .fetch_one(pool)
+        .await?;
+        count
+    } else {
+        0
+    };
+
+    Ok(IngestHygieneCounts {
+        pending_embeddings_total,
+        pending_tags_total,
+        pending_embeddings_failed,
+        pending_embeddings_repeated_failures,
+        pending_tags_repeated_failures,
+        pending_embeddings_denied_targets,
+        pending_tags_denied_targets,
+        thought_duplicate_fingerprint_groups,
+        thought_empty_content,
+        thought_oversize_content,
+        thought_fingerprint_drift,
+        artifact_chunk_fingerprint_drift,
+        sidecar_fingerprint_drift: thought_sparse_drift
+            + chunk_sparse_drift
+            + contextual_fingerprint_drift,
+        retracted_or_denied_sidecars,
+        eval_markers_in_retrieval_sidecars,
+        contextual_fingerprint_drift,
+        contextual_denied_ready_rows,
+    })
+}
+
+async fn count_denied_pending_embeddings(pool: &PgPool) -> Result<i64, StorageError> {
+    let (count,): (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM pending_embeddings p
+        LEFT JOIN thoughts t
+          ON p.target_kind = 'thought'
+         AND t.id = p.target_id
+        LEFT JOIN artifact_chunks ac
+          ON p.target_kind = 'artifact_chunk'
+         AND ac.id = p.target_id
+        LEFT JOIN thoughts pt ON pt.id = ac.source_thought_id
+        WHERE p.target_kind NOT IN ('thought','artifact_chunk')
+           OR (
+                p.target_kind = 'thought'
+                AND (
+                    t.id IS NULL
+                    OR t.retracted_at IS NOT NULL
+                    OR t.scope LIKE 'archive.%'
+                    OR t.id = ANY($1::uuid[])
+                    OR lower(coalesce(t.metadata->>'source_file', '')) ~ $2
+                    OR t.content ~ $3
+                )
+           )
+           OR (
+                p.target_kind = 'artifact_chunk'
+                AND (
+                    ac.id IS NULL
+                    OR pt.id IS NULL
+                    OR ac.retracted_at IS NOT NULL
+                    OR pt.retracted_at IS NOT NULL
+                    OR pt.scope LIKE 'archive.%'
+                    OR pt.id = ANY($1::uuid[])
+                    OR lower(coalesce(pt.metadata->>'source_file', '')) ~ $2
+                    OR pt.content ~ $3
+                    OR ac.content ~ $3
+                )
+           )
+        "#,
+    )
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
+async fn count_denied_pending_tags(pool: &PgPool) -> Result<i64, StorageError> {
+    let (count,): (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM pending_tags p
+        LEFT JOIN thoughts t ON t.id = p.thought_id
+        WHERE t.id IS NULL
+           OR t.retracted_at IS NOT NULL
+           OR t.scope LIKE 'archive.%'
+           OR t.id = ANY($1::uuid[])
+           OR lower(coalesce(t.metadata->>'source_file', '')) ~ $2
+           OR t.content ~ $3
+        "#,
+    )
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
+async fn count_retracted_or_denied_sidecars(pool: &PgPool) -> Result<i64, StorageError> {
+    let (thought_dense,): (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM thought_embeddings_bge_m3 b
+        JOIN thoughts t ON t.id = b.thought_id
+        WHERE t.retracted_at IS NOT NULL
+           OR t.scope LIKE 'archive.%'
+           OR t.id = ANY($1::uuid[])
+           OR lower(coalesce(t.metadata->>'source_file', '')) ~ $2
+           OR t.content ~ $3
+        "#,
+    )
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .fetch_one(pool)
+    .await?;
+    let (thought_sparse,): (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM thought_sparse_embeddings_bge_m3 s
+        JOIN thoughts t ON t.id = s.thought_id
+        WHERE t.retracted_at IS NOT NULL
+           OR t.scope LIKE 'archive.%'
+           OR t.id = ANY($1::uuid[])
+           OR lower(coalesce(t.metadata->>'source_file', '')) ~ $2
+           OR t.content ~ $3
+        "#,
+    )
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .fetch_one(pool)
+    .await?;
+    let (chunk_dense,): (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM artifact_chunk_embeddings_bge_m3 b
+        JOIN artifact_chunks ac ON ac.id = b.chunk_id
+        JOIN thoughts t ON t.id = ac.source_thought_id
+        WHERE ac.retracted_at IS NOT NULL
+           OR t.retracted_at IS NOT NULL
+           OR t.scope LIKE 'archive.%'
+           OR t.id = ANY($1::uuid[])
+           OR lower(coalesce(t.metadata->>'source_file', '')) ~ $2
+           OR t.content ~ $3
+           OR ac.content ~ $3
+        "#,
+    )
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .fetch_one(pool)
+    .await?;
+    let (chunk_sparse,): (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM artifact_chunk_sparse_embeddings_bge_m3 s
+        JOIN artifact_chunks ac ON ac.id = s.chunk_id
+        JOIN thoughts t ON t.id = ac.source_thought_id
+        WHERE ac.retracted_at IS NOT NULL
+           OR t.retracted_at IS NOT NULL
+           OR t.scope LIKE 'archive.%'
+           OR t.id = ANY($1::uuid[])
+           OR lower(coalesce(t.metadata->>'source_file', '')) ~ $2
+           OR t.content ~ $3
+           OR ac.content ~ $3
+        "#,
+    )
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .fetch_one(pool)
+    .await?;
+    let contextual = if table_exists(pool, "artifact_chunk_contexts").await? {
+        let (count,): (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*)::bigint
+            FROM artifact_chunk_contexts c
+            JOIN artifact_chunks ac ON ac.id = c.chunk_id
+            JOIN thoughts t ON t.id = c.source_thought_id
+            WHERE c.retracted_at IS NULL
+              AND (
+                  c.status = 'ready'
+                  OR EXISTS (
+                      SELECT 1
+                      FROM artifact_chunk_context_embeddings_bge_m3 e
+                      WHERE e.context_id = c.id
+                  )
+              )
+              AND (
+                  ac.retracted_at IS NOT NULL
+                  OR t.retracted_at IS NOT NULL
+                  OR t.scope LIKE 'archive.%'
+                  OR t.id = ANY($1::uuid[])
+                  OR lower(coalesce(t.metadata->>'source_file', '')) ~ $2
+                  OR t.content ~ $3
+                  OR ac.content ~ $3
+                  OR c.context_text ~ $3
+                  OR c.contextual_content ~ $3
+              )
+            "#,
+        )
+        .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+        .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+        .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+        .fetch_one(pool)
+        .await?;
+        count
+    } else {
+        0
+    };
+    Ok(thought_dense + thought_sparse + chunk_dense + chunk_sparse + contextual)
+}
+
+async fn count_eval_markers_in_sidecars(pool: &PgPool) -> Result<i64, StorageError> {
+    let (thought_sparse,): (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM thought_sparse_embeddings_bge_m3 s
+        JOIN thoughts t ON t.id = s.thought_id
+        WHERE t.id = ANY($1::uuid[])
+           OR lower(coalesce(t.metadata->>'source_file', '')) ~ $2
+           OR t.content ~ $3
+        "#,
+    )
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .fetch_one(pool)
+    .await?;
+    let (chunk_sparse,): (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM artifact_chunk_sparse_embeddings_bge_m3 s
+        JOIN artifact_chunks ac ON ac.id = s.chunk_id
+        JOIN thoughts t ON t.id = ac.source_thought_id
+        WHERE t.id = ANY($1::uuid[])
+           OR lower(coalesce(t.metadata->>'source_file', '')) ~ $2
+           OR t.content ~ $3
+           OR ac.content ~ $3
+        "#,
+    )
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .fetch_one(pool)
+    .await?;
+    Ok(thought_sparse + chunk_sparse)
+}
+
+pub async fn run_ingest_hygiene(
+    pool: &PgPool,
+    options: IngestHygieneOptions,
+) -> Result<IngestHygieneReport, StorageError> {
+    let max_rows = options.max_rows.max(0);
+    let options = IngestHygieneOptions {
+        max_rows,
+        stale_after_hours: options.stale_after_hours.max(1),
+        max_failed_attempts: options.max_failed_attempts.max(1),
+        ..options
+    };
+    let counts = collect_ingest_hygiene_counts(pool, options).await?;
+    if !options.apply {
+        return Ok(IngestHygieneReport {
+            mode: "dry-run".to_string(),
+            run_id: None,
+            options,
+            counts,
+            mutations: Vec::new(),
+        });
+    }
+    if options.max_rows <= 0 {
+        return Ok(IngestHygieneReport {
+            mode: "apply".to_string(),
+            run_id: None,
+            options,
+            counts,
+            mutations: Vec::new(),
+        });
+    }
+    if !table_exists(pool, "ingest_hygiene_runs").await?
+        || !table_exists(pool, "ingest_hygiene_mutations").await?
+    {
+        return Err(StorageError::BgeSidecarTableMissing(
+            "ingest_hygiene_runs/ingest_hygiene_mutations".to_string(),
+        ));
+    }
+
+    let run_id = start_ingest_hygiene_run(pool, options).await?;
+    let mut remaining = options.max_rows;
+    let mut mutations = Vec::new();
+    let pending_embeddings =
+        delete_denied_pending_embeddings(pool, run_id, options, remaining).await?;
+    remaining = remaining.saturating_sub(pending_embeddings.len() as i64);
+    mutations.extend(pending_embeddings);
+
+    if remaining > 0 {
+        let pending_tags = delete_denied_pending_tags(pool, run_id, options, remaining).await?;
+        remaining = remaining.saturating_sub(pending_tags.len() as i64);
+        mutations.extend(pending_tags);
+    }
+
+    if remaining > 0 {
+        let rows = delete_denied_thought_dense_sidecars(pool, run_id, remaining).await?;
+        remaining = remaining.saturating_sub(rows.len() as i64);
+        mutations.extend(rows);
+    }
+    if remaining > 0 {
+        let rows = delete_denied_thought_sparse_sidecars(pool, run_id, remaining).await?;
+        remaining = remaining.saturating_sub(rows.len() as i64);
+        mutations.extend(rows);
+    }
+    if remaining > 0 {
+        let rows = delete_denied_chunk_dense_sidecars(pool, run_id, remaining).await?;
+        remaining = remaining.saturating_sub(rows.len() as i64);
+        mutations.extend(rows);
+    }
+    if remaining > 0 {
+        let rows = delete_denied_chunk_sparse_sidecars(pool, run_id, remaining).await?;
+        remaining = remaining.saturating_sub(rows.len() as i64);
+        mutations.extend(rows);
+    }
+    if remaining > 0 && table_exists(pool, "artifact_chunk_context_embeddings_bge_m3").await? {
+        let rows = delete_denied_context_embeddings(pool, run_id, remaining).await?;
+        remaining = remaining.saturating_sub(rows.len() as i64);
+        mutations.extend(rows);
+    }
+    if remaining > 0 && table_exists(pool, "artifact_chunk_contexts").await? {
+        let rows = quarantine_denied_context_rows(pool, run_id, remaining).await?;
+        mutations.extend(rows);
+    }
+
+    finish_ingest_hygiene_run(
+        pool,
+        run_id,
+        "completed",
+        options,
+        &counts,
+        &mutations,
+        None,
+    )
+    .await?;
+
+    Ok(IngestHygieneReport {
+        mode: "apply".to_string(),
+        run_id: Some(run_id),
+        options,
+        counts,
+        mutations,
+    })
+}
+
+async fn start_ingest_hygiene_run(
+    pool: &PgPool,
+    options: IngestHygieneOptions,
+) -> Result<Uuid, StorageError> {
+    let (run_id,): (Uuid,) = sqlx::query_as(
+        r#"
+        INSERT INTO ingest_hygiene_runs (mode, status, parameters)
+        VALUES ('apply', 'running', $1)
+        RETURNING id
+        "#,
+    )
+    .bind(serde_json::json!({
+        "max_rows": options.max_rows,
+        "stale_after_hours": options.stale_after_hours,
+        "max_failed_attempts": options.max_failed_attempts,
+    }))
+    .fetch_one(pool)
+    .await?;
+    Ok(run_id)
+}
+
+async fn finish_ingest_hygiene_run(
+    pool: &PgPool,
+    run_id: Uuid,
+    status: &str,
+    options: IngestHygieneOptions,
+    counts: &IngestHygieneCounts,
+    mutations: &[IngestHygieneMutation],
+    error: Option<&str>,
+) -> Result<(), StorageError> {
+    sqlx::query(
+        r#"
+        UPDATE ingest_hygiene_runs
+        SET status = $2,
+            stats = $3,
+            finished_at = NOW(),
+            error = $4
+        WHERE id = $1
+        "#,
+    )
+    .bind(run_id)
+    .bind(status)
+    .bind(serde_json::json!({
+        "pre_counts": IngestHygieneReport {
+            mode: "apply".to_string(),
+            run_id: Some(run_id),
+            options,
+            counts: counts.clone(),
+            mutations: Vec::new(),
+        }.to_json()["counts"].clone(),
+        "mutation_count": mutations.len(),
+        "mutations_by_table": mutations.iter().fold(
+            serde_json::Map::new(),
+            |mut acc, mutation| {
+                let n = acc
+                    .get(&mutation.target_table)
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    + 1;
+                acc.insert(mutation.target_table.clone(), serde_json::json!(n));
+                acc
+            }
+        ),
+    }))
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn row_to_hygiene_mutation(
+    row: &sqlx::postgres::PgRow,
+) -> Result<IngestHygieneMutation, sqlx::Error> {
+    Ok(IngestHygieneMutation {
+        mutation_kind: row.try_get("mutation_kind")?,
+        target_table: row.try_get("target_table")?,
+        target_kind: row.try_get("target_kind")?,
+        target_id: row.try_get("target_id")?,
+        reason: row.try_get("reason")?,
+    })
+}
+
+async fn delete_denied_pending_embeddings(
+    pool: &PgPool,
+    run_id: Uuid,
+    options: IngestHygieneOptions,
+    limit: i64,
+) -> Result<Vec<IngestHygieneMutation>, StorageError> {
+    if limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        r#"
+        WITH classified AS (
+            SELECT p.id,
+                   p.target_kind,
+                   p.target_id,
+                   p.enqueued_at,
+                   to_jsonb(p) AS prior_state,
+                   CASE
+                       WHEN p.target_kind NOT IN ('thought','artifact_chunk') THEN 'unsupported_target_kind'
+                       WHEN p.target_kind = 'thought' AND t.id IS NULL THEN 'missing_thought'
+                       WHEN p.target_kind = 'thought' AND t.retracted_at IS NOT NULL THEN 'thought_retracted'
+                       WHEN p.target_kind = 'thought' AND t.scope LIKE 'archive.%' THEN 'archive_scope'
+                       WHEN p.target_kind = 'thought' AND t.id = ANY($1::uuid[]) THEN 'known_eval_thought_id'
+                       WHEN p.target_kind = 'thought'
+                            AND lower(coalesce(t.metadata->>'source_file', '')) ~ $2 THEN 'eval_source_file'
+                       WHEN p.target_kind = 'thought' AND t.content ~ $3 THEN 'thought_eval_marker'
+                       WHEN p.target_kind = 'artifact_chunk' AND ac.id IS NULL THEN 'missing_artifact_chunk'
+                       WHEN p.target_kind = 'artifact_chunk' AND pt.id IS NULL THEN 'missing_parent_thought'
+                       WHEN p.target_kind = 'artifact_chunk' AND ac.retracted_at IS NOT NULL THEN 'chunk_retracted'
+                       WHEN p.target_kind = 'artifact_chunk' AND pt.retracted_at IS NOT NULL THEN 'parent_retracted'
+                       WHEN p.target_kind = 'artifact_chunk' AND pt.scope LIKE 'archive.%' THEN 'archive_scope'
+                       WHEN p.target_kind = 'artifact_chunk' AND pt.id = ANY($1::uuid[]) THEN 'known_eval_thought_id'
+                       WHEN p.target_kind = 'artifact_chunk'
+                            AND lower(coalesce(pt.metadata->>'source_file', '')) ~ $2 THEN 'eval_source_file'
+                       WHEN p.target_kind = 'artifact_chunk' AND pt.content ~ $3 THEN 'parent_eval_marker'
+                       WHEN p.target_kind = 'artifact_chunk' AND ac.content ~ $3 THEN 'raw_chunk_eval_marker'
+                       WHEN p.attempts >= $4 THEN 'failed_attempt_cap'
+                       WHEN p.last_error IS NOT NULL
+                            AND p.enqueued_at < NOW() - ($5 * INTERVAL '1 hour') THEN 'stale_failed_pending_embedding'
+                       ELSE NULL
+                   END AS reason
+            FROM pending_embeddings p
+            LEFT JOIN thoughts t
+              ON p.target_kind = 'thought'
+             AND t.id = p.target_id
+            LEFT JOIN artifact_chunks ac
+              ON p.target_kind = 'artifact_chunk'
+             AND ac.id = p.target_id
+            LEFT JOIN thoughts pt ON pt.id = ac.source_thought_id
+        ),
+        victims AS (
+            SELECT *
+            FROM classified
+            WHERE reason IS NOT NULL
+            ORDER BY enqueued_at ASC
+            LIMIT $6
+        ),
+        audit AS (
+            INSERT INTO ingest_hygiene_mutations (
+                run_id,
+                mutation_kind,
+                target_table,
+                target_kind,
+                target_id,
+                reason,
+                prior_state
+            )
+            SELECT $7, 'delete', 'pending_embeddings', target_kind, target_id, reason, prior_state
+            FROM victims
+            RETURNING mutation_kind, target_table, target_kind, target_id, reason
+        ),
+        deleted AS (
+            DELETE FROM pending_embeddings p
+            USING victims v
+            WHERE p.id = v.id
+            RETURNING v.target_kind, v.target_id, v.reason
+        )
+        SELECT mutation_kind, target_table, target_kind, target_id, reason
+        FROM audit
+        "#,
+    )
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .bind(options.max_failed_attempts)
+    .bind(options.stale_after_hours)
+    .bind(limit)
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(row_to_hygiene_mutation)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+async fn delete_denied_pending_tags(
+    pool: &PgPool,
+    run_id: Uuid,
+    options: IngestHygieneOptions,
+    limit: i64,
+) -> Result<Vec<IngestHygieneMutation>, StorageError> {
+    if limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        r#"
+        WITH classified AS (
+            SELECT p.thought_id,
+                   p.enqueued_at,
+                   to_jsonb(p) AS prior_state,
+                   CASE
+                       WHEN t.id IS NULL THEN 'missing_thought'
+                       WHEN t.retracted_at IS NOT NULL THEN 'thought_retracted'
+                       WHEN t.scope LIKE 'archive.%' THEN 'archive_scope'
+                       WHEN t.id = ANY($1::uuid[]) THEN 'known_eval_thought_id'
+                       WHEN lower(coalesce(t.metadata->>'source_file', '')) ~ $2 THEN 'eval_source_file'
+                       WHEN t.content ~ $3 THEN 'thought_eval_marker'
+                       WHEN p.attempts >= $4 THEN 'failed_attempt_cap'
+                       WHEN p.enqueued_at < NOW() - ($5 * INTERVAL '1 hour') THEN 'stale_pending_tag'
+                       ELSE NULL
+                   END AS reason
+            FROM pending_tags p
+            LEFT JOIN thoughts t ON t.id = p.thought_id
+        ),
+        victims AS (
+            SELECT *
+            FROM classified
+            WHERE reason IS NOT NULL
+            ORDER BY enqueued_at ASC
+            LIMIT $6
+        ),
+        audit AS (
+            INSERT INTO ingest_hygiene_mutations (
+                run_id,
+                mutation_kind,
+                target_table,
+                target_kind,
+                target_id,
+                reason,
+                prior_state
+            )
+            SELECT $7, 'delete', 'pending_tags', 'thought', thought_id, reason, prior_state
+            FROM victims
+            RETURNING mutation_kind, target_table, target_kind, target_id, reason
+        ),
+        deleted AS (
+            DELETE FROM pending_tags p
+            USING victims v
+            WHERE p.thought_id = v.thought_id
+            RETURNING v.thought_id, v.reason
+        )
+        SELECT mutation_kind, target_table, target_kind, target_id, reason
+        FROM audit
+        "#,
+    )
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .bind(options.max_failed_attempts)
+    .bind(options.stale_after_hours)
+    .bind(limit)
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(row_to_hygiene_mutation)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+async fn delete_denied_thought_dense_sidecars(
+    pool: &PgPool,
+    run_id: Uuid,
+    limit: i64,
+) -> Result<Vec<IngestHygieneMutation>, StorageError> {
+    if limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        r#"
+        WITH victims AS (
+            SELECT b.id,
+                   b.thought_id,
+                   to_jsonb(b) AS prior_state,
+                   CASE
+                       WHEN t.id IS NULL THEN 'missing_thought'
+                       WHEN t.retracted_at IS NOT NULL THEN 'thought_retracted'
+                       WHEN t.scope LIKE 'archive.%' THEN 'archive_scope'
+                       WHEN t.id = ANY($1::uuid[]) THEN 'known_eval_thought_id'
+                       WHEN lower(coalesce(t.metadata->>'source_file', '')) ~ $2 THEN 'eval_source_file'
+                       WHEN t.content ~ $3 THEN 'thought_eval_marker'
+                       ELSE NULL
+                   END AS reason
+            FROM thought_embeddings_bge_m3 b
+            LEFT JOIN thoughts t ON t.id = b.thought_id
+            WHERE t.id IS NULL
+               OR t.retracted_at IS NOT NULL
+               OR t.scope LIKE 'archive.%'
+               OR t.id = ANY($1::uuid[])
+               OR lower(coalesce(t.metadata->>'source_file', '')) ~ $2
+               OR t.content ~ $3
+            ORDER BY b.created_at ASC
+            LIMIT $4
+        ),
+        audit AS (
+            INSERT INTO ingest_hygiene_mutations (
+                run_id,
+                mutation_kind,
+                target_table,
+                target_kind,
+                target_id,
+                reason,
+                prior_state
+            )
+            SELECT $5, 'delete', 'thought_embeddings_bge_m3', 'thought', thought_id, reason, prior_state
+            FROM victims
+            RETURNING mutation_kind, target_table, target_kind, target_id, reason
+        ),
+        deleted AS (
+            DELETE FROM thought_embeddings_bge_m3 b
+            USING victims v
+            WHERE b.id = v.id
+            RETURNING v.thought_id
+        )
+        SELECT mutation_kind, target_table, target_kind, target_id, reason
+        FROM audit
+        "#,
+    )
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .bind(limit)
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(row_to_hygiene_mutation)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+async fn delete_denied_thought_sparse_sidecars(
+    pool: &PgPool,
+    run_id: Uuid,
+    limit: i64,
+) -> Result<Vec<IngestHygieneMutation>, StorageError> {
+    if limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        r#"
+        WITH victims AS (
+            SELECT s.id,
+                   s.thought_id,
+                   to_jsonb(s) AS prior_state,
+                   CASE
+                       WHEN t.id IS NULL THEN 'missing_thought'
+                       WHEN t.retracted_at IS NOT NULL THEN 'thought_retracted'
+                       WHEN t.scope LIKE 'archive.%' THEN 'archive_scope'
+                       WHEN t.id = ANY($1::uuid[]) THEN 'known_eval_thought_id'
+                       WHEN lower(coalesce(t.metadata->>'source_file', '')) ~ $2 THEN 'eval_source_file'
+                       WHEN t.content ~ $3 THEN 'thought_eval_marker'
+                       ELSE NULL
+                   END AS reason
+            FROM thought_sparse_embeddings_bge_m3 s
+            LEFT JOIN thoughts t ON t.id = s.thought_id
+            WHERE t.id IS NULL
+               OR t.retracted_at IS NOT NULL
+               OR t.scope LIKE 'archive.%'
+               OR t.id = ANY($1::uuid[])
+               OR lower(coalesce(t.metadata->>'source_file', '')) ~ $2
+               OR t.content ~ $3
+            ORDER BY s.created_at ASC
+            LIMIT $4
+        ),
+        audit AS (
+            INSERT INTO ingest_hygiene_mutations (
+                run_id,
+                mutation_kind,
+                target_table,
+                target_kind,
+                target_id,
+                reason,
+                prior_state
+            )
+            SELECT $5, 'delete', 'thought_sparse_embeddings_bge_m3', 'thought', thought_id, reason, prior_state
+            FROM victims
+            RETURNING mutation_kind, target_table, target_kind, target_id, reason
+        ),
+        deleted AS (
+            DELETE FROM thought_sparse_embeddings_bge_m3 s
+            USING victims v
+            WHERE s.id = v.id
+            RETURNING v.thought_id
+        )
+        SELECT mutation_kind, target_table, target_kind, target_id, reason
+        FROM audit
+        "#,
+    )
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .bind(limit)
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(row_to_hygiene_mutation)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+async fn delete_denied_chunk_dense_sidecars(
+    pool: &PgPool,
+    run_id: Uuid,
+    limit: i64,
+) -> Result<Vec<IngestHygieneMutation>, StorageError> {
+    if limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        r#"
+        WITH victims AS (
+            SELECT b.id,
+                   b.chunk_id,
+                   to_jsonb(b) AS prior_state,
+                   CASE
+                       WHEN ac.id IS NULL THEN 'missing_artifact_chunk'
+                       WHEN t.id IS NULL THEN 'missing_parent_thought'
+                       WHEN ac.retracted_at IS NOT NULL THEN 'chunk_retracted'
+                       WHEN t.retracted_at IS NOT NULL THEN 'parent_retracted'
+                       WHEN t.scope LIKE 'archive.%' THEN 'archive_scope'
+                       WHEN t.id = ANY($1::uuid[]) THEN 'known_eval_thought_id'
+                       WHEN lower(coalesce(t.metadata->>'source_file', '')) ~ $2 THEN 'eval_source_file'
+                       WHEN t.content ~ $3 THEN 'parent_eval_marker'
+                       WHEN ac.content ~ $3 THEN 'raw_chunk_eval_marker'
+                       ELSE NULL
+                   END AS reason
+            FROM artifact_chunk_embeddings_bge_m3 b
+            LEFT JOIN artifact_chunks ac ON ac.id = b.chunk_id
+            LEFT JOIN thoughts t ON t.id = ac.source_thought_id
+            WHERE ac.id IS NULL
+               OR t.id IS NULL
+               OR ac.retracted_at IS NOT NULL
+               OR t.retracted_at IS NOT NULL
+               OR t.scope LIKE 'archive.%'
+               OR t.id = ANY($1::uuid[])
+               OR lower(coalesce(t.metadata->>'source_file', '')) ~ $2
+               OR t.content ~ $3
+               OR ac.content ~ $3
+            ORDER BY b.created_at ASC
+            LIMIT $4
+        ),
+        audit AS (
+            INSERT INTO ingest_hygiene_mutations (
+                run_id,
+                mutation_kind,
+                target_table,
+                target_kind,
+                target_id,
+                reason,
+                prior_state
+            )
+            SELECT $5, 'delete', 'artifact_chunk_embeddings_bge_m3', 'artifact_chunk', chunk_id, reason, prior_state
+            FROM victims
+            RETURNING mutation_kind, target_table, target_kind, target_id, reason
+        ),
+        deleted AS (
+            DELETE FROM artifact_chunk_embeddings_bge_m3 b
+            USING victims v
+            WHERE b.id = v.id
+            RETURNING v.chunk_id
+        )
+        SELECT mutation_kind, target_table, target_kind, target_id, reason
+        FROM audit
+        "#,
+    )
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .bind(limit)
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(row_to_hygiene_mutation)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+async fn delete_denied_chunk_sparse_sidecars(
+    pool: &PgPool,
+    run_id: Uuid,
+    limit: i64,
+) -> Result<Vec<IngestHygieneMutation>, StorageError> {
+    if limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        r#"
+        WITH victims AS (
+            SELECT s.id,
+                   s.chunk_id,
+                   to_jsonb(s) AS prior_state,
+                   CASE
+                       WHEN ac.id IS NULL THEN 'missing_artifact_chunk'
+                       WHEN t.id IS NULL THEN 'missing_parent_thought'
+                       WHEN ac.retracted_at IS NOT NULL THEN 'chunk_retracted'
+                       WHEN t.retracted_at IS NOT NULL THEN 'parent_retracted'
+                       WHEN t.scope LIKE 'archive.%' THEN 'archive_scope'
+                       WHEN t.id = ANY($1::uuid[]) THEN 'known_eval_thought_id'
+                       WHEN lower(coalesce(t.metadata->>'source_file', '')) ~ $2 THEN 'eval_source_file'
+                       WHEN t.content ~ $3 THEN 'parent_eval_marker'
+                       WHEN ac.content ~ $3 THEN 'raw_chunk_eval_marker'
+                       ELSE NULL
+                   END AS reason
+            FROM artifact_chunk_sparse_embeddings_bge_m3 s
+            LEFT JOIN artifact_chunks ac ON ac.id = s.chunk_id
+            LEFT JOIN thoughts t ON t.id = ac.source_thought_id
+            WHERE ac.id IS NULL
+               OR t.id IS NULL
+               OR ac.retracted_at IS NOT NULL
+               OR t.retracted_at IS NOT NULL
+               OR t.scope LIKE 'archive.%'
+               OR t.id = ANY($1::uuid[])
+               OR lower(coalesce(t.metadata->>'source_file', '')) ~ $2
+               OR t.content ~ $3
+               OR ac.content ~ $3
+            ORDER BY s.created_at ASC
+            LIMIT $4
+        ),
+        audit AS (
+            INSERT INTO ingest_hygiene_mutations (
+                run_id,
+                mutation_kind,
+                target_table,
+                target_kind,
+                target_id,
+                reason,
+                prior_state
+            )
+            SELECT $5, 'delete', 'artifact_chunk_sparse_embeddings_bge_m3', 'artifact_chunk', chunk_id, reason, prior_state
+            FROM victims
+            RETURNING mutation_kind, target_table, target_kind, target_id, reason
+        ),
+        deleted AS (
+            DELETE FROM artifact_chunk_sparse_embeddings_bge_m3 s
+            USING victims v
+            WHERE s.id = v.id
+            RETURNING v.chunk_id
+        )
+        SELECT mutation_kind, target_table, target_kind, target_id, reason
+        FROM audit
+        "#,
+    )
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .bind(limit)
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(row_to_hygiene_mutation)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+async fn delete_denied_context_embeddings(
+    pool: &PgPool,
+    run_id: Uuid,
+    limit: i64,
+) -> Result<Vec<IngestHygieneMutation>, StorageError> {
+    if limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        r#"
+        WITH victims AS (
+            SELECT e.id,
+                   e.context_id,
+                   to_jsonb(e) AS prior_state,
+                   CASE
+                       WHEN c.id IS NULL THEN 'missing_context'
+                       WHEN ac.id IS NULL THEN 'missing_artifact_chunk'
+                       WHEN t.id IS NULL THEN 'missing_parent_thought'
+                       WHEN c.retracted_at IS NOT NULL THEN 'context_retracted'
+                       WHEN c.status <> 'ready' THEN 'context_not_ready'
+                       WHEN ac.retracted_at IS NOT NULL THEN 'chunk_retracted'
+                       WHEN t.retracted_at IS NOT NULL THEN 'parent_retracted'
+                       WHEN t.scope LIKE 'archive.%' THEN 'archive_scope'
+                       WHEN t.id = ANY($1::uuid[]) THEN 'known_eval_thought_id'
+                       WHEN lower(coalesce(t.metadata->>'source_file', '')) ~ $2 THEN 'eval_source_file'
+                       WHEN t.content ~ $3 THEN 'parent_eval_marker'
+                       WHEN ac.content ~ $3 THEN 'raw_chunk_eval_marker'
+                       WHEN c.context_text ~ $3 THEN 'context_eval_marker'
+                       WHEN c.contextual_content ~ $3 THEN 'contextual_content_eval_marker'
+                       ELSE NULL
+                   END AS reason
+            FROM artifact_chunk_context_embeddings_bge_m3 e
+            LEFT JOIN artifact_chunk_contexts c ON c.id = e.context_id
+            LEFT JOIN artifact_chunks ac ON ac.id = c.chunk_id
+            LEFT JOIN thoughts t ON t.id = c.source_thought_id
+            WHERE c.id IS NULL
+               OR ac.id IS NULL
+               OR t.id IS NULL
+               OR c.retracted_at IS NOT NULL
+               OR c.status <> 'ready'
+               OR ac.retracted_at IS NOT NULL
+               OR t.retracted_at IS NOT NULL
+               OR t.scope LIKE 'archive.%'
+               OR t.id = ANY($1::uuid[])
+               OR lower(coalesce(t.metadata->>'source_file', '')) ~ $2
+               OR t.content ~ $3
+               OR ac.content ~ $3
+               OR c.context_text ~ $3
+               OR c.contextual_content ~ $3
+            ORDER BY e.created_at ASC
+            LIMIT $4
+        ),
+        audit AS (
+            INSERT INTO ingest_hygiene_mutations (
+                run_id,
+                mutation_kind,
+                target_table,
+                target_kind,
+                target_id,
+                reason,
+                prior_state
+            )
+            SELECT $5, 'delete', 'artifact_chunk_context_embeddings_bge_m3', 'artifact_chunk_context', context_id, reason, prior_state
+            FROM victims
+            RETURNING mutation_kind, target_table, target_kind, target_id, reason
+        ),
+        deleted AS (
+            DELETE FROM artifact_chunk_context_embeddings_bge_m3 e
+            USING victims v
+            WHERE e.id = v.id
+            RETURNING v.context_id
+        )
+        SELECT mutation_kind, target_table, target_kind, target_id, reason
+        FROM audit
+        "#,
+    )
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .bind(limit)
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(row_to_hygiene_mutation)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+}
+
+async fn quarantine_denied_context_rows(
+    pool: &PgPool,
+    run_id: Uuid,
+    limit: i64,
+) -> Result<Vec<IngestHygieneMutation>, StorageError> {
+    if limit <= 0 {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        r#"
+        WITH victims AS (
+            SELECT c.id,
+                   to_jsonb(c) AS prior_state,
+                   CASE
+                       WHEN ac.id IS NULL THEN 'missing_artifact_chunk'
+                       WHEN t.id IS NULL THEN 'missing_parent_thought'
+                       WHEN ac.retracted_at IS NOT NULL THEN 'chunk_retracted'
+                       WHEN t.retracted_at IS NOT NULL THEN 'parent_retracted'
+                       WHEN t.scope LIKE 'archive.%' THEN 'archive_scope'
+                       WHEN t.id = ANY($1::uuid[]) THEN 'known_eval_thought_id'
+                       WHEN lower(coalesce(t.metadata->>'source_file', '')) ~ $2 THEN 'eval_source_file'
+                       WHEN t.content ~ $3 THEN 'parent_eval_marker'
+                       WHEN ac.content ~ $3 THEN 'raw_chunk_eval_marker'
+                       WHEN c.context_text ~ $3 THEN 'context_eval_marker'
+                       WHEN c.contextual_content ~ $3 THEN 'contextual_content_eval_marker'
+                       ELSE NULL
+                   END AS reason
+            FROM artifact_chunk_contexts c
+            LEFT JOIN artifact_chunks ac ON ac.id = c.chunk_id
+            LEFT JOIN thoughts t ON t.id = c.source_thought_id
+            WHERE c.status = 'ready'
+              AND c.retracted_at IS NULL
+              AND (
+                  ac.id IS NULL
+                  OR t.id IS NULL
+                  OR ac.retracted_at IS NOT NULL
+                  OR t.retracted_at IS NOT NULL
+                  OR t.scope LIKE 'archive.%'
+                  OR t.id = ANY($1::uuid[])
+                  OR lower(coalesce(t.metadata->>'source_file', '')) ~ $2
+                  OR t.content ~ $3
+                  OR ac.content ~ $3
+                  OR c.context_text ~ $3
+                  OR c.contextual_content ~ $3
+              )
+            ORDER BY c.created_at ASC
+            LIMIT $4
+        ),
+        audit AS (
+            INSERT INTO ingest_hygiene_mutations (
+                run_id,
+                mutation_kind,
+                target_table,
+                target_kind,
+                target_id,
+                reason,
+                prior_state
+            )
+            SELECT $5, 'quarantine', 'artifact_chunk_contexts', 'artifact_chunk_context', id, reason, prior_state
+            FROM victims
+            RETURNING mutation_kind, target_table, target_kind, target_id, reason
+        ),
+        updated AS (
+            UPDATE artifact_chunk_contexts c
+            SET status = 'rejected',
+                rejection_reason = v.reason,
+                retracted_at = NOW(),
+                updated_at = NOW()
+            FROM victims v
+            WHERE c.id = v.id
+            RETURNING c.id
+        )
+        SELECT mutation_kind, target_table, target_kind, target_id, reason
+        FROM audit
+        "#,
+    )
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .bind(limit)
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(row_to_hygiene_mutation)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
 }
 
 // -- M4 Path B-OB1: thought tagging sidecar --------------------------------
@@ -7018,6 +8567,178 @@ mod tests {
         .unwrap();
         assert_eq!(rows.len(), 1);
         assert_ne!(rows[0].0, id_a.into_uuid());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn enqueue_unembedded_thoughts_filters_archive_and_eval_before_pending(pool: PgPool) {
+        let model = EmbeddingModel::bge_m3();
+        let clean = insert_test_thought(&pool, "clean hygiene enqueue row", "global").await;
+        let _archive =
+            insert_test_thought(&pool, "archive row should not enqueue", "archive.2026").await;
+        let _kgr = insert_test_thought(&pool, "KGR024 poisoned enqueue row", "global").await;
+        let _source_file = insert_test_thought_with_metadata(
+            &pool,
+            "gold source file should not enqueue",
+            "global",
+            Metadata::from(json!({"source_file": "eval/gold/kengram-gold-100-answer-key.md"})),
+        )
+        .await;
+
+        let enqueued = enqueue_unembedded_thoughts(&pool, &model.id, None, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(enqueued, 1);
+
+        let rows: Vec<(Uuid,)> = sqlx::query_as(
+            r#"
+            SELECT target_id
+            FROM pending_embeddings
+            WHERE target_kind = 'thought' AND model_id = 'bge-m3:1024'
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, vec![(clean.into_uuid(),)]);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ingest_hygiene_dry_run_detects_fingerprint_drift_without_mutating(pool: PgPool) {
+        let drifted = insert_test_thought(&pool, "original drift content", "global").await;
+        sqlx::query("UPDATE thoughts SET content = 'changed drift content' WHERE id = $1")
+            .bind(drifted.into_uuid())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let report = run_ingest_hygiene(
+            &pool,
+            IngestHygieneOptions {
+                apply: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.mode, "dry-run");
+        assert!(report.run_id.is_none());
+        assert_eq!(report.counts.thought_fingerprint_drift, 1);
+        assert!(report.mutations.is_empty());
+
+        let audit_runs: (i64,) = sqlx::query_as("SELECT COUNT(*)::bigint FROM ingest_hygiene_runs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(audit_runs.0, 0, "dry-run must not write audit rows");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ingest_hygiene_apply_is_bounded_and_audited(pool: PgPool) {
+        let bad_a = insert_test_thought(&pool, "KGR001 pending bad a", "global").await;
+        let bad_b = insert_test_thought(&pool, "KGR002 pending bad b", "global").await;
+        enqueue_embedding(&pool, target::THOUGHT, bad_a.into_uuid(), "bge-m3:1024")
+            .await
+            .unwrap();
+        enqueue_embedding(&pool, target::THOUGHT, bad_b.into_uuid(), "bge-m3:1024")
+            .await
+            .unwrap();
+        assert_eq!(count_pending(&pool).await.unwrap(), 2);
+
+        let report = run_ingest_hygiene(
+            &pool,
+            IngestHygieneOptions {
+                apply: true,
+                max_rows: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.mode, "apply");
+        assert!(report.run_id.is_some());
+        assert_eq!(report.counts.pending_embeddings_denied_targets, 2);
+        assert_eq!(report.mutations.len(), 1);
+        assert_eq!(report.mutations[0].target_table, "pending_embeddings");
+        assert_eq!(report.mutations[0].reason, "thought_eval_marker");
+        assert_eq!(count_pending(&pool).await.unwrap(), 1);
+
+        let run_id = report.run_id.unwrap();
+        let audit_run: (String, i64) = sqlx::query_as(
+            r#"
+            SELECT status, (stats->>'mutation_count')::bigint
+            FROM ingest_hygiene_runs
+            WHERE id = $1
+            "#,
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audit_run.0, "completed");
+        assert_eq!(audit_run.1, 1);
+        let audit_mutations: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::bigint FROM ingest_hygiene_mutations WHERE run_id = $1",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audit_mutations.0, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ingest_hygiene_apply_deletes_denied_sidecars_with_audit(pool: PgPool) {
+        let model = EmbeddingModel::bge_m3();
+        let denied = insert_test_thought(&pool, "KGR003 indexed sidecar bad row", "global").await;
+        insert_thought_embedding(
+            &pool,
+            denied,
+            &Embedding::new(model.clone(), unit_vector_1024(0)).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            thought_has_embedding(&pool, denied, &model).await.unwrap(),
+            "fixture must start with a retrieval-bearing sidecar"
+        );
+
+        let report = run_ingest_hygiene(
+            &pool,
+            IngestHygieneOptions {
+                apply: true,
+                max_rows: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.mode, "apply");
+        assert_eq!(report.counts.retracted_or_denied_sidecars, 1);
+        assert_eq!(report.mutations.len(), 1);
+        assert_eq!(report.mutations[0].mutation_kind, "delete");
+        assert_eq!(
+            report.mutations[0].target_table,
+            "thought_embeddings_bge_m3"
+        );
+        assert_eq!(report.mutations[0].target_kind.as_deref(), Some("thought"));
+        assert_eq!(report.mutations[0].target_id, Some(denied.into_uuid()));
+        assert_eq!(report.mutations[0].reason, "thought_eval_marker");
+        assert!(
+            !thought_has_embedding(&pool, denied, &model).await.unwrap(),
+            "apply must remove the denied retrieval-bearing sidecar"
+        );
+
+        let audit_mutations: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::bigint FROM ingest_hygiene_mutations WHERE run_id = $1 AND target_table = 'thought_embeddings_bge_m3'",
+        )
+        .bind(report.run_id.unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audit_mutations.0, 1);
     }
 
     // -- M4: tag-sidecar tests ------------------------------------------------

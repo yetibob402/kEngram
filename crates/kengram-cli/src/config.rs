@@ -10,8 +10,9 @@ use figment::{
 };
 use kengram_extract::BUNDLED_TAGGER_VERSION;
 use kengram_mcp::{
+    DEFAULT_GRAPH_PER_SEED_CAP, DEFAULT_GRAPH_SEED_COUNT, DEFAULT_GRAPH_TOTAL_CAP,
     DEFAULT_QUERY_EXPANSION_MAX_HYDE_CHARS, DEFAULT_QUERY_EXPANSION_MAX_VARIANTS,
-    DEFAULT_QUERY_EXPANSION_PROMPT_VERSION,
+    DEFAULT_QUERY_EXPANSION_PROMPT_VERSION, default_graph_relations,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -51,6 +52,14 @@ pub struct SearchConfig {
     /// Subordinate gate for the BGE-M3 sparse lexical retrieval leg. The
     /// data-prep sidecar can be populated while this remains ineffective.
     pub sparse_lexical_enabled: bool,
+    /// Subordinate gate for Stage-5 graph augmentation. Takes effect only
+    /// when `full_pipeline_enabled` is also true.
+    pub graph_augmentation_enabled: bool,
+    pub graph_seed_count: usize,
+    pub graph_per_seed_cap: usize,
+    pub graph_total_cap: usize,
+    pub graph_relations: Vec<String>,
+    pub graph_direction: String,
     /// Subordinate gate for Stage-4 query expansion. Takes effect only when
     /// `full_pipeline_enabled` is also true and a provider is configured.
     pub query_expansion_enabled: bool,
@@ -85,6 +94,10 @@ impl SearchConfig {
         self.full_pipeline_enabled && self.sparse_lexical_enabled
     }
 
+    pub fn graph_augmentation_effective(&self) -> bool {
+        self.full_pipeline_enabled && self.graph_augmentation_enabled
+    }
+
     pub fn query_expansion_effective(&self) -> bool {
         self.full_pipeline_enabled && self.query_expansion_enabled
     }
@@ -101,6 +114,15 @@ impl Default for SearchConfig {
             full_pipeline_enabled: false,
             tag_domain_routing_enabled: false,
             sparse_lexical_enabled: false,
+            graph_augmentation_enabled: false,
+            graph_seed_count: DEFAULT_GRAPH_SEED_COUNT,
+            graph_per_seed_cap: DEFAULT_GRAPH_PER_SEED_CAP,
+            graph_total_cap: DEFAULT_GRAPH_TOTAL_CAP,
+            graph_relations: default_graph_relations()
+                .into_iter()
+                .map(|relation| relation.as_str().to_string())
+                .collect(),
+            graph_direction: "both".to_string(),
             query_expansion_enabled: false,
             hyde_enabled: false,
             query_expansion_max_variants: DEFAULT_QUERY_EXPANSION_MAX_VARIANTS,
@@ -509,8 +531,23 @@ mod tests {
         assert!(!c.search.full_pipeline_enabled);
         assert!(!c.search.tag_domain_routing_enabled);
         assert!(!c.search.sparse_lexical_enabled);
+        assert!(!c.search.graph_augmentation_enabled);
         assert!(!c.search.query_expansion_enabled);
         assert!(!c.search.hyde_enabled);
+        assert_eq!(c.search.graph_seed_count, DEFAULT_GRAPH_SEED_COUNT);
+        assert_eq!(c.search.graph_per_seed_cap, DEFAULT_GRAPH_PER_SEED_CAP);
+        assert_eq!(c.search.graph_total_cap, DEFAULT_GRAPH_TOTAL_CAP);
+        assert_eq!(
+            c.search.graph_relations,
+            vec![
+                "supports".to_string(),
+                "requires".to_string(),
+                "decided_by".to_string(),
+                "replaces".to_string(),
+                "refines".to_string()
+            ]
+        );
+        assert_eq!(c.search.graph_direction, "both");
         assert_eq!(
             c.search.query_expansion_max_variants,
             DEFAULT_QUERY_EXPANSION_MAX_VARIANTS
@@ -528,6 +565,7 @@ mod tests {
         assert!(!c.search.chunk_serving_effective());
         assert!(!c.search.tag_domain_routing_effective());
         assert!(!c.search.sparse_lexical_effective());
+        assert!(!c.search.graph_augmentation_effective());
         assert!(!c.search.query_expansion_effective());
         assert!(!c.search.hyde_effective());
     }
@@ -598,6 +636,53 @@ mod tests {
         assert!(c.search.full_pipeline_enabled);
         assert!(c.search.sparse_lexical_enabled);
         assert!(c.search.sparse_lexical_effective());
+    }
+
+    #[test]
+    fn graph_augmentation_requires_full_pipeline_master_gate() {
+        let toml = r#"
+            [search]
+            full_pipeline_enabled = false
+            graph_augmentation_enabled = true
+            graph_seed_count = 5
+            graph_per_seed_cap = 2
+            graph_total_cap = 7
+            graph_relations = ["supports", "requires"]
+            graph_direction = "outbound"
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert!(!c.search.full_pipeline_enabled);
+        assert!(c.search.graph_augmentation_enabled);
+        assert!(!c.search.graph_augmentation_effective());
+        assert_eq!(c.search.graph_seed_count, 5);
+        assert_eq!(c.search.graph_per_seed_cap, 2);
+        assert_eq!(c.search.graph_total_cap, 7);
+        assert_eq!(
+            c.search.graph_relations,
+            vec!["supports".to_string(), "requires".to_string()]
+        );
+        assert_eq!(c.search.graph_direction, "outbound");
+    }
+
+    #[test]
+    fn graph_augmentation_effective_when_both_gates_true() {
+        let toml = r#"
+            [search]
+            full_pipeline_enabled = true
+            graph_augmentation_enabled = true
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert!(c.search.full_pipeline_enabled);
+        assert!(c.search.graph_augmentation_enabled);
+        assert!(c.search.graph_augmentation_effective());
     }
 
     #[test]

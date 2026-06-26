@@ -1,0 +1,129 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH seeds(seed_id, seed_rank) AS (\n            SELECT * FROM unnest($1::uuid[], $2::int[])\n        ),\n        candidate_edges AS (\n            SELECT\n                s.seed_id,\n                s.seed_rank,\n                tl.id AS link_id,\n                tl.relation,\n                'outbound'::text AS direction,\n                tl.source AS link_source,\n                tl.note,\n                tl.created_at AS link_created_at,\n                tl.to_thought_id AS neighbor_id\n            FROM seeds s\n            JOIN thought_links tl ON tl.from_thought_id = s.seed_id\n            WHERE $4::bool\n              AND tl.deleted_at IS NULL\n              AND tl.to_kind = 'thought'\n              AND (cardinality($3::text[]) = 0 OR tl.relation = ANY($3::text[]))\n\n            UNION ALL\n\n            SELECT\n                s.seed_id,\n                s.seed_rank,\n                tl.id AS link_id,\n                tl.relation,\n                'inbound'::text AS direction,\n                tl.source AS link_source,\n                tl.note,\n                tl.created_at AS link_created_at,\n                tl.from_thought_id AS neighbor_id\n            FROM seeds s\n            JOIN thought_links tl ON tl.to_thought_id = s.seed_id\n            WHERE $5::bool\n              AND tl.deleted_at IS NULL\n              AND (cardinality($3::text[]) = 0 OR tl.relation = ANY($3::text[]))\n        ),\n        filtered_edges AS (\n            SELECT\n                e.seed_id,\n                e.seed_rank,\n                e.link_id,\n                e.relation,\n                e.direction,\n                e.link_source,\n                e.note,\n                e.link_created_at,\n                t.id,\n                t.scope,\n                t.content,\n                t.source,\n                t.created_at,\n                t.metadata,\n                t.content_fingerprint,\n                t.tags,\n                t.tags_extractor_model,\n                t.tags_extractor_version,\n                t.tags_extracted_at\n            FROM candidate_edges e\n            JOIN thoughts t ON t.id = e.neighbor_id\n            WHERE ($6::text IS NULL OR t.scope = $6)\n              AND ($7::text IS NULL OR t.scope LIKE $7 || '%')\n              AND t.retracted_at IS NULL\n              AND t.id <> ALL($10::uuid[])\n              AND lower(coalesce(t.metadata->>'source_file', '')) !~ $11\n              AND t.content !~ $12\n        ),\n        ranked_edges AS (\n            SELECT\n                *,\n                row_number() OVER (\n                    PARTITION BY seed_id\n                    ORDER BY link_created_at DESC, link_id ASC\n                ) AS per_seed_rank\n            FROM filtered_edges\n        )\n        SELECT\n            seed_id AS \"seed_id!\",\n            link_id AS \"link_id!\",\n            relation AS \"relation!\",\n            direction AS \"direction!\",\n            link_source AS \"link_source!\",\n            note,\n            id,\n            scope,\n            content,\n            source,\n            created_at,\n            metadata,\n            content_fingerprint,\n            tags,\n            tags_extractor_model,\n            tags_extractor_version,\n            tags_extracted_at\n        FROM ranked_edges\n        WHERE per_seed_rank <= $8\n        ORDER BY seed_rank ASC, per_seed_rank ASC, link_created_at DESC, link_id ASC\n        LIMIT $9\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "seed_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "link_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "relation!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "direction!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "link_source!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "note",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "scope",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "content",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "source",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "metadata",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 12,
+        "name": "content_fingerprint",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 13,
+        "name": "tags",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 14,
+        "name": "tags_extractor_model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 15,
+        "name": "tags_extractor_version",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 16,
+        "name": "tags_extracted_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Int4Array",
+        "TextArray",
+        "Bool",
+        "Bool",
+        "Text",
+        "Text",
+        "Int8",
+        "Int8",
+        "UuidArray",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "5e6c805f2319b60c19231762242c5ba18eee9aac3575af66311beef5bffe23ab"
+}

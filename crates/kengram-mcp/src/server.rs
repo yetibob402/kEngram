@@ -332,6 +332,8 @@ impl KengramServer {
             hyde_enabled: full_pipeline_enabled
                 && query_expansion_runtime.query_expansion_enabled
                 && query_expansion_runtime.hyde_enabled,
+            graph_augmentation_enabled: full_pipeline_enabled
+                && query_expansion_runtime.graph_augmentation_enabled,
             ..query_expansion_runtime
         };
         Self {
@@ -371,6 +373,10 @@ impl std::fmt::Debug for KengramServer {
                 &self.query_expansion_runtime.query_expansion_enabled,
             )
             .field("hyde_enabled", &self.query_expansion_runtime.hyde_enabled)
+            .field(
+                "graph_augmentation_enabled",
+                &self.query_expansion_runtime.graph_augmentation_enabled,
+            )
             .finish()
     }
 }
@@ -955,6 +961,15 @@ fn search_response_json(
                     serde_json::to_value(&h.chunk_metadata).unwrap_or(serde_json::Value::Null),
                 );
             }
+            if include_full_pipeline_tags || !h.graph_provenance.is_empty() {
+                let obj = hit
+                    .as_object_mut()
+                    .expect("search hit JSON is constructed as an object");
+                obj.insert(
+                    "graph_provenance".into(),
+                    serde_json::to_value(&h.graph_provenance).unwrap_or(serde_json::Value::Null),
+                );
+            }
             hit
         })
         .collect();
@@ -1326,6 +1341,7 @@ mod tests {
             chunk_start_char: None,
             chunk_end_char: None,
             chunk_metadata: None,
+            graph_provenance: vec![],
         }
     }
 
@@ -1394,9 +1410,11 @@ mod tests {
         resp.results[0].tags.domain_scope = Some("infra".to_string());
 
         let json = search_response_json(&resp, false, false);
+        let hit = json["results"][0].as_object().unwrap();
         let tags = json["results"][0]["tags"].as_object().unwrap();
         assert!(!tags.contains_key("retrieval_aliases"));
         assert!(!tags.contains_key("domain_scope"));
+        assert!(!hit.contains_key("graph_provenance"));
     }
 
     #[test]
@@ -1406,12 +1424,32 @@ mod tests {
         resp.results[0].tags.domain_scope = Some("infra".to_string());
 
         let json = search_response_json(&resp, false, true);
+        let hit = json["results"][0].as_object().unwrap();
         let tags = json["results"][0]["tags"].as_object().unwrap();
         assert_eq!(
             tags["retrieval_aliases"],
             serde_json::json!(["memory search"])
         );
         assert_eq!(tags["domain_scope"], serde_json::json!("infra"));
+        assert_eq!(hit["graph_provenance"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn search_response_json_includes_nonempty_graph_provenance_when_flag_off() {
+        let mut resp = search_json_response();
+        resp.results[0].graph_provenance = vec![search::GraphProvenance {
+            seed_thought_id: uuid::Uuid::new_v4().to_string(),
+            link_id: uuid::Uuid::new_v4().to_string(),
+            relation: "supports".to_string(),
+            direction: "outbound".to_string(),
+            source: "thought_link".to_string(),
+            note: Some("fixture edge".to_string()),
+        }];
+
+        let json = search_response_json(&resp, false, false);
+        let hit = json["results"][0].as_object().unwrap();
+        assert_eq!(hit["graph_provenance"][0]["relation"], "supports");
+        assert_eq!(hit["graph_provenance"][0]["direction"], "outbound");
     }
 
     #[sqlx::test(migrations = "../../migrations")]

@@ -44,10 +44,13 @@ pub use relate::{
 };
 pub use retract::{RetractError, RetractThoughtRequest, RetractThoughtResponse, retract_thought};
 pub use search::{
-    DEFAULT_SEARCH_LIMIT, DEFAULT_TOP_K_PER_LEG, GetThoughtResponse, ListScopesRequest,
-    ListScopesResponse, MAX_SEARCH_LIMIT, ReadError, RecentRequest, RecentResponse,
-    ScopeSummaryHit, SearchHit, SearchRequest, SearchResponse, SearchRuntimeOptions, get_thought,
-    list_scopes, recent_thoughts, search_thoughts, search_thoughts_with_runtime,
+    DEFAULT_GRAPH_PER_SEED_CAP, DEFAULT_GRAPH_SEED_COUNT, DEFAULT_GRAPH_TOTAL_CAP,
+    DEFAULT_SEARCH_LIMIT, DEFAULT_TOP_K_PER_LEG, GetThoughtResponse, GraphProvenance,
+    ListScopesRequest, ListScopesResponse, MAX_GRAPH_PER_SEED_CAP, MAX_GRAPH_SEED_COUNT,
+    MAX_GRAPH_TOTAL_CAP, MAX_SEARCH_LIMIT, ReadError, RecentRequest, RecentResponse,
+    ScopeSummaryHit, SearchHit, SearchRequest, SearchResponse, SearchRuntimeOptions,
+    default_graph_relations, get_thought, list_scopes, recent_thoughts, search_thoughts,
+    search_thoughts_with_runtime,
 };
 pub use server::{
     CaptureArgs, GetRelatedThoughtsArgs, GetThoughtArgs, KengramServer, LinkThoughtsArgs,

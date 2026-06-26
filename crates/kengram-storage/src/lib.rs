@@ -2593,6 +2593,29 @@ pub struct RelatedTarget {
     pub note: Option<String>,
 }
 
+/// One thought-target graph neighbor safe to feed into search-time graph
+/// augmentation. Unlike `fetch_related_thoughts`, this shape is already
+/// filtered for search semantics: live links only, thought targets only,
+/// non-retracted neighbor thoughts, scope/scope_prefix respected, and eval
+/// contamination excluded at source.
+#[derive(Debug, Clone)]
+pub struct GraphNeighborHit {
+    pub seed_thought_id: ThoughtId,
+    pub link_id: LinkId,
+    pub relation: RelationKind,
+    pub direction: LinkDirection,
+    pub link_source: LinkSource,
+    pub note: Option<String>,
+    pub thought: Thought,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GraphNonThoughtTargetCounts {
+    pub entity: i64,
+    pub person: i64,
+    pub url: i64,
+}
+
 /// Three-way live/soft-deleted/never-existed status of an edge identified
 /// by `(from, relation, target)`. Used by the MCP `unlink_thoughts`
 /// orchestrator to distinguish "we just removed this edge" from "this
@@ -2930,6 +2953,234 @@ pub async fn fetch_related_thoughts(
     }
 
     Ok(rows)
+}
+
+/// Fetch bounded graph neighbors for search-time augmentation. This is
+/// stricter than `fetch_related_thoughts`: only thought targets are returned
+/// as candidates, soft-deleted links are excluded, retracted neighbor thoughts
+/// are excluded, explicit scope filters are enforced, and eval/adjudication
+/// contamination is filtered before the rows leave storage.
+pub async fn search_graph_neighbors(
+    pool: &PgPool,
+    seed_ids: &[ThoughtId],
+    relations: &[RelationKind],
+    direction: LinkDirection,
+    per_seed_cap: usize,
+    total_cap: usize,
+    scope: Option<&str>,
+    scope_prefix: Option<&str>,
+) -> Result<Vec<GraphNeighborHit>, StorageError> {
+    if seed_ids.is_empty() || per_seed_cap == 0 || total_cap == 0 {
+        return Ok(Vec::new());
+    }
+
+    let seed_uuids: Vec<Uuid> = seed_ids.iter().map(|id| id.into_uuid()).collect();
+    let seed_ranks: Vec<i32> = (0..seed_uuids.len()).map(|idx| idx as i32).collect();
+    let relation_filter: Vec<String> = relations
+        .iter()
+        .map(|relation| relation.as_str().to_string())
+        .collect();
+    let include_outbound = matches!(direction, LinkDirection::Outbound | LinkDirection::Both);
+    let include_inbound = matches!(direction, LinkDirection::Inbound | LinkDirection::Both);
+    if !include_outbound && !include_inbound {
+        return Ok(Vec::new());
+    }
+
+    let rows = sqlx::query!(
+        r#"
+        WITH seeds(seed_id, seed_rank) AS (
+            SELECT * FROM unnest($1::uuid[], $2::int[])
+        ),
+        candidate_edges AS (
+            SELECT
+                s.seed_id,
+                s.seed_rank,
+                tl.id AS link_id,
+                tl.relation,
+                'outbound'::text AS direction,
+                tl.source AS link_source,
+                tl.note,
+                tl.created_at AS link_created_at,
+                tl.to_thought_id AS neighbor_id
+            FROM seeds s
+            JOIN thought_links tl ON tl.from_thought_id = s.seed_id
+            WHERE $4::bool
+              AND tl.deleted_at IS NULL
+              AND tl.to_kind = 'thought'
+              AND (cardinality($3::text[]) = 0 OR tl.relation = ANY($3::text[]))
+
+            UNION ALL
+
+            SELECT
+                s.seed_id,
+                s.seed_rank,
+                tl.id AS link_id,
+                tl.relation,
+                'inbound'::text AS direction,
+                tl.source AS link_source,
+                tl.note,
+                tl.created_at AS link_created_at,
+                tl.from_thought_id AS neighbor_id
+            FROM seeds s
+            JOIN thought_links tl ON tl.to_thought_id = s.seed_id
+            WHERE $5::bool
+              AND tl.deleted_at IS NULL
+              AND (cardinality($3::text[]) = 0 OR tl.relation = ANY($3::text[]))
+        ),
+        filtered_edges AS (
+            SELECT
+                e.seed_id,
+                e.seed_rank,
+                e.link_id,
+                e.relation,
+                e.direction,
+                e.link_source,
+                e.note,
+                e.link_created_at,
+                t.id,
+                t.scope,
+                t.content,
+                t.source,
+                t.created_at,
+                t.metadata,
+                t.content_fingerprint,
+                t.tags,
+                t.tags_extractor_model,
+                t.tags_extractor_version,
+                t.tags_extracted_at
+            FROM candidate_edges e
+            JOIN thoughts t ON t.id = e.neighbor_id
+            WHERE ($6::text IS NULL OR t.scope = $6)
+              AND ($7::text IS NULL OR t.scope LIKE $7 || '%')
+              AND t.retracted_at IS NULL
+              AND t.id <> ALL($10::uuid[])
+              AND lower(coalesce(t.metadata->>'source_file', '')) !~ $11
+              AND t.content !~ $12
+        ),
+        ranked_edges AS (
+            SELECT
+                *,
+                row_number() OVER (
+                    PARTITION BY seed_id
+                    ORDER BY link_created_at DESC, link_id ASC
+                ) AS per_seed_rank
+            FROM filtered_edges
+        )
+        SELECT
+            seed_id AS "seed_id!",
+            link_id AS "link_id!",
+            relation AS "relation!",
+            direction AS "direction!",
+            link_source AS "link_source!",
+            note,
+            id,
+            scope,
+            content,
+            source,
+            created_at,
+            metadata,
+            content_fingerprint,
+            tags,
+            tags_extractor_model,
+            tags_extractor_version,
+            tags_extracted_at
+        FROM ranked_edges
+        WHERE per_seed_rank <= $8
+        ORDER BY seed_rank ASC, per_seed_rank ASC, link_created_at DESC, link_id ASC
+        LIMIT $9
+        "#,
+        &seed_uuids,
+        &seed_ranks,
+        &relation_filter,
+        include_outbound,
+        include_inbound,
+        scope,
+        scope_prefix,
+        per_seed_cap as i64,
+        total_cap as i64,
+        EVAL_CONTAMINATION_KNOWN_IDS,
+        EVAL_CONTAMINATION_SOURCE_FILE_REGEX,
+        EVAL_CONTAMINATION_CONTENT_REGEX,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|r| {
+            let direction = match r.direction.as_str() {
+                "outbound" => LinkDirection::Outbound,
+                _ => LinkDirection::Inbound,
+            };
+            let thought = Thought {
+                id: ThoughtId::from(r.id),
+                scope: Scope::new(r.scope)?,
+                content: r.content,
+                source: Source::new(r.source)?,
+                created_at: r.created_at,
+                metadata: Metadata::from(r.metadata),
+                content_fingerprint: fingerprint_from_bytes(r.content_fingerprint)?,
+                tags: tags_from_value(r.tags)?,
+                tags_extractor_model: r.tags_extractor_model,
+                tags_extractor_version: r.tags_extractor_version,
+                tags_extracted_at: r.tags_extracted_at,
+            };
+            Ok(GraphNeighborHit {
+                seed_thought_id: ThoughtId::from(r.seed_id),
+                link_id: LinkId::from(r.link_id),
+                relation: r.relation.parse()?,
+                direction,
+                link_source: r.link_source.parse()?,
+                note: r.note,
+                thought,
+            })
+        })
+        .collect()
+}
+
+/// Count outbound non-thought targets adjacent to the graph seeds. Search
+/// graph augmentation never follows these into invented hits; the counts are
+/// only profile/provenance evidence for Smith and operators.
+pub async fn count_graph_non_thought_targets(
+    pool: &PgPool,
+    seed_ids: &[ThoughtId],
+    relations: &[RelationKind],
+    direction: LinkDirection,
+) -> Result<GraphNonThoughtTargetCounts, StorageError> {
+    if seed_ids.is_empty() || matches!(direction, LinkDirection::Inbound) {
+        return Ok(GraphNonThoughtTargetCounts::default());
+    }
+
+    let seed_uuids: Vec<Uuid> = seed_ids.iter().map(|id| id.into_uuid()).collect();
+    let relation_filter: Vec<String> = relations
+        .iter()
+        .map(|relation| relation.as_str().to_string())
+        .collect();
+    let rows = sqlx::query!(
+        r#"
+        SELECT tl.to_kind, COUNT(*) AS "count!"
+        FROM thought_links tl
+        WHERE tl.from_thought_id = ANY($1::uuid[])
+          AND tl.deleted_at IS NULL
+          AND tl.to_kind <> 'thought'
+          AND (cardinality($2::text[]) = 0 OR tl.relation = ANY($2::text[]))
+        GROUP BY tl.to_kind
+        "#,
+        &seed_uuids,
+        &relation_filter,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut counts = GraphNonThoughtTargetCounts::default();
+    for row in rows {
+        match row.to_kind.as_str() {
+            "entity" => counts.entity = row.count,
+            "person" => counts.person = row.count,
+            "url" => counts.url = row.count,
+            _ => {}
+        }
+    }
+    Ok(counts)
 }
 
 fn link_target_from_row(

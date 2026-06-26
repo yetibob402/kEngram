@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT tl.to_kind, COUNT(*) AS \"count!\"\n        FROM thought_links tl\n        WHERE tl.from_thought_id = ANY($1::uuid[])\n          AND tl.deleted_at IS NULL\n          AND tl.to_kind <> 'thought'\n          AND (cardinality($2::text[]) = 0 OR tl.relation = ANY($2::text[]))\n        GROUP BY tl.to_kind\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "to_kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "f1267427453c004842a69c60389081002762b7663cea69a3df221f6952160ca0"
+}

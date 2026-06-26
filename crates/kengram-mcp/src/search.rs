@@ -20,11 +20,12 @@
 
 use kengram_core::{
     DEFAULT_RECENCY_HALF_LIFE_DAYS, DEFAULT_RRF_K, Embedder, EmbeddingModel, EmbeddingStatus, Hit,
-    Metadata, Scope, Source, Tags, Thought, ThoughtId, normalize_domain_scope,
-    normalize_retrieval_alias, recency_boost, rrf_fuse,
+    LinkDirection, Metadata, RelationKind, Scope, Source, Tags, Thought, ThoughtId,
+    normalize_domain_scope, normalize_retrieval_alias, recency_boost, rrf_fuse,
 };
 use kengram_embed::{RerankScore, Reranker, RerankerError};
 use sqlx::PgPool;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 use time::OffsetDateTime;
 
@@ -45,6 +46,22 @@ pub const DEFAULT_RERANK_CANDIDATE_POOL: usize = 32;
 const RERANK_BACKEND_MAX_BATCH: usize = 32;
 const PAIRWISE_MAX_SUBQUERIES: usize = 8;
 const PAIRWISE_PER_SUBQUERY_TOP_K: usize = 25;
+pub const DEFAULT_GRAPH_SEED_COUNT: usize = 12;
+pub const DEFAULT_GRAPH_PER_SEED_CAP: usize = 3;
+pub const DEFAULT_GRAPH_TOTAL_CAP: usize = 24;
+pub const MAX_GRAPH_SEED_COUNT: usize = 64;
+pub const MAX_GRAPH_PER_SEED_CAP: usize = 16;
+pub const MAX_GRAPH_TOTAL_CAP: usize = 256;
+
+pub fn default_graph_relations() -> Vec<RelationKind> {
+    vec![
+        RelationKind::Supports,
+        RelationKind::Requires,
+        RelationKind::DecidedBy,
+        RelationKind::Replaces,
+        RelationKind::Refines,
+    ]
+}
 
 #[derive(Debug, Clone)]
 pub struct SearchRuntimeOptions {
@@ -52,6 +69,12 @@ pub struct SearchRuntimeOptions {
     pub hyde_enabled: bool,
     pub query_expansion_max_variants: usize,
     pub query_expansion_max_hyde_chars: usize,
+    pub graph_augmentation_enabled: bool,
+    pub graph_seed_count: usize,
+    pub graph_per_seed_cap: usize,
+    pub graph_total_cap: usize,
+    pub graph_relations: Vec<RelationKind>,
+    pub graph_direction: LinkDirection,
 }
 
 impl Default for SearchRuntimeOptions {
@@ -61,6 +84,12 @@ impl Default for SearchRuntimeOptions {
             hyde_enabled: false,
             query_expansion_max_variants: DEFAULT_QUERY_EXPANSION_MAX_VARIANTS,
             query_expansion_max_hyde_chars: DEFAULT_QUERY_EXPANSION_MAX_HYDE_CHARS,
+            graph_augmentation_enabled: false,
+            graph_seed_count: DEFAULT_GRAPH_SEED_COUNT,
+            graph_per_seed_cap: DEFAULT_GRAPH_PER_SEED_CAP,
+            graph_total_cap: DEFAULT_GRAPH_TOTAL_CAP,
+            graph_relations: default_graph_relations(),
+            graph_direction: LinkDirection::Both,
         }
     }
 }
@@ -79,6 +108,12 @@ struct ExpansionPlan {
     queries: Vec<String>,
     hyde: Option<String>,
     decomposition: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GraphExpansion {
+    ranking: Vec<Hit>,
+    provenance: HashMap<ThoughtId, Vec<GraphProvenance>>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +196,17 @@ pub struct SearchHit {
     pub chunk_start_char: Option<i32>,
     pub chunk_end_char: Option<i32>,
     pub chunk_metadata: Option<serde_json::Value>,
+    pub graph_provenance: Vec<GraphProvenance>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GraphProvenance {
+    pub seed_thought_id: String,
+    pub link_id: String,
+    pub relation: String,
+    pub direction: String,
+    pub source: String,
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +242,7 @@ pub struct SearchProfile {
     pub tag_domain_routing_enabled: bool,
     pub query_expansion_enabled: bool,
     pub hyde_enabled: bool,
+    pub graph_augmentation_enabled: bool,
     pub query_expansion_provider: Option<String>,
     pub query_expansion_model_id: Option<String>,
     pub query_expansion_prompt_version: Option<String>,
@@ -220,6 +267,21 @@ pub struct SearchProfile {
     pub query_expansion_chunk_vector_hits: usize,
     pub query_expansion_thought_fts_hits: usize,
     pub query_expansion_chunk_fts_hits: usize,
+    pub graph_seed_count: usize,
+    pub graph_per_seed_cap: usize,
+    pub graph_total_cap: usize,
+    pub graph_direction: String,
+    pub graph_relations: Vec<String>,
+    pub graph_seeds_considered: usize,
+    pub graph_candidates_before_dedupe: usize,
+    pub graph_candidates_after_dedupe: usize,
+    pub graph_candidates_retained_after_filters: usize,
+    pub graph_merged_provenance_count: usize,
+    pub graph_entity_provenance_count: i64,
+    pub graph_person_provenance_count: i64,
+    pub graph_url_provenance_count: i64,
+    pub graph_per_relation_counts: BTreeMap<String, usize>,
+    pub graph_expansion_ms: f64,
     pub fused_hit_count: usize,
     pub rerank_candidate_count: usize,
     pub result_count: usize,
@@ -372,11 +434,23 @@ async fn search_thoughts_with_tuning(
         request.full_pipeline_enabled && request.tag_domain_routing_enabled;
     let query_expansion_enabled = request.full_pipeline_enabled && runtime.query_expansion_enabled;
     let hyde_enabled = query_expansion_enabled && runtime.hyde_enabled;
+    let graph_augmentation_enabled =
+        request.full_pipeline_enabled && runtime.graph_augmentation_enabled;
     profile.full_pipeline_enabled = request.full_pipeline_enabled;
     profile.chunk_serving_enabled = chunk_serving_enabled;
     profile.tag_domain_routing_enabled = tag_domain_routing_enabled;
     profile.query_expansion_enabled = query_expansion_enabled;
     profile.hyde_enabled = hyde_enabled;
+    profile.graph_augmentation_enabled = graph_augmentation_enabled;
+    profile.graph_seed_count = runtime.graph_seed_count.min(MAX_GRAPH_SEED_COUNT);
+    profile.graph_per_seed_cap = runtime.graph_per_seed_cap.min(MAX_GRAPH_PER_SEED_CAP);
+    profile.graph_total_cap = runtime.graph_total_cap.min(MAX_GRAPH_TOTAL_CAP);
+    profile.graph_direction = runtime.graph_direction.as_str().to_string();
+    profile.graph_relations = runtime
+        .graph_relations
+        .iter()
+        .map(|relation| relation.as_str().to_string())
+        .collect();
     profile.planner_route = if tag_domain_routing_enabled {
         "tag_domain_routing_v0"
     } else {
@@ -590,6 +664,17 @@ async fn search_thoughts_with_tuning(
         rankings.extend(expansion_rankings.chunk_fts_rankings);
     }
     let mut fused = rrf_fuse(rankings, DEFAULT_RRF_K);
+    let graph_expansion = collect_graph_expansion(
+        pool,
+        graph_augmentation_enabled,
+        &runtime,
+        &fused,
+        scope_filter,
+        scope_prefix_filter,
+        &mut profile,
+    )
+    .await?;
+    merge_graph_expansion(&mut fused, &graph_expansion, DEFAULT_RRF_K);
     let half_life = request
         .recency_half_life_days
         .unwrap_or(DEFAULT_RECENCY_HALF_LIFE_DAYS);
@@ -616,6 +701,10 @@ async fn search_thoughts_with_tuning(
     } else if request.tag_filter.is_some() {
         tracing::debug!("search_thoughts: tag_filter present but empty-object — no-op");
     }
+    profile.graph_candidates_retained_after_filters = fused
+        .iter()
+        .filter(|hit| graph_expansion.provenance.contains_key(&hit.thought.id))
+        .count();
     profile.tag_filter_ms = elapsed_ms(tag_filter_started);
 
     // Optional rerank stage.
@@ -646,7 +735,7 @@ async fn search_thoughts_with_tuning(
     let results: Vec<SearchHit> = fused
         .into_iter()
         .take(limit)
-        .map(search_hit_from_core_hit)
+        .map(|hit| search_hit_from_core_hit(hit, &graph_expansion.provenance))
         .collect();
     profile.result_projection_ms = elapsed_ms(projection_started);
     profile.result_count = results.len();
@@ -869,8 +958,157 @@ async fn collect_expansion_rankings(
     out
 }
 
-fn search_hit_from_core_hit(h: Hit) -> SearchHit {
+async fn collect_graph_expansion(
+    pool: &PgPool,
+    graph_augmentation_enabled: bool,
+    runtime: &SearchRuntimeOptions,
+    fused: &[Hit],
+    scope_filter: Option<&str>,
+    scope_prefix_filter: Option<&str>,
+    profile: &mut SearchProfile,
+) -> Result<GraphExpansion, ReadError> {
+    if !graph_augmentation_enabled || fused.is_empty() {
+        return Ok(GraphExpansion::default());
+    }
+
+    let started = Instant::now();
+    let seed_count = runtime.graph_seed_count.min(MAX_GRAPH_SEED_COUNT);
+    let per_seed_cap = runtime.graph_per_seed_cap.min(MAX_GRAPH_PER_SEED_CAP);
+    let total_cap = runtime.graph_total_cap.min(MAX_GRAPH_TOTAL_CAP);
+    if seed_count == 0 || per_seed_cap == 0 || total_cap == 0 {
+        profile.graph_expansion_ms = elapsed_ms(started);
+        return Ok(GraphExpansion::default());
+    }
+
+    let seeds = fused
+        .iter()
+        .take(seed_count)
+        .map(|hit| hit.thought.id)
+        .collect::<Vec<_>>();
+    profile.graph_seeds_considered = seeds.len();
+
+    let non_thought = kengram_storage::count_graph_non_thought_targets(
+        pool,
+        &seeds,
+        &runtime.graph_relations,
+        runtime.graph_direction,
+    )
+    .await?;
+    profile.graph_entity_provenance_count = non_thought.entity;
+    profile.graph_person_provenance_count = non_thought.person;
+    profile.graph_url_provenance_count = non_thought.url;
+
+    let rows = kengram_storage::search_graph_neighbors(
+        pool,
+        &seeds,
+        &runtime.graph_relations,
+        runtime.graph_direction,
+        per_seed_cap,
+        total_cap,
+        scope_filter,
+        scope_prefix_filter,
+    )
+    .await?;
+    profile.graph_candidates_before_dedupe = rows.len();
+
+    let base_ids = fused
+        .iter()
+        .map(|hit| hit.thought.id)
+        .collect::<HashSet<_>>();
+    let mut by_thought: HashMap<ThoughtId, Hit> = HashMap::new();
+    let mut provenance: HashMap<ThoughtId, Vec<GraphProvenance>> = HashMap::new();
+    let mut per_relation = BTreeMap::<String, usize>::new();
+    let mut merged_existing = HashSet::new();
+    let mut order = Vec::new();
+
+    for row in rows {
+        let thought_id = row.thought.id;
+        *per_relation
+            .entry(row.relation.as_str().to_string())
+            .or_default() += 1;
+        if base_ids.contains(&thought_id) {
+            merged_existing.insert(thought_id);
+        }
+        provenance
+            .entry(thought_id)
+            .or_default()
+            .push(GraphProvenance {
+                seed_thought_id: row.seed_thought_id.as_uuid().to_string(),
+                link_id: row.link_id.as_uuid().to_string(),
+                relation: row.relation.as_str().to_string(),
+                direction: row.direction.as_str().to_string(),
+                source: row.link_source.as_str().to_string(),
+                note: row.note,
+            });
+        by_thought.entry(thought_id).or_insert_with(|| {
+            order.push(thought_id);
+            Hit {
+                thought: row.thought,
+                vector_score: None,
+                lexical_score: None,
+                trigram_score: None,
+                rrf_score: None,
+                rerank_score: None,
+                chunk: None,
+            }
+        });
+    }
+
+    let ranking = order
+        .into_iter()
+        .filter_map(|id| by_thought.remove(&id))
+        .collect::<Vec<_>>();
+
+    profile.graph_candidates_after_dedupe = ranking.len();
+    profile.graph_merged_provenance_count = merged_existing.len();
+    profile.graph_per_relation_counts = per_relation;
+    profile.graph_expansion_ms = elapsed_ms(started);
+
+    Ok(GraphExpansion {
+        ranking,
+        provenance,
+    })
+}
+
+fn merge_graph_expansion(fused: &mut Vec<Hit>, graph: &GraphExpansion, k: f32) {
+    if graph.ranking.is_empty() {
+        return;
+    }
+
+    let mut positions = fused
+        .iter()
+        .enumerate()
+        .map(|(idx, hit)| (hit.thought.id, idx))
+        .collect::<HashMap<_, _>>();
+    for (idx, graph_hit) in graph.ranking.iter().cloned().enumerate() {
+        let rank = (idx + 1) as f32;
+        let contribution = 1.0 / (k + rank);
+        if let Some(existing_idx) = positions.get(&graph_hit.thought.id).copied() {
+            let current = fused[existing_idx].rrf_score.unwrap_or(0.0);
+            fused[existing_idx].rrf_score = Some(current + contribution);
+        } else {
+            let mut inserted = graph_hit;
+            inserted.rrf_score = Some(contribution);
+            positions.insert(inserted.thought.id, fused.len());
+            fused.push(inserted);
+        }
+    }
+    fused.sort_by(|a, b| {
+        let av = a.rrf_score.unwrap_or(0.0);
+        let bv = b.rrf_score.unwrap_or(0.0);
+        bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
+fn search_hit_from_core_hit(
+    h: Hit,
+    graph_provenance: &HashMap<ThoughtId, Vec<GraphProvenance>>,
+) -> SearchHit {
     let chunk = h.chunk;
+    let graph_provenance = graph_provenance
+        .get(&h.thought.id)
+        .cloned()
+        .unwrap_or_default();
     SearchHit {
         thought_id: h.thought.id,
         content: h.thought.content,
@@ -895,6 +1133,7 @@ fn search_hit_from_core_hit(h: Hit) -> SearchHit {
         chunk_start_char: chunk.as_ref().and_then(|c| c.start_char),
         chunk_end_char: chunk.as_ref().and_then(|c| c.end_char),
         chunk_metadata: chunk.map(|c| c.metadata),
+        graph_provenance,
     }
 }
 
@@ -1641,7 +1880,9 @@ mod tests {
         QueryExpansionError, QueryExpansionInput, QueryExpansionOutput, QueryExpansionProvider,
     };
     use async_trait::async_trait;
-    use kengram_core::{EmbeddingModel, TagKind, Tags};
+    use kengram_core::{
+        EmbeddingModel, LinkDirection, LinkSource, LinkTarget, RelationKind, TagKind, Tags,
+    };
     use kengram_embed::{FakeBehavior, FakeEmbedder, FakeReranker};
 
     const TEST_EMBEDDER_MODEL_ID: &str = "qwen3-embedding";
@@ -2220,6 +2461,37 @@ mod tests {
         id
     }
 
+    async fn cap_with_tags_in_scope(
+        pool: &PgPool,
+        content: &str,
+        scope: &str,
+        tags: Tags,
+    ) -> ThoughtId {
+        let id = cap(pool, content, scope).await;
+        kengram_storage::update_thought_tags(pool, id, &tags, "fake/tagger", 1)
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn link_thoughts_for_test(
+        from: ThoughtId,
+        relation: RelationKind,
+        to: ThoughtId,
+        pool: &PgPool,
+    ) {
+        kengram_storage::insert_link(
+            pool,
+            from,
+            relation,
+            &LinkTarget::Thought(to),
+            LinkSource::Agent,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_thoughts_filters_by_tag_kind(pool: PgPool) {
         let embedder = test_embedder();
@@ -2586,6 +2858,7 @@ mod tests {
                 hyde_enabled: true,
                 query_expansion_max_variants: 4,
                 query_expansion_max_hyde_chars: 600,
+                ..SearchRuntimeOptions::default()
             },
             SearchRequest {
                 query: "original belt four".to_string(),
@@ -2614,6 +2887,529 @@ mod tests {
         assert_eq!(profile.query_expansion_variant_count, 1);
         assert!(profile.query_expansion_hyde_used);
         assert!(profile.query_expansion_thought_fts_hits >= 2);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn graph_subordinate_flag_is_ineffective_when_master_gate_off(pool: PgPool) {
+        let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
+        let seed_id = cap(&pool, "graph seed alpha marker", "global").await;
+        let neighbor_id = cap(&pool, "linked neighbor only", "global").await;
+        link_thoughts_for_test(seed_id, RelationKind::Supports, neighbor_id, &pool).await;
+
+        let resp = search_thoughts_with_runtime(
+            &pool,
+            &bad,
+            None,
+            None,
+            SearchRuntimeOptions {
+                graph_augmentation_enabled: true,
+                ..SearchRuntimeOptions::default()
+            },
+            SearchRequest {
+                query: "graph seed alpha".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(false),
+                candidate_pool: None,
+                tag_filter: None,
+                chunk_serving_enabled: false,
+                full_pipeline_enabled: false,
+                tag_domain_routing_enabled: false,
+                include_profile: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let ids: Vec<_> = resp.results.iter().map(|hit| hit.thought_id).collect();
+        assert!(ids.contains(&seed_id));
+        assert!(!ids.contains(&neighbor_id));
+        let profile = resp.profile.expect("profile requested");
+        assert!(!profile.full_pipeline_enabled);
+        assert!(!profile.graph_augmentation_enabled);
+        assert_eq!(profile.graph_candidates_before_dedupe, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn graph_flag_true_adds_neighbor_with_provenance_without_dropping_base(pool: PgPool) {
+        let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
+        let seed_id = cap(&pool, "graph seed beta marker", "global").await;
+        let neighbor_id = cap(&pool, "linked graph neighbor beta", "global").await;
+        link_thoughts_for_test(seed_id, RelationKind::Supports, neighbor_id, &pool).await;
+
+        let resp = search_thoughts_with_runtime(
+            &pool,
+            &bad,
+            None,
+            None,
+            SearchRuntimeOptions {
+                graph_augmentation_enabled: true,
+                graph_seed_count: 12,
+                graph_per_seed_cap: 3,
+                graph_total_cap: 24,
+                ..SearchRuntimeOptions::default()
+            },
+            SearchRequest {
+                query: "graph seed beta".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(false),
+                candidate_pool: None,
+                tag_filter: None,
+                chunk_serving_enabled: false,
+                full_pipeline_enabled: true,
+                tag_domain_routing_enabled: false,
+                include_profile: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let ids: Vec<_> = resp.results.iter().map(|hit| hit.thought_id).collect();
+        assert!(ids.contains(&seed_id));
+        assert!(ids.contains(&neighbor_id));
+        let neighbor = resp
+            .results
+            .iter()
+            .find(|hit| hit.thought_id == neighbor_id)
+            .expect("graph neighbor should be returned");
+        assert_eq!(neighbor.graph_provenance.len(), 1);
+        assert_eq!(neighbor.graph_provenance[0].relation, "supports");
+        assert_eq!(neighbor.graph_provenance[0].direction, "outbound");
+        let profile = resp.profile.expect("profile requested");
+        assert!(profile.graph_augmentation_enabled);
+        assert_eq!(profile.graph_candidates_before_dedupe, 1);
+        assert_eq!(profile.graph_candidates_after_dedupe, 1);
+        assert_eq!(
+            profile.graph_per_relation_counts.get("supports").copied(),
+            Some(1)
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn graph_seed_count_limits_which_fused_hits_expand(pool: PgPool) {
+        let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
+        let first_seed = cap(&pool, "graph seed cap alpha primary", "global").await;
+        let second_seed = cap(&pool, "graph seed cap alpha secondary", "global").await;
+        let first_neighbor = cap(&pool, "first seed graph neighbor", "global").await;
+        let second_neighbor = cap(&pool, "second seed graph neighbor", "global").await;
+        link_thoughts_for_test(first_seed, RelationKind::Supports, first_neighbor, &pool).await;
+        link_thoughts_for_test(second_seed, RelationKind::Supports, second_neighbor, &pool).await;
+
+        let resp = search_thoughts_with_runtime(
+            &pool,
+            &bad,
+            None,
+            None,
+            SearchRuntimeOptions {
+                graph_augmentation_enabled: true,
+                graph_seed_count: 1,
+                graph_direction: LinkDirection::Outbound,
+                ..SearchRuntimeOptions::default()
+            },
+            SearchRequest {
+                query: "graph seed cap alpha primary".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(false),
+                candidate_pool: None,
+                tag_filter: None,
+                chunk_serving_enabled: false,
+                full_pipeline_enabled: true,
+                tag_domain_routing_enabled: false,
+                include_profile: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let ids: Vec<_> = resp.results.iter().map(|hit| hit.thought_id).collect();
+        assert!(ids.contains(&first_seed));
+        assert!(ids.contains(&first_neighbor));
+        assert!(!ids.contains(&second_neighbor));
+        let profile = resp.profile.expect("profile requested");
+        assert_eq!(profile.graph_seeds_considered, 1);
+        assert_eq!(profile.graph_candidates_before_dedupe, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn graph_duplicate_base_hit_merges_provenance(pool: PgPool) {
+        let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
+        let seed_id = cap(&pool, "duplicate graph seed marker", "global").await;
+        let duplicate_id = cap(&pool, "duplicate graph seed neighbor marker", "global").await;
+        link_thoughts_for_test(seed_id, RelationKind::Supports, duplicate_id, &pool).await;
+
+        let resp = search_thoughts_with_runtime(
+            &pool,
+            &bad,
+            None,
+            None,
+            SearchRuntimeOptions {
+                graph_augmentation_enabled: true,
+                graph_direction: LinkDirection::Outbound,
+                ..SearchRuntimeOptions::default()
+            },
+            SearchRequest {
+                query: "duplicate graph seed".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(false),
+                candidate_pool: None,
+                tag_filter: None,
+                chunk_serving_enabled: false,
+                full_pipeline_enabled: true,
+                tag_domain_routing_enabled: false,
+                include_profile: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let duplicate_hits = resp
+            .results
+            .iter()
+            .filter(|hit| hit.thought_id == duplicate_id)
+            .count();
+        assert_eq!(duplicate_hits, 1, "base and graph duplicate must merge");
+        let hit = resp
+            .results
+            .iter()
+            .find(|hit| hit.thought_id == duplicate_id)
+            .unwrap();
+        assert_eq!(hit.graph_provenance.len(), 1);
+        let profile = resp.profile.expect("profile requested");
+        assert_eq!(profile.graph_merged_provenance_count, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn graph_tag_filter_remains_hard_before_rerank(pool: PgPool) {
+        let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
+        let seed_id = cap_with_tags_in_scope(
+            &pool,
+            "tag filter graph seed",
+            "global",
+            Tags {
+                kind: Some(TagKind::Task),
+                ..Tags::default()
+            },
+        )
+        .await;
+        let neighbor_id = cap_with_tags_in_scope(
+            &pool,
+            "graph neighbor filtered by tag",
+            "global",
+            Tags {
+                kind: Some(TagKind::Idea),
+                ..Tags::default()
+            },
+        )
+        .await;
+        link_thoughts_for_test(seed_id, RelationKind::Supports, neighbor_id, &pool).await;
+
+        let resp = search_thoughts_with_runtime(
+            &pool,
+            &bad,
+            None,
+            None,
+            SearchRuntimeOptions {
+                graph_augmentation_enabled: true,
+                ..SearchRuntimeOptions::default()
+            },
+            SearchRequest {
+                query: "tag filter graph seed".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(false),
+                candidate_pool: None,
+                tag_filter: Some(serde_json::json!({"kind": "task"})),
+                chunk_serving_enabled: false,
+                full_pipeline_enabled: true,
+                tag_domain_routing_enabled: false,
+                include_profile: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let ids: Vec<_> = resp.results.iter().map(|hit| hit.thought_id).collect();
+        assert_eq!(ids, vec![seed_id]);
+        assert!(!ids.contains(&neighbor_id));
+        let profile = resp.profile.expect("profile requested");
+        assert_eq!(profile.graph_candidates_before_dedupe, 1);
+        assert_eq!(profile.graph_candidates_retained_after_filters, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn graph_neighbor_contamination_never_reaches_rerank_pool(pool: PgPool) {
+        let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
+        let reranker = FakeReranker::new();
+        let seed_id = cap(&pool, "graph contamination clean seed", "global").await;
+        let clean_neighbor = cap(&pool, "clean graph neighbor evidence", "global").await;
+        let denied_neighbor = cap(&pool, "KGR024 denied graph neighbor evidence", "global").await;
+        link_thoughts_for_test(seed_id, RelationKind::Supports, clean_neighbor, &pool).await;
+        link_thoughts_for_test(seed_id, RelationKind::Supports, denied_neighbor, &pool).await;
+
+        let resp = search_thoughts_with_runtime(
+            &pool,
+            &bad,
+            Some(&reranker),
+            None,
+            SearchRuntimeOptions {
+                graph_augmentation_enabled: true,
+                graph_per_seed_cap: 5,
+                graph_total_cap: 5,
+                ..SearchRuntimeOptions::default()
+            },
+            SearchRequest {
+                query: "graph contamination clean seed".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(true),
+                candidate_pool: Some(10),
+                tag_filter: None,
+                chunk_serving_enabled: false,
+                full_pipeline_enabled: true,
+                tag_domain_routing_enabled: false,
+                include_profile: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(resp.rerank_used);
+        let rerank_call = reranker
+            .last_call()
+            .expect("reranker should record candidate pool");
+        assert!(
+            rerank_call
+                .candidates
+                .iter()
+                .any(|candidate| candidate.contains("clean graph neighbor evidence"))
+        );
+        assert!(
+            rerank_call
+                .candidates
+                .iter()
+                .all(|candidate| !candidate.contains("KGR024")),
+            "denied graph neighbor must not enter rerank pool"
+        );
+        let ids: Vec<_> = resp.results.iter().map(|hit| hit.thought_id).collect();
+        assert!(ids.contains(&clean_neighbor));
+        assert!(!ids.contains(&denied_neighbor));
+        let profile = resp.profile.expect("profile requested");
+        assert_eq!(profile.graph_candidates_before_dedupe, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn graph_non_thought_targets_are_profiled_not_returned_as_hits(pool: PgPool) {
+        let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
+        let seed_id = cap(&pool, "non thought graph seed", "global").await;
+        for target in [
+            LinkTarget::Entity("Model T".to_string()),
+            LinkTarget::Person("Bob Hrbek".to_string()),
+            LinkTarget::Url("https://example.com/model-t".to_string()),
+        ] {
+            kengram_storage::insert_link(
+                &pool,
+                seed_id,
+                RelationKind::Supports,
+                &target,
+                LinkSource::Agent,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let resp = search_thoughts_with_runtime(
+            &pool,
+            &bad,
+            None,
+            None,
+            SearchRuntimeOptions {
+                graph_augmentation_enabled: true,
+                ..SearchRuntimeOptions::default()
+            },
+            SearchRequest {
+                query: "non thought graph seed".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(false),
+                candidate_pool: None,
+                tag_filter: None,
+                chunk_serving_enabled: false,
+                full_pipeline_enabled: true,
+                tag_domain_routing_enabled: false,
+                include_profile: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.results.len(), 1);
+        assert_eq!(resp.results[0].thought_id, seed_id);
+        let profile = resp.profile.expect("profile requested");
+        assert_eq!(profile.graph_candidates_before_dedupe, 0);
+        assert_eq!(profile.graph_entity_provenance_count, 1);
+        assert_eq!(profile.graph_person_provenance_count, 1);
+        assert_eq!(profile.graph_url_provenance_count, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn graph_storage_respects_relation_direction_scope_and_caps(pool: PgPool) {
+        let seed = cap(&pool, "graph storage seed", "work.alpha").await;
+        let supports_out = cap(&pool, "supports outbound", "work.alpha").await;
+        let requires_out = cap(&pool, "requires outbound", "work.alpha").await;
+        let supports_in = cap(&pool, "supports inbound", "work.alpha").await;
+        let other_scope = cap(&pool, "supports other scope", "personal").await;
+        link_thoughts_for_test(seed, RelationKind::Supports, supports_out, &pool).await;
+        link_thoughts_for_test(seed, RelationKind::Requires, requires_out, &pool).await;
+        link_thoughts_for_test(supports_in, RelationKind::Supports, seed, &pool).await;
+        link_thoughts_for_test(seed, RelationKind::Supports, other_scope, &pool).await;
+
+        let outbound_supports = kengram_storage::search_graph_neighbors(
+            &pool,
+            &[seed],
+            &[RelationKind::Supports],
+            LinkDirection::Outbound,
+            10,
+            10,
+            Some("work.alpha"),
+            None,
+        )
+        .await
+        .unwrap();
+        let outbound_ids = outbound_supports
+            .iter()
+            .map(|hit| hit.thought.id)
+            .collect::<Vec<_>>();
+        assert_eq!(outbound_ids, vec![supports_out]);
+
+        let inbound_supports = kengram_storage::search_graph_neighbors(
+            &pool,
+            &[seed],
+            &[RelationKind::Supports],
+            LinkDirection::Inbound,
+            10,
+            10,
+            None,
+            Some("work."),
+        )
+        .await
+        .unwrap();
+        let inbound_ids = inbound_supports
+            .iter()
+            .map(|hit| hit.thought.id)
+            .collect::<Vec<_>>();
+        assert_eq!(inbound_ids, vec![supports_in]);
+
+        let capped = kengram_storage::search_graph_neighbors(
+            &pool,
+            &[seed],
+            &[RelationKind::Supports, RelationKind::Requires],
+            LinkDirection::Both,
+            2,
+            2,
+            None,
+            Some("work."),
+        )
+        .await
+        .unwrap();
+        assert_eq!(capped.len(), 2, "per-seed and total cap must bind");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn graph_storage_total_cap_binds_across_multiple_seeds(pool: PgPool) {
+        let seed_a = cap(&pool, "graph total cap seed a", "work.alpha").await;
+        let seed_b = cap(&pool, "graph total cap seed b", "work.alpha").await;
+        let a1 = cap(&pool, "graph total cap a1", "work.alpha").await;
+        let a2 = cap(&pool, "graph total cap a2", "work.alpha").await;
+        let b1 = cap(&pool, "graph total cap b1", "work.alpha").await;
+        let b2 = cap(&pool, "graph total cap b2", "work.alpha").await;
+        link_thoughts_for_test(seed_a, RelationKind::Supports, a1, &pool).await;
+        link_thoughts_for_test(seed_a, RelationKind::Supports, a2, &pool).await;
+        link_thoughts_for_test(seed_b, RelationKind::Supports, b1, &pool).await;
+        link_thoughts_for_test(seed_b, RelationKind::Supports, b2, &pool).await;
+
+        let capped = kengram_storage::search_graph_neighbors(
+            &pool,
+            &[seed_a, seed_b],
+            &[RelationKind::Supports],
+            LinkDirection::Outbound,
+            2,
+            3,
+            None,
+            Some("work."),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(capped.len(), 3, "total cap must bind after per-seed caps");
+        assert_eq!(
+            capped
+                .iter()
+                .filter(|hit| hit.seed_thought_id == seed_a)
+                .count(),
+            2
+        );
+        assert_eq!(
+            capped
+                .iter()
+                .filter(|hit| hit.seed_thought_id == seed_b)
+                .count(),
+            1
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn graph_storage_excludes_soft_deleted_and_retracted_neighbors(pool: PgPool) {
+        let seed = cap(&pool, "graph exclusion seed", "global").await;
+        let clean = cap(&pool, "graph clean neighbor", "global").await;
+        let deleted = cap(&pool, "graph deleted neighbor", "global").await;
+        let retracted = cap(&pool, "graph retracted neighbor", "global").await;
+        link_thoughts_for_test(seed, RelationKind::Supports, clean, &pool).await;
+        link_thoughts_for_test(seed, RelationKind::Supports, deleted, &pool).await;
+        link_thoughts_for_test(seed, RelationKind::Supports, retracted, &pool).await;
+        kengram_storage::delete_link(
+            &pool,
+            seed,
+            RelationKind::Supports,
+            &LinkTarget::Thought(deleted),
+        )
+        .await
+        .unwrap();
+        kengram_storage::retract_thought(&pool, retracted, Some("test retraction"))
+            .await
+            .unwrap();
+
+        let hits = kengram_storage::search_graph_neighbors(
+            &pool,
+            &[seed],
+            &[RelationKind::Supports],
+            LinkDirection::Outbound,
+            10,
+            10,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ids = hits.iter().map(|hit| hit.thought.id).collect::<Vec<_>>();
+        assert_eq!(ids, vec![clean]);
     }
 
     #[sqlx::test(migrations = "../../migrations")]

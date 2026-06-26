@@ -15,14 +15,14 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use kengram_core::{Embedder, EmbeddingModel, Tagger};
+use kengram_core::{Embedder, EmbeddingModel, LinkDirection, RelationKind, Tagger};
 use kengram_embed::{
     OpenAICompatibleConfig, OpenAICompatibleEmbedder, Reranker, TeiReranker, TeiRerankerConfig,
 };
 use kengram_extract::{OpenAICompatibleConfig as TaggerConfigBuilder, OpenAICompatibleTagger};
 use kengram_mcp::{
     KengramServer, OpenAICompatibleQueryExpansionProvider, QueryExpansionConfig,
-    QueryExpansionProvider, SearchRuntimeOptions,
+    QueryExpansionProvider, SearchRuntimeOptions, default_graph_relations,
 };
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -331,6 +331,37 @@ fn build_query_expander(
     }
 }
 
+fn parse_graph_runtime_config(
+    c: &SearchConfig,
+) -> anyhow::Result<(Vec<RelationKind>, LinkDirection)> {
+    if !c.graph_augmentation_effective() {
+        return Ok((default_graph_relations(), LinkDirection::Both));
+    }
+
+    if c.graph_relations.is_empty() {
+        anyhow::bail!("graph_augmentation_enabled requires a non-empty graph_relations allowlist");
+    }
+    let relations = c
+        .graph_relations
+        .iter()
+        .map(|relation| {
+            relation
+                .parse::<RelationKind>()
+                .with_context(|| format!("parsing search.graph_relations value {relation:?}"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let direction = c
+        .graph_direction
+        .parse::<LinkDirection>()
+        .with_context(|| {
+            format!(
+                "parsing search.graph_direction value {:?}",
+                c.graph_direction
+            )
+        })?;
+    Ok((relations, direction))
+}
+
 /// Resolved tagger plus the bits of the original config the callers need
 /// to know about. `tagger` is `None` on silent-disable (empty `provider`);
 /// the `version` field is the configured `model_version` either way so
@@ -482,17 +513,31 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
     let full_pipeline_enabled = config.search.full_pipeline_enabled;
     let tag_domain_routing_enabled = config.search.tag_domain_routing_effective();
     let sparse_lexical_enabled = config.search.sparse_lexical_effective();
+    let graph_augmentation_enabled = config.search.graph_augmentation_effective();
+    let (graph_relations, graph_direction) = parse_graph_runtime_config(&config.search)?;
     let query_expansion_runtime = SearchRuntimeOptions {
         query_expansion_enabled: config.search.query_expansion_effective(),
         hyde_enabled: config.search.hyde_effective(),
         query_expansion_max_variants: config.search.query_expansion_max_variants,
         query_expansion_max_hyde_chars: config.search.query_expansion_max_hyde_chars,
+        graph_augmentation_enabled,
+        graph_seed_count: config.search.graph_seed_count,
+        graph_per_seed_cap: config.search.graph_per_seed_cap,
+        graph_total_cap: config.search.graph_total_cap,
+        graph_relations: graph_relations.clone(),
+        graph_direction,
     };
     tracing::info!(
         chunk_serving_enabled,
         full_pipeline_enabled,
         tag_domain_routing_enabled,
         sparse_lexical_enabled,
+        graph_augmentation_enabled,
+        graph_seed_count = query_expansion_runtime.graph_seed_count,
+        graph_per_seed_cap = query_expansion_runtime.graph_per_seed_cap,
+        graph_total_cap = query_expansion_runtime.graph_total_cap,
+        graph_direction = %query_expansion_runtime.graph_direction.as_str(),
+        graph_relations = ?graph_relations.iter().map(|relation| relation.as_str()).collect::<Vec<_>>(),
         query_expansion_enabled = query_expansion_runtime.query_expansion_enabled,
         hyde_enabled = query_expansion_runtime.hyde_enabled,
         "search config resolved"

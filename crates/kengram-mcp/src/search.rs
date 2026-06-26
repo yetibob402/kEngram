@@ -710,8 +710,14 @@ async fn search_thoughts_with_tuning(
     // Optional rerank stage.
     let rerank_enabled = request.rerank.unwrap_or(true);
     let candidate_pool = request.candidate_pool.unwrap_or(default_candidate_pool);
+    // Graph expansion is additive to the rerank pool. Keep the configured
+    // baseline candidate_pool intact, then allow retained graph candidates to
+    // add capacity so a graph-only hit cannot evict a baseline hit before the
+    // cross-encoder sees it.
+    let effective_candidate_pool =
+        candidate_pool.saturating_add(profile.graph_candidates_retained_after_filters);
     profile.rerank_candidate_count = if rerank_enabled && reranker.is_some() {
-        candidate_pool.min(fused.len())
+        effective_candidate_pool.min(fused.len())
     } else {
         0
     };
@@ -722,7 +728,7 @@ async fn search_thoughts_with_tuning(
                 rr,
                 &query,
                 &mut fused,
-                candidate_pool,
+                effective_candidate_pool,
                 chunk_serving_enabled,
             )
             .await
@@ -3210,6 +3216,107 @@ mod tests {
         assert!(!ids.contains(&denied_neighbor));
         let profile = resp.profile.expect("profile requested");
         assert_eq!(profile.graph_candidates_before_dedupe, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn graph_rerank_pool_is_additive_and_preserves_baseline_candidates(pool: PgPool) {
+        let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
+        let seed_id = cap(&pool, "graph additive baseline marker seed", "global").await;
+        cap(&pool, "graph additive baseline marker second", "global").await;
+        cap(&pool, "graph additive baseline marker third", "global").await;
+        cap(&pool, "graph additive baseline marker fourth", "global").await;
+        let graph_neighbor = cap(&pool, "graph additive competing neighbor", "global").await;
+        link_thoughts_for_test(seed_id, RelationKind::Supports, graph_neighbor, &pool).await;
+
+        let baseline_reranker = FakeReranker::new();
+        search_thoughts_with_runtime(
+            &pool,
+            &bad,
+            Some(&baseline_reranker),
+            None,
+            SearchRuntimeOptions::default(),
+            SearchRequest {
+                query: "graph additive baseline marker".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(true),
+                candidate_pool: Some(3),
+                tag_filter: None,
+                chunk_serving_enabled: false,
+                full_pipeline_enabled: true,
+                tag_domain_routing_enabled: false,
+                include_profile: true,
+            },
+        )
+        .await
+        .unwrap();
+        let baseline_candidates = baseline_reranker
+            .last_call()
+            .expect("baseline reranker should record candidate pool")
+            .candidates;
+        assert_eq!(baseline_candidates.len(), 3);
+        assert!(
+            baseline_candidates
+                .iter()
+                .all(|candidate| candidate.contains("graph additive baseline marker"))
+        );
+
+        let graph_reranker = FakeReranker::new();
+        let resp = search_thoughts_with_runtime(
+            &pool,
+            &bad,
+            Some(&graph_reranker),
+            None,
+            SearchRuntimeOptions {
+                graph_augmentation_enabled: true,
+                graph_direction: LinkDirection::Outbound,
+                graph_total_cap: 1,
+                ..SearchRuntimeOptions::default()
+            },
+            SearchRequest {
+                query: "graph additive baseline marker".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(true),
+                candidate_pool: Some(3),
+                tag_filter: None,
+                chunk_serving_enabled: false,
+                full_pipeline_enabled: true,
+                tag_domain_routing_enabled: false,
+                include_profile: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let graph_candidates = graph_reranker
+            .last_call()
+            .expect("graph reranker should record candidate pool")
+            .candidates;
+        assert_eq!(
+            graph_candidates.len(),
+            4,
+            "candidate pool should grow from baseline 3 to baseline 3 + graph 1"
+        );
+        for baseline_candidate in baseline_candidates {
+            assert!(
+                graph_candidates.contains(&baseline_candidate),
+                "graph expansion must not evict baseline rerank candidate: {baseline_candidate}"
+            );
+        }
+        assert!(
+            graph_candidates
+                .iter()
+                .any(|candidate| candidate == "graph additive competing neighbor"),
+            "graph candidate should still compete in the cross-encoder input"
+        );
+        let profile = resp.profile.expect("profile requested");
+        assert_eq!(profile.rerank_candidate_count, 4);
+        assert_eq!(profile.graph_candidates_retained_after_filters, 1);
     }
 
     #[sqlx::test(migrations = "../../migrations")]

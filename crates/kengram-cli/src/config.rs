@@ -9,6 +9,10 @@ use figment::{
     providers::{Env, Format, Serialized, Toml},
 };
 use kengram_extract::BUNDLED_TAGGER_VERSION;
+use kengram_mcp::{
+    DEFAULT_QUERY_EXPANSION_MAX_HYDE_CHARS, DEFAULT_QUERY_EXPANSION_MAX_VARIANTS,
+    DEFAULT_QUERY_EXPANSION_PROMPT_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -31,7 +35,7 @@ pub struct Config {
     pub reranker: RerankerConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SearchConfig {
     /// Default-off gate for chunk dense + chunk FTS retrieval in
@@ -47,6 +51,25 @@ pub struct SearchConfig {
     /// Subordinate gate for the BGE-M3 sparse lexical retrieval leg. The
     /// data-prep sidecar can be populated while this remains ineffective.
     pub sparse_lexical_enabled: bool,
+    /// Subordinate gate for Stage-4 query expansion. Takes effect only when
+    /// `full_pipeline_enabled` is also true and a provider is configured.
+    pub query_expansion_enabled: bool,
+    /// Subordinate gate for HyDE pseudo-document generation. Takes effect
+    /// only when full pipeline + query expansion are both effective.
+    pub hyde_enabled: bool,
+    pub query_expansion_max_variants: usize,
+    pub query_expansion_timeout_seconds: u64,
+    /// `""` disables provider calls and forces original-query-only search.
+    /// Supported provider: `"openai-compatible"` (local/vLLM/Ollama-style
+    /// chat completions).
+    pub query_expansion_provider: String,
+    pub query_expansion_endpoint: String,
+    pub query_expansion_model_name: String,
+    pub query_expansion_model_id: String,
+    pub query_expansion_api_key: Option<String>,
+    pub query_expansion_temperature: f32,
+    pub query_expansion_prompt_version: String,
+    pub query_expansion_max_hyde_chars: usize,
 }
 
 impl SearchConfig {
@@ -60,6 +83,37 @@ impl SearchConfig {
 
     pub fn sparse_lexical_effective(&self) -> bool {
         self.full_pipeline_enabled && self.sparse_lexical_enabled
+    }
+
+    pub fn query_expansion_effective(&self) -> bool {
+        self.full_pipeline_enabled && self.query_expansion_enabled
+    }
+
+    pub fn hyde_effective(&self) -> bool {
+        self.full_pipeline_enabled && self.query_expansion_enabled && self.hyde_enabled
+    }
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            chunk_serving_enabled: false,
+            full_pipeline_enabled: false,
+            tag_domain_routing_enabled: false,
+            sparse_lexical_enabled: false,
+            query_expansion_enabled: false,
+            hyde_enabled: false,
+            query_expansion_max_variants: DEFAULT_QUERY_EXPANSION_MAX_VARIANTS,
+            query_expansion_timeout_seconds: 10,
+            query_expansion_provider: String::new(),
+            query_expansion_endpoint: "http://localhost:8000/v1".to_string(),
+            query_expansion_model_name: "qwen3-coder:30b".to_string(),
+            query_expansion_model_id: "vllm/qwen3-coder:30b".to_string(),
+            query_expansion_api_key: None,
+            query_expansion_temperature: 0.1,
+            query_expansion_prompt_version: DEFAULT_QUERY_EXPANSION_PROMPT_VERSION.to_string(),
+            query_expansion_max_hyde_chars: DEFAULT_QUERY_EXPANSION_MAX_HYDE_CHARS,
+        }
     }
 }
 
@@ -455,9 +509,27 @@ mod tests {
         assert!(!c.search.full_pipeline_enabled);
         assert!(!c.search.tag_domain_routing_enabled);
         assert!(!c.search.sparse_lexical_enabled);
+        assert!(!c.search.query_expansion_enabled);
+        assert!(!c.search.hyde_enabled);
+        assert_eq!(
+            c.search.query_expansion_max_variants,
+            DEFAULT_QUERY_EXPANSION_MAX_VARIANTS
+        );
+        assert_eq!(c.search.query_expansion_timeout_seconds, 10);
+        assert_eq!(c.search.query_expansion_provider, "");
+        assert_eq!(
+            c.search.query_expansion_prompt_version,
+            DEFAULT_QUERY_EXPANSION_PROMPT_VERSION
+        );
+        assert_eq!(
+            c.search.query_expansion_max_hyde_chars,
+            DEFAULT_QUERY_EXPANSION_MAX_HYDE_CHARS
+        );
         assert!(!c.search.chunk_serving_effective());
         assert!(!c.search.tag_domain_routing_effective());
         assert!(!c.search.sparse_lexical_effective());
+        assert!(!c.search.query_expansion_effective());
+        assert!(!c.search.hyde_effective());
     }
 
     #[test]
@@ -526,6 +598,55 @@ mod tests {
         assert!(c.search.full_pipeline_enabled);
         assert!(c.search.sparse_lexical_enabled);
         assert!(c.search.sparse_lexical_effective());
+    }
+
+    #[test]
+    fn query_expansion_requires_full_pipeline_master_gate() {
+        let toml = r#"
+            [search]
+            full_pipeline_enabled = false
+            query_expansion_enabled = true
+            hyde_enabled = true
+            query_expansion_provider = "openai-compatible"
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert!(!c.search.full_pipeline_enabled);
+        assert!(c.search.query_expansion_enabled);
+        assert!(c.search.hyde_enabled);
+        assert!(!c.search.query_expansion_effective());
+        assert!(!c.search.hyde_effective());
+    }
+
+    #[test]
+    fn query_expansion_and_hyde_effective_when_all_gates_true() {
+        let toml = r#"
+            [search]
+            full_pipeline_enabled = true
+            query_expansion_enabled = true
+            hyde_enabled = true
+            query_expansion_provider = "openai-compatible"
+            query_expansion_max_variants = 3
+            query_expansion_timeout_seconds = 7
+            query_expansion_endpoint = "http://localhost:8000/v1"
+            query_expansion_model_name = "local-model"
+            query_expansion_model_id = "local/local-model"
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert!(c.search.full_pipeline_enabled);
+        assert!(c.search.query_expansion_effective());
+        assert!(c.search.hyde_effective());
+        assert_eq!(c.search.query_expansion_max_variants, 3);
+        assert_eq!(c.search.query_expansion_timeout_seconds, 7);
+        assert_eq!(c.search.query_expansion_provider, "openai-compatible");
+        assert_eq!(c.search.query_expansion_model_id, "local/local-model");
     }
 
     #[test]

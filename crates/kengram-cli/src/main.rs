@@ -20,14 +20,19 @@ use kengram_embed::{
     OpenAICompatibleConfig, OpenAICompatibleEmbedder, Reranker, TeiReranker, TeiRerankerConfig,
 };
 use kengram_extract::{OpenAICompatibleConfig as TaggerConfigBuilder, OpenAICompatibleTagger};
-use kengram_mcp::KengramServer;
+use kengram_mcp::{
+    KengramServer, OpenAICompatibleQueryExpansionProvider, QueryExpansionConfig,
+    QueryExpansionProvider, SearchRuntimeOptions,
+};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Config, EmbedderConfig, RerankerConfig, TaggerConfig, WorkerConfig};
+use crate::config::{
+    Config, EmbedderConfig, RerankerConfig, SearchConfig, TaggerConfig, WorkerConfig,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -275,6 +280,57 @@ fn build_reranker(c: &RerankerConfig) -> anyhow::Result<Option<Arc<dyn Reranker>
     }
 }
 
+fn build_query_expander(
+    c: &SearchConfig,
+) -> anyhow::Result<Option<Arc<dyn QueryExpansionProvider>>> {
+    if !c.query_expansion_effective() {
+        tracing::info!(
+            full_pipeline_enabled = c.full_pipeline_enabled,
+            query_expansion_enabled = c.query_expansion_enabled,
+            "query expansion: gated off (original-query-only fallback)",
+        );
+        return Ok(None);
+    }
+    if c.query_expansion_provider.is_empty() {
+        tracing::info!("query expansion: not configured (original-query-only fallback)");
+        return Ok(None);
+    }
+    match c.query_expansion_provider.as_str() {
+        "openai-compatible" => {
+            let provider = OpenAICompatibleQueryExpansionProvider::new(QueryExpansionConfig {
+                endpoint: c.query_expansion_endpoint.clone(),
+                model_name: c.query_expansion_model_name.clone(),
+                model_id: c.query_expansion_model_id.clone(),
+                api_key: c.query_expansion_api_key.clone(),
+                timeout: Duration::from_secs(c.query_expansion_timeout_seconds),
+                temperature: c.query_expansion_temperature,
+                prompt_version: c.query_expansion_prompt_version.clone(),
+                max_hyde_chars: c.query_expansion_max_hyde_chars,
+            })
+            .with_context(|| {
+                format!(
+                    "constructing query expansion provider for endpoint {}",
+                    c.query_expansion_endpoint
+                )
+            })?;
+            tracing::info!(
+                provider = %c.query_expansion_provider,
+                endpoint = %c.query_expansion_endpoint,
+                model_id = %c.query_expansion_model_id,
+                prompt_version = %c.query_expansion_prompt_version,
+                timeout_seconds = c.query_expansion_timeout_seconds,
+                max_variants = c.query_expansion_max_variants,
+                hyde_enabled = c.hyde_effective(),
+                "query expansion: resolved config",
+            );
+            Ok(Some(Arc::new(provider)))
+        }
+        other => anyhow::bail!(
+            "unknown query expansion provider: {other:?} (valid: 'openai-compatible' or empty)"
+        ),
+    }
+}
+
 /// Resolved tagger plus the bits of the original config the callers need
 /// to know about. `tagger` is `None` on silent-disable (empty `provider`);
 /// the `version` field is the configured `model_version` either way so
@@ -403,6 +459,7 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
         .await
         .context("ensuring vector search readiness")?;
     let reranker = build_reranker(&config.reranker)?;
+    let query_expander = build_query_expander(&config.search)?;
     // Server only needs the tagger model_id (to stamp pending_tags rows).
     // The actual tagger HTTP client lives in the worker process.
     let ResolvedTagger {
@@ -425,15 +482,25 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
     let full_pipeline_enabled = config.search.full_pipeline_enabled;
     let tag_domain_routing_enabled = config.search.tag_domain_routing_effective();
     let sparse_lexical_enabled = config.search.sparse_lexical_effective();
+    let query_expansion_runtime = SearchRuntimeOptions {
+        query_expansion_enabled: config.search.query_expansion_effective(),
+        hyde_enabled: config.search.hyde_effective(),
+        query_expansion_max_variants: config.search.query_expansion_max_variants,
+        query_expansion_max_hyde_chars: config.search.query_expansion_max_hyde_chars,
+    };
     tracing::info!(
         chunk_serving_enabled,
         full_pipeline_enabled,
         tag_domain_routing_enabled,
         sparse_lexical_enabled,
+        query_expansion_enabled = query_expansion_runtime.query_expansion_enabled,
+        hyde_enabled = query_expansion_runtime.hyde_enabled,
         "search config resolved"
     );
+    let query_expander_for_factory = query_expander.clone();
+    let query_expansion_runtime_for_factory = query_expansion_runtime.clone();
     let factory = move || {
-        Ok(KengramServer::new(
+        Ok(KengramServer::new_with_query_expansion(
             pool_for_factory.clone(),
             embedder_for_factory.clone(),
             reranker_for_factory.clone(),
@@ -441,6 +508,8 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
             chunk_serving_enabled,
             full_pipeline_enabled,
             tag_domain_routing_enabled,
+            query_expander_for_factory.clone(),
+            query_expansion_runtime_for_factory.clone(),
         ))
     };
 

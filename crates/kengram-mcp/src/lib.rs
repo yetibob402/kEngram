@@ -15,6 +15,7 @@ pub mod filters;
 pub mod finalize;
 pub mod link;
 mod normalize;
+pub mod query_expansion;
 pub mod relate;
 pub mod retract;
 pub mod search;
@@ -31,6 +32,12 @@ pub use link::{
     LinkError, LinkThoughtsRequest, LinkThoughtsResponse, MAX_LINK_NOTE_LEN, MAX_TARGET_NAME_LEN,
     MAX_TARGET_URL_LEN, UnlinkStatus, UnlinkThoughtsResponse, link_thoughts, unlink_thoughts,
 };
+pub use query_expansion::{
+    DEFAULT_QUERY_EXPANSION_MAX_HYDE_CHARS, DEFAULT_QUERY_EXPANSION_MAX_VARIANTS,
+    DEFAULT_QUERY_EXPANSION_PROMPT_VERSION, NormalizedQueryExpansion,
+    OpenAICompatibleQueryExpansionProvider, QueryExpansionConfig, QueryExpansionError,
+    QueryExpansionInput, QueryExpansionOutput, QueryExpansionProvider, normalize_expansion_output,
+};
 pub use relate::{
     GetRelatedThoughtsRequest, GetRelatedThoughtsResponse, RELATED_CONTENT_PREVIEW_LEN,
     RelateError, RelatedTargetHit, get_related_thoughts,
@@ -39,8 +46,8 @@ pub use retract::{RetractError, RetractThoughtRequest, RetractThoughtResponse, r
 pub use search::{
     DEFAULT_SEARCH_LIMIT, DEFAULT_TOP_K_PER_LEG, GetThoughtResponse, ListScopesRequest,
     ListScopesResponse, MAX_SEARCH_LIMIT, ReadError, RecentRequest, RecentResponse,
-    ScopeSummaryHit, SearchHit, SearchRequest, SearchResponse, get_thought, list_scopes,
-    recent_thoughts, search_thoughts,
+    ScopeSummaryHit, SearchHit, SearchRequest, SearchResponse, SearchRuntimeOptions, get_thought,
+    list_scopes, recent_thoughts, search_thoughts, search_thoughts_with_runtime,
 };
 pub use server::{
     CaptureArgs, GetRelatedThoughtsArgs, GetThoughtArgs, KengramServer, LinkThoughtsArgs,

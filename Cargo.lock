@@ -1681,6 +1681,7 @@ dependencies = [
  "kengram-embed",
  "kengram-extract",
  "kengram-storage",
+ "reqwest",
  "rmcp",
  "serde",
  "serde_json",

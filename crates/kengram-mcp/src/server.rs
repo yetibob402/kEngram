@@ -30,11 +30,12 @@ use std::sync::Arc;
 
 use crate::capture::{self, CaptureError, CaptureRequest, MAX_CONTENT_LEN};
 use crate::link::{self, LinkError, LinkThoughtsRequest, MAX_LINK_NOTE_LEN};
+use crate::query_expansion::QueryExpansionProvider;
 use crate::relate::{self, GetRelatedThoughtsRequest, RelateError};
 use crate::retract::{self, RetractError, RetractThoughtRequest};
 use crate::search::{
     self, GetThoughtResponse, ListScopesRequest, ListScopesResponse, ReadError, RecentRequest,
-    RecentResponse, SearchRequest, SearchResponse,
+    RecentResponse, SearchRequest, SearchResponse, SearchRuntimeOptions,
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -281,6 +282,10 @@ pub struct KengramServer {
     /// Effective tag/domain routing gate. Stored true only when both
     /// `full_pipeline_enabled` and the subordinate routing flag are true.
     tag_domain_routing_enabled: bool,
+    /// Optional provider for Stage-4 query expansion / HyDE. `None` is the
+    /// fail-closed provider-disabled path.
+    query_expander: Option<Arc<dyn QueryExpansionProvider>>,
+    query_expansion_runtime: SearchRuntimeOptions,
     tool_router: ToolRouter<Self>,
 }
 
@@ -294,8 +299,41 @@ impl KengramServer {
         full_pipeline_enabled: bool,
         tag_domain_routing_enabled: bool,
     ) -> Self {
+        Self::new_with_query_expansion(
+            pool,
+            embedder,
+            reranker,
+            tagger_model_id,
+            chunk_serving_enabled,
+            full_pipeline_enabled,
+            tag_domain_routing_enabled,
+            None,
+            SearchRuntimeOptions::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_query_expansion(
+        pool: PgPool,
+        embedder: Arc<dyn Embedder>,
+        reranker: Option<Arc<dyn Reranker>>,
+        tagger_model_id: Option<String>,
+        chunk_serving_enabled: bool,
+        full_pipeline_enabled: bool,
+        tag_domain_routing_enabled: bool,
+        query_expander: Option<Arc<dyn QueryExpansionProvider>>,
+        query_expansion_runtime: SearchRuntimeOptions,
+    ) -> Self {
         let chunk_serving_enabled = full_pipeline_enabled && chunk_serving_enabled;
         let tag_domain_routing_enabled = full_pipeline_enabled && tag_domain_routing_enabled;
+        let query_expansion_runtime = SearchRuntimeOptions {
+            query_expansion_enabled: full_pipeline_enabled
+                && query_expansion_runtime.query_expansion_enabled,
+            hyde_enabled: full_pipeline_enabled
+                && query_expansion_runtime.query_expansion_enabled
+                && query_expansion_runtime.hyde_enabled,
+            ..query_expansion_runtime
+        };
         Self {
             pool,
             embedder,
@@ -304,6 +342,8 @@ impl KengramServer {
             chunk_serving_enabled,
             full_pipeline_enabled,
             tag_domain_routing_enabled,
+            query_expander,
+            query_expansion_runtime,
             tool_router: Self::tool_router(),
         }
     }
@@ -326,6 +366,11 @@ impl std::fmt::Debug for KengramServer {
                 "tag_domain_routing_enabled",
                 &self.tag_domain_routing_enabled,
             )
+            .field(
+                "query_expansion_enabled",
+                &self.query_expansion_runtime.query_expansion_enabled,
+            )
+            .field("hyde_enabled", &self.query_expansion_runtime.hyde_enabled)
             .finish()
     }
 }
@@ -428,10 +473,12 @@ impl KengramServer {
             tag_filter: args.tag_filter.map(serde_json::Value::Object),
         };
 
-        let resp = search::search_thoughts(
+        let resp = search::search_thoughts_with_runtime(
             &self.pool,
             self.embedder.as_ref(),
             self.reranker.as_deref(),
+            self.query_expander.as_deref(),
+            self.query_expansion_runtime.clone(),
             request,
         )
         .await

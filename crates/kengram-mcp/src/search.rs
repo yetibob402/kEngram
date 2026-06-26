@@ -28,6 +28,11 @@ use sqlx::PgPool;
 use std::time::Instant;
 use time::OffsetDateTime;
 
+use crate::query_expansion::{
+    DEFAULT_QUERY_EXPANSION_MAX_HYDE_CHARS, DEFAULT_QUERY_EXPANSION_MAX_VARIANTS,
+    QueryExpansionProvider, normalize_expansion_output,
+};
+
 pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 pub const MAX_SEARCH_LIMIT: usize = 100;
 pub const DEFAULT_TOP_K_PER_LEG: usize = 50;
@@ -40,6 +45,41 @@ pub const DEFAULT_RERANK_CANDIDATE_POOL: usize = 32;
 const RERANK_BACKEND_MAX_BATCH: usize = 32;
 const PAIRWISE_MAX_SUBQUERIES: usize = 8;
 const PAIRWISE_PER_SUBQUERY_TOP_K: usize = 25;
+
+#[derive(Debug, Clone)]
+pub struct SearchRuntimeOptions {
+    pub query_expansion_enabled: bool,
+    pub hyde_enabled: bool,
+    pub query_expansion_max_variants: usize,
+    pub query_expansion_max_hyde_chars: usize,
+}
+
+impl Default for SearchRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            query_expansion_enabled: false,
+            hyde_enabled: false,
+            query_expansion_max_variants: DEFAULT_QUERY_EXPANSION_MAX_VARIANTS,
+            query_expansion_max_hyde_chars: DEFAULT_QUERY_EXPANSION_MAX_HYDE_CHARS,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ExpansionRankings {
+    thought_vector_rankings: Vec<Vec<Hit>>,
+    chunk_vector_rankings: Vec<Vec<Hit>>,
+    thought_fts_rankings: Vec<Vec<Hit>>,
+    chunk_fts_rankings: Vec<Vec<Hit>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ExpansionPlan {
+    route: String,
+    queries: Vec<String>,
+    hyde: Option<String>,
+    decomposition: Vec<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct SearchRequest {
@@ -144,6 +184,9 @@ pub struct SearchProfile {
     pub tag_facet_ms: f64,
     pub rrf_fusion_ms: f64,
     pub tag_filter_ms: f64,
+    pub query_expansion_ms: f64,
+    pub query_expansion_vector_knn_ms: f64,
+    pub query_expansion_fts_ms: f64,
     pub rerank_ms: f64,
     pub result_projection_ms: f64,
     pub parent_resolution_ms: f64,
@@ -151,7 +194,15 @@ pub struct SearchProfile {
     pub full_pipeline_enabled: bool,
     pub chunk_serving_enabled: bool,
     pub tag_domain_routing_enabled: bool,
+    pub query_expansion_enabled: bool,
+    pub hyde_enabled: bool,
+    pub query_expansion_provider: Option<String>,
+    pub query_expansion_model_id: Option<String>,
+    pub query_expansion_prompt_version: Option<String>,
+    pub query_expansion_fallback: bool,
+    pub query_expansion_fallback_reason: Option<String>,
     pub planner_route: &'static str,
+    pub query_expansion_route: Option<String>,
     pub planner_inferred_domains: Vec<String>,
     pub planner_tag_terms: Vec<String>,
     pub thought_vector_hits: usize,
@@ -162,6 +213,13 @@ pub struct SearchProfile {
     pub domain_scope_hits: usize,
     pub tag_facet_hits: usize,
     pub chunk_pairwise_subqueries: usize,
+    pub query_expansion_variant_count: usize,
+    pub query_expansion_decomposition_count: usize,
+    pub query_expansion_hyde_used: bool,
+    pub query_expansion_thought_vector_hits: usize,
+    pub query_expansion_chunk_vector_hits: usize,
+    pub query_expansion_thought_fts_hits: usize,
+    pub query_expansion_chunk_fts_hits: usize,
     pub fused_hit_count: usize,
     pub rerank_candidate_count: usize,
     pub result_count: usize,
@@ -243,10 +301,31 @@ pub async fn search_thoughts(
     reranker: Option<&dyn Reranker>,
     request: SearchRequest,
 ) -> Result<SearchResponse, ReadError> {
+    search_thoughts_with_runtime(
+        pool,
+        embedder,
+        reranker,
+        None,
+        SearchRuntimeOptions::default(),
+        request,
+    )
+    .await
+}
+
+pub async fn search_thoughts_with_runtime(
+    pool: &PgPool,
+    embedder: &dyn Embedder,
+    reranker: Option<&dyn Reranker>,
+    query_expander: Option<&dyn QueryExpansionProvider>,
+    runtime: SearchRuntimeOptions,
+    request: SearchRequest,
+) -> Result<SearchResponse, ReadError> {
     search_thoughts_with_tuning(
         pool,
         embedder,
         reranker,
+        query_expander,
+        runtime,
         request,
         DEFAULT_LEXICAL_TOP_K,
         DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS,
@@ -259,6 +338,8 @@ async fn search_thoughts_with_tuning(
     pool: &PgPool,
     embedder: &dyn Embedder,
     reranker: Option<&dyn Reranker>,
+    query_expander: Option<&dyn QueryExpansionProvider>,
+    runtime: SearchRuntimeOptions,
     request: SearchRequest,
     lexical_top_k: usize,
     lexical_timeout_ms: u64,
@@ -289,14 +370,27 @@ async fn search_thoughts_with_tuning(
     let chunk_serving_enabled = request.full_pipeline_enabled && request.chunk_serving_enabled;
     let tag_domain_routing_enabled =
         request.full_pipeline_enabled && request.tag_domain_routing_enabled;
+    let query_expansion_enabled = request.full_pipeline_enabled && runtime.query_expansion_enabled;
+    let hyde_enabled = query_expansion_enabled && runtime.hyde_enabled;
     profile.full_pipeline_enabled = request.full_pipeline_enabled;
     profile.chunk_serving_enabled = chunk_serving_enabled;
     profile.tag_domain_routing_enabled = tag_domain_routing_enabled;
+    profile.query_expansion_enabled = query_expansion_enabled;
+    profile.hyde_enabled = hyde_enabled;
     profile.planner_route = if tag_domain_routing_enabled {
         "tag_domain_routing_v0"
     } else {
         "baseline"
     };
+    let expansion_plan = build_expansion_plan(
+        query_expander,
+        query_expansion_enabled,
+        hyde_enabled,
+        &runtime,
+        &query,
+        &mut profile,
+    )
+    .await;
 
     // Vector leg (soft-fail to empty + flag).
     let embedding_started = Instant::now();
@@ -457,6 +551,26 @@ async fn search_thoughts_with_tuning(
         (vec![], vec![])
     };
 
+    let expansion_rankings = if expansion_plan
+        .as_ref()
+        .is_some_and(|plan| plan.has_generated_inputs())
+    {
+        collect_expansion_rankings(
+            pool,
+            embedder,
+            expansion_plan.as_ref().expect("checked above"),
+            chunk_serving_enabled,
+            scope_filter,
+            scope_prefix_filter,
+            lexical_top_k,
+            lexical_timeout_ms,
+            &mut profile,
+        )
+        .await
+    } else {
+        ExpansionRankings::default()
+    };
+
     // RRF fuse → recency boost.
     let rrf_started = Instant::now();
     let mut rankings = vec![vector_hits, lexical_hits];
@@ -468,6 +582,12 @@ async fn search_thoughts_with_tuning(
     if tag_domain_routing_enabled {
         rankings.push(domain_scope_hits);
         rankings.push(tag_facet_hits);
+    }
+    rankings.extend(expansion_rankings.thought_vector_rankings);
+    rankings.extend(expansion_rankings.thought_fts_rankings);
+    if chunk_serving_enabled {
+        rankings.extend(expansion_rankings.chunk_vector_rankings);
+        rankings.extend(expansion_rankings.chunk_fts_rankings);
     }
     let mut fused = rrf_fuse(rankings, DEFAULT_RRF_K);
     let half_life = request
@@ -542,6 +662,211 @@ async fn search_thoughts_with_tuning(
 
 fn elapsed_ms(started: Instant) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0
+}
+
+impl ExpansionPlan {
+    fn has_generated_inputs(&self) -> bool {
+        !self.queries.is_empty() || !self.decomposition.is_empty() || self.hyde.is_some()
+    }
+
+    fn generated_inputs(&self) -> Vec<String> {
+        let mut values = Vec::new();
+        values.extend(self.queries.clone());
+        values.extend(self.decomposition.clone());
+        if let Some(hyde) = self.hyde.clone() {
+            values.push(hyde);
+        }
+        dedupe_lowercase_limited(values, 16)
+    }
+}
+
+async fn build_expansion_plan(
+    query_expander: Option<&dyn QueryExpansionProvider>,
+    query_expansion_enabled: bool,
+    hyde_enabled: bool,
+    runtime: &SearchRuntimeOptions,
+    query: &str,
+    profile: &mut SearchProfile,
+) -> Option<ExpansionPlan> {
+    if !query_expansion_enabled {
+        return None;
+    }
+    profile.planner_route = "query_expansion_v0";
+    let started = Instant::now();
+    let expander = match query_expander {
+        Some(expander) => expander,
+        None => {
+            profile.query_expansion_fallback = true;
+            profile.query_expansion_fallback_reason = Some("provider_disabled".to_string());
+            profile.query_expansion_ms = elapsed_ms(started);
+            return None;
+        }
+    };
+    profile.query_expansion_provider = Some(expander.provider_name().to_string());
+    profile.query_expansion_model_id = Some(expander.model_id().to_string());
+    profile.query_expansion_prompt_version = Some(expander.prompt_version().to_string());
+
+    let max_variants = runtime.query_expansion_max_variants.min(8);
+    match expander
+        .expand(crate::query_expansion::QueryExpansionInput {
+            query: query.to_string(),
+            max_variants,
+            hyde_enabled,
+        })
+        .await
+    {
+        Ok(raw) => {
+            let normalized = normalize_expansion_output(
+                query,
+                raw,
+                max_variants,
+                hyde_enabled,
+                runtime.query_expansion_max_hyde_chars,
+            );
+            profile.query_expansion_route = Some(normalized.route.clone());
+            profile.query_expansion_variant_count = normalized.queries.len();
+            profile.query_expansion_decomposition_count = normalized.decomposition.len();
+            profile.query_expansion_hyde_used = normalized.hyde.is_some();
+            profile.query_expansion_ms = elapsed_ms(started);
+            Some(ExpansionPlan {
+                route: normalized.route,
+                queries: normalized.queries,
+                hyde: normalized.hyde,
+                decomposition: normalized.decomposition,
+            })
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                reason = e.reason_code(),
+                "query expansion provider failed; falling back to original-query-only retrieval",
+            );
+            profile.query_expansion_fallback = true;
+            profile.query_expansion_fallback_reason = Some(e.reason_code().to_string());
+            profile.query_expansion_ms = elapsed_ms(started);
+            None
+        }
+    }
+}
+
+async fn collect_expansion_rankings(
+    pool: &PgPool,
+    embedder: &dyn Embedder,
+    plan: &ExpansionPlan,
+    chunk_serving_enabled: bool,
+    scope_filter: Option<&str>,
+    scope_prefix_filter: Option<&str>,
+    lexical_top_k: usize,
+    lexical_timeout_ms: u64,
+    profile: &mut SearchProfile,
+) -> ExpansionRankings {
+    let inputs = plan.generated_inputs();
+    if inputs.is_empty() {
+        return ExpansionRankings::default();
+    }
+
+    let mut out = ExpansionRankings::default();
+    let vector_started = Instant::now();
+    match embedder.embed(&inputs).await {
+        Ok(vectors) => {
+            for vector in vectors {
+                match kengram_storage::search_vector_knn(
+                    pool,
+                    vector.clone(),
+                    embedder.model(),
+                    scope_filter,
+                    scope_prefix_filter,
+                    DEFAULT_TOP_K_PER_LEG as i64,
+                )
+                .await
+                {
+                    Ok(hits) => {
+                        profile.query_expansion_thought_vector_hits += hits.len();
+                        if !hits.is_empty() {
+                            out.thought_vector_rankings.push(hits);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "query-expansion thought vector leg failed; continuing",
+                        );
+                    }
+                }
+                if chunk_serving_enabled {
+                    match kengram_storage::search_artifact_chunks_vector_knn(
+                        pool,
+                        vector,
+                        embedder.model(),
+                        scope_filter,
+                        scope_prefix_filter,
+                        DEFAULT_TOP_K_PER_LEG as i64,
+                    )
+                    .await
+                    {
+                        Ok(hits) => {
+                            profile.query_expansion_chunk_vector_hits += hits.len();
+                            if !hits.is_empty() {
+                                out.chunk_vector_rankings.push(hits);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "query-expansion chunk vector leg failed; continuing",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "embedder failed for query-expansion variants; keeping lexical expansion legs only",
+            );
+        }
+    }
+    profile.query_expansion_vector_knn_ms = elapsed_ms(vector_started);
+
+    let fts_started = Instant::now();
+    for input in &inputs {
+        let thought_hits = bounded_fts_hits(
+            pool,
+            input,
+            scope_filter,
+            scope_prefix_filter,
+            lexical_top_k,
+            lexical_timeout_ms,
+        )
+        .await;
+        profile.query_expansion_thought_fts_hits += thought_hits.len();
+        if !thought_hits.is_empty() {
+            out.thought_fts_rankings.push(thought_hits);
+        }
+        if chunk_serving_enabled {
+            let chunk_hits = bounded_artifact_chunk_fts_hits(
+                pool,
+                input,
+                scope_filter,
+                scope_prefix_filter,
+                lexical_top_k,
+                lexical_timeout_ms,
+            )
+            .await;
+            profile.query_expansion_chunk_fts_hits += chunk_hits.len();
+            if !chunk_hits.is_empty() {
+                out.chunk_fts_rankings.push(chunk_hits);
+            }
+        }
+    }
+    profile.query_expansion_fts_ms = elapsed_ms(fts_started);
+    tracing::debug!(
+        route = %plan.route,
+        inputs = inputs.len(),
+        "query-expansion legs collected",
+    );
+    out
 }
 
 fn search_hit_from_core_hit(h: Hit) -> SearchHit {
@@ -1312,6 +1637,10 @@ mod tests {
     use super::*;
     use crate::capture::{CaptureRequest, capture};
     use crate::drain::drain_pending_embeddings;
+    use crate::query_expansion::{
+        QueryExpansionError, QueryExpansionInput, QueryExpansionOutput, QueryExpansionProvider,
+    };
+    use async_trait::async_trait;
     use kengram_core::{EmbeddingModel, TagKind, Tags};
     use kengram_embed::{FakeBehavior, FakeEmbedder, FakeReranker};
 
@@ -1319,6 +1648,32 @@ mod tests {
 
     fn test_embedding_model() -> EmbeddingModel {
         EmbeddingModel::new(TEST_EMBEDDER_MODEL_ID, 4096)
+    }
+
+    struct StaticQueryExpander {
+        output: Result<QueryExpansionOutput, QueryExpansionError>,
+    }
+
+    #[async_trait]
+    impl QueryExpansionProvider for StaticQueryExpander {
+        fn provider_name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn model_id(&self) -> &str {
+            "fake/query-expander"
+        }
+
+        fn prompt_version(&self) -> &str {
+            "fake-v1"
+        }
+
+        async fn expand(
+            &self,
+            _input: QueryExpansionInput,
+        ) -> Result<QueryExpansionOutput, QueryExpansionError> {
+            self.output.clone()
+        }
     }
 
     fn test_embedder() -> FakeEmbedder {
@@ -1685,6 +2040,8 @@ mod tests {
             &pool,
             &embedder,
             None,
+            None,
+            SearchRuntimeOptions::default(),
             SearchRequest {
                 query: needle.to_string(),
                 scope: None,
@@ -2107,6 +2464,156 @@ mod tests {
         assert!(profile.tag_domain_routing_enabled);
         assert_eq!(profile.planner_route, "tag_domain_routing_v0");
         assert!(profile.tag_facet_hits >= 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn query_expansion_subordinate_flag_is_ineffective_when_master_gate_off(pool: PgPool) {
+        let embedder = test_embedder();
+        let baseline_id = cap(&pool, "original-only baseline marker", "global").await;
+        let expansion_only_id = cap(&pool, "variant-only hidden marker", "global").await;
+        let expander = StaticQueryExpander {
+            output: Ok(QueryExpansionOutput {
+                route: Some("semantic".to_string()),
+                queries: vec!["variant-only hidden".to_string()],
+                hyde: None,
+                decomposition: vec![],
+                facets: Default::default(),
+            }),
+        };
+        let request = SearchRequest {
+            query: "original-only baseline".to_string(),
+            scope: None,
+            scope_prefix: None,
+            limit: Some(10),
+            recency_half_life_days: Some(0.0),
+            rerank: Some(false),
+            candidate_pool: None,
+            tag_filter: None,
+            chunk_serving_enabled: false,
+            full_pipeline_enabled: false,
+            tag_domain_routing_enabled: false,
+            include_profile: true,
+        };
+        let runtime = SearchRuntimeOptions {
+            query_expansion_enabled: true,
+            hyde_enabled: true,
+            ..SearchRuntimeOptions::default()
+        };
+
+        let resp =
+            search_thoughts_with_runtime(&pool, &embedder, None, Some(&expander), runtime, request)
+                .await
+                .unwrap();
+        let ids: Vec<_> = resp.results.iter().map(|hit| hit.thought_id).collect();
+        assert!(ids.contains(&baseline_id));
+        assert!(!ids.contains(&expansion_only_id));
+        let profile = resp.profile.expect("profile requested");
+        assert!(!profile.full_pipeline_enabled);
+        assert!(!profile.query_expansion_enabled);
+        assert_eq!(profile.planner_route, "baseline");
+        assert_eq!(profile.query_expansion_variant_count, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn query_expansion_provider_failure_falls_back_to_original_query(pool: PgPool) {
+        let embedder = test_embedder();
+        let baseline_id = cap(&pool, "fallback baseline marker", "global").await;
+        let expander = StaticQueryExpander {
+            output: Err(QueryExpansionError::Timeout { seconds: 1 }),
+        };
+        let resp = search_thoughts_with_runtime(
+            &pool,
+            &embedder,
+            None,
+            Some(&expander),
+            SearchRuntimeOptions {
+                query_expansion_enabled: true,
+                hyde_enabled: true,
+                ..SearchRuntimeOptions::default()
+            },
+            SearchRequest {
+                query: "fallback baseline".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(false),
+                candidate_pool: None,
+                tag_filter: None,
+                chunk_serving_enabled: false,
+                full_pipeline_enabled: true,
+                tag_domain_routing_enabled: false,
+                include_profile: true,
+            },
+        )
+        .await
+        .unwrap();
+        let ids: Vec<_> = resp.results.iter().map(|hit| hit.thought_id).collect();
+        assert!(ids.contains(&baseline_id));
+        let profile = resp.profile.expect("profile requested");
+        assert!(profile.full_pipeline_enabled);
+        assert!(profile.query_expansion_enabled);
+        assert!(profile.query_expansion_fallback);
+        assert_eq!(
+            profile.query_expansion_fallback_reason.as_deref(),
+            Some("timeout")
+        );
+        assert_eq!(profile.query_expansion_variant_count, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn query_expansion_flag_true_adds_candidates_without_dropping_original(pool: PgPool) {
+        let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
+        let baseline_id = cap(&pool, "original belt four baseline", "global").await;
+        let variant_id = cap(&pool, "expanded semantic marker", "global").await;
+        let hyde_id = cap(&pool, "pseudo document marker", "global").await;
+        let expander = StaticQueryExpander {
+            output: Ok(QueryExpansionOutput {
+                route: Some("semantic".to_string()),
+                queries: vec!["expanded semantic marker".to_string()],
+                hyde: Some("pseudo document marker".to_string()),
+                decomposition: vec![],
+                facets: Default::default(),
+            }),
+        };
+        let resp = search_thoughts_with_runtime(
+            &pool,
+            &bad,
+            None,
+            Some(&expander),
+            SearchRuntimeOptions {
+                query_expansion_enabled: true,
+                hyde_enabled: true,
+                query_expansion_max_variants: 4,
+                query_expansion_max_hyde_chars: 600,
+            },
+            SearchRequest {
+                query: "original belt four".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(false),
+                candidate_pool: None,
+                tag_filter: None,
+                chunk_serving_enabled: false,
+                full_pipeline_enabled: true,
+                tag_domain_routing_enabled: false,
+                include_profile: true,
+            },
+        )
+        .await
+        .unwrap();
+        let ids: Vec<_> = resp.results.iter().map(|hit| hit.thought_id).collect();
+        assert!(ids.contains(&baseline_id));
+        assert!(ids.contains(&variant_id));
+        assert!(ids.contains(&hyde_id));
+        let profile = resp.profile.expect("profile requested");
+        assert_eq!(profile.planner_route, "query_expansion_v0");
+        assert_eq!(profile.query_expansion_route.as_deref(), Some("semantic"));
+        assert_eq!(profile.query_expansion_variant_count, 1);
+        assert!(profile.query_expansion_hyde_used);
+        assert!(profile.query_expansion_thought_fts_hits >= 2);
     }
 
     #[sqlx::test(migrations = "../../migrations")]

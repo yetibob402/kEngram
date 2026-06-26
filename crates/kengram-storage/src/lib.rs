@@ -53,6 +53,10 @@ mod bge_sparse {
     pub const VOCAB_SIZE: usize = 250_002;
     pub const VOCAB_SIZE_I32: i32 = 250_002;
     pub const MODEL_VERSION: i32 = 1;
+    pub const THOUGHT_TABLE: &str = "thought_sparse_embeddings_bge_m3";
+    pub const THOUGHT_HNSW_INDEX: &str = "thought_sparse_embeddings_bge_m3_hnsw";
+    pub const CHUNK_TABLE: &str = "artifact_chunk_sparse_embeddings_bge_m3";
+    pub const CHUNK_HNSW_INDEX: &str = "artifact_chunk_sparse_embeddings_bge_m3_hnsw";
 }
 
 #[derive(Debug, Clone)]
@@ -4168,6 +4172,154 @@ pub async fn search_artifact_chunk_contexts_vector_knn(
     chunk_vector_rows_to_hits(rows)
 }
 
+/// Sparse lexical kNN over BGE-M3 thought sidecars. Uses pgvector sparsevec
+/// inner-product distance and fails closed if the sparse sidecar/index is not
+/// ready.
+pub async fn search_thoughts_sparse_lexical(
+    pool: &PgPool,
+    query_sparse: &SparseLexicalVector,
+    scope: Option<&str>,
+    scope_prefix: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Hit>, StorageError> {
+    validate_bge_m3_sparse(query_sparse)?;
+    assert_bge_sparse_thought_search_ready(pool).await?;
+
+    let sparsevec_literal = query_sparse.sparsevec_literal();
+    let mut tx = pool.begin().await?;
+    set_bge_hnsw_ef_search(&mut tx).await?;
+    let rows: Vec<LexicalSearchRow> = sqlx::query_as(
+        r#"
+        SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
+               t.content_fingerprint, t.tags,
+               t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at,
+               (-(b.embedding <#> $1::text::sparsevec))::real AS rank
+        FROM thought_sparse_embeddings_bge_m3 b
+        JOIN thoughts t ON t.id = b.thought_id
+        WHERE b.model_id = $2
+          AND b.model_version = $3
+          AND ($4::text IS NULL OR t.scope = $4)
+          AND ($5::text IS NULL OR t.scope LIKE $5 || '%')
+          AND t.retracted_at IS NULL
+          AND t.id <> ALL($7::uuid[])
+          AND lower(coalesce(t.metadata->>'source_file', '')) !~ $8
+          AND t.content !~ $9
+        ORDER BY b.embedding <#> $1::text::sparsevec
+        LIMIT $6
+        "#,
+    )
+    .bind(&sparsevec_literal)
+    .bind(bge_sparse::MODEL_ID)
+    .bind(bge_sparse::MODEL_VERSION)
+    .bind(scope)
+    .bind(scope_prefix)
+    .bind(limit)
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    lexical_rows_to_hits(rows)
+}
+
+/// Sparse lexical kNN over BGE-M3 artifact chunk sidecars. Each result
+/// resolves to its source parent thought and carries the best matching chunk
+/// as provenance.
+pub async fn search_artifact_chunks_sparse_lexical(
+    pool: &PgPool,
+    query_sparse: &SparseLexicalVector,
+    scope: Option<&str>,
+    scope_prefix: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Hit>, StorageError> {
+    validate_bge_m3_sparse(query_sparse)?;
+    assert_bge_sparse_chunk_search_ready(pool).await?;
+
+    let sparsevec_literal = query_sparse.sparsevec_literal();
+    let mut tx = pool.begin().await?;
+    set_bge_hnsw_ef_search(&mut tx).await?;
+    let rows: Vec<ChunkLexicalSearchRow> = sqlx::query_as(
+        r#"
+        WITH candidates AS (
+            SELECT t.id,
+                   t.scope,
+                   t.content AS parent_content,
+                   t.source,
+                   t.created_at,
+                   t.metadata AS parent_metadata,
+                   t.content_fingerprint,
+                   t.tags,
+                   t.tags_extractor_model,
+                   t.tags_extractor_version,
+                   t.tags_extracted_at,
+                   ac.id AS chunk_id,
+                   ac.artifact_id,
+                   ac.source_thought_id,
+                   ac.chunk_index,
+                   ac.content AS chunk_content,
+                   ac.chunker_id,
+                   ac.chunker_version,
+                   ac.token_estimate,
+                   ac.start_char,
+                   ac.end_char,
+                   jsonb_set(
+                       ac.metadata,
+                       '{sparse_lexical}',
+                       jsonb_build_object(
+                           'model_id', b.model_id,
+                           'model_version', b.model_version,
+                           'nonzero_count', b.nonzero_count,
+                           'sparse', true
+                       ),
+                       true
+                   ) AS chunk_metadata,
+                   (-(b.embedding <#> $1::text::sparsevec))::real AS rank
+            FROM artifact_chunk_sparse_embeddings_bge_m3 b
+            JOIN artifact_chunks ac ON ac.id = b.chunk_id
+            JOIN thoughts t ON t.id = ac.source_thought_id
+            WHERE b.model_id = $2
+              AND b.model_version = $3
+              AND ac.retracted_at IS NULL
+              AND ac.source_thought_id IS NOT NULL
+              AND t.retracted_at IS NULL
+              AND ($4::text IS NULL OR t.scope = $4)
+              AND ($5::text IS NULL OR t.scope LIKE $5 || '%')
+              AND t.id <> ALL($7::uuid[])
+              AND lower(coalesce(t.metadata->>'source_file', '')) !~ $8
+              AND t.content !~ $9
+              AND ac.content !~ $9
+            ORDER BY b.embedding <#> $1::text::sparsevec
+            LIMIT GREATEST($6, $6 * 8)
+        ),
+        best_per_parent AS (
+            SELECT DISTINCT ON (id) *
+            FROM candidates
+            ORDER BY id, rank DESC, chunk_index ASC
+        )
+        SELECT *
+        FROM best_per_parent
+        ORDER BY rank DESC, created_at DESC, chunk_index ASC
+        LIMIT $6
+        "#,
+    )
+    .bind(&sparsevec_literal)
+    .bind(bge_sparse::MODEL_ID)
+    .bind(bge_sparse::MODEL_VERSION)
+    .bind(scope)
+    .bind(scope_prefix)
+    .bind(limit)
+    .bind(EVAL_CONTAMINATION_KNOWN_IDS)
+    .bind(EVAL_CONTAMINATION_SOURCE_FILE_REGEX)
+    .bind(EVAL_CONTAMINATION_CONTENT_REGEX)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    chunk_lexical_rows_to_hits(rows)
+}
+
 async fn ann_projection_search_ready(
     pool: &PgPool,
     projection_id: &str,
@@ -4491,6 +4643,12 @@ pub async fn ensure_vector_search_ready(
     ensure_ann_projection_ready(pool, model).await
 }
 
+pub async fn ensure_sparse_search_ready(pool: &PgPool) -> Result<(), StorageError> {
+    assert_bge_sparse_thought_search_ready(pool).await?;
+    assert_bge_sparse_chunk_search_ready(pool).await?;
+    Ok(())
+}
+
 async fn assert_bge_vector_search_ready(pool: &PgPool) -> Result<(), StorageError> {
     if !table_exists(pool, bge::THOUGHT_TABLE).await? {
         return Err(StorageError::BgeSidecarTableMissing(
@@ -4501,6 +4659,38 @@ async fn assert_bge_vector_search_ready(pool: &PgPool) -> Result<(), StorageErro
     if !index_ready(pool, bge::THOUGHT_HNSW_INDEX).await? {
         return Err(StorageError::BgeSidecarIndexNotReady(
             bge::THOUGHT_HNSW_INDEX.to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+async fn assert_bge_sparse_thought_search_ready(pool: &PgPool) -> Result<(), StorageError> {
+    if !table_exists(pool, bge_sparse::THOUGHT_TABLE).await? {
+        return Err(StorageError::BgeSidecarTableMissing(
+            bge_sparse::THOUGHT_TABLE.to_string(),
+        ));
+    }
+
+    if !index_ready(pool, bge_sparse::THOUGHT_HNSW_INDEX).await? {
+        return Err(StorageError::BgeSidecarIndexNotReady(
+            bge_sparse::THOUGHT_HNSW_INDEX.to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+async fn assert_bge_sparse_chunk_search_ready(pool: &PgPool) -> Result<(), StorageError> {
+    if !table_exists(pool, bge_sparse::CHUNK_TABLE).await? {
+        return Err(StorageError::BgeSidecarTableMissing(
+            bge_sparse::CHUNK_TABLE.to_string(),
+        ));
+    }
+
+    if !index_ready(pool, bge_sparse::CHUNK_HNSW_INDEX).await? {
+        return Err(StorageError::BgeSidecarIndexNotReady(
+            bge_sparse::CHUNK_HNSW_INDEX.to_string(),
         ));
     }
 
@@ -5766,6 +5956,101 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, StorageError::InvalidSparseModel { .. }));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_thought_sparse_lexical_finds_inserted_vector_and_filters_eval(pool: PgPool) {
+        let clean = insert_test_thought(&pool, "clean sparse lexical candidate", "global").await;
+        let denied = insert_test_thought(&pool, "KGR024 sparse lexical candidate", "global").await;
+        let query = test_sparse_vector(vec![(7, 1.0)]);
+        let clean_vector = test_sparse_vector(vec![(11, 1.0)]);
+        let provenance = SparseEmbeddingProvenance::bge_m3_flag_embedding("FlagEmbedding 1.0 test");
+
+        insert_thought_sparse_embedding(
+            &pool,
+            denied,
+            sha256_of("KGR024 sparse lexical candidate"),
+            "KGR024 sparse lexical candidate".len() as i32,
+            &query,
+            &provenance,
+        )
+        .await
+        .unwrap();
+        insert_thought_sparse_embedding(
+            &pool,
+            clean,
+            sha256_of("clean sparse lexical candidate"),
+            "clean sparse lexical candidate".len() as i32,
+            &clean_vector,
+            &provenance,
+        )
+        .await
+        .unwrap();
+
+        let hits = search_thoughts_sparse_lexical(&pool, &query, None, None, 10)
+            .await
+            .unwrap();
+        let hit_ids = hits.iter().map(|hit| hit.thought.id).collect::<Vec<_>>();
+
+        assert!(hit_ids.contains(&clean));
+        assert!(
+            !hit_ids.contains(&denied),
+            "KGR-labeled sparse thought candidate must be excluded before sparse pooling"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_chunk_sparse_lexical_finds_chunk_and_filters_eval_content(pool: PgPool) {
+        let clean_parent = insert_test_thought(&pool, "clean sparse chunk parent", "global").await;
+        let denied_parent =
+            insert_test_thought(&pool, "also clean sparse chunk parent", "global").await;
+        let clean_chunk =
+            insert_test_chunk(&pool, clean_parent, "clean sparse chunk candidate").await;
+        let denied_chunk =
+            insert_test_chunk(&pool, denied_parent, "KGR024 sparse chunk candidate").await;
+        let query = test_sparse_vector(vec![(17, 1.0)]);
+        let clean_vector = test_sparse_vector(vec![(19, 1.0)]);
+        let provenance = SparseEmbeddingProvenance::bge_m3_flag_embedding("FlagEmbedding 1.0 test");
+
+        insert_artifact_chunk_sparse_embedding(
+            &pool,
+            denied_chunk,
+            sha256_of("KGR024 sparse chunk candidate"),
+            "KGR024 sparse chunk candidate".len() as i32,
+            &query,
+            &provenance,
+        )
+        .await
+        .unwrap();
+        insert_artifact_chunk_sparse_embedding(
+            &pool,
+            clean_chunk,
+            sha256_of("clean sparse chunk candidate"),
+            "clean sparse chunk candidate".len() as i32,
+            &clean_vector,
+            &provenance,
+        )
+        .await
+        .unwrap();
+
+        let hits = search_artifact_chunks_sparse_lexical(&pool, &query, None, None, 10)
+            .await
+            .unwrap();
+        let hit_ids = hits.iter().map(|hit| hit.thought.id).collect::<Vec<_>>();
+
+        assert!(hit_ids.contains(&clean_parent));
+        assert!(
+            !hit_ids.contains(&denied_parent),
+            "KGR-labeled sparse chunk content must be excluded before sparse chunk pooling"
+        );
+        let clean_hit = hits
+            .iter()
+            .find(|hit| hit.thought.id == clean_parent)
+            .expect("clean chunk parent should be returned");
+        assert_eq!(
+            clean_hit.chunk.as_ref().map(|chunk| chunk.chunk_id),
+            Some(clean_chunk)
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]

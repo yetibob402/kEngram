@@ -29,6 +29,9 @@ pub struct Config {
     pub server: ServerConfig,
     pub database: DatabaseConfig,
     pub embedder: EmbedderConfig,
+    /// Sparse query encoder for Stage-3 BGE-M3 lexical serving. Empty
+    /// provider keeps sparse serving fail-closed even if sidecars are filled.
+    pub sparse_embedder: SparseEmbedderConfig,
     pub worker: WorkerConfig,
     pub search: SearchConfig,
     /// M4: renamed from `[extractor]`. The tagger is a metadata-tagging
@@ -286,6 +289,37 @@ impl Default for EmbedderConfig {
             model: "bge-m3".to_string(),
             model_id: "bge-m3:1024".to_string(),
             dimensions: 1024,
+            api_key: None,
+            timeout_seconds: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SparseEmbedderConfig {
+    /// `""` disables sparse query encoding. Supported provider:
+    /// `"openai-compatible"` endpoints that return BGE-M3 lexical weights.
+    pub provider: String,
+    /// `/v1` base URL for the sparse-capable embeddings endpoint.
+    pub endpoint: String,
+    /// Backend model name as the provider understands it.
+    pub model: String,
+    /// Kengram-side sparse model identity.
+    pub model_id: String,
+    pub vocab_size: usize,
+    pub api_key: Option<String>,
+    pub timeout_seconds: u64,
+}
+
+impl Default for SparseEmbedderConfig {
+    fn default() -> Self {
+        Self {
+            provider: String::new(),
+            endpoint: "http://localhost:11434/v1".to_string(),
+            model: "bge-m3".to_string(),
+            model_id: "bge-m3:sparse".to_string(),
+            vocab_size: 250_002,
             api_key: None,
             timeout_seconds: 5,
         }
@@ -574,6 +608,17 @@ mod tests {
         assert_eq!(c.embedder.model_id, "bge-m3:1024");
         assert_eq!(c.embedder.dimensions, 1024);
         assert_eq!(c.embedder.timeout_seconds, 5);
+    }
+
+    #[test]
+    fn default_sparse_embedder_is_disabled_bge_m3_lexical_contract() {
+        let c = Config::default();
+        assert_eq!(c.sparse_embedder.provider, "");
+        assert_eq!(c.sparse_embedder.endpoint, "http://localhost:11434/v1");
+        assert_eq!(c.sparse_embedder.model, "bge-m3");
+        assert_eq!(c.sparse_embedder.model_id, "bge-m3:sparse");
+        assert_eq!(c.sparse_embedder.vocab_size, 250_002);
+        assert_eq!(c.sparse_embedder.timeout_seconds, 5);
     }
 
     #[test]

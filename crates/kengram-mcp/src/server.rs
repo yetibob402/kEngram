@@ -10,7 +10,8 @@
 //! `retract_thought`. Tag drainage lives in the worker, not here.
 
 use kengram_core::{
-    Embedder, LinkDirection, LinkTarget, Metadata, RelationKind, Scope, Source, ThoughtId,
+    Embedder, LinkDirection, LinkTarget, Metadata, RelationKind, Scope, Source, SparseEmbedder,
+    ThoughtId,
 };
 use kengram_embed::Reranker;
 use rmcp::{
@@ -267,6 +268,7 @@ pub struct GetRelatedThoughtsArgs {
 pub struct KengramServer {
     pool: PgPool,
     embedder: Arc<dyn Embedder>,
+    sparse_embedder: Option<Arc<dyn SparseEmbedder>>,
     /// `None` when no `[reranker]` config is provided; the search pipeline
     /// silently falls through to the RRF + recency pipeline.
     reranker: Option<Arc<dyn Reranker>>,
@@ -324,9 +326,38 @@ impl KengramServer {
         query_expander: Option<Arc<dyn QueryExpansionProvider>>,
         query_expansion_runtime: SearchRuntimeOptions,
     ) -> Self {
+        Self::new_with_sparse_and_query_expansion(
+            pool,
+            embedder,
+            None,
+            reranker,
+            tagger_model_id,
+            chunk_serving_enabled,
+            full_pipeline_enabled,
+            tag_domain_routing_enabled,
+            query_expander,
+            query_expansion_runtime,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_sparse_and_query_expansion(
+        pool: PgPool,
+        embedder: Arc<dyn Embedder>,
+        sparse_embedder: Option<Arc<dyn SparseEmbedder>>,
+        reranker: Option<Arc<dyn Reranker>>,
+        tagger_model_id: Option<String>,
+        chunk_serving_enabled: bool,
+        full_pipeline_enabled: bool,
+        tag_domain_routing_enabled: bool,
+        query_expander: Option<Arc<dyn QueryExpansionProvider>>,
+        query_expansion_runtime: SearchRuntimeOptions,
+    ) -> Self {
         let chunk_serving_enabled = full_pipeline_enabled && chunk_serving_enabled;
         let tag_domain_routing_enabled = full_pipeline_enabled && tag_domain_routing_enabled;
         let query_expansion_runtime = SearchRuntimeOptions {
+            sparse_lexical_enabled: full_pipeline_enabled
+                && query_expansion_runtime.sparse_lexical_enabled,
             query_expansion_enabled: full_pipeline_enabled
                 && query_expansion_runtime.query_expansion_enabled,
             hyde_enabled: full_pipeline_enabled
@@ -347,6 +378,7 @@ impl KengramServer {
         Self {
             pool,
             embedder,
+            sparse_embedder,
             reranker,
             tagger_model_id,
             chunk_serving_enabled,
@@ -499,9 +531,10 @@ impl KengramServer {
             tag_filter: args.tag_filter.map(serde_json::Value::Object),
         };
 
-        let resp = search::search_thoughts_with_runtime(
+        let resp = search::search_thoughts_with_runtime_and_sparse(
             &self.pool,
             self.embedder.as_ref(),
+            self.sparse_embedder.as_deref(),
             self.reranker.as_deref(),
             self.query_expander.as_deref(),
             self.query_expansion_runtime.clone(),
@@ -796,6 +829,13 @@ fn map_read_error(err: ReadError) -> String {
         ReadError::NotFound => "thought not found".to_string(),
         ReadError::ScopeAndPrefixBothSet => {
             "scope and scope_prefix are mutually exclusive; supply at most one".to_string()
+        }
+        ReadError::SparseQueryEncoderUnavailable => {
+            "sparse lexical search is enabled but no sparse query encoder is configured".to_string()
+        }
+        ReadError::SparseQueryEncoding(e) => {
+            tracing::error!(error = %e, "sparse query encoding error");
+            "sparse query encoding failed".to_string()
         }
         ReadError::Storage(e) => {
             tracing::error!(error = %e, "read storage error");

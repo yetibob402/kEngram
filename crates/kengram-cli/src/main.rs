@@ -16,9 +16,13 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use kengram_core::{Embedder, EmbeddingModel, LinkDirection, RelationKind, Tagger};
+use kengram_core::{
+    Embedder, EmbeddingModel, LinkDirection, RelationKind, SparseEmbedder, SparseEmbeddingModel,
+    Tagger,
+};
 use kengram_embed::{
-    OpenAICompatibleConfig, OpenAICompatibleEmbedder, Reranker, TeiReranker, TeiRerankerConfig,
+    OpenAICompatibleConfig, OpenAICompatibleEmbedder, OpenAICompatibleSparseConfig,
+    OpenAICompatibleSparseEmbedder, Reranker, TeiReranker, TeiRerankerConfig,
 };
 use kengram_extract::{OpenAICompatibleConfig as TaggerConfigBuilder, OpenAICompatibleTagger};
 use kengram_mcp::{
@@ -32,7 +36,8 @@ use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{
-    Config, EmbedderConfig, RerankerConfig, SearchConfig, TaggerConfig, WorkerConfig,
+    Config, EmbedderConfig, RerankerConfig, SearchConfig, SparseEmbedderConfig, TaggerConfig,
+    WorkerConfig,
 };
 
 #[derive(Parser, Debug)]
@@ -253,6 +258,41 @@ fn build_embedder(c: &EmbedderConfig) -> anyhow::Result<Arc<dyn Embedder>> {
             Ok(Arc::new(embedder))
         }
         other => anyhow::bail!("unknown embedder provider: {other:?} (valid: 'openai-compatible')"),
+    }
+}
+
+fn build_sparse_embedder(
+    c: &SparseEmbedderConfig,
+) -> anyhow::Result<Option<Arc<dyn SparseEmbedder>>> {
+    if c.provider.is_empty() {
+        tracing::info!("sparse embedder: not configured (sparse lexical serving unavailable)");
+        return Ok(None);
+    }
+
+    match c.provider.as_str() {
+        "openai-compatible" => {
+            let embedder = OpenAICompatibleSparseEmbedder::new(OpenAICompatibleSparseConfig {
+                endpoint: c.endpoint.clone(),
+                model_name: c.model.clone(),
+                model: SparseEmbeddingModel::new(c.model_id.clone(), 1, c.vocab_size),
+                api_key: c.api_key.clone(),
+                timeout: Duration::from_secs(c.timeout_seconds),
+            })
+            .with_context(|| format!("constructing sparse embedder for endpoint {}", c.endpoint))?;
+            tracing::info!(
+                provider = %c.provider,
+                endpoint = %c.endpoint,
+                model_name = %c.model,
+                model_id = %c.model_id,
+                vocab_size = c.vocab_size,
+                timeout_seconds = c.timeout_seconds,
+                "sparse embedder: resolved config",
+            );
+            Ok(Some(Arc::new(embedder)))
+        }
+        other => anyhow::bail!(
+            "unknown sparse embedder provider: {other:?} (valid: 'openai-compatible' or empty)"
+        ),
     }
 }
 
@@ -496,6 +536,18 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
     kengram_storage::ensure_vector_search_ready(&pool, embedder.model())
         .await
         .context("ensuring vector search readiness")?;
+    let sparse_lexical_enabled = config.search.sparse_lexical_effective();
+    let sparse_embedder = build_sparse_embedder(&config.sparse_embedder)?;
+    if sparse_lexical_enabled {
+        if sparse_embedder.is_none() {
+            anyhow::bail!(
+                "search.sparse_lexical_enabled is effective but [sparse_embedder].provider is empty"
+            );
+        }
+        kengram_storage::ensure_sparse_search_ready(&pool)
+            .await
+            .context("ensuring sparse lexical search readiness")?;
+    }
     let reranker = build_reranker(&config.reranker)?;
     let query_expander = build_query_expander(&config.search)?;
     // Server only needs the tagger model_id (to stamp pending_tags rows).
@@ -519,7 +571,6 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
     let chunk_serving_enabled = config.search.chunk_serving_effective();
     let full_pipeline_enabled = config.search.full_pipeline_enabled;
     let tag_domain_routing_enabled = config.search.tag_domain_routing_effective();
-    let sparse_lexical_enabled = config.search.sparse_lexical_effective();
     let graph_augmentation_enabled = config.search.graph_augmentation_effective();
     let contextual_retrieval_enabled = config.search.contextual_retrieval_effective();
     let contextual_chunk_vector_enabled = config.search.contextual_chunk_vector_effective();
@@ -530,6 +581,7 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
         hyde_enabled: config.search.hyde_effective(),
         query_expansion_max_variants: config.search.query_expansion_max_variants,
         query_expansion_max_hyde_chars: config.search.query_expansion_max_hyde_chars,
+        sparse_lexical_enabled,
         graph_augmentation_enabled,
         graph_seed_count: config.search.graph_seed_count,
         graph_per_seed_cap: config.search.graph_per_seed_cap,
@@ -560,11 +612,13 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
         "search config resolved"
     );
     let query_expander_for_factory = query_expander.clone();
+    let sparse_embedder_for_factory = sparse_embedder.clone();
     let query_expansion_runtime_for_factory = query_expansion_runtime.clone();
     let factory = move || {
-        Ok(KengramServer::new_with_query_expansion(
+        Ok(KengramServer::new_with_sparse_and_query_expansion(
             pool_for_factory.clone(),
             embedder_for_factory.clone(),
+            sparse_embedder_for_factory.clone(),
             reranker_for_factory.clone(),
             tagger_model_id_for_factory.clone(),
             chunk_serving_enabled,

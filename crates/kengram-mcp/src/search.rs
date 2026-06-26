@@ -20,7 +20,7 @@
 
 use kengram_core::{
     DEFAULT_RECENCY_HALF_LIFE_DAYS, DEFAULT_RRF_K, Embedder, EmbeddingModel, EmbeddingStatus, Hit,
-    LinkDirection, Metadata, RelationKind, Scope, Source, Tags, Thought, ThoughtId,
+    LinkDirection, Metadata, RelationKind, Scope, Source, SparseEmbedder, Tags, Thought, ThoughtId,
     normalize_domain_scope, normalize_retrieval_alias, recency_boost, rrf_fuse,
 };
 use kengram_embed::{RerankScore, Reranker, RerankerError};
@@ -69,6 +69,7 @@ pub struct SearchRuntimeOptions {
     pub hyde_enabled: bool,
     pub query_expansion_max_variants: usize,
     pub query_expansion_max_hyde_chars: usize,
+    pub sparse_lexical_enabled: bool,
     pub graph_augmentation_enabled: bool,
     pub graph_seed_count: usize,
     pub graph_per_seed_cap: usize,
@@ -87,6 +88,7 @@ impl Default for SearchRuntimeOptions {
             hyde_enabled: false,
             query_expansion_max_variants: DEFAULT_QUERY_EXPANSION_MAX_VARIANTS,
             query_expansion_max_hyde_chars: DEFAULT_QUERY_EXPANSION_MAX_HYDE_CHARS,
+            sparse_lexical_enabled: false,
             graph_augmentation_enabled: false,
             graph_seed_count: DEFAULT_GRAPH_SEED_COUNT,
             graph_per_seed_cap: DEFAULT_GRAPH_PER_SEED_CAP,
@@ -251,6 +253,7 @@ pub struct SearchProfile {
     pub query_expansion_enabled: bool,
     pub hyde_enabled: bool,
     pub graph_augmentation_enabled: bool,
+    pub sparse_lexical_enabled: bool,
     pub contextual_retrieval_enabled: bool,
     pub contextual_chunk_vector_enabled: bool,
     pub contextual_chunk_fts_enabled: bool,
@@ -266,6 +269,8 @@ pub struct SearchProfile {
     pub thought_vector_hits: usize,
     pub chunk_vector_hits: usize,
     pub contextual_chunk_vector_hits: usize,
+    pub thought_sparse_hits: usize,
+    pub chunk_sparse_hits: usize,
     pub thought_fts_hits: usize,
     pub chunk_fts_hits: usize,
     pub contextual_chunk_fts_hits: usize,
@@ -289,6 +294,7 @@ pub struct SearchProfile {
     pub graph_candidates_before_dedupe: usize,
     pub graph_candidates_after_dedupe: usize,
     pub graph_candidates_retained_after_filters: usize,
+    pub sparse_candidates_retained_after_filters: usize,
     pub contextual_candidates_retained_after_filters: usize,
     pub graph_merged_provenance_count: usize,
     pub graph_entity_provenance_count: i64,
@@ -296,6 +302,9 @@ pub struct SearchProfile {
     pub graph_url_provenance_count: i64,
     pub graph_per_relation_counts: BTreeMap<String, usize>,
     pub graph_expansion_ms: f64,
+    pub query_sparse_encoding_ms: f64,
+    pub thought_sparse_knn_ms: f64,
+    pub chunk_sparse_knn_ms: f64,
     pub fused_hit_count: usize,
     pub rerank_candidate_count: usize,
     pub result_count: usize,
@@ -367,6 +376,12 @@ pub enum ReadError {
     #[error("scope and scope_prefix are mutually exclusive; supply at most one")]
     ScopeAndPrefixBothSet,
 
+    #[error("sparse lexical search is enabled but no sparse query encoder is configured")]
+    SparseQueryEncoderUnavailable,
+
+    #[error("sparse query encoding failed: {0}")]
+    SparseQueryEncoding(String),
+
     #[error("storage error: {0}")]
     Storage(#[from] kengram_storage::StorageError),
 }
@@ -396,9 +411,31 @@ pub async fn search_thoughts_with_runtime(
     runtime: SearchRuntimeOptions,
     request: SearchRequest,
 ) -> Result<SearchResponse, ReadError> {
+    search_thoughts_with_runtime_and_sparse(
+        pool,
+        embedder,
+        None,
+        reranker,
+        query_expander,
+        runtime,
+        request,
+    )
+    .await
+}
+
+pub async fn search_thoughts_with_runtime_and_sparse(
+    pool: &PgPool,
+    embedder: &dyn Embedder,
+    sparse_embedder: Option<&dyn SparseEmbedder>,
+    reranker: Option<&dyn Reranker>,
+    query_expander: Option<&dyn QueryExpansionProvider>,
+    runtime: SearchRuntimeOptions,
+    request: SearchRequest,
+) -> Result<SearchResponse, ReadError> {
     search_thoughts_with_tuning(
         pool,
         embedder,
+        sparse_embedder,
         reranker,
         query_expander,
         runtime,
@@ -413,6 +450,7 @@ pub async fn search_thoughts_with_runtime(
 async fn search_thoughts_with_tuning(
     pool: &PgPool,
     embedder: &dyn Embedder,
+    sparse_embedder: Option<&dyn SparseEmbedder>,
     reranker: Option<&dyn Reranker>,
     query_expander: Option<&dyn QueryExpansionProvider>,
     runtime: SearchRuntimeOptions,
@@ -446,6 +484,7 @@ async fn search_thoughts_with_tuning(
     let chunk_serving_enabled = request.full_pipeline_enabled && request.chunk_serving_enabled;
     let tag_domain_routing_enabled =
         request.full_pipeline_enabled && request.tag_domain_routing_enabled;
+    let sparse_lexical_enabled = request.full_pipeline_enabled && runtime.sparse_lexical_enabled;
     let query_expansion_enabled = request.full_pipeline_enabled && runtime.query_expansion_enabled;
     let hyde_enabled = query_expansion_enabled && runtime.hyde_enabled;
     let graph_augmentation_enabled =
@@ -459,6 +498,7 @@ async fn search_thoughts_with_tuning(
     profile.full_pipeline_enabled = request.full_pipeline_enabled;
     profile.chunk_serving_enabled = chunk_serving_enabled;
     profile.tag_domain_routing_enabled = tag_domain_routing_enabled;
+    profile.sparse_lexical_enabled = sparse_lexical_enabled;
     profile.query_expansion_enabled = query_expansion_enabled;
     profile.hyde_enabled = hyde_enabled;
     profile.graph_augmentation_enabled = graph_augmentation_enabled;
@@ -476,6 +516,8 @@ async fn search_thoughts_with_tuning(
         .collect();
     profile.planner_route = if tag_domain_routing_enabled {
         "tag_domain_routing_v0"
+    } else if sparse_lexical_enabled {
+        "sparse_lexical_v0"
     } else {
         "baseline"
     };
@@ -597,6 +639,53 @@ async fn search_thoughts_with_tuning(
             }
             None => (vec![], vec![], vec![], false),
         };
+
+    let (sparse_thought_hits, sparse_chunk_hits) = if sparse_lexical_enabled {
+        let Some(sparse_embedder) = sparse_embedder else {
+            return Err(ReadError::SparseQueryEncoderUnavailable);
+        };
+        let sparse_encoding_started = Instant::now();
+        let sparse_query = sparse_embedder
+            .encode_sparse(std::slice::from_ref(&query))
+            .await
+            .map_err(|e| ReadError::SparseQueryEncoding(e.to_string()))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                ReadError::SparseQueryEncoding(
+                    "sparse query encoder returned no vectors".to_string(),
+                )
+            })?;
+        profile.query_sparse_encoding_ms = elapsed_ms(sparse_encoding_started);
+
+        let thought_sparse_started = Instant::now();
+        let sparse_thought_hits = kengram_storage::search_thoughts_sparse_lexical(
+            pool,
+            &sparse_query,
+            scope_filter,
+            scope_prefix_filter,
+            DEFAULT_TOP_K_PER_LEG as i64,
+        )
+        .await?;
+        profile.thought_sparse_knn_ms = elapsed_ms(thought_sparse_started);
+        profile.thought_sparse_hits = sparse_thought_hits.len();
+
+        let chunk_sparse_started = Instant::now();
+        let sparse_chunk_hits = kengram_storage::search_artifact_chunks_sparse_lexical(
+            pool,
+            &sparse_query,
+            scope_filter,
+            scope_prefix_filter,
+            DEFAULT_TOP_K_PER_LEG as i64,
+        )
+        .await?;
+        profile.chunk_sparse_knn_ms = elapsed_ms(chunk_sparse_started);
+        profile.chunk_sparse_hits = sparse_chunk_hits.len();
+
+        (sparse_thought_hits, sparse_chunk_hits)
+    } else {
+        (vec![], vec![])
+    };
 
     // Lexical leg: FTS-backed and bounded. The GIN index should make this
     // fast; the timeout is a defensive belt so lexical failures do not turn
@@ -727,7 +816,16 @@ async fn search_thoughts_with_tuning(
         .chain(contextual_chunk_lexical_hits.iter())
         .map(|hit| hit.thought.id)
         .collect::<HashSet<_>>();
+    let sparse_candidate_ids = sparse_thought_hits
+        .iter()
+        .chain(sparse_chunk_hits.iter())
+        .map(|hit| hit.thought.id)
+        .collect::<HashSet<_>>();
     let mut rankings = vec![vector_hits, lexical_hits];
+    if sparse_lexical_enabled {
+        rankings.push(sparse_thought_hits);
+        rankings.push(sparse_chunk_hits);
+    }
     if chunk_serving_enabled {
         rankings.push(chunk_vector_hits);
         rankings.push(chunk_lexical_hits);
@@ -791,6 +889,10 @@ async fn search_thoughts_with_tuning(
         .iter()
         .filter(|hit| graph_expansion.provenance.contains_key(&hit.thought.id))
         .count();
+    profile.sparse_candidates_retained_after_filters = fused
+        .iter()
+        .filter(|hit| sparse_candidate_ids.contains(&hit.thought.id))
+        .count();
     profile.contextual_candidates_retained_after_filters = fused
         .iter()
         .filter(|hit| contextual_candidate_ids.contains(&hit.thought.id))
@@ -806,6 +908,7 @@ async fn search_thoughts_with_tuning(
     // baseline hit before the cross-encoder sees it.
     let effective_candidate_pool = candidate_pool
         .saturating_add(profile.graph_candidates_retained_after_filters)
+        .saturating_add(profile.sparse_candidates_retained_after_filters)
         .saturating_add(profile.contextual_candidates_retained_after_filters);
     profile.rerank_candidate_count = if rerank_enabled && reranker.is_some() {
         effective_candidate_pool.min(fused.len())
@@ -2009,9 +2112,11 @@ mod tests {
     };
     use async_trait::async_trait;
     use kengram_core::{
-        EmbeddingModel, LinkDirection, LinkSource, LinkTarget, RelationKind, TagKind, Tags,
+        EmbedderError, EmbeddingModel, LinkDirection, LinkSource, LinkTarget, RelationKind,
+        SparseEmbeddingModel, SparseLexicalVector, SparseWeight, TagKind, Tags,
     };
     use kengram_embed::{FakeBehavior, FakeEmbedder, FakeReranker};
+    use sha2::{Digest, Sha256};
 
     const TEST_EMBEDDER_MODEL_ID: &str = "qwen3-embedding";
 
@@ -2043,6 +2148,63 @@ mod tests {
         ) -> Result<QueryExpansionOutput, QueryExpansionError> {
             self.output.clone()
         }
+    }
+
+    struct StaticSparseEmbedder {
+        vector: SparseLexicalVector,
+    }
+
+    #[async_trait]
+    impl SparseEmbedder for StaticSparseEmbedder {
+        fn sparse_model(&self) -> &SparseEmbeddingModel {
+            &self.vector.model
+        }
+
+        async fn encode_sparse(
+            &self,
+            texts: &[String],
+        ) -> Result<Vec<SparseLexicalVector>, EmbedderError> {
+            if texts.is_empty() {
+                return Err(EmbedderError::EmptyBatch);
+            }
+            Ok(vec![self.vector.clone(); texts.len()])
+        }
+    }
+
+    fn test_sparse_vector(weights: Vec<(u32, f32)>) -> SparseLexicalVector {
+        SparseLexicalVector::new(
+            SparseEmbeddingModel::bge_m3_sparse(),
+            weights
+                .into_iter()
+                .map(|(token_id, weight)| SparseWeight::new(token_id, weight))
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn sha256_of(content: &str) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(content.as_bytes());
+        hasher.finalize().into()
+    }
+
+    async fn insert_sparse_for_test(
+        pool: &PgPool,
+        thought_id: ThoughtId,
+        content: &str,
+        vector: &SparseLexicalVector,
+    ) {
+        let provenance = kengram_storage::SparseEmbeddingProvenance::bge_m3_flag_embedding("test");
+        kengram_storage::insert_thought_sparse_embedding(
+            pool,
+            thought_id,
+            sha256_of(content),
+            content.len() as i32,
+            vector,
+            &provenance,
+        )
+        .await
+        .unwrap();
     }
 
     fn test_embedder() -> FakeEmbedder {
@@ -2477,6 +2639,7 @@ mod tests {
         let resp = search_thoughts_with_tuning(
             &pool,
             &embedder,
+            None,
             None,
             None,
             SearchRuntimeOptions::default(),
@@ -3717,6 +3880,145 @@ mod tests {
         let profile = resp.profile.expect("profile requested");
         assert_eq!(profile.rerank_candidate_count, 4);
         assert_eq!(profile.graph_candidates_retained_after_filters, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn sparse_rerank_pool_is_additive_and_preserves_baseline_candidates(pool: PgPool) {
+        let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
+        cap(&pool, "sparse additive baseline marker first", "global").await;
+        cap(&pool, "sparse additive baseline marker second", "global").await;
+        cap(&pool, "sparse additive baseline marker third", "global").await;
+        let sparse_content = "lexical unrelated sparse-only competitor";
+        let sparse_id = cap(&pool, sparse_content, "global").await;
+        let sparse_vector = test_sparse_vector(vec![(101, 1.0)]);
+        insert_sparse_for_test(&pool, sparse_id, sparse_content, &sparse_vector).await;
+
+        let baseline_reranker = FakeReranker::new();
+        search_thoughts_with_runtime(
+            &pool,
+            &bad,
+            Some(&baseline_reranker),
+            None,
+            SearchRuntimeOptions::default(),
+            SearchRequest {
+                query: "sparse additive baseline marker".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(true),
+                candidate_pool: Some(3),
+                tag_filter: None,
+                chunk_serving_enabled: false,
+                full_pipeline_enabled: true,
+                tag_domain_routing_enabled: false,
+                include_profile: true,
+            },
+        )
+        .await
+        .unwrap();
+        let baseline_candidates = baseline_reranker
+            .last_call()
+            .expect("baseline reranker should record candidate pool")
+            .candidates;
+        assert_eq!(baseline_candidates.len(), 3);
+        assert!(
+            baseline_candidates
+                .iter()
+                .all(|candidate| candidate.contains("sparse additive baseline marker"))
+        );
+
+        let sparse_reranker = FakeReranker::new();
+        let sparse_embedder = StaticSparseEmbedder {
+            vector: sparse_vector,
+        };
+        let resp = search_thoughts_with_runtime_and_sparse(
+            &pool,
+            &bad,
+            Some(&sparse_embedder),
+            Some(&sparse_reranker),
+            None,
+            SearchRuntimeOptions {
+                sparse_lexical_enabled: true,
+                ..SearchRuntimeOptions::default()
+            },
+            SearchRequest {
+                query: "sparse additive baseline marker".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(true),
+                candidate_pool: Some(3),
+                tag_filter: None,
+                chunk_serving_enabled: false,
+                full_pipeline_enabled: true,
+                tag_domain_routing_enabled: false,
+                include_profile: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let sparse_candidates = sparse_reranker
+            .last_call()
+            .expect("sparse reranker should record candidate pool")
+            .candidates;
+        assert_eq!(
+            sparse_candidates.len(),
+            4,
+            "candidate pool should grow from baseline 3 to baseline 3 + sparse 1"
+        );
+        for baseline_candidate in baseline_candidates {
+            assert!(
+                sparse_candidates.contains(&baseline_candidate),
+                "sparse expansion must not evict baseline rerank candidate: {baseline_candidate}"
+            );
+        }
+        assert!(
+            sparse_candidates
+                .iter()
+                .any(|candidate| candidate == sparse_content),
+            "sparse candidate should still compete in the cross-encoder input"
+        );
+        let profile = resp.profile.expect("profile requested");
+        assert!(profile.sparse_lexical_enabled);
+        assert_eq!(profile.thought_sparse_hits, 1);
+        assert_eq!(profile.rerank_candidate_count, 4);
+        assert_eq!(profile.sparse_candidates_retained_after_filters, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn sparse_lexical_enabled_without_encoder_fails_closed(pool: PgPool) {
+        let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
+        let err = search_thoughts_with_runtime(
+            &pool,
+            &bad,
+            None,
+            None,
+            SearchRuntimeOptions {
+                sparse_lexical_enabled: true,
+                ..SearchRuntimeOptions::default()
+            },
+            SearchRequest {
+                query: "sparse missing encoder".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(false),
+                candidate_pool: None,
+                tag_filter: None,
+                chunk_serving_enabled: false,
+                full_pipeline_enabled: true,
+                tag_domain_routing_enabled: false,
+                include_profile: false,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ReadError::SparseQueryEncoderUnavailable));
     }
 
     #[sqlx::test(migrations = "../../migrations")]

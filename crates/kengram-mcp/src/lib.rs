@@ -50,7 +50,7 @@ pub use search::{
     MAX_GRAPH_TOTAL_CAP, MAX_SEARCH_LIMIT, ReadError, RecentRequest, RecentResponse,
     ScopeSummaryHit, SearchHit, SearchRequest, SearchResponse, SearchRuntimeOptions,
     default_graph_relations, get_thought, list_scopes, recent_thoughts, search_thoughts,
-    search_thoughts_with_runtime,
+    search_thoughts_with_runtime, search_thoughts_with_runtime_and_sparse,
 };
 pub use server::{
     CaptureArgs, GetRelatedThoughtsArgs, GetThoughtArgs, KengramServer, LinkThoughtsArgs,

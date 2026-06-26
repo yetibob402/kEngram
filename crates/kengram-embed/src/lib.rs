@@ -17,11 +17,13 @@
 pub mod fake;
 pub mod fake_reranker;
 pub mod openai_compatible;
+pub mod openai_compatible_sparse;
 pub mod reranker;
 pub mod tei_reranker;
 
 pub use fake::{FakeBehavior, FakeEmbedder};
 pub use fake_reranker::{FakeReranker, FakeRerankerBehavior, FakeRerankerScoring, RecordedRerank};
 pub use openai_compatible::{OpenAICompatibleConfig, OpenAICompatibleEmbedder};
+pub use openai_compatible_sparse::{OpenAICompatibleSparseConfig, OpenAICompatibleSparseEmbedder};
 pub use reranker::{RerankScore, Reranker, RerankerError};
 pub use tei_reranker::{TeiReranker, TeiRerankerConfig};

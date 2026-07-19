@@ -233,42 +233,53 @@ pub async fn unlink_thoughts(
     claimed_producer_class: Option<&str>,
 ) -> Result<UnlinkThoughtsResponse, LinkError> {
     validate_source_event(&source_event)?;
-    match kengram_storage::lookup_link_status(pool, from, relation, target).await? {
-        LinkStatus::Live => {
-            let operations = serde_json::json!([{
-                "action": "delete",
-                "from_thought_id": from.to_string(),
-                "relation": relation.as_str(),
-                "to_kind": target.kind_str(),
-                "to_value": target.value_str(),
-                "source": "agent",
-            }]);
-            let result = kengram_storage::corpus_hygiene::mutate_thought_relations_serialized(
-                pool,
-                kengram_storage::corpus_hygiene::RelationMutationRequest {
-                    operations: &operations,
-                    source_event_namespace: &source_event.namespace,
-                    source_event_ref: &source_event.source_ref,
-                    source_event_payload_hash: &source_event.payload_hash,
-                    request_metadata: &source_event.metadata,
-                    claimed_producer_class,
-                },
-            )
-            .await?;
-            if result.get("status").and_then(|v| v.as_str()) == Some("source_event_conflict") {
-                return Err(LinkError::SourceEventConflict);
-            }
-            Ok(UnlinkThoughtsResponse {
-                status: UnlinkStatus::DeletedNow,
-            })
-        }
-        LinkStatus::SoftDeleted => Ok(UnlinkThoughtsResponse {
-            status: UnlinkStatus::AlreadyDeleted,
-        }),
-        LinkStatus::NeverExisted => Ok(UnlinkThoughtsResponse {
-            status: UnlinkStatus::NeverExisted,
-        }),
+    let operations = serde_json::json!([{
+        "action": "delete",
+        "from_thought_id": from.to_string(),
+        "relation": relation.as_str(),
+        "to_kind": target.kind_str(),
+        "to_value": target.value_str(),
+        "source": "agent",
+    }]);
+    let result = kengram_storage::corpus_hygiene::mutate_thought_relations_serialized(
+        pool,
+        kengram_storage::corpus_hygiene::RelationMutationRequest {
+            operations: &operations,
+            source_event_namespace: &source_event.namespace,
+            source_event_ref: &source_event.source_ref,
+            source_event_payload_hash: &source_event.payload_hash,
+            request_metadata: &source_event.metadata,
+            claimed_producer_class,
+        },
+    )
+    .await?;
+    if result.get("status").and_then(|v| v.as_str()) == Some("source_event_conflict") {
+        return Err(LinkError::SourceEventConflict);
     }
+    if result
+        .get("link_ids")
+        .and_then(|ids| ids.as_array())
+        .is_some_and(|ids| !ids.is_empty())
+    {
+        return Ok(UnlinkThoughtsResponse {
+            status: UnlinkStatus::DeletedNow,
+        });
+    }
+
+    // Only derive the no-op discriminator after the durable request ledger
+    // has accepted this exact payload and canonical delete intent.
+    let status = match kengram_storage::lookup_link_status(pool, from, relation, target).await? {
+        LinkStatus::Live => {
+            return Err(LinkError::Storage(kengram_storage::StorageError::Database(
+                sqlx::Error::Protocol(
+                    "link became live after serialized unlink result".to_string(),
+                ),
+            )));
+        }
+        LinkStatus::SoftDeleted => UnlinkStatus::AlreadyDeleted,
+        LinkStatus::NeverExisted => UnlinkStatus::NeverExisted,
+    };
+    Ok(UnlinkThoughtsResponse { status })
 }
 
 fn validate_source_event(event: &RelationSourceEventRequest) -> Result<(), LinkError> {
@@ -607,6 +618,83 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp.status, UnlinkStatus::AlreadyDeleted);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn unlink_conflict_is_checked_for_already_deleted_and_never_existed(pool: PgPool) {
+        let from = cap(&pool, "unlink conflict source").await;
+        let first_target = LinkTarget::Thought(cap(&pool, "first unlink target").await);
+        let deleted_target = LinkTarget::Thought(cap(&pool, "already deleted target").await);
+        let never_target = LinkTarget::Thought(cap(&pool, "never existed target").await);
+
+        for target in [&first_target, &deleted_target] {
+            link_thoughts(
+                &pool,
+                LinkThoughtsRequest {
+                    from_thought_id: from,
+                    relation: RelationKind::References,
+                    target: target.clone(),
+                    note: None,
+                    source_event: relation_event(),
+                    claimed_producer_class: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let accepted_event = relation_event();
+        let first = unlink_thoughts(
+            &pool,
+            from,
+            RelationKind::References,
+            &first_target,
+            accepted_event.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.status, UnlinkStatus::DeletedNow);
+        unlink_thoughts(
+            &pool,
+            from,
+            RelationKind::References,
+            &deleted_target,
+            relation_event(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let already_deleted_conflict = unlink_thoughts(
+            &pool,
+            from,
+            RelationKind::References,
+            &deleted_target,
+            accepted_event.clone(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            already_deleted_conflict,
+            LinkError::SourceEventConflict
+        ));
+
+        let never_existed_conflict = unlink_thoughts(
+            &pool,
+            from,
+            RelationKind::References,
+            &never_target,
+            accepted_event,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            never_existed_conflict,
+            LinkError::SourceEventConflict
+        ));
     }
 
     #[sqlx::test(migrations = "../../migrations")]

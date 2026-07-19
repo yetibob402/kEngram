@@ -253,7 +253,7 @@ mod tests {
     use super::*;
     use kengram_core::EmbeddingModel;
     use serde_json::json;
-    use sqlx::Row;
+    use sqlx::{PgConnection, Row, postgres::PgRow};
 
     const TEST_EMBEDDER_MODEL_ID: &str = "bge-m3:1024";
     const TEST_TAGGER_MODEL_ID: &str = "fake/tagger";
@@ -266,6 +266,61 @@ mod tests {
             metadata: None,
             argus_source_event: None,
         }
+    }
+
+    fn unit_vector_literal() -> String {
+        format!("[{}]", vec!["0.03125"; 1024].join(","))
+    }
+
+    async fn gated_capture_on_connection(
+        connection: &mut PgConnection,
+        scope: &str,
+        content: &str,
+        source_event: Option<(&str, &str, &str)>,
+        relation_intents: &serde_json::Value,
+        tagger_model_id: Option<&str>,
+    ) -> PgRow {
+        let (namespace, source_ref, payload_hash) = source_event
+            .map(|(namespace, source_ref, payload_hash)| {
+                (Some(namespace), Some(source_ref), Some(payload_hash))
+            })
+            .unwrap_or((None, None, None));
+        sqlx::query(
+            r#"
+            SELECT *
+            FROM public.capture_thought_gated(
+                p_scope => $1,
+                p_content => $2,
+                p_source => 'test',
+                p_metadata => '{}'::jsonb,
+                p_source_created_at => NULL::timestamptz,
+                p_candidate_embedding => $3::vector(1024),
+                p_embedding_model_id => 'bge-m3:1024',
+                p_embedding_model_version => 1,
+                p_bypass_reason => NULL::jsonb,
+                p_source_event_namespace => $4,
+                p_source_event_ref => $5,
+                p_source_event_payload_hash => $6,
+                p_source_event_metadata => '{}'::jsonb,
+                p_relation_intents => $7,
+                p_tagger_model_id => $8,
+                p_claimed_producer_class => NULL::text,
+                p_correlation_id => NULL::text,
+                p_force_keep_token => NULL::text
+            )
+            "#,
+        )
+        .bind(scope)
+        .bind(content)
+        .bind(unit_vector_literal())
+        .bind(namespace)
+        .bind(source_ref)
+        .bind(payload_hash)
+        .bind(relation_intents)
+        .bind(tagger_model_id)
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap()
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -678,5 +733,381 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(counts, (0, 0, 0));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn protected_atoms_use_exact_canonical_membership(pool: PgPool) {
+        sqlx::query(
+            "UPDATE corpus_hygiene_gate_settings SET mode='enforce' WHERE principal_name='kengram_rt_session'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut connection = pool.acquire().await.unwrap();
+        sqlx::query("SET SESSION AUTHORIZATION kengram_rt_session")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+
+        let mut outcomes = Vec::new();
+        for (case_name, keeper_atom, candidate_atom) in [
+            ("bare-count", "12", "1"),
+            ("issue-number", "#12", "#1"),
+            ("currency-amount", "$12", "$1"),
+        ] {
+            let scope = format!("agents/protected-{case_name}");
+            let keeper = format!(
+                "The operational queue reports {keeper_atom} pending items and this deliberately long shared description repeats the same stable words so semantic similarity stays exact while the protected fact differs."
+            );
+            let candidate = format!(
+                "The operational queue reports {candidate_atom} pending items and this deliberately long shared description repeats the same stable words so semantic similarity stays exact while the protected fact differs."
+            );
+            let empty_intents = json!([]);
+            let first = gated_capture_on_connection(
+                &mut connection,
+                &scope,
+                &keeper,
+                None,
+                &empty_intents,
+                None,
+            )
+            .await;
+            let second = gated_capture_on_connection(
+                &mut connection,
+                &scope,
+                &candidate,
+                None,
+                &empty_intents,
+                None,
+            )
+            .await;
+            outcomes.push((
+                case_name,
+                first.try_get::<String, _>("action").unwrap(),
+                second.try_get::<String, _>("action").unwrap(),
+                second.try_get::<uuid::Uuid, _>("gate_event_id").unwrap(),
+                candidate_atom.to_string(),
+            ));
+        }
+
+        sqlx::query("RESET SESSION AUTHORIZATION")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        drop(connection);
+
+        for (case_name, first_action, second_action, gate_event_id, candidate_atom) in outcomes {
+            assert_eq!(first_action, "inserted", "{case_name} keeper");
+            assert_eq!(second_action, "inserted", "{case_name} candidate");
+            let missing: Vec<String> = sqlx::query_scalar(
+                "SELECT unnest(missing_protected_atoms) FROM thought_ingest_gate_events WHERE id=$1",
+            )
+            .bind(gate_event_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(missing, vec![candidate_atom], "{case_name}");
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_replay_rejects_changed_canonical_relation_intent(pool: PgPool) {
+        let mut connection = pool.acquire().await.unwrap();
+        sqlx::query("SET SESSION AUTHORIZATION kengram_rt_native_mcp")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+
+        let empty_intents = json!([]);
+        let target = gated_capture_on_connection(
+            &mut connection,
+            "agents/relation-replay",
+            "Target thought for changed relation intent replay validation.",
+            None,
+            &empty_intents,
+            None,
+        )
+        .await
+        .try_get::<uuid::Uuid, _>("thought_id")
+        .unwrap();
+        let supports = json!([{
+            "action": "create",
+            "relation": "supports",
+            "to_kind": "thought",
+            "to_value": target,
+            "source": "agent",
+        }]);
+        let references = json!([{
+            "action": "create",
+            "relation": "references",
+            "to_kind": "thought",
+            "to_value": target,
+            "source": "agent",
+        }]);
+        let source_identity = Some(("tests/capture-replay", "changed-intent", "payload-a"));
+        let first = gated_capture_on_connection(
+            &mut connection,
+            "agents/relation-replay",
+            "Source thought whose durable replay intent must remain supports.",
+            source_identity,
+            &supports,
+            None,
+        )
+        .await;
+        let source_thought_id = first.try_get::<uuid::Uuid, _>("thought_id").unwrap();
+        let replay = gated_capture_on_connection(
+            &mut connection,
+            "agents/relation-replay",
+            "Source thought whose durable replay intent must remain supports.",
+            source_identity,
+            &references,
+            None,
+        )
+        .await;
+        let replay_action = replay.try_get::<String, _>("action").unwrap();
+
+        sqlx::query("RESET SESSION AUTHORIZATION")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(replay_action, "source_event_conflict");
+        let relations: Vec<String> = sqlx::query_scalar(
+            "SELECT relation FROM thought_links WHERE from_thought_id=$1 AND deleted_at IS NULL ORDER BY relation",
+        )
+        .bind(source_thought_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(relations, vec!["supports"]);
+        let recorded_relation: String = sqlx::query_scalar(
+            "SELECT operations->0->>'relation' FROM thought_relation_request_events WHERE source_event_namespace='tests/capture-replay' AND source_event_ref='changed-intent'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(recorded_relation, "supports");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn runtime_role_duplicate_is_classified_by_gate_without_table_update(pool: PgPool) {
+        let runtime_can_update: bool = sqlx::query_scalar(
+            "SELECT has_table_privilege('kengram_rt_session', 'argus_source_events', 'UPDATE')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!runtime_can_update);
+
+        let mut connection = pool.acquire().await.unwrap();
+        sqlx::query("SET SESSION AUTHORIZATION kengram_rt_session")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        let identity = Some(("tests/runtime-adapter", "duplicate-1", "payload-1"));
+        let content = "An adapter-equivalent duplicate must be accepted and classified through the security-definer gate without direct source-event UPDATE privilege.";
+        let first = gated_capture_on_connection(
+            &mut connection,
+            "agents/runtime-adapter",
+            content,
+            identity,
+            &json!([]),
+            None,
+        )
+        .await;
+        let replay = gated_capture_on_connection(
+            &mut connection,
+            "agents/runtime-adapter",
+            content,
+            identity,
+            &json!([]),
+            None,
+        )
+        .await;
+        let dispositions = (
+            first.try_get::<String, _>("action").unwrap(),
+            first.try_get::<String, _>("source_event_action").unwrap(),
+            replay.try_get::<String, _>("action").unwrap(),
+            replay.try_get::<String, _>("source_event_action").unwrap(),
+        );
+        sqlx::query("RESET SESSION AUTHORIZATION")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dispositions,
+            (
+                "inserted".into(),
+                "stored".into(),
+                "exact_duplicate".into(),
+                "replay".into()
+            )
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn contended_family_lock_fails_open_and_queues_with_signal(pool: PgPool) {
+        sqlx::query(
+            "UPDATE corpus_hygiene_gate_settings SET mode='enforce' WHERE principal_name='kengram_rt_session'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let agent_key = "blocked-lock-agent";
+        let mut lock_connection = pool.acquire().await.unwrap();
+        sqlx::query("BEGIN")
+            .execute(&mut *lock_connection)
+            .await
+            .unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 727061667331::bigint))")
+            .bind(agent_key)
+            .execute(&mut *lock_connection)
+            .await
+            .unwrap();
+
+        let mut capture_connection = pool.acquire().await.unwrap();
+        sqlx::query("SET SESSION AUTHORIZATION kengram_rt_session")
+            .execute(&mut *capture_connection)
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let row = gated_capture_on_connection(
+            &mut capture_connection,
+            &format!("agents/{agent_key}"),
+            "A contended family lock must keep this capture and queue ordinary asynchronous embedding and tag work instead of waiting.",
+            None,
+            &json!([]),
+            Some(TEST_TAGGER_MODEL_ID),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let thought_id = row.try_get::<uuid::Uuid, _>("thought_id").unwrap();
+        let action = row.try_get::<String, _>("action").unwrap();
+        let gate_event_id = row.try_get::<uuid::Uuid, _>("gate_event_id").unwrap();
+        sqlx::query("RESET SESSION AUTHORIZATION")
+            .execute(&mut *capture_connection)
+            .await
+            .unwrap();
+        sqlx::query("ROLLBACK")
+            .execute(&mut *lock_connection)
+            .await
+            .unwrap();
+        drop(capture_connection);
+        drop(lock_connection);
+
+        assert_eq!(action, "fail_open_insert");
+        assert!(elapsed < std::time::Duration::from_secs(1));
+        let pending_embedding: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pending_embeddings WHERE target_kind='thought' AND target_id=$1 AND model_id='bge-m3:1024'",
+        )
+        .bind(thought_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let pending_tag: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pending_tags WHERE thought_id=$1")
+                .bind(thought_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let signal: (String, String) = sqlx::query_as(
+            "SELECT action, bypass_reason->>'code' FROM thought_ingest_gate_events WHERE id=$1",
+        )
+        .bind(gate_event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pending_embedding, 1);
+        assert_eq!(pending_tag, 1);
+        assert_eq!(
+            signal,
+            (
+                "fail_open_insert".into(),
+                "similarity_lock_contended".into()
+            )
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn comparison_statement_timeout_fails_open_and_queues(pool: PgPool) {
+        let mut lock_connection = pool.acquire().await.unwrap();
+        sqlx::query("BEGIN")
+            .execute(&mut *lock_connection)
+            .await
+            .unwrap();
+        sqlx::query("LOCK TABLE thought_embeddings_bge_m3 IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock_connection)
+            .await
+            .unwrap();
+
+        let metadata = json!({});
+        let intents = json!([]);
+        let candidate = vec![0.03125_f32; 1024];
+        let started = std::time::Instant::now();
+        let result = kengram_storage::corpus_hygiene::capture_thought_gated(
+            &pool,
+            kengram_storage::corpus_hygiene::GatedCaptureRequest {
+                scope: "agents/comparison-timeout",
+                content: "A blocked similarity table read must become a durable queued fail-open capture before the total caller deadline.",
+                source: "test",
+                metadata: &metadata,
+                source_created_at: Some(OffsetDateTime::now_utc()),
+                candidate_embedding: Some(&candidate),
+                embedding_model_id: Some("bge-m3:1024"),
+                embedding_model_version: Some(1),
+                bypass_reason: None,
+                source_event_namespace: None,
+                source_event_ref: None,
+                source_event_payload_hash: None,
+                source_event_metadata: None,
+                relation_intents: &intents,
+                tagger_model_id: Some(TEST_TAGGER_MODEL_ID),
+                claimed_producer_class: None,
+                correlation_id: Some("comparison-timeout"),
+                force_keep_token: None,
+            },
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+        sqlx::query("ROLLBACK")
+            .execute(&mut *lock_connection)
+            .await
+            .unwrap();
+        drop(lock_connection);
+
+        assert_eq!(result.action, "fail_open_insert");
+        assert!(elapsed < std::time::Duration::from_secs(1));
+        let thought_id = result.thought_id.unwrap();
+        let pending_embedding: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pending_embeddings WHERE target_kind='thought' AND target_id=$1",
+        )
+        .bind(thought_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let pending_tag: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pending_tags WHERE thought_id=$1")
+                .bind(thought_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let bypass: (String, String) = sqlx::query_as(
+            "SELECT bypass_reason->>'code', bypass_reason->>'sqlstate' FROM thought_ingest_gate_events WHERE id=$1",
+        )
+        .bind(result.gate_event_id.unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pending_embedding, 1);
+        assert_eq!(pending_tag, 1);
+        assert_eq!(
+            bypass,
+            ("similarity_comparison_unavailable".into(), "57014".into())
+        );
     }
 }

@@ -1076,6 +1076,8 @@ mod tests {
         let b = capture_and_enqueue_tag(&pool, "thought B").await;
 
         // Agent-supplied edge from a to b.
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let request_metadata = serde_json::json!({"test": true});
         kengram_storage::insert_link(
             &pool,
             a,
@@ -1083,6 +1085,12 @@ mod tests {
             &LinkTarget::Thought(b),
             LinkSource::Agent,
             None,
+            kengram_storage::RelationMutationIdentity {
+                namespace: "tests/drain-relations",
+                source_ref: &request_id,
+                payload_hash: &request_id,
+                metadata: &request_metadata,
+            },
         )
         .await
         .unwrap();

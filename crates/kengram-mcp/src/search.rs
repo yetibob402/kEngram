@@ -2840,6 +2840,8 @@ mod tests {
         to: ThoughtId,
         pool: &PgPool,
     ) {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let metadata = serde_json::json!({"test": true});
         kengram_storage::insert_link(
             pool,
             from,
@@ -2847,6 +2849,12 @@ mod tests {
             &LinkTarget::Thought(to),
             LinkSource::Agent,
             None,
+            kengram_storage::RelationMutationIdentity {
+                namespace: "tests/search-relations",
+                source_ref: &request_id,
+                payload_hash: &request_id,
+                metadata: &metadata,
+            },
         )
         .await
         .unwrap();
@@ -4030,6 +4038,8 @@ mod tests {
             LinkTarget::Person("Bob Hrbek".to_string()),
             LinkTarget::Url("https://example.com/model-t".to_string()),
         ] {
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let metadata = serde_json::json!({"test": true});
             kengram_storage::insert_link(
                 &pool,
                 seed_id,
@@ -4037,6 +4047,12 @@ mod tests {
                 &target,
                 LinkSource::Agent,
                 None,
+                kengram_storage::RelationMutationIdentity {
+                    namespace: "tests/search-relations",
+                    source_ref: &request_id,
+                    payload_hash: &request_id,
+                    metadata: &metadata,
+                },
             )
             .await
             .unwrap();
@@ -4193,11 +4209,19 @@ mod tests {
         link_thoughts_for_test(seed, RelationKind::Supports, clean, &pool).await;
         link_thoughts_for_test(seed, RelationKind::Supports, deleted, &pool).await;
         link_thoughts_for_test(seed, RelationKind::Supports, retracted, &pool).await;
+        let delete_request_id = uuid::Uuid::new_v4().to_string();
+        let delete_metadata = serde_json::json!({"test": true});
         kengram_storage::delete_link(
             &pool,
             seed,
             RelationKind::Supports,
             &LinkTarget::Thought(deleted),
+            kengram_storage::RelationMutationIdentity {
+                namespace: "tests/search-relations",
+                source_ref: &delete_request_id,
+                payload_hash: &delete_request_id,
+                metadata: &delete_metadata,
+            },
         )
         .await
         .unwrap();

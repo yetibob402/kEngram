@@ -4696,6 +4696,17 @@ pub enum LinkStatus {
     NeverExisted,
 }
 
+/// Producer-stable identity for compatibility callers that still use the
+/// typed storage link helpers instead of calling the serialized relation
+/// primitive directly. The producer must reuse this identity on retry.
+#[derive(Debug, Clone, Copy)]
+pub struct RelationMutationIdentity<'a> {
+    pub namespace: &'a str,
+    pub source_ref: &'a str,
+    pub payload_hash: &'a str,
+    pub metadata: &'a serde_json::Value,
+}
+
 /// Insert a link with a polymorphic target. Idempotent on the
 /// `(from, relation, to_kind, to_value)` quadruple via the partial unique
 /// index `thought_links_unique_edge` (which only covers rows with
@@ -4708,7 +4719,8 @@ pub enum LinkStatus {
 /// CHECK violations (e.g., `to_url` not matching `^https?://`) are surfaced
 /// as `StorageError::Database`. The MCP layer should pre-validate where
 /// it can so the operator-facing error is actionable; this layer is the
-/// last line of defense.
+/// last line of defense. `request_identity` must come from the producer and
+/// remain byte-stable across retries of one logical request.
 pub async fn insert_link(
     pool: &PgPool,
     from: ThoughtId,
@@ -4716,6 +4728,7 @@ pub async fn insert_link(
     target: &LinkTarget,
     source: LinkSource,
     note: Option<&str>,
+    request_identity: RelationMutationIdentity<'_>,
 ) -> Result<(LinkId, bool), StorageError> {
     let was_live = lookup_link_status(pool, from, relation, target).await? == LinkStatus::Live;
     let operation = serde_json::json!([{
@@ -4727,20 +4740,27 @@ pub async fn insert_link(
         "source": source.as_str(),
         "note": note,
     }]);
-    let request_id = Uuid::new_v4().to_string();
-    let metadata = serde_json::json!({"compatibility_surface": "insert_link"});
+    let metadata = serde_json::json!({
+        "compatibility_surface": "insert_link",
+        "producer_metadata": request_identity.metadata,
+    });
     let result = corpus_hygiene::mutate_thought_relations_serialized(
         pool,
         corpus_hygiene::RelationMutationRequest {
             operations: &operation,
-            source_event_namespace: "kengram/storage-compat",
-            source_event_ref: &request_id,
-            source_event_payload_hash: &request_id,
+            source_event_namespace: request_identity.namespace,
+            source_event_ref: request_identity.source_ref,
+            source_event_payload_hash: request_identity.payload_hash,
             request_metadata: &metadata,
             claimed_producer_class: None,
         },
     )
     .await?;
+    if result.get("status").and_then(|value| value.as_str()) != Some("completed") {
+        return Err(StorageError::Database(sqlx::Error::Protocol(format!(
+            "serialized link mutation did not complete: {result}"
+        ))));
+    }
     let id = result
         .get("link_ids")
         .and_then(|ids| ids.as_array())
@@ -4801,35 +4821,16 @@ pub async fn lookup_link_status(
 /// Soft-delete the live edge identified by `(from, relation, target)`.
 /// Returns `Some(link_id)` if a live row was just soft-deleted; `None`
 /// otherwise (the edge was already soft-deleted or never existed —
-/// callers should pair with `lookup_link_status` to disambiguate).
+/// callers should pair with `lookup_link_status` to disambiguate). The
+/// producer must reuse `request_identity` on retry.
 pub async fn delete_link(
     pool: &PgPool,
     from: ThoughtId,
     relation: RelationKind,
     target: &LinkTarget,
+    request_identity: RelationMutationIdentity<'_>,
 ) -> Result<Option<LinkId>, StorageError> {
     let value = target.value_str();
-    let row = sqlx::query(
-        r#"
-        SELECT id
-        FROM thought_links
-        WHERE from_thought_id = $1
-          AND relation = $2
-          AND to_kind = $3
-          AND to_value = $4
-          AND deleted_at IS NULL
-        "#,
-    )
-    .bind(from.into_uuid())
-    .bind(relation.as_str())
-    .bind(target.kind_str())
-    .bind(&value)
-    .fetch_optional(pool)
-    .await?;
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let id: Uuid = row.try_get("id")?;
     let operation = serde_json::json!([{
         "action": "delete",
         "from_thought_id": from.to_string(),
@@ -4838,21 +4839,34 @@ pub async fn delete_link(
         "to_value": value,
         "source": "agent",
     }]);
-    let request_id = Uuid::new_v4().to_string();
-    let metadata = serde_json::json!({"compatibility_surface": "delete_link"});
-    corpus_hygiene::mutate_thought_relations_serialized(
+    let metadata = serde_json::json!({
+        "compatibility_surface": "delete_link",
+        "producer_metadata": request_identity.metadata,
+    });
+    let result = corpus_hygiene::mutate_thought_relations_serialized(
         pool,
         corpus_hygiene::RelationMutationRequest {
             operations: &operation,
-            source_event_namespace: "kengram/storage-compat",
-            source_event_ref: &request_id,
-            source_event_payload_hash: &request_id,
+            source_event_namespace: request_identity.namespace,
+            source_event_ref: request_identity.source_ref,
+            source_event_payload_hash: request_identity.payload_hash,
             request_metadata: &metadata,
             claimed_producer_class: None,
         },
     )
     .await?;
-    Ok(Some(LinkId::from(id)))
+    if result.get("status").and_then(|value| value.as_str()) != Some("completed") {
+        return Err(StorageError::Database(sqlx::Error::Protocol(format!(
+            "serialized unlink mutation did not complete: {result}"
+        ))));
+    }
+    Ok(result
+        .get("link_ids")
+        .and_then(|ids| ids.as_array())
+        .and_then(|ids| ids.first())
+        .and_then(|id| id.as_str())
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .map(LinkId::from))
 }
 
 /// Soft-delete all live (`deleted_at IS NULL`) edges where this thought is
@@ -4862,10 +4876,12 @@ pub async fn delete_link(
 ///
 /// Agent-supplied edges (`source = 'agent'`) are unaffected — the operator
 /// has explicit authority over those, and a tagger-prompt iteration must
-/// not silently erase them.
+/// not silently erase them. The caller supplies the retry-stable generation
+/// identity that owns this replacement request.
 pub async fn soft_delete_tagger_edges_for_thought(
     pool: &PgPool,
     from_thought_id: ThoughtId,
+    request_identity: RelationMutationIdentity<'_>,
 ) -> Result<i64, StorageError> {
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)::bigint FROM thought_links WHERE from_thought_id = $1 AND source = 'tagger' AND deleted_at IS NULL",
@@ -4878,20 +4894,27 @@ pub async fn soft_delete_tagger_edges_for_thought(
         "from_thought_id": from_thought_id.to_string(),
         "relations": [],
     }]);
-    let request_id = Uuid::new_v4().to_string();
-    let metadata = serde_json::json!({"compatibility_surface": "soft_delete_tagger_edges"});
-    corpus_hygiene::mutate_thought_relations_serialized(
+    let metadata = serde_json::json!({
+        "compatibility_surface": "soft_delete_tagger_edges",
+        "producer_metadata": request_identity.metadata,
+    });
+    let result = corpus_hygiene::mutate_thought_relations_serialized(
         pool,
         corpus_hygiene::RelationMutationRequest {
             operations: &operation,
-            source_event_namespace: "kengram/storage-compat",
-            source_event_ref: &request_id,
-            source_event_payload_hash: &request_id,
+            source_event_namespace: request_identity.namespace,
+            source_event_ref: request_identity.source_ref,
+            source_event_payload_hash: request_identity.payload_hash,
             request_metadata: &metadata,
             claimed_producer_class: None,
         },
     )
     .await?;
+    if result.get("status").and_then(|value| value.as_str()) != Some("completed") {
+        return Err(StorageError::Database(sqlx::Error::Protocol(format!(
+            "serialized tagger-edge mutation did not complete: {result}"
+        ))));
+    }
     Ok(count)
 }
 
@@ -6838,6 +6861,75 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(content.as_bytes());
         hasher.finalize().into()
+    }
+
+    async fn insert_link(
+        pool: &PgPool,
+        from: ThoughtId,
+        relation: RelationKind,
+        target: &LinkTarget,
+        source: LinkSource,
+        note: Option<&str>,
+    ) -> Result<(LinkId, bool), StorageError> {
+        let request_id = Uuid::new_v4().to_string();
+        let metadata = json!({"test": true});
+        super::insert_link(
+            pool,
+            from,
+            relation,
+            target,
+            source,
+            note,
+            RelationMutationIdentity {
+                namespace: "tests/storage-compat",
+                source_ref: &request_id,
+                payload_hash: &request_id,
+                metadata: &metadata,
+            },
+        )
+        .await
+    }
+
+    async fn delete_link(
+        pool: &PgPool,
+        from: ThoughtId,
+        relation: RelationKind,
+        target: &LinkTarget,
+    ) -> Result<Option<LinkId>, StorageError> {
+        let request_id = Uuid::new_v4().to_string();
+        let metadata = json!({"test": true});
+        super::delete_link(
+            pool,
+            from,
+            relation,
+            target,
+            RelationMutationIdentity {
+                namespace: "tests/storage-compat",
+                source_ref: &request_id,
+                payload_hash: &request_id,
+                metadata: &metadata,
+            },
+        )
+        .await
+    }
+
+    async fn soft_delete_tagger_edges_for_thought(
+        pool: &PgPool,
+        from: ThoughtId,
+    ) -> Result<i64, StorageError> {
+        let request_id = Uuid::new_v4().to_string();
+        let metadata = json!({"test": true});
+        super::soft_delete_tagger_edges_for_thought(
+            pool,
+            from,
+            RelationMutationIdentity {
+                namespace: "tests/storage-compat",
+                source_ref: &request_id,
+                payload_hash: &request_id,
+                metadata: &metadata,
+            },
+        )
+        .await
     }
 
     fn new_thought<'a>(
@@ -9187,6 +9279,67 @@ mod tests {
         assert!(first_is_new);
         assert!(!second_is_new, "second insert of same triple must be no-op");
         assert_eq!(first_id, second_id, "must return same link id on conflict");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn storage_compat_relations_use_producer_stable_identity(pool: PgPool) {
+        let from = insert_test_thought(&pool, "stable identity source", "global").await;
+        let first_target = insert_test_thought(&pool, "stable identity target", "global").await;
+        let changed_target =
+            insert_test_thought(&pool, "stable identity changed target", "global").await;
+        let metadata = json!({"producer": "fixture"});
+        let identity = RelationMutationIdentity {
+            namespace: "tests/storage-stable-identity",
+            source_ref: "request-1",
+            payload_hash: "payload-1",
+            metadata: &metadata,
+        };
+
+        let (first_id, first_is_new) = super::insert_link(
+            &pool,
+            from,
+            RelationKind::Supports,
+            &t(first_target),
+            LinkSource::Agent,
+            None,
+            identity,
+        )
+        .await
+        .unwrap();
+        let (replayed_id, replayed_is_new) = super::insert_link(
+            &pool,
+            from,
+            RelationKind::Supports,
+            &t(first_target),
+            LinkSource::Agent,
+            None,
+            identity,
+        )
+        .await
+        .unwrap();
+        assert!(first_is_new);
+        assert!(!replayed_is_new);
+        assert_eq!(replayed_id, first_id);
+
+        let conflict = super::insert_link(
+            &pool,
+            from,
+            RelationKind::Supports,
+            &t(changed_target),
+            LinkSource::Agent,
+            None,
+            identity,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(conflict, StorageError::Database(_)));
+        let request_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM thought_relation_request_events WHERE source_event_namespace='tests/storage-stable-identity' AND source_event_ref='request-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(request_count, 1);
     }
 
     #[sqlx::test(migrations = "../../migrations")]

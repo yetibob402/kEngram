@@ -442,7 +442,8 @@ BEGIN
 
     SELECT COALESCE(jsonb_agg(value ORDER BY
                value->>'action', value->>'from_thought_id', value->>'relation',
-               value->>'to_kind', value->>'to_value', value->>'source', value->>'note'),
+               value->>'to_kind', value->>'to_value', value->>'source', value->>'note',
+               value::text),
                '[]'::jsonb)
     INTO v_canonical
     FROM jsonb_array_elements(p_operations);
@@ -777,6 +778,7 @@ DECLARE
     v_effective timestamptz;
     v_fingerprint bytea;
     v_existing_event argus_source_events%ROWTYPE;
+    v_existing_relation thought_relation_request_events%ROWTYPE;
     v_existing_thought uuid;
     v_new_thought uuid;
     v_match_id uuid;
@@ -790,17 +792,24 @@ DECLARE
     v_event_action text;
     v_relation_results jsonb := '[]'::jsonb;
     v_relation_ops jsonb := '[]'::jsonb;
+    v_canonical_relation_intents jsonb := '[]'::jsonb;
+    v_existing_relation_intents jsonb := '[]'::jsonb;
     v_has_relations boolean := false;
+    v_relation_replay_conflict boolean := false;
     v_force_keep boolean := false;
     v_vector_valid boolean := false;
+    v_comparison_available boolean := true;
     v_effective_bypass jsonb;
     v_queue_model_id text;
     v_atoms text[] := ARRAY[]::text[];
+    v_match_atoms text[] := ARRAY[]::text[];
     v_missing_atoms text[] := ARRAY[]::text[];
     v_novelty double precision;
     v_polarity_safe boolean := true;
     v_request_identity text;
     v_status_token text;
+    v_comparison_sqlstate text;
+    v_comparison_error text;
 BEGIN
     IF p_content IS NULL OR p_content = '' THEN
         RAISE EXCEPTION 'content_must_be_nonempty' USING ERRCODE = '22023';
@@ -884,9 +893,29 @@ BEGIN
            OR intent.value ? 'from_thought_id'
            OR COALESCE(intent.value->>'action', 'create') <> 'create'
            OR COALESCE(intent.value->>'source', 'agent') <> 'agent'
+           OR COALESCE(intent.value->>'relation', '') NOT IN (
+                  'replaces','requires','references','supports',
+                  'belongs_to','decided_by','refines'
+              )
+           OR COALESCE(intent.value->>'to_kind', 'thought') NOT IN (
+                  'thought','entity','person','url'
+              )
+           OR NULLIF(intent.value->>'to_value', '') IS NULL
+           OR (
+                  COALESCE(intent.value->>'to_kind', 'thought') = 'url'
+                  AND intent.value->>'to_value' !~ '^https?://'
+              )
     ) THEN
         RAISE EXCEPTION 'invalid_capture_relation_intent' USING ERRCODE = '22023';
     END IF;
+
+    SELECT COALESCE(jsonb_agg(
+               value ORDER BY
+               value->>'action', value->>'relation', value->>'to_kind',
+               value->>'to_value', value->>'source', value->>'note', value::text
+           ), '[]'::jsonb)
+    INTO v_canonical_relation_intents
+    FROM jsonb_array_elements(p_relation_intents);
 
     v_fingerprint := public.digest(p_content, 'sha256');
     v_request_identity := COALESCE(
@@ -913,6 +942,61 @@ BEGIN
                         )
                     )
                 WHERE id = v_existing_event.id;
+                RETURN QUERY SELECT NULL::uuid, 'source_event_conflict'::text,
+                    v_existing_event.thought_id, NULL::double precision,
+                    v_settings.semantic_threshold, v_effective, v_observed,
+                    'conflict'::text, 'conflict'::text, '[]'::jsonb, NULL::uuid;
+                RETURN;
+            END IF;
+
+            -- A source replay is valid only when its canonical relation intent
+            -- is the same request that completed with the source event.  The
+            -- relation ledger stores the gate-supplied from_thought_id, so
+            -- compare the canonical producer intent after removing that one
+            -- derived field.  This also rejects adding or removing all intents
+            -- under an already-completed source identity.
+            SELECT * INTO v_existing_relation
+            FROM public.thought_relation_request_events
+            WHERE source_event_namespace = p_source_event_namespace
+              AND source_event_ref = p_source_event_ref
+            FOR UPDATE;
+
+            IF v_has_relations THEN
+                -- Force UUID parsing and self-reference validation before a
+                -- replay can return success without reaching relation DML.
+                IF EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements(v_canonical_relation_intents) AS intent(value)
+                    WHERE COALESCE(intent.value->>'to_kind', 'thought') = 'thought'
+                      AND (intent.value->>'to_value')::uuid = v_existing_event.thought_id
+                ) THEN
+                    RAISE EXCEPTION 'relation_intent_self_reference' USING ERRCODE = '23514';
+                END IF;
+
+                IF v_existing_relation.id IS NULL THEN
+                    v_relation_replay_conflict := true;
+                ELSE
+                    SELECT COALESCE(jsonb_agg(
+                               value - 'from_thought_id' ORDER BY
+                               value->>'action', value->>'relation', value->>'to_kind',
+                               value->>'to_value', value->>'source', value->>'note',
+                               (value - 'from_thought_id')::text
+                           ), '[]'::jsonb)
+                    INTO v_existing_relation_intents
+                    FROM jsonb_array_elements(v_existing_relation.operations);
+
+                    v_relation_replay_conflict :=
+                        v_existing_relation.status <> 'completed'
+                        OR v_existing_relation.source_event_payload_hash
+                           <> p_source_event_payload_hash
+                        OR v_existing_relation_intents
+                           IS DISTINCT FROM v_canonical_relation_intents;
+                END IF;
+            ELSE
+                v_relation_replay_conflict := v_existing_relation.id IS NOT NULL;
+            END IF;
+
+            IF v_relation_replay_conflict THEN
                 RETURN QUERY SELECT NULL::uuid, 'source_event_conflict'::text,
                     v_existing_event.thought_id, NULL::double precision,
                     v_settings.semantic_threshold, v_effective, v_observed,
@@ -958,13 +1042,26 @@ BEGIN
         v_agent_key := (pg_catalog.regexp_match(p_scope, '^(agents|sessions)/([^/]+)$'))[2];
 
         IF v_agent_key IS NOT NULL THEN
-            PERFORM pg_catalog.pg_advisory_xact_lock(
+            -- Capture availability must not wait indefinitely behind another
+            -- family comparison.  A contended lock is a comparison failure,
+            -- so keep the thought, queue ordinary async work, and audit the
+            -- fail-open signal instead of blocking the caller.
+            IF pg_catalog.pg_try_advisory_xact_lock(
                 pg_catalog.hashtextextended(v_agent_key, 727061667331::bigint)
-            );
-            -- The fingerprint may have appeared while waiting on the family lock.
-            SELECT id INTO v_existing_thought
-            FROM public.thoughts
-            WHERE content_fingerprint = v_fingerprint;
+            ) THEN
+                -- The fingerprint may have appeared before this transaction
+                -- acquired the family lock.
+                SELECT id INTO v_existing_thought
+                FROM public.thoughts
+                WHERE content_fingerprint = v_fingerprint;
+            ELSE
+                v_comparison_available := false;
+                v_vector_valid := false;
+                v_effective_bypass := jsonb_build_object(
+                    'code', 'similarity_lock_contended',
+                    'agent_key', v_agent_key
+                );
+            END IF;
         END IF;
 
         IF v_existing_thought IS NOT NULL THEN
@@ -975,65 +1072,91 @@ BEGIN
             v_force_keep := v_has_relations OR v_profile.keep_only OR p_force_keep_token IS NOT NULL;
             IF v_agent_key IS NULL THEN
                 v_action := 'out_of_family_insert';
+            ELSIF NOT v_comparison_available THEN
+                v_action := 'fail_open_insert';
             ELSIF NOT v_vector_valid AND v_mode IN ('shadow','enforce') THEN
                 v_action := 'fail_open_insert';
             ELSIF v_vector_valid THEN
-                SELECT candidate.id, candidate.content, candidate.similarity
-                INTO v_match_id, v_match_content, v_similarity
-                FROM (
-                    SELECT t.id, t.content,
-                           1 - (e.embedding <=> p_candidate_embedding) AS similarity
-                    FROM public.thoughts t
-                    JOIN public.thought_embeddings_bge_m3 e ON e.thought_id = t.id
-                    WHERE t.retracted_at IS NULL
-                      AND t.scope IN ('agents/' || v_agent_key, 'sessions/' || v_agent_key)
-                      AND t.created_at >= v_effective - make_interval(days => v_settings.window_days)
-                      AND t.created_at <= v_effective + interval '5 minutes'
-                      AND e.model_id = 'bge-m3:1024' AND e.model_version = 1
-                    ORDER BY e.embedding <=> p_candidate_embedding
-                    LIMIT 20
-                ) candidate
-                ORDER BY candidate.similarity DESC
-                LIMIT 1;
+                BEGIN
+                    SELECT candidate.id, candidate.content, candidate.similarity
+                    INTO v_match_id, v_match_content, v_similarity
+                    FROM (
+                        SELECT t.id, t.content,
+                               1 - (e.embedding <=> p_candidate_embedding) AS similarity
+                        FROM public.thoughts t
+                        JOIN public.thought_embeddings_bge_m3 e ON e.thought_id = t.id
+                        WHERE t.retracted_at IS NULL
+                          AND t.scope IN ('agents/' || v_agent_key, 'sessions/' || v_agent_key)
+                          AND t.created_at >= v_effective - make_interval(days => v_settings.window_days)
+                          AND t.created_at <= v_effective + interval '5 minutes'
+                          AND e.model_id = 'bge-m3:1024' AND e.model_version = 1
+                        ORDER BY e.embedding <=> p_candidate_embedding
+                        LIMIT 20
+                    ) candidate
+                    ORDER BY candidate.similarity DESC
+                    LIMIT 1;
+                EXCEPTION
+                    -- These conditions arise only inside the similarity read.
+                    -- Principal, timestamp, source identity, relation, insert,
+                    -- queue, and integrity failures remain outside this catch
+                    -- and therefore stay fail-closed.
+                    WHEN query_canceled OR lock_not_available
+                         OR object_not_in_prerequisite_state OR data_exception THEN
+                        GET STACKED DIAGNOSTICS
+                            v_comparison_sqlstate = RETURNED_SQLSTATE,
+                            v_comparison_error = MESSAGE_TEXT;
+                        v_comparison_available := false;
+                        v_vector_valid := false;
+                        v_effective_bypass := jsonb_build_object(
+                            'code', 'similarity_comparison_unavailable',
+                            'sqlstate', v_comparison_sqlstate,
+                            'detail', v_comparison_error
+                        );
+                END;
 
-                IF v_match_id IS NOT NULL THEN
-                    v_atoms := public.corpus_hygiene_protected_atoms(p_content);
-                    SELECT COALESCE(array_agg(atom ORDER BY atom), ARRAY[]::text[])
-                    INTO v_missing_atoms
-                    FROM unnest(v_atoms) atom
-                    WHERE position(atom IN lower(v_match_content)) = 0;
-                    v_novelty := public.corpus_hygiene_novelty_ratio(p_content, v_match_content);
-
-                    FOREACH v_status_token IN ARRAY ARRAY[
-                        'not','failed','blocked','reverted','superseded','approved','denied',
-                        'open','closed','enabled','disabled'
-                    ] LOOP
-                        IF (lower(p_content) ~ ('(^|[^[:alnum:]_])' || v_status_token || '([^[:alnum:]_]|$)'))
-                           <> (lower(v_match_content) ~ ('(^|[^[:alnum:]_])' || v_status_token || '([^[:alnum:]_]|$)')) THEN
-                            v_polarity_safe := false;
-                        END IF;
-                    END LOOP;
-                END IF;
-
-                IF NOT v_force_keep
-                   AND v_mode = 'enforce'
-                   AND v_profile.enforce_eligible
-                   AND v_match_id IS NOT NULL
-                   AND v_similarity > v_settings.semantic_threshold
-                   AND length(p_content) >= 120
-                   AND cardinality(v_missing_atoms) = 0
-                   AND v_polarity_safe
-                   AND v_novelty <= v_settings.novelty_bound THEN
-                    v_action := 'semantic_duplicate';
-                    v_new_thought := v_match_id;
-                ELSIF v_match_id IS NOT NULL
-                      AND v_similarity >= v_settings.observation_floor
-                      AND v_mode = 'shadow' THEN
-                    v_action := 'shadow_candidate';
-                ELSIF v_has_relations THEN
-                    v_action := 'relation_intent_keep';
+                IF NOT v_comparison_available THEN
+                    v_action := 'fail_open_insert';
                 ELSE
-                    v_action := 'inserted';
+                    IF v_match_id IS NOT NULL THEN
+                        v_atoms := public.corpus_hygiene_protected_atoms(p_content);
+                        v_match_atoms := public.corpus_hygiene_protected_atoms(v_match_content);
+                        SELECT COALESCE(array_agg(atom ORDER BY atom), ARRAY[]::text[])
+                        INTO v_missing_atoms
+                        FROM unnest(v_atoms) atom
+                        WHERE NOT atom = ANY(v_match_atoms);
+                        v_novelty := public.corpus_hygiene_novelty_ratio(p_content, v_match_content);
+
+                        FOREACH v_status_token IN ARRAY ARRAY[
+                            'not','failed','blocked','reverted','superseded','approved','denied',
+                            'open','closed','enabled','disabled'
+                        ] LOOP
+                            IF (lower(p_content) ~ ('(^|[^[:alnum:]_])' || v_status_token || '([^[:alnum:]_]|$)'))
+                               <> (lower(v_match_content) ~ ('(^|[^[:alnum:]_])' || v_status_token || '([^[:alnum:]_]|$)')) THEN
+                                v_polarity_safe := false;
+                            END IF;
+                        END LOOP;
+                    END IF;
+
+                    IF NOT v_force_keep
+                       AND v_mode = 'enforce'
+                       AND v_profile.enforce_eligible
+                       AND v_match_id IS NOT NULL
+                       AND v_similarity > v_settings.semantic_threshold
+                       AND length(p_content) >= 120
+                       AND cardinality(v_missing_atoms) = 0
+                       AND v_polarity_safe
+                       AND v_novelty <= v_settings.novelty_bound THEN
+                        v_action := 'semantic_duplicate';
+                        v_new_thought := v_match_id;
+                    ELSIF v_match_id IS NOT NULL
+                          AND v_similarity >= v_settings.observation_floor
+                          AND v_mode = 'shadow' THEN
+                        v_action := 'shadow_candidate';
+                    ELSIF v_has_relations THEN
+                        v_action := 'relation_intent_keep';
+                    ELSE
+                        v_action := 'inserted';
+                    END IF;
                 END IF;
             ELSIF v_has_relations THEN
                 v_action := 'relation_intent_keep';
@@ -1092,10 +1215,11 @@ BEGIN
     IF v_has_relations THEN
         SELECT COALESCE(jsonb_agg(
             value || jsonb_build_object('from_thought_id', v_new_thought::text)
-            ORDER BY value->>'relation', value->>'to_kind', value->>'to_value'
+            ORDER BY value->>'action', value->>'relation', value->>'to_kind',
+                     value->>'to_value', value->>'source', value->>'note', value::text
         ), '[]'::jsonb)
         INTO v_relation_ops
-        FROM jsonb_array_elements(p_relation_intents);
+        FROM jsonb_array_elements(v_canonical_relation_intents);
 
         v_relation_results := public.mutate_thought_relations_serialized(
             v_relation_ops,

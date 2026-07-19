@@ -30,6 +30,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::time::Instant;
 
 use crate::capture::{self, CaptureError, CaptureRequest, MAX_CONTENT_LEN};
 use crate::link::{self, LinkError, MAX_LINK_NOTE_LEN};
@@ -40,6 +41,9 @@ use crate::search::{
     self, GetThoughtResponse, ListScopesRequest, ListScopesResponse, ReadError, RecentRequest,
     RecentResponse, SearchRequest, SearchResponse, SearchRuntimeOptions,
 };
+
+const CAPTURE_TOTAL_TIMEOUT: Duration = Duration::from_secs(1);
+const CAPTURE_EMBEDDING_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CaptureArgs {
@@ -491,6 +495,7 @@ impl KengramServer {
         description = "Capture a thought into kengram's persistent memory. Returns the thought_id and embedding_status='pending'. The thought is durable and findable by FTS lexical search immediately; vector search picks it up on the next worker tick (default 5 seconds). Identical content (SHA-256 of the bytes) is deduplicated — the response will include `is_duplicate: true` and the pre-existing thought_id when the fingerprint collides. To express that this thought refines, replaces, references, supports, depends on, belongs under, or was decided by another thought, use `link_thoughts` after capture — these relations are queryable via `get_related_thoughts`. Do NOT encode cross-thought relationships in the `metadata` field; metadata is opaque to retrieval and graph traversal. To make a term filterable as an entity or topic, put it in the opening sentence — the tagger lifts phrases from prose surface vocabulary, with extraction probability falling off after the opening."
     )]
     async fn capture(&self, Parameters(args): Parameters<CaptureArgs>) -> Result<String, String> {
+        let capture_deadline = Instant::now() + CAPTURE_TOTAL_TIMEOUT;
         let source = Source::new(args.source).map_err(|e| format!("invalid source: {e}"))?;
 
         let scope = match args.scope {
@@ -553,7 +558,9 @@ impl KengramServer {
             && self.embedder.model().dimensions == 1024
         {
             let texts = vec![args.content.clone()];
-            match tokio::time::timeout(Duration::from_secs(1), self.embedder.embed(&texts)).await {
+            let embedding_timeout = CAPTURE_EMBEDDING_TIMEOUT
+                .min(capture_deadline.saturating_duration_since(Instant::now()));
+            match tokio::time::timeout(embedding_timeout, self.embedder.embed(&texts)).await {
                 Ok(Ok(vectors)) if vectors.len() == 1 && vectors[0].len() == 1024 => (
                     Some(vectors.into_iter().next().expect("length checked")),
                     None,
@@ -577,7 +584,7 @@ impl KengramServer {
                     None,
                     Some(serde_json::json!({
                         "code": "embedding_timeout",
-                        "timeout_ms": 1000
+                        "timeout_ms": CAPTURE_EMBEDDING_TIMEOUT.as_millis()
                     })),
                 ),
             }
@@ -611,26 +618,35 @@ impl KengramServer {
             }),
         };
 
-        let resp = capture::capture_with_gate_options(
-            &self.pool,
-            // Invalid/unavailable candidates always queue the reviewed BGE
-            // model, independent of a stale server embedder configuration.
-            "bge-m3:1024",
-            self.tagger_model_id.as_deref(),
-            request,
-            capture::CaptureGateOptions {
-                source_created_at,
-                candidate_embedding,
-                bypass_reason,
-                relation_intents,
-                // The database derives the authenticated producer class from
-                // session_user. Leaving this optional assertion unset also
-                // keeps the reviewed break-glass/admin-DSN rollback usable.
-                claimed_producer_class: None,
-                correlation_id: args.correlation_id,
-            },
+        let resp = tokio::time::timeout_at(
+            capture_deadline,
+            capture::capture_with_gate_options(
+                &self.pool,
+                // Invalid/unavailable candidates always queue the reviewed BGE
+                // model, independent of a stale server embedder configuration.
+                "bge-m3:1024",
+                self.tagger_model_id.as_deref(),
+                request,
+                capture::CaptureGateOptions {
+                    source_created_at,
+                    candidate_embedding,
+                    bypass_reason,
+                    relation_intents,
+                    // The database derives the authenticated producer class from
+                    // session_user. Leaving this optional assertion unset also
+                    // keeps the reviewed break-glass/admin-DSN rollback usable.
+                    claimed_producer_class: None,
+                    correlation_id: args.correlation_id,
+                },
+            ),
         )
         .await
+        .map_err(|_| {
+            format!(
+                "capture exceeded the {}ms embedding-plus-gate deadline",
+                CAPTURE_TOTAL_TIMEOUT.as_millis()
+            )
+        })?
         .map_err(map_capture_error)?;
 
         let body = serde_json::json!({
@@ -1380,13 +1396,29 @@ Tools: `capture`, `search_thoughts`, `recent_thoughts`, `list_scopes`, `get_thou
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kengram_core::{EmbeddingModel, TagKind, Tags};
+    use kengram_core::{EmbedderError, EmbeddingModel, TagKind, Tags};
     use kengram_embed::FakeEmbedder;
 
     const TEST_EMBEDDER_MODEL_ID: &str = "bge-m3:1024";
 
     fn test_embedder() -> FakeEmbedder {
         FakeEmbedder::with_model(EmbeddingModel::new(TEST_EMBEDDER_MODEL_ID, 1024))
+    }
+
+    struct SlowEmbedder {
+        model: EmbeddingModel,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for SlowEmbedder {
+        fn model(&self) -> &EmbeddingModel {
+            &self.model
+        }
+
+        async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedderError> {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok(vec![vec![0.0; 1024]])
+        }
     }
 
     fn server(pool: PgPool) -> KengramServer {
@@ -1720,6 +1752,60 @@ mod tests {
         assert!(json["thought_id"].is_string());
         assert_eq!(json["embedding_status"], "pending");
         assert_eq!(json["is_duplicate"], false);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_total_deadline_reserves_gate_time_after_embedding_timeout(pool: PgPool) {
+        let server = KengramServer::new(
+            pool.clone(),
+            Arc::new(SlowEmbedder {
+                model: EmbeddingModel::new(TEST_EMBEDDER_MODEL_ID, 1024),
+            }),
+            None,
+            Some("fake/tagger".to_string()),
+            false,
+            false,
+            false,
+        );
+        let started = std::time::Instant::now();
+        let raw = server
+            .capture(Parameters(CaptureArgs {
+                content:
+                    "Embedding timeout must still leave time for a durable gated fail-open insert."
+                        .into(),
+                source: "test".into(),
+                scope: Some("agents/total-deadline".into()),
+                metadata: None,
+                argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: Some("total-deadline-test".into()),
+            }))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let gate_event_id = response["gate_event_id"].as_str().unwrap();
+        let bypass_code: String = sqlx::query_scalar(
+            "SELECT bypass_reason->>'code' FROM thought_ingest_gate_events WHERE id=$1::uuid",
+        )
+        .bind(gate_event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let pending_embedding: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_embeddings")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let pending_tag: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_tags")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert!(elapsed < CAPTURE_TOTAL_TIMEOUT, "elapsed={elapsed:?}");
+        assert_eq!(bypass_code, "embedding_timeout");
+        assert_eq!(pending_embedding, 1);
+        assert_eq!(pending_tag, 1);
     }
 
     #[sqlx::test(migrations = "../../migrations")]

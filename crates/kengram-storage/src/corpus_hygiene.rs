@@ -11,6 +11,10 @@ use sqlx::{PgPool, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+/// Leaves the MCP caller enough of its one-second end-to-end budget to commit
+/// and serialize a structured fail-open result after a comparison timeout.
+const CAPTURE_GATE_STATEMENT_TIMEOUT: &str = "400ms";
+
 #[derive(Debug, Clone)]
 pub struct GatedCaptureRequest<'a> {
     pub scope: &'a str,
@@ -55,6 +59,11 @@ pub async fn capture_thought_gated(
     let vector = request
         .candidate_embedding
         .map(|values| Vector::from(values.to_vec()));
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+        .bind(CAPTURE_GATE_STATEMENT_TIMEOUT)
+        .execute(&mut *tx)
+        .await?;
     let row = sqlx::query(
         r#"
         SELECT *
@@ -82,10 +91,10 @@ pub async fn capture_thought_gated(
     .bind(request.claimed_producer_class)
     .bind(request.correlation_id)
     .bind(request.force_keep_token)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
 
-    Ok(GatedCaptureResult {
+    let result = GatedCaptureResult {
         thought_id: row.try_get("thought_id")?,
         action: row.try_get("action")?,
         matched_thought_id: row.try_get("matched_thought_id")?,
@@ -97,7 +106,9 @@ pub async fn capture_thought_gated(
         source_event_action: row.try_get("source_event_action")?,
         relation_results: row.try_get("relation_results")?,
         gate_event_id: row.try_get("gate_event_id")?,
-    })
+    };
+    tx.commit().await?;
+    Ok(result)
 }
 
 #[derive(Debug, Clone)]

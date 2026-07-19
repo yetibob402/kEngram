@@ -254,6 +254,7 @@ mod tests {
     use kengram_core::EmbeddingModel;
     use serde_json::json;
     use sqlx::{PgConnection, Row, postgres::PgRow};
+    use std::time::Duration;
 
     const TEST_EMBEDDER_MODEL_ID: &str = "bge-m3:1024";
     const TEST_TAGGER_MODEL_ID: &str = "fake/tagger";
@@ -270,6 +271,55 @@ mod tests {
 
     fn unit_vector_literal() -> String {
         format!("[{}]", vec!["0.03125"; 1024].join(","))
+    }
+
+    const SOURCE_EVENT_CLAIM_TEST_LOCK: i64 = 7_301_001;
+
+    async fn install_source_event_claim_barrier(pool: &PgPool) {
+        sqlx::query(
+            r#"
+            CREATE FUNCTION public.test_block_source_event_claim()
+            RETURNS trigger
+            LANGUAGE plpgsql
+            AS $test$
+            BEGIN
+                PERFORM pg_catalog.pg_advisory_xact_lock(7301001);
+                RETURN NEW;
+            END
+            $test$
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER test_block_source_event_claim
+            BEFORE INSERT ON public.argus_source_events
+            FOR EACH ROW EXECUTE FUNCTION public.test_block_source_event_claim()
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn wait_for_active_test_clients(pool: &PgPool, prefix: &str, expected: i64) {
+        let pattern = format!("{prefix}%");
+        for _ in 0..200 {
+            let active: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_catalog.pg_stat_activity WHERE application_name LIKE $1 AND state = 'active'",
+            )
+            .bind(&pattern)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if active >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {expected} concurrent {prefix} clients");
     }
 
     async fn gated_capture_on_connection(
@@ -530,6 +580,81 @@ mod tests {
         assert_eq!(status, "conflict");
         assert_eq!(error.as_deref(), Some("payload_hash_conflict"));
         assert_eq!(payload_hash, "payload-a");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn concurrent_identical_source_event_first_delivery_replays_without_error(pool: PgPool) {
+        install_source_event_claim_barrier(&pool).await;
+
+        let mut blocker = pool.acquire().await.unwrap();
+        sqlx::query("SELECT pg_catalog.pg_advisory_lock($1)")
+            .bind(SOURCE_EVENT_CLAIM_TEST_LOCK)
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+
+        let spawn_capture = |pool: PgPool, application_name: &'static str| {
+            tokio::spawn(async move {
+                let mut connection = pool.acquire().await.unwrap();
+                sqlx::query("SET SESSION AUTHORIZATION kengram_rt_native_mcp")
+                    .execute(&mut *connection)
+                    .await
+                    .unwrap();
+                sqlx::query("SELECT pg_catalog.set_config('application_name', $1, false)")
+                    .bind(application_name)
+                    .execute(&mut *connection)
+                    .await
+                    .unwrap();
+                let row = gated_capture_on_connection(
+                    &mut connection,
+                    "agents/concurrent-source-claim",
+                    "Concurrent byte-identical first deliveries share one durable source claim.",
+                    Some((
+                        "tests/concurrent-source-claim",
+                        "same-first-delivery",
+                        "same-payload",
+                    )),
+                    &json!([]),
+                    None,
+                )
+                .await;
+                let result = (
+                    row.try_get::<uuid::Uuid, _>("thought_id").unwrap(),
+                    row.try_get::<String, _>("action").unwrap(),
+                    row.try_get::<String, _>("source_event_status").unwrap(),
+                    row.try_get::<String, _>("source_event_action").unwrap(),
+                );
+                sqlx::query("RESET SESSION AUTHORIZATION")
+                    .execute(&mut *connection)
+                    .await
+                    .unwrap();
+                result
+            })
+        };
+
+        let first = spawn_capture(pool.clone(), "source_claim_race_first");
+        let second = spawn_capture(pool.clone(), "source_claim_race_second");
+        wait_for_active_test_clients(&pool, "source_claim_race_", 2).await;
+        sqlx::query("SELECT pg_catalog.pg_advisory_unlock($1)")
+            .bind(SOURCE_EVENT_CLAIM_TEST_LOCK)
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+        assert_eq!(first.0, second.0);
+        assert_eq!(first.2, "stored");
+        assert_eq!(second.2, "stored");
+        let mut dispositions = [(first.1, first.3), (second.1, second.3)];
+        dispositions.sort();
+        assert_eq!(
+            dispositions,
+            [
+                ("exact_duplicate".to_string(), "replay".to_string()),
+                ("inserted".to_string(), "stored".to_string()),
+            ]
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]

@@ -256,28 +256,23 @@ pub async fn unlink_thoughts(
     if result.get("status").and_then(|v| v.as_str()) == Some("source_event_conflict") {
         return Err(LinkError::SourceEventConflict);
     }
-    if result
-        .get("link_ids")
-        .and_then(|ids| ids.as_array())
-        .is_some_and(|ids| !ids.is_empty())
-    {
-        return Ok(UnlinkThoughtsResponse {
-            status: UnlinkStatus::DeletedNow,
-        });
-    }
-
-    // Only derive the no-op discriminator after the durable request ledger
-    // has accepted this exact payload and canonical delete intent.
-    let status = match kengram_storage::lookup_link_status(pool, from, relation, target).await? {
-        LinkStatus::Live => {
+    let outcome = result
+        .get("operation_results")
+        .and_then(|results| results.as_array())
+        .and_then(|results| results.first())
+        .and_then(|result| result.get("outcome"))
+        .and_then(|outcome| outcome.as_str());
+    let status = match outcome {
+        Some("deleted_now") => UnlinkStatus::DeletedNow,
+        Some("already_deleted") => UnlinkStatus::AlreadyDeleted,
+        Some("never_existed") => UnlinkStatus::NeverExisted,
+        _ => {
             return Err(LinkError::Storage(kengram_storage::StorageError::Database(
-                sqlx::Error::Protocol(
-                    "link became live after serialized unlink result".to_string(),
-                ),
+                sqlx::Error::Protocol(format!(
+                    "serialized unlink returned no durable outcome: {result}"
+                )),
             )));
         }
-        LinkStatus::SoftDeleted => UnlinkStatus::AlreadyDeleted,
-        LinkStatus::NeverExisted => UnlinkStatus::NeverExisted,
     };
     Ok(UnlinkThoughtsResponse { status })
 }
@@ -330,6 +325,7 @@ mod tests {
     use super::*;
     use crate::capture::{CaptureRequest, capture};
     use kengram_core::{Scope, Source};
+    use std::time::Duration;
 
     const TEST_EMBEDDER_MODEL_ID: &str = "bge-m3:1024";
 
@@ -341,6 +337,143 @@ mod tests {
             payload_hash: id,
             metadata: serde_json::json!({}),
         }
+    }
+
+    const RELATION_CLAIM_TEST_LOCK: i64 = 7_301_002;
+
+    async fn install_relation_claim_barrier(pool: &PgPool) {
+        sqlx::query(
+            r#"
+            CREATE FUNCTION public.test_block_relation_claim()
+            RETURNS trigger
+            LANGUAGE plpgsql
+            AS $test$
+            BEGIN
+                PERFORM pg_catalog.pg_advisory_xact_lock(7301002);
+                RETURN NEW;
+            END
+            $test$
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER test_block_relation_claim
+            BEFORE INSERT ON public.thought_relation_request_events
+            FOR EACH ROW EXECUTE FUNCTION public.test_block_relation_claim()
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn wait_for_active_relation_clients(pool: &PgPool, prefix: &str) {
+        let pattern = format!("{prefix}%");
+        for _ in 0..200 {
+            let active: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_catalog.pg_stat_activity WHERE application_name LIKE $1 AND state = 'active'",
+            )
+            .bind(&pattern)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if active >= 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for two concurrent {prefix} clients");
+    }
+
+    fn spawn_relation_mutation(
+        pool: PgPool,
+        application_name: String,
+        operations: serde_json::Value,
+        source_ref: String,
+    ) -> tokio::task::JoinHandle<serde_json::Value> {
+        tokio::spawn(async move {
+            let mut connection = pool.acquire().await.unwrap();
+            sqlx::query("SET SESSION AUTHORIZATION kengram_rt_native_mcp")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            sqlx::query("SELECT pg_catalog.set_config('application_name', $1, false)")
+                .bind(application_name)
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            let result = sqlx::query_scalar::<_, serde_json::Value>(
+                r#"
+                SELECT public.mutate_thought_relations_serialized(
+                    $1, 'tests/concurrent-relation-claim', $2,
+                    'same-payload', '{}'::jsonb, NULL::text
+                )
+                "#,
+            )
+            .bind(operations)
+            .bind(source_ref)
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+            sqlx::query("RESET SESSION AUTHORIZATION")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            result
+        })
+    }
+
+    async fn run_relation_claim_race(
+        pool: &PgPool,
+        application_prefix: &str,
+        operations: serde_json::Value,
+        source_ref: &str,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let mut blocker = pool.acquire().await.unwrap();
+        sqlx::query("SELECT pg_catalog.pg_advisory_lock($1)")
+            .bind(RELATION_CLAIM_TEST_LOCK)
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let first = spawn_relation_mutation(
+            pool.clone(),
+            format!("{application_prefix}first"),
+            operations.clone(),
+            source_ref.to_string(),
+        );
+        let second = spawn_relation_mutation(
+            pool.clone(),
+            format!("{application_prefix}second"),
+            operations,
+            source_ref.to_string(),
+        );
+        wait_for_active_relation_clients(pool, application_prefix).await;
+        sqlx::query("SELECT pg_catalog.pg_advisory_unlock($1)")
+            .bind(RELATION_CLAIM_TEST_LOCK)
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        (first.await.unwrap(), second.await.unwrap())
+    }
+
+    fn assert_completed_replay_pair(first: &serde_json::Value, second: &serde_json::Value) {
+        assert_eq!(
+            first.get("status").and_then(|v| v.as_str()),
+            Some("completed")
+        );
+        assert_eq!(
+            second.get("status").and_then(|v| v.as_str()),
+            Some("completed")
+        );
+        assert_eq!(first.get("link_ids"), second.get("link_ids"));
+        assert_eq!(
+            first.get("operation_results"),
+            second.get("operation_results")
+        );
+        assert_ne!(first.get("replayed"), second.get("replayed"));
     }
 
     async fn cap(pool: &PgPool, content: &str) -> ThoughtId {
@@ -695,6 +828,137 @@ mod tests {
             never_existed_conflict,
             LinkError::SourceEventConflict
         ));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn concurrent_identical_relation_and_unlink_first_deliveries_replay_without_error(
+        pool: PgPool,
+    ) {
+        let from = cap(&pool, "concurrent relation source").await;
+        let target = cap(&pool, "concurrent relation target").await;
+        install_relation_claim_barrier(&pool).await;
+
+        let create = serde_json::json!([{
+            "action": "create",
+            "from_thought_id": from.to_string(),
+            "relation": "references",
+            "to_kind": "thought",
+            "to_value": target.to_string(),
+            "source": "agent",
+        }]);
+        let (first, second) =
+            run_relation_claim_race(&pool, "relation_claim_race_create_", create, "same-create")
+                .await;
+        assert_completed_replay_pair(&first, &second);
+
+        let delete = serde_json::json!([{
+            "action": "delete",
+            "from_thought_id": from.to_string(),
+            "relation": "references",
+            "to_kind": "thought",
+            "to_value": target.to_string(),
+            "source": "agent",
+        }]);
+        let (first, second) =
+            run_relation_claim_race(&pool, "relation_claim_race_delete_", delete, "same-delete")
+                .await;
+        assert_completed_replay_pair(&first, &second);
+        assert_eq!(
+            first
+                .pointer("/operation_results/0/outcome")
+                .and_then(|v| v.as_str()),
+            Some("deleted_now")
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn exact_noop_unlink_replays_recorded_outcome_after_independent_relink(pool: PgPool) {
+        let from = cap(&pool, "stable no-op unlink source").await;
+        let target = LinkTarget::Thought(cap(&pool, "stable no-op unlink target").await);
+
+        let never_existed_event = relation_event();
+        let first = unlink_thoughts(
+            &pool,
+            from,
+            RelationKind::References,
+            &target,
+            never_existed_event.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.status, UnlinkStatus::NeverExisted);
+        link_thoughts(
+            &pool,
+            LinkThoughtsRequest {
+                from_thought_id: from,
+                relation: RelationKind::References,
+                target: target.clone(),
+                note: None,
+                source_event: relation_event(),
+                claimed_producer_class: None,
+            },
+        )
+        .await
+        .unwrap();
+        let replay = unlink_thoughts(
+            &pool,
+            from,
+            RelationKind::References,
+            &target,
+            never_existed_event,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.status, UnlinkStatus::NeverExisted);
+
+        unlink_thoughts(
+            &pool,
+            from,
+            RelationKind::References,
+            &target,
+            relation_event(),
+            None,
+        )
+        .await
+        .unwrap();
+        let already_deleted_event = relation_event();
+        let first = unlink_thoughts(
+            &pool,
+            from,
+            RelationKind::References,
+            &target,
+            already_deleted_event.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.status, UnlinkStatus::AlreadyDeleted);
+        link_thoughts(
+            &pool,
+            LinkThoughtsRequest {
+                from_thought_id: from,
+                relation: RelationKind::References,
+                target: target.clone(),
+                note: None,
+                source_event: relation_event(),
+                claimed_producer_class: None,
+            },
+        )
+        .await
+        .unwrap();
+        let replay = unlink_thoughts(
+            &pool,
+            from,
+            RelationKind::References,
+            &target,
+            already_deleted_event,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.status, UnlinkStatus::AlreadyDeleted);
     }
 
     #[sqlx::test(migrations = "../../migrations")]

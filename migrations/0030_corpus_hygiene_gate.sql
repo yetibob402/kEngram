@@ -230,6 +230,8 @@ CREATE TABLE thought_relation_request_events (
     request_metadata          jsonb NOT NULL DEFAULT '{}'::jsonb,
     status                    text NOT NULL CHECK (status IN ('pending','completed')),
     result_link_ids           uuid[] NOT NULL DEFAULT '{}',
+    operation_results         jsonb NOT NULL DEFAULT '[]'::jsonb
+                              CHECK (jsonb_typeof(operation_results) = 'array'),
     created_at                timestamptz NOT NULL DEFAULT transaction_timestamp(),
     completed_at              timestamptz,
     UNIQUE (source_event_namespace, source_event_ref)
@@ -417,6 +419,9 @@ DECLARE
     v_note text;
     v_link_id uuid;
     v_result_ids uuid[] := ARRAY[]::uuid[];
+    v_operation_ids uuid[];
+    v_operation_results jsonb := '[]'::jsonb;
+    v_operation_outcome text;
     v_require_active boolean;
 BEGIN
     IF NULLIF(btrim(p_source_event_namespace), '') IS NULL
@@ -449,27 +454,44 @@ BEGIN
     FROM jsonb_array_elements(p_operations);
     v_intent_hash := public.digest(convert_to(v_canonical::text, 'UTF8'), 'sha256');
 
-    SELECT * INTO v_existing
-    FROM public.thought_relation_request_events
-    WHERE source_event_namespace = p_source_event_namespace
-      AND source_event_ref = p_source_event_ref
-    FOR UPDATE;
+    -- Claim the replay key before endpoint locking or relation mutation.
+    -- ON CONFLICT waits for a concurrent claimant; the re-read below then
+    -- returns that claimant's completed result instead of leaking 23505.
+    INSERT INTO public.thought_relation_request_events (
+        source_event_namespace, source_event_ref, source_event_payload_hash,
+        producer_principal, producer_class, profile_revision,
+        canonical_intent_hash, operations, request_metadata, status
+    ) VALUES (
+        p_source_event_namespace, p_source_event_ref, p_source_event_payload_hash,
+        v_principal, v_profile.producer_class, v_profile.profile_revision,
+        v_intent_hash, v_canonical, COALESCE(p_request_metadata, '{}'::jsonb), 'pending'
+    )
+    ON CONFLICT (source_event_namespace, source_event_ref) DO NOTHING
+    RETURNING * INTO v_existing;
 
-    IF FOUND THEN
+    IF NOT FOUND THEN
+        SELECT * INTO STRICT v_existing
+        FROM public.thought_relation_request_events
+        WHERE source_event_namespace = p_source_event_namespace
+          AND source_event_ref = p_source_event_ref
+        FOR UPDATE;
+
         IF v_existing.source_event_payload_hash = p_source_event_payload_hash
            AND v_existing.canonical_intent_hash = v_intent_hash THEN
             RETURN jsonb_build_object(
                 'status', v_existing.status,
                 'replayed', true,
                 'request_id', v_existing.id,
-                'link_ids', to_jsonb(v_existing.result_link_ids)
+                'link_ids', to_jsonb(v_existing.result_link_ids),
+                'operation_results', v_existing.operation_results
             );
         END IF;
         RETURN jsonb_build_object(
             'status', 'source_event_conflict',
             'replayed', false,
             'request_id', v_existing.id,
-            'link_ids', '[]'::jsonb
+            'link_ids', '[]'::jsonb,
+            'operation_results', '[]'::jsonb
         );
     END IF;
 
@@ -528,19 +550,10 @@ BEGIN
     END IF;
     PERFORM public.lock_thought_relation_endpoints(v_endpoint_ids, v_require_active);
 
-    INSERT INTO public.thought_relation_request_events (
-        source_event_namespace, source_event_ref, source_event_payload_hash,
-        producer_principal, producer_class, profile_revision,
-        canonical_intent_hash, operations, request_metadata, status
-    ) VALUES (
-        p_source_event_namespace, p_source_event_ref, p_source_event_payload_hash,
-        v_principal, v_profile.producer_class, v_profile.profile_revision,
-        v_intent_hash, v_canonical, COALESCE(p_request_metadata, '{}'::jsonb), 'pending'
-    )
-    RETURNING id INTO v_link_id;
-
     FOR v_op IN SELECT value FROM jsonb_array_elements(v_canonical)
     LOOP
+        v_link_id := NULL;
+        v_operation_ids := ARRAY[]::uuid[];
         v_action := COALESCE(v_op->>'action', 'create');
         v_from := (v_op->>'from_thought_id')::uuid;
         v_relation := v_op->>'relation';
@@ -583,7 +596,15 @@ BEGIN
                     'tagger', v_note
                 ) RETURNING id INTO v_link_id;
                 v_result_ids := array_append(v_result_ids, v_link_id);
+                v_operation_ids := array_append(v_operation_ids, v_link_id);
             END LOOP;
+            v_operation_results := v_operation_results || jsonb_build_array(
+                jsonb_build_object(
+                    'action', 'replace_tagger_set',
+                    'outcome', 'replaced',
+                    'link_ids', to_jsonb(v_operation_ids)
+                )
+            );
             CONTINUE;
         END IF;
 
@@ -623,6 +644,7 @@ BEGIN
               AND deleted_at IS NULL;
 
             IF v_link_id IS NULL THEN
+                v_operation_outcome := 'created';
                 INSERT INTO public.thought_links (
                     from_thought_id, relation, to_kind,
                     to_thought_id, to_entity, to_person, to_url,
@@ -635,8 +657,11 @@ BEGIN
                     CASE WHEN v_to_kind = 'url' THEN v_to_value END,
                     v_source, v_note
                 ) RETURNING id INTO v_link_id;
+            ELSE
+                v_operation_outcome := 'already_live';
             END IF;
             v_result_ids := array_append(v_result_ids, v_link_id);
+            v_operation_ids := array_append(v_operation_ids, v_link_id);
         ELSE
             UPDATE public.thought_links
             SET deleted_at = transaction_timestamp()
@@ -647,13 +672,35 @@ BEGIN
               AND deleted_at IS NULL
             RETURNING id INTO v_link_id;
             IF v_link_id IS NOT NULL THEN
+                v_operation_outcome := 'deleted_now';
                 v_result_ids := array_append(v_result_ids, v_link_id);
+                v_operation_ids := array_append(v_operation_ids, v_link_id);
+            ELSIF EXISTS (
+                SELECT 1
+                FROM public.thought_links
+                WHERE from_thought_id = v_from
+                  AND relation = v_relation
+                  AND to_kind = v_to_kind
+                  AND to_value = v_to_value
+                  AND deleted_at IS NOT NULL
+            ) THEN
+                v_operation_outcome := 'already_deleted';
+            ELSE
+                v_operation_outcome := 'never_existed';
             END IF;
         END IF;
+        v_operation_results := v_operation_results || jsonb_build_array(
+            jsonb_build_object(
+                'action', v_action,
+                'outcome', v_operation_outcome,
+                'link_ids', to_jsonb(v_operation_ids)
+            )
+        );
     END LOOP;
 
     UPDATE public.thought_relation_request_events
     SET status = 'completed', result_link_ids = v_result_ids,
+        operation_results = v_operation_results,
         completed_at = transaction_timestamp()
     WHERE source_event_namespace = p_source_event_namespace
       AND source_event_ref = p_source_event_ref;
@@ -661,7 +708,8 @@ BEGIN
     RETURN jsonb_build_object(
         'status', 'completed',
         'replayed', false,
-        'link_ids', to_jsonb(v_result_ids)
+        'link_ids', to_jsonb(v_result_ids),
+        'operation_results', v_operation_results
     );
 EXCEPTION
     WHEN no_data_found THEN
@@ -925,12 +973,25 @@ BEGIN
     );
 
     IF p_source_event_namespace IS NOT NULL THEN
-        SELECT * INTO v_existing_event
-        FROM public.argus_source_events
-        WHERE namespace = p_source_event_namespace AND source_ref = p_source_event_ref
-        FOR UPDATE;
+        -- Atomically claim a missing source identity. A concurrent claimant
+        -- either rolls back (letting this INSERT win) or commits (letting the
+        -- locked re-read below classify replay/conflict without a 23505).
+        INSERT INTO public.argus_source_events (
+            namespace, source_ref, payload_hash, status, metadata
+        ) VALUES (
+            p_source_event_namespace, p_source_event_ref,
+            p_source_event_payload_hash, 'pending',
+            COALESCE(p_source_event_metadata, '{}'::jsonb)
+        )
+        ON CONFLICT (namespace, source_ref) DO NOTHING
+        RETURNING * INTO v_existing_event;
 
-        IF FOUND THEN
+        IF NOT FOUND THEN
+            SELECT * INTO STRICT v_existing_event
+            FROM public.argus_source_events
+            WHERE namespace = p_source_event_namespace AND source_ref = p_source_event_ref
+            FOR UPDATE;
+
             IF v_existing_event.payload_hash <> p_source_event_payload_hash THEN
                 UPDATE public.argus_source_events
                 SET status = 'conflict', error = 'payload_hash_conflict',
@@ -1016,14 +1077,6 @@ BEGIN
                 NULLIF(v_existing_event.metadata->'corpus_hygiene'->>'gate_event_id','')::uuid;
             RETURN;
         END IF;
-
-        INSERT INTO public.argus_source_events (
-            namespace, source_ref, payload_hash, status, metadata
-        ) VALUES (
-            p_source_event_namespace, p_source_event_ref,
-            p_source_event_payload_hash, 'pending',
-            COALESCE(p_source_event_metadata, '{}'::jsonb)
-        );
     END IF;
 
     SELECT id INTO v_existing_thought

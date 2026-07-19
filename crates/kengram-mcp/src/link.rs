@@ -8,7 +8,6 @@
 //! Postgres.
 
 use kengram_core::{LinkId, LinkTarget, RelationKind, ThoughtId};
-use kengram_storage::LinkStatus;
 use sqlx::PgPool;
 
 /// Note column max length — bounded so a single bogus note can't OOM a
@@ -48,10 +47,9 @@ pub struct LinkThoughtsResponse {
     pub from_thought_id: ThoughtId,
     pub relation: RelationKind,
     pub target: LinkTarget,
-    /// `false` when the (from, relation, target) edge already existed live —
-    /// the returned `link_id` belongs to the pre-existing row and no new
-    /// row was inserted. If the edge was previously soft-deleted, a fresh
-    /// row is inserted and `is_new = true`.
+    /// The durable result recorded for this request identity. `false` when
+    /// the edge already existed live; `true` when this request created it.
+    /// Exact retries return the originally recorded value verbatim.
     pub is_new: bool,
 }
 
@@ -121,9 +119,10 @@ pub enum LinkError {
 
 /// Create a link from a thought to a polymorphic target. Idempotent on the
 /// `(from, relation, to_kind, to_value)` quadruple: re-asserting the same
-/// live edge returns the existing `LinkId` with `is_new = false`. If the
-/// edge was previously soft-deleted, a fresh live row is inserted and
-/// `is_new = true`.
+/// live edge under a fresh request identity returns the existing `LinkId`
+/// with `is_new = false`. If the edge was previously soft-deleted, a fresh
+/// live row is inserted and `is_new = true`. Exact request retries return
+/// their recorded `LinkId` and `is_new` outcome verbatim.
 ///
 /// Validation order: target shape (non-empty / well-formed URL / length) →
 /// self-link check (thought targets only) → note length → endpoint
@@ -166,14 +165,6 @@ pub async fn link_thoughts(
         return Err(LinkError::ToThoughtMissing(*to));
     }
 
-    let was_live = kengram_storage::lookup_link_status(
-        pool,
-        request.from_thought_id,
-        request.relation,
-        &request.target,
-    )
-    .await?
-        == LinkStatus::Live;
     let operations = serde_json::json!([{
         "action": "create",
         "from_thought_id": request.from_thought_id.to_string(),
@@ -210,13 +201,27 @@ pub async fn link_thoughts(
                 sqlx::Error::Protocol(format!("serialized relation returned no link id: {result}")),
             ))
         })?;
+    let is_new = match result
+        .pointer("/operation_results/0/outcome")
+        .and_then(|outcome| outcome.as_str())
+    {
+        Some("created") => true,
+        Some("already_live") => false,
+        _ => {
+            return Err(LinkError::Storage(kengram_storage::StorageError::Database(
+                sqlx::Error::Protocol(format!(
+                    "serialized create returned no durable outcome: {result}"
+                )),
+            )));
+        }
+    };
 
     Ok(LinkThoughtsResponse {
         link_id,
         from_thought_id: request.from_thought_id,
         relation: request.relation,
         target: request.target,
-        is_new: !was_live,
+        is_new,
     })
 }
 
@@ -388,6 +393,32 @@ mod tests {
         panic!("timed out waiting for two concurrent {prefix} clients");
     }
 
+    async fn wait_for_relation_claim_waiters(pool: &PgPool) {
+        for _ in 0..500 {
+            let waiting: i64 = sqlx::query_scalar(
+                r#"
+                SELECT COUNT(*)::bigint
+                FROM pg_catalog.pg_locks AS locks
+                JOIN pg_catalog.pg_stat_activity AS activity ON activity.pid = locks.pid
+                WHERE locks.locktype = 'advisory'
+                  AND NOT locks.granted
+                  AND locks.classid::bigint = 0
+                  AND locks.objid::bigint = $1
+                  AND activity.datname = current_database()
+                "#,
+            )
+            .bind(RELATION_CLAIM_TEST_LOCK)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting >= 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for two public create calls at the relation claim barrier");
+    }
+
     fn spawn_relation_mutation(
         pool: PgPool,
         application_name: String,
@@ -534,6 +565,45 @@ mod tests {
         assert!(first.is_new);
         assert!(!second.is_new);
         assert_eq!(first.link_id, second.link_id);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn exact_create_replays_recorded_outcome_after_independent_relink(pool: PgPool) {
+        let from = cap(&pool, "stable create source").await;
+        let target = LinkTarget::Thought(cap(&pool, "stable create target").await);
+        let original_event = relation_event();
+        let request = |source_event| LinkThoughtsRequest {
+            from_thought_id: from,
+            relation: RelationKind::References,
+            target: target.clone(),
+            note: None,
+            source_event,
+            claimed_producer_class: None,
+        };
+
+        let first = link_thoughts(&pool, request(original_event.clone()))
+            .await
+            .unwrap();
+        assert!(first.is_new);
+        unlink_thoughts(
+            &pool,
+            from,
+            RelationKind::References,
+            &target,
+            relation_event(),
+            None,
+        )
+        .await
+        .unwrap();
+        let replacement = link_thoughts(&pool, request(relation_event()))
+            .await
+            .unwrap();
+        assert!(replacement.is_new);
+        assert_ne!(replacement.link_id, first.link_id);
+
+        let replay = link_thoughts(&pool, request(original_event)).await.unwrap();
+        assert_eq!(replay.link_id, first.link_id);
+        assert_eq!(replay.is_new, first.is_new);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -869,6 +939,87 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("deleted_now")
         );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn concurrent_distinct_creates_report_one_recorded_creation(pool: PgPool) {
+        let from = cap(&pool, "concurrent public create source").await;
+        let target = LinkTarget::Thought(cap(&pool, "concurrent public create target").await);
+        let first_event = relation_event();
+        let second_event = relation_event();
+        install_relation_claim_barrier(&pool).await;
+
+        let mut blocker = pool.acquire().await.unwrap();
+        sqlx::query("SELECT pg_catalog.pg_advisory_lock($1)")
+            .bind(RELATION_CLAIM_TEST_LOCK)
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+
+        let first_pool = pool.clone();
+        let first_target = target.clone();
+        let first_source_ref = first_event.source_ref.clone();
+        let first = tokio::spawn(async move {
+            link_thoughts(
+                &first_pool,
+                LinkThoughtsRequest {
+                    from_thought_id: from,
+                    relation: RelationKind::References,
+                    target: first_target,
+                    note: None,
+                    source_event: first_event,
+                    claimed_producer_class: None,
+                },
+            )
+            .await
+            .unwrap()
+        });
+        let second_pool = pool.clone();
+        let second_target = target.clone();
+        let second_source_ref = second_event.source_ref.clone();
+        let second = tokio::spawn(async move {
+            link_thoughts(
+                &second_pool,
+                LinkThoughtsRequest {
+                    from_thought_id: from,
+                    relation: RelationKind::References,
+                    target: second_target,
+                    note: None,
+                    source_event: second_event,
+                    claimed_producer_class: None,
+                },
+            )
+            .await
+            .unwrap()
+        });
+
+        wait_for_relation_claim_waiters(&pool).await;
+        sqlx::query("SELECT pg_catalog.pg_advisory_unlock($1)")
+            .bind(RELATION_CLAIM_TEST_LOCK)
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+
+        assert_eq!(first.link_id, second.link_id);
+        assert_eq!(usize::from(first.is_new) + usize::from(second.is_new), 1);
+        let (created, already_live): (i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+                COUNT(*) FILTER (WHERE operation_results->0->>'outcome' = 'created')::bigint,
+                COUNT(*) FILTER (WHERE operation_results->0->>'outcome' = 'already_live')::bigint
+            FROM thought_relation_request_events
+            WHERE source_event_namespace = 'tests/relation'
+              AND source_event_ref IN ($1, $2)
+            "#,
+        )
+        .bind(first_source_ref)
+        .bind(second_source_ref)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((created, already_live), (1, 1));
     }
 
     #[sqlx::test(migrations = "../../migrations")]

@@ -4711,9 +4711,11 @@ pub struct RelationMutationIdentity<'a> {
 /// `(from, relation, to_kind, to_value)` quadruple via the partial unique
 /// index `thought_links_unique_edge` (which only covers rows with
 /// `deleted_at IS NULL`): re-asserting a live edge returns the existing
-/// row's `LinkId` with `is_new = false`. If the edge previously existed
-/// but was soft-deleted, this inserts a fresh live row (the partial unique
-/// index ignores the soft-deleted predecessor).
+/// row's `LinkId` with `is_new = false` under a fresh request identity. If
+/// the edge previously existed but was soft-deleted, this inserts a fresh
+/// live row (the partial unique index ignores the soft-deleted predecessor).
+/// Exact request retries return their recorded `LinkId` and `is_new` outcome
+/// verbatim.
 ///
 /// Foreign-key violations (thought target missing in `thoughts`) and
 /// CHECK violations (e.g., `to_url` not matching `^https?://`) are surfaced
@@ -4730,7 +4732,6 @@ pub async fn insert_link(
     note: Option<&str>,
     request_identity: RelationMutationIdentity<'_>,
 ) -> Result<(LinkId, bool), StorageError> {
-    let was_live = lookup_link_status(pool, from, relation, target).await? == LinkStatus::Live;
     let operation = serde_json::json!([{
         "action": "create",
         "from_thought_id": from.to_string(),
@@ -4772,7 +4773,19 @@ pub async fn insert_link(
                 "serialized link mutation returned no link id: {result}"
             )))
         })?;
-    Ok((LinkId::from(id), !was_live))
+    let is_new = match result
+        .pointer("/operation_results/0/outcome")
+        .and_then(|outcome| outcome.as_str())
+    {
+        Some("created") => true,
+        Some("already_live") => false,
+        _ => {
+            return Err(StorageError::Database(sqlx::Error::Protocol(format!(
+                "serialized link mutation returned no durable outcome: {result}"
+            ))));
+        }
+    };
+    Ok((LinkId::from(id), is_new))
 }
 
 /// Determine the live/soft-deleted/never-existed status of an edge
@@ -6854,6 +6867,64 @@ mod tests {
     };
     use serde_json::json;
     use sha2::{Digest, Sha256};
+    use std::time::Duration;
+
+    const CREATE_CLAIM_TEST_LOCK: i64 = 7_301_003;
+
+    async fn install_create_claim_barrier(pool: &PgPool) {
+        sqlx::query(
+            r#"
+            CREATE FUNCTION public.test_block_create_claim()
+            RETURNS trigger
+            LANGUAGE plpgsql
+            AS $test$
+            BEGIN
+                PERFORM pg_catalog.pg_advisory_xact_lock(7301003);
+                RETURN NEW;
+            END
+            $test$
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER test_block_create_claim
+            BEFORE INSERT ON public.thought_relation_request_events
+            FOR EACH ROW EXECUTE FUNCTION public.test_block_create_claim()
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn wait_for_create_claim_waiters(pool: &PgPool) {
+        for _ in 0..500 {
+            let waiting: i64 = sqlx::query_scalar(
+                r#"
+                SELECT COUNT(*)::bigint
+                FROM pg_catalog.pg_locks AS locks
+                JOIN pg_catalog.pg_stat_activity AS activity ON activity.pid = locks.pid
+                WHERE locks.locktype = 'advisory'
+                  AND NOT locks.granted
+                  AND locks.classid::bigint = 0
+                  AND locks.objid::bigint = $1
+                  AND activity.datname = current_database()
+                "#,
+            )
+            .bind(CREATE_CLAIM_TEST_LOCK)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting >= 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for two storage create calls at the claim barrier");
+    }
 
     /// Compute SHA-256 of `content` and return the 32-byte array. Mirrors
     /// what the MCP capture layer will do before calling insert_thought.
@@ -9282,6 +9353,95 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
+    async fn concurrent_distinct_storage_creates_report_one_recorded_creation(pool: PgPool) {
+        let from = insert_test_thought(&pool, "concurrent storage source", "global").await;
+        let target = t(insert_test_thought(&pool, "concurrent storage target", "global").await);
+        let first_source_ref = Uuid::new_v4().to_string();
+        let second_source_ref = Uuid::new_v4().to_string();
+        install_create_claim_barrier(&pool).await;
+
+        let mut blocker = pool.acquire().await.unwrap();
+        sqlx::query("SELECT pg_catalog.pg_advisory_lock($1)")
+            .bind(CREATE_CLAIM_TEST_LOCK)
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+
+        let first_pool = pool.clone();
+        let first_target = target.clone();
+        let first_ref = first_source_ref.clone();
+        let first = tokio::spawn(async move {
+            let metadata = json!({"request": "first"});
+            super::insert_link(
+                &first_pool,
+                from,
+                RelationKind::References,
+                &first_target,
+                LinkSource::Agent,
+                None,
+                RelationMutationIdentity {
+                    namespace: "tests/storage-concurrent-create",
+                    source_ref: &first_ref,
+                    payload_hash: &first_ref,
+                    metadata: &metadata,
+                },
+            )
+            .await
+            .unwrap()
+        });
+        let second_pool = pool.clone();
+        let second_target = target.clone();
+        let second_ref = second_source_ref.clone();
+        let second = tokio::spawn(async move {
+            let metadata = json!({"request": "second"});
+            super::insert_link(
+                &second_pool,
+                from,
+                RelationKind::References,
+                &second_target,
+                LinkSource::Agent,
+                None,
+                RelationMutationIdentity {
+                    namespace: "tests/storage-concurrent-create",
+                    source_ref: &second_ref,
+                    payload_hash: &second_ref,
+                    metadata: &metadata,
+                },
+            )
+            .await
+            .unwrap()
+        });
+
+        wait_for_create_claim_waiters(&pool).await;
+        sqlx::query("SELECT pg_catalog.pg_advisory_unlock($1)")
+            .bind(CREATE_CLAIM_TEST_LOCK)
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let (first_id, first_created) = first.await.unwrap();
+        let (second_id, second_created) = second.await.unwrap();
+
+        assert_eq!(first_id, second_id);
+        assert_eq!(usize::from(first_created) + usize::from(second_created), 1);
+        let (created, already_live): (i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+                COUNT(*) FILTER (WHERE operation_results->0->>'outcome' = 'created')::bigint,
+                COUNT(*) FILTER (WHERE operation_results->0->>'outcome' = 'already_live')::bigint
+            FROM thought_relation_request_events
+            WHERE source_event_namespace = 'tests/storage-concurrent-create'
+              AND source_event_ref IN ($1, $2)
+            "#,
+        )
+        .bind(first_source_ref)
+        .bind(second_source_ref)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((created, already_live), (1, 1));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
     async fn storage_compat_relations_use_producer_stable_identity(pool: PgPool) {
         let from = insert_test_thought(&pool, "stable identity source", "global").await;
         let first_target = insert_test_thought(&pool, "stable identity target", "global").await;
@@ -9318,7 +9478,7 @@ mod tests {
         .await
         .unwrap();
         assert!(first_is_new);
-        assert!(!replayed_is_new);
+        assert!(replayed_is_new);
         assert_eq!(replayed_id, first_id);
 
         let conflict = super::insert_link(
@@ -9340,6 +9500,61 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(request_count, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn exact_storage_create_replays_recorded_outcome_after_independent_relink(pool: PgPool) {
+        let from = insert_test_thought(&pool, "stable storage create source", "global").await;
+        let target = t(insert_test_thought(&pool, "stable storage create target", "global").await);
+        let metadata = json!({"producer": "stable-create-fixture"});
+        let identity = RelationMutationIdentity {
+            namespace: "tests/storage-stable-create",
+            source_ref: "request-1",
+            payload_hash: "payload-1",
+            metadata: &metadata,
+        };
+
+        let (first_id, first_created) = super::insert_link(
+            &pool,
+            from,
+            RelationKind::References,
+            &target,
+            LinkSource::Agent,
+            None,
+            identity,
+        )
+        .await
+        .unwrap();
+        assert!(first_created);
+        delete_link(&pool, from, RelationKind::References, &target)
+            .await
+            .unwrap();
+        let (replacement_id, replacement_created) = insert_link(
+            &pool,
+            from,
+            RelationKind::References,
+            &target,
+            LinkSource::Agent,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(replacement_created);
+        assert_ne!(replacement_id, first_id);
+
+        let (replay_id, replay_created) = super::insert_link(
+            &pool,
+            from,
+            RelationKind::References,
+            &target,
+            LinkSource::Agent,
+            None,
+            identity,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay_id, first_id);
+        assert_eq!(replay_created, first_created);
     }
 
     #[sqlx::test(migrations = "../../migrations")]

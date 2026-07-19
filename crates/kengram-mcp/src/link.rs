@@ -7,7 +7,7 @@
 //! error is actionable rather than a generic FK/CHECK violation from
 //! Postgres.
 
-use kengram_core::{LinkId, LinkSource, LinkTarget, RelationKind, ThoughtId};
+use kengram_core::{LinkId, LinkTarget, RelationKind, ThoughtId};
 use kengram_storage::LinkStatus;
 use sqlx::PgPool;
 
@@ -30,6 +30,16 @@ pub struct LinkThoughtsRequest {
     pub relation: RelationKind,
     pub target: LinkTarget,
     pub note: Option<String>,
+    pub source_event: RelationSourceEventRequest,
+    pub claimed_producer_class: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RelationSourceEventRequest {
+    pub namespace: String,
+    pub source_ref: String,
+    pub payload_hash: String,
+    pub metadata: serde_json::Value,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +111,12 @@ pub enum LinkError {
 
     #[error("storage error: {0}")]
     Storage(#[from] kengram_storage::StorageError),
+
+    #[error("invalid relation source event: {0}")]
+    InvalidSourceEvent(&'static str),
+
+    #[error("relation source-event replay conflicts with its prior payload or intent")]
+    SourceEventConflict,
 }
 
 /// Create a link from a thought to a polymorphic target. Idempotent on the
@@ -118,6 +134,7 @@ pub async fn link_thoughts(
     pool: &PgPool,
     request: LinkThoughtsRequest,
 ) -> Result<LinkThoughtsResponse, LinkError> {
+    validate_source_event(&request.source_event)?;
     validate_target(&request.target)?;
 
     if let LinkTarget::Thought(to) = &request.target
@@ -149,22 +166,57 @@ pub async fn link_thoughts(
         return Err(LinkError::ToThoughtMissing(*to));
     }
 
-    let (link_id, is_new) = kengram_storage::insert_link(
+    let was_live = kengram_storage::lookup_link_status(
         pool,
         request.from_thought_id,
         request.relation,
         &request.target,
-        LinkSource::Agent,
-        request.note.as_deref(),
+    )
+    .await?
+        == LinkStatus::Live;
+    let operations = serde_json::json!([{
+        "action": "create",
+        "from_thought_id": request.from_thought_id.to_string(),
+        "relation": request.relation.as_str(),
+        "to_kind": request.target.kind_str(),
+        "to_value": request.target.value_str(),
+        "source": "agent",
+        "note": request.note,
+    }]);
+    let result = kengram_storage::corpus_hygiene::mutate_thought_relations_serialized(
+        pool,
+        kengram_storage::corpus_hygiene::RelationMutationRequest {
+            operations: &operations,
+            source_event_namespace: &request.source_event.namespace,
+            source_event_ref: &request.source_event.source_ref,
+            source_event_payload_hash: &request.source_event.payload_hash,
+            request_metadata: &request.source_event.metadata,
+            claimed_producer_class: request.claimed_producer_class.as_deref(),
+        },
     )
     .await?;
+    if result.get("status").and_then(|v| v.as_str()) == Some("source_event_conflict") {
+        return Err(LinkError::SourceEventConflict);
+    }
+    let link_id = result
+        .get("link_ids")
+        .and_then(|ids| ids.as_array())
+        .and_then(|ids| ids.first())
+        .and_then(|id| id.as_str())
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .map(LinkId::from)
+        .ok_or_else(|| {
+            LinkError::Storage(kengram_storage::StorageError::Database(
+                sqlx::Error::Protocol(format!("serialized relation returned no link id: {result}")),
+            ))
+        })?;
 
     Ok(LinkThoughtsResponse {
         link_id,
         from_thought_id: request.from_thought_id,
         relation: request.relation,
         target: request.target,
-        is_new,
+        is_new: !was_live,
     })
 }
 
@@ -177,22 +229,38 @@ pub async fn unlink_thoughts(
     from: ThoughtId,
     relation: RelationKind,
     target: &LinkTarget,
+    source_event: RelationSourceEventRequest,
+    claimed_producer_class: Option<&str>,
 ) -> Result<UnlinkThoughtsResponse, LinkError> {
+    validate_source_event(&source_event)?;
     match kengram_storage::lookup_link_status(pool, from, relation, target).await? {
         LinkStatus::Live => {
-            // The lookup → delete pair is racy in theory but kengram is
-            // single-user single-active-session. If the row was deleted
-            // between lookup and update we'd return None from delete_link;
-            // map that to AlreadyDeleted (the operator-facing meaning is
-            // accurate either way).
-            match kengram_storage::delete_link(pool, from, relation, target).await? {
-                Some(_) => Ok(UnlinkThoughtsResponse {
-                    status: UnlinkStatus::DeletedNow,
-                }),
-                None => Ok(UnlinkThoughtsResponse {
-                    status: UnlinkStatus::AlreadyDeleted,
-                }),
+            let operations = serde_json::json!([{
+                "action": "delete",
+                "from_thought_id": from.to_string(),
+                "relation": relation.as_str(),
+                "to_kind": target.kind_str(),
+                "to_value": target.value_str(),
+                "source": "agent",
+            }]);
+            let result = kengram_storage::corpus_hygiene::mutate_thought_relations_serialized(
+                pool,
+                kengram_storage::corpus_hygiene::RelationMutationRequest {
+                    operations: &operations,
+                    source_event_namespace: &source_event.namespace,
+                    source_event_ref: &source_event.source_ref,
+                    source_event_payload_hash: &source_event.payload_hash,
+                    request_metadata: &source_event.metadata,
+                    claimed_producer_class,
+                },
+            )
+            .await?;
+            if result.get("status").and_then(|v| v.as_str()) == Some("source_event_conflict") {
+                return Err(LinkError::SourceEventConflict);
             }
+            Ok(UnlinkThoughtsResponse {
+                status: UnlinkStatus::DeletedNow,
+            })
         }
         LinkStatus::SoftDeleted => Ok(UnlinkThoughtsResponse {
             status: UnlinkStatus::AlreadyDeleted,
@@ -201,6 +269,19 @@ pub async fn unlink_thoughts(
             status: UnlinkStatus::NeverExisted,
         }),
     }
+}
+
+fn validate_source_event(event: &RelationSourceEventRequest) -> Result<(), LinkError> {
+    if event.namespace.trim().is_empty() {
+        return Err(LinkError::InvalidSourceEvent("namespace is required"));
+    }
+    if event.source_ref.trim().is_empty() {
+        return Err(LinkError::InvalidSourceEvent("source_ref is required"));
+    }
+    if event.payload_hash.trim().is_empty() {
+        return Err(LinkError::InvalidSourceEvent("payload_hash is required"));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_target(target: &LinkTarget) -> Result<(), LinkError> {
@@ -241,6 +322,16 @@ mod tests {
 
     const TEST_EMBEDDER_MODEL_ID: &str = "bge-m3:1024";
 
+    fn relation_event() -> RelationSourceEventRequest {
+        let id = uuid::Uuid::new_v4().to_string();
+        RelationSourceEventRequest {
+            namespace: "tests/relation".to_string(),
+            source_ref: id.clone(),
+            payload_hash: id,
+            metadata: serde_json::json!({}),
+        }
+    }
+
     async fn cap(pool: &PgPool, content: &str) -> ThoughtId {
         capture(
             pool,
@@ -270,6 +361,8 @@ mod tests {
                 relation: RelationKind::Refines,
                 target: LinkTarget::Thought(b),
                 note: Some("first link".into()),
+                source_event: relation_event(),
+                claimed_producer_class: None,
             },
         )
         .await
@@ -289,6 +382,8 @@ mod tests {
             relation: RelationKind::Refines,
             target: LinkTarget::Thought(b),
             note: None,
+            source_event: relation_event(),
+            claimed_producer_class: None,
         };
         let first = link_thoughts(&pool, req()).await.unwrap();
         let second = link_thoughts(&pool, req()).await.unwrap();
@@ -307,6 +402,8 @@ mod tests {
                 relation: RelationKind::Refines,
                 target: LinkTarget::Thought(a),
                 note: None,
+                source_event: relation_event(),
+                claimed_producer_class: None,
             },
         )
         .await
@@ -325,6 +422,8 @@ mod tests {
                 relation: RelationKind::Refines,
                 target: LinkTarget::Thought(b),
                 note: None,
+                source_event: relation_event(),
+                claimed_producer_class: None,
             },
         )
         .await
@@ -343,6 +442,8 @@ mod tests {
                 relation: RelationKind::References,
                 target: LinkTarget::Thought(phantom),
                 note: None,
+                source_event: relation_event(),
+                claimed_producer_class: None,
             },
         )
         .await
@@ -362,6 +463,8 @@ mod tests {
                 relation: RelationKind::Refines,
                 target: LinkTarget::Thought(b),
                 note: Some(too_long),
+                source_event: relation_event(),
+                claimed_producer_class: None,
             },
         )
         .await
@@ -379,6 +482,8 @@ mod tests {
                 relation: RelationKind::BelongsTo,
                 target: LinkTarget::Entity("Probe 2 experiment".into()),
                 note: None,
+                source_event: relation_event(),
+                claimed_producer_class: None,
             },
         )
         .await
@@ -397,6 +502,8 @@ mod tests {
                 relation: RelationKind::References,
                 target: LinkTarget::Url("https://anthropic.com".into()),
                 note: None,
+                source_event: relation_event(),
+                claimed_producer_class: None,
             },
         )
         .await
@@ -415,6 +522,8 @@ mod tests {
                 relation: RelationKind::References,
                 target: LinkTarget::Url("ftp://example.com".into()),
                 note: None,
+                source_event: relation_event(),
+                claimed_producer_class: None,
             },
         )
         .await
@@ -432,6 +541,8 @@ mod tests {
                 relation: RelationKind::BelongsTo,
                 target: LinkTarget::Entity("   ".into()),
                 note: None,
+                source_event: relation_event(),
+                claimed_producer_class: None,
             },
         )
         .await
@@ -446,9 +557,16 @@ mod tests {
         let target = LinkTarget::Thought(b);
 
         // Never existed.
-        let resp = unlink_thoughts(&pool, a, RelationKind::Refines, &target)
-            .await
-            .unwrap();
+        let resp = unlink_thoughts(
+            &pool,
+            a,
+            RelationKind::Refines,
+            &target,
+            relation_event(),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(resp.status, UnlinkStatus::NeverExisted);
 
         // Live → DeletedNow.
@@ -459,19 +577,35 @@ mod tests {
                 relation: RelationKind::Refines,
                 target: target.clone(),
                 note: None,
+                source_event: relation_event(),
+                claimed_producer_class: None,
             },
         )
         .await
         .unwrap();
-        let resp = unlink_thoughts(&pool, a, RelationKind::Refines, &target)
-            .await
-            .unwrap();
+        let resp = unlink_thoughts(
+            &pool,
+            a,
+            RelationKind::Refines,
+            &target,
+            relation_event(),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(resp.status, UnlinkStatus::DeletedNow);
 
         // Already soft-deleted → AlreadyDeleted.
-        let resp = unlink_thoughts(&pool, a, RelationKind::Refines, &target)
-            .await
-            .unwrap();
+        let resp = unlink_thoughts(
+            &pool,
+            a,
+            RelationKind::Refines,
+            &target,
+            relation_event(),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(resp.status, UnlinkStatus::AlreadyDeleted);
     }
 
@@ -485,11 +619,20 @@ mod tests {
             relation: RelationKind::Refines,
             target: target.clone(),
             note: None,
+            source_event: relation_event(),
+            claimed_producer_class: None,
         };
         let first = link_thoughts(&pool, req()).await.unwrap();
-        unlink_thoughts(&pool, a, RelationKind::Refines, &target)
-            .await
-            .unwrap();
+        unlink_thoughts(
+            &pool,
+            a,
+            RelationKind::Refines,
+            &target,
+            relation_event(),
+            None,
+        )
+        .await
+        .unwrap();
         let second = link_thoughts(&pool, req()).await.unwrap();
         assert!(second.is_new);
         assert_ne!(first.link_id, second.link_id);

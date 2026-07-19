@@ -139,6 +139,16 @@ mod tests {
         )
         .await
         .unwrap();
+        // The production gate repairs the historic lost-enqueue class
+        // atomically. This fixture removes that row solely to exercise the
+        // backfill healer's legacy recovery behavior.
+        sqlx::query(
+            "DELETE FROM pending_embeddings WHERE target_kind = 'thought' AND target_id = $1",
+        )
+        .bind(inserted.id.into_uuid())
+        .execute(pool)
+        .await
+        .unwrap();
         inserted.id
     }
 

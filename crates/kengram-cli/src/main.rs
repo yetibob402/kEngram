@@ -10,6 +10,7 @@ mod bench;
 mod chunk;
 mod config;
 mod contextual;
+mod corpus_hygiene_security;
 mod eval;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
@@ -175,6 +176,12 @@ enum Command {
         #[arg(long, default_value_t = kengram_storage::DEFAULT_INGEST_HYGIENE_MAX_FAILED_ATTEMPTS)]
         max_failed_attempts: i32,
     },
+    /// Operator-only recovery for a candidate retained in the durable corpus
+    /// hygiene gate ledger.
+    CorpusGate {
+        #[command(subcommand)]
+        action: CorpusGateAction,
+    },
     /// Print corpus + storage telemetry: thought counts, embeddings,
     /// links, per-scope summary, per-table heap/index/total sizes.
     /// Operator-facing snapshot of "how much am I storing?" without psql.
@@ -221,6 +228,16 @@ enum Command {
         /// implications.
         #[arg(long)]
         skip_version_check: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CorpusGateAction {
+    /// Reinsert one semantically skipped candidate through the gate's
+    /// break-glass force-keep path.
+    Restore {
+        #[arg(long)]
+        gate_event: uuid::Uuid,
     },
 }
 
@@ -1194,8 +1211,26 @@ async fn run_tag(
                     // Relations go to thought_links via apply_tagger_relations,
                     // NOT into tags.relations (migration 0011 removed the
                     // JSONB key).
-                    kengram_mcp::apply_tagger_relations(&pool, t.id, &output.relations).await;
-                    tagged += 1;
+                    match kengram_mcp::apply_tagger_relations(
+                        &pool,
+                        t.id,
+                        uuid::Uuid::new_v4(),
+                        &model_id,
+                        tagger_version,
+                        &output.relations,
+                    )
+                    .await
+                    {
+                        Ok(_) => tagged += 1,
+                        Err(err) => {
+                            tracing::warn!(
+                                thought_id = %t.id,
+                                error = ?err,
+                                "kengram tag: atomic relation write failed; continuing",
+                            );
+                            failed += 1;
+                        }
+                    }
                 }
             }
             Err(err) => {
@@ -1290,6 +1325,11 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        Command::CorpusGate { action } => match action {
+            CorpusGateAction::Restore { gate_event } => {
+                corpus_hygiene_security::restore_gate_event(config, gate_event).await
+            }
+        },
         Command::Stats {
             scope_prefix,
             top_scopes,

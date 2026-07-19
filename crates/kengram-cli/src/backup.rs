@@ -11,16 +11,18 @@
 //! See DEVELOPMENT.md "Migrating between machines" for the operator
 //! walkthrough.
 
-use std::{path::PathBuf, process::Stdio};
+use std::{fs::File, io::Read, path::PathBuf, process::Stdio};
 
 use anyhow::{Context, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::process::Command;
 
 use crate::config::Config;
+use crate::corpus_hygiene_security::{self, CorpusHygieneSecurityManifest, SecurityPacket};
 
 /// Schema version of the manifest itself. Bump only on incompatible shape
 /// changes (added fields are backward-compatible via serde defaults;
@@ -157,6 +159,11 @@ pub async fn run_backup(
         .with_context(|| format!("connecting to {}", config.database.url))?;
 
     let manifest = build_manifest(&pool, &config, !skip_embeddings).await?;
+    let security_packet = if corpus_hygiene_security::is_installed(&pool).await? {
+        Some(corpus_hygiene_security::build_verified_packet(&pool).await?)
+    } else {
+        None
+    };
 
     // Default output path: ./kengram-backup-<RFC3339-compact>.tar.gz in CWD.
     let output_path = match to {
@@ -206,7 +213,30 @@ pub async fn run_backup(
         std::fs::write(&manifest_path, manifest_json)
             .with_context(|| format!("writing {}", manifest_path.display()))?;
 
-        // 3. tar -czf.
+        // 3. Migration-0030's cluster-global security boundary.  Backups
+        // refuse before this point if roles, membership options, owners,
+        // triggers, principal map, or direct-write denials drifted.
+        let mut checksums = vec![
+            format!("{}  kengram.dump", sha256_file(&dump_path)?),
+            format!("{}  manifest.json", sha256_file(&manifest_path)?),
+        ];
+        if let Some(packet) = &security_packet {
+            let security_path = tmp.join("corpus_hygiene_security.json");
+            let reconcile_path = tmp.join("reconcile-corpus-hygiene-security.sql");
+            std::fs::write(&security_path, &packet.manifest_json)?;
+            std::fs::write(&reconcile_path, &packet.reconcile_sql)?;
+            checksums.push(format!(
+                "{}  corpus_hygiene_security.json",
+                packet.manifest_sha256
+            ));
+            checksums.push(format!(
+                "{}  reconcile-corpus-hygiene-security.sql",
+                packet.reconcile_sha256
+            ));
+        }
+        std::fs::write(tmp.join("checksums.sha256"), checksums.join("\n") + "\n")?;
+
+        // 4. tar -czf.
         let mut tar = Command::new("tar");
         tar.arg("-czf")
             .arg(&output_path)
@@ -223,6 +253,22 @@ pub async fn run_backup(
     let _ = std::fs::remove_dir_all(&tmp);
 
     result?;
+
+    // The archive cannot contain a digest of itself; write the whole-archive
+    // digest as an adjacent, deterministic sidecar.
+    let archive_sha = sha256_file(&output_path)?;
+    let archive_sha_path = PathBuf::from(format!("{}.sha256", output_path.display()));
+    std::fs::write(
+        &archive_sha_path,
+        format!(
+            "{}  {}\n",
+            archive_sha,
+            output_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        ),
+    )?;
 
     // 4. Print summary.
     let bytes = std::fs::metadata(&output_path)
@@ -255,6 +301,10 @@ pub async fn run_backup(
     );
     if let Some(t) = &manifest.tagger {
         println!("  tagger:    {} v{}", t.model_id, t.version);
+    }
+    if security_packet.is_some() {
+        println!("  security:  exact corpus-hygiene role/owner/ACL manifest included");
+        println!("  archive:   sha256 {}", archive_sha);
     }
     Ok(())
 }
@@ -301,6 +351,29 @@ pub async fn run_restore(
             .with_context(|| format!("reading {}", manifest_path.display()))?;
         let manifest: BackupManifest = serde_json::from_slice(&manifest_bytes)
             .context("parsing manifest.json — corrupt or wrong format")?;
+
+        let checksums_path = tmp.join("checksums.sha256");
+        if checksums_path.exists() {
+            verify_component_checksums(&tmp)?;
+        } else if manifest.schema.head_version >= 30 {
+            bail!("migration-0030+ archive is missing checksums.sha256");
+        }
+
+        let security_path = tmp.join("corpus_hygiene_security.json");
+        let reconcile_path = tmp.join("reconcile-corpus-hygiene-security.sql");
+        let source_security = if manifest.schema.head_version >= 30 {
+            if !security_path.exists() || !reconcile_path.exists() {
+                bail!("migration-0030+ archive is missing corpus-hygiene security artifacts");
+            }
+            Some(
+                serde_json::from_slice::<CorpusHygieneSecurityManifest>(&std::fs::read(
+                    &security_path,
+                )?)
+                .context("parsing corpus_hygiene_security.json")?,
+            )
+        } else {
+            None
+        };
 
         if manifest.manifest_version > MANIFEST_VERSION {
             bail!(
@@ -413,7 +486,16 @@ pub async fn run_restore(
             .arg(&dump_path);
         run_subprocess(restore, "pg_restore").await?;
 
-        // 8. Done.
+        // 8. Reconcile cluster-global roles/owners/ACLs before any restored
+        // writer can start, then read back the exact boundary.
+        if let Some(source_security) = source_security {
+            let reconcile_sql = std::fs::read_to_string(&reconcile_path)?;
+            corpus_hygiene_security::apply_reconciliation(&pool, &reconcile_sql).await?;
+            let target_packet = corpus_hygiene_security::build_verified_packet(&pool).await?;
+            ensure_security_equivalent(&source_security, &target_packet)?;
+        }
+
+        // 9. Done.
         println!();
         println!(
             "restored from {} (backup created {}). Run `kengram stats` to verify.",
@@ -429,6 +511,97 @@ pub async fn run_restore(
 
     let _ = std::fs::remove_dir_all(&tmp);
     result
+}
+
+fn sha256_file(path: &std::path::Path) -> anyhow::Result<String> {
+    let mut file =
+        File::open(path).with_context(|| format!("opening {} for hashing", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn verify_component_checksums(root: &std::path::Path) -> anyhow::Result<()> {
+    let path = root.join("checksums.sha256");
+    if !path.exists() {
+        bail!("backup archive missing checksums.sha256");
+    }
+    for (line_number, line) in std::fs::read_to_string(&path)?.lines().enumerate() {
+        let (expected, relative) = line
+            .split_once("  ")
+            .with_context(|| format!("invalid checksums.sha256 line {}", line_number + 1))?;
+        if relative.contains('/') || relative.contains("..") {
+            bail!("unsafe checksum path: {relative}");
+        }
+        let actual = sha256_file(&root.join(relative))?;
+        if actual != expected {
+            bail!(
+                "backup component checksum mismatch for {relative}: expected {expected}, got {actual}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ensure_security_equivalent(
+    source: &CorpusHygieneSecurityManifest,
+    target: &SecurityPacket,
+) -> anyhow::Result<()> {
+    let restored = &target.manifest;
+    // PostgreSQL 17 added the table MAINTAIN privilege to the owner's
+    // implicit ACL (`m`).  Owners are compared independently and remain the
+    // same canonical role, so cross-major restore compares every non-owner
+    // grant exactly while allowing that platform-owned capability delta.
+    let object_acls_match = if source.server_version == restored.server_version {
+        source.objects_and_acls == restored.objects_and_acls
+    } else {
+        non_owner_acl_view(&source.objects_and_acls)
+            == non_owner_acl_view(&restored.objects_and_acls)
+    };
+    if source.roles != restored.roles
+        || source.memberships != restored.memberships
+        || source.producer_principals_sha256 != restored.producer_principals_sha256
+        || source.functions != restored.functions
+        || source.triggers != restored.triggers
+        || !object_acls_match
+        || source.privilege_proof != restored.privilege_proof
+    {
+        bail!("restored corpus-hygiene security boundary differs from the signed source manifest");
+    }
+    Ok(())
+}
+
+fn non_owner_acl_view(value: &serde_json::Value) -> serde_json::Value {
+    let mut normalized = value.clone();
+    if let Some(objects) = normalized.as_array_mut() {
+        for object in objects {
+            let owner_prefix = object["owner"]
+                .as_str()
+                .map(|owner| format!("{owner}="))
+                .unwrap_or_default();
+            if let Some(acls) = object
+                .get_mut("acl")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                acls.retain(|acl| {
+                    !acl.as_str()
+                        .is_some_and(|entry| entry.starts_with(&owner_prefix))
+                });
+            }
+        }
+    }
+    normalized
 }
 
 /// Build the manifest by querying the live DB and reading config.

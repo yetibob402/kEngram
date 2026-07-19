@@ -15,6 +15,8 @@ use sqlx::{PgPool, PgTransaction, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod corpus_hygiene;
+
 pub mod target {
     //! `embeddings.target_kind` enum-as-string. Matches the CHECK constraint
     //! on the column. The `FACT` value is preserved for migration
@@ -779,66 +781,63 @@ pub struct InsertedThought {
     pub created_at: OffsetDateTime,
 }
 
-/// Insert a thought. The database generates `id` and `created_at`. Returns
-/// `(InsertedThought, is_new)`:
-/// - `is_new = true`: a fresh row was inserted; caller should enqueue
-///   embedding + tag jobs.
-/// - `is_new = false`: a row with the same `content_fingerprint` already
-///   exists; the returned `id` + `created_at` belong to that existing row;
-///   no new jobs should be enqueued.
-///
-/// Implementation: `INSERT ... ON CONFLICT (content_fingerprint) DO NOTHING
-/// RETURNING ...`. On conflict no row is returned, so we fall through to a
-/// SELECT by fingerprint to fetch the existing row.
+/// Insert a thought through migration 0030's database chokepoint.  The
+/// legacy fingerprint field remains on `NewThought` for source compatibility,
+/// but it is never sent to PostgreSQL: the gate computes the authoritative
+/// digest from the exact content bytes stored in `thoughts`.
 pub async fn insert_thought(
     pool: &PgPool,
     t: NewThought<'_>,
 ) -> Result<(InsertedThought, bool), StorageError> {
-    let fingerprint: &[u8] = &t.content_fingerprint;
-    let inserted = sqlx::query!(
-        r#"
-        INSERT INTO thoughts (scope, content, source, metadata, content_fingerprint)
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (content_fingerprint) DO NOTHING
-        RETURNING id, created_at
-        "#,
-        t.scope.as_str(),
-        t.content,
-        t.source.as_str(),
-        t.metadata.as_value(),
-        fingerprint,
+    let bypass = serde_json::json!({
+        "code": "storage_insert_without_candidate_embedding",
+        "detail": "caller queues embedding separately"
+    });
+    let relation_intents = serde_json::json!([]);
+    let result = corpus_hygiene::capture_thought_gated(
+        pool,
+        corpus_hygiene::GatedCaptureRequest {
+            scope: t.scope.as_str(),
+            content: t.content,
+            source: t.source.as_str(),
+            metadata: t.metadata.as_value(),
+            source_created_at: Some(OffsetDateTime::now_utc()),
+            candidate_embedding: None,
+            embedding_model_id: None,
+            embedding_model_version: None,
+            bypass_reason: Some(&bypass),
+            source_event_namespace: None,
+            source_event_ref: None,
+            source_event_payload_hash: None,
+            source_event_metadata: None,
+            relation_intents: &relation_intents,
+            tagger_model_id: None,
+            claimed_producer_class: None,
+            correlation_id: None,
+            force_keep_token: None,
+        },
     )
-    .fetch_optional(pool)
     .await?;
 
-    if let Some(row) = inserted {
-        return Ok((
-            InsertedThought {
-                id: ThoughtId::from(row.id),
-                created_at: row.created_at,
-            },
-            true,
-        ));
-    }
-
-    // Fingerprint collision: fetch the existing row.
-    let existing = sqlx::query!(
-        r#"
-        SELECT id, created_at
-        FROM thoughts
-        WHERE content_fingerprint = $1
-        "#,
-        fingerprint,
-    )
-    .fetch_one(pool)
-    .await?;
-
+    let id = result.thought_id.ok_or_else(|| {
+        StorageError::Database(sqlx::Error::Protocol(
+            "capture_thought_gated returned no thought_id".to_string(),
+        ))
+    })?;
+    let is_new = matches!(
+        result.action.as_str(),
+        "inserted"
+            | "out_of_family_insert"
+            | "fail_open_insert"
+            | "relation_intent_keep"
+            | "shadow_candidate"
+    );
     Ok((
         InsertedThought {
-            id: ThoughtId::from(existing.id),
-            created_at: existing.created_at,
+            id: ThoughtId::from(id),
+            created_at: result.effective_created_at,
         },
-        false,
+        is_new,
     ))
 }
 
@@ -4308,6 +4307,9 @@ pub struct ThoughtTags {
 pub struct PendingTagJob {
     pub thought_id: ThoughtId,
     pub tagger_model_id: String,
+    /// Stable identity for one genuine enqueue. Retries preserve it; a
+    /// completed row followed by a later enqueue receives a fresh UUID.
+    pub tag_job_generation_id: Uuid,
     pub attempts: i32,
 }
 
@@ -4389,15 +4391,15 @@ pub async fn enqueue_tag_job(
     thought_id: ThoughtId,
     tagger_model_id: &str,
 ) -> Result<bool, StorageError> {
-    let result = sqlx::query!(
+    let result = sqlx::query(
         r#"
         INSERT INTO pending_tags (thought_id, tagger_model_id)
         VALUES ($1, $2)
         ON CONFLICT (thought_id) DO NOTHING
         "#,
-        thought_id.into_uuid(),
-        tagger_model_id,
     )
+    .bind(thought_id.into_uuid())
+    .bind(tagger_model_id)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)
@@ -4439,36 +4441,45 @@ pub async fn fetch_pending_tag_jobs(
     pool: &PgPool,
     batch_size: i64,
 ) -> Result<Vec<PendingTagJob>, StorageError> {
-    let rows = sqlx::query!(
+    let rows = sqlx::query(
         r#"
-        SELECT thought_id, tagger_model_id, attempts
+        SELECT thought_id, tagger_model_id, tag_job_generation_id, attempts
         FROM pending_tags
         ORDER BY enqueued_at ASC
         LIMIT $1
         "#,
-        batch_size,
     )
+    .bind(batch_size)
     .fetch_all(pool)
     .await?;
-    Ok(rows
+    let jobs = rows
         .into_iter()
-        .map(|r| PendingTagJob {
-            thought_id: ThoughtId::from(r.thought_id),
-            tagger_model_id: r.tagger_model_id,
-            attempts: r.attempts,
+        .map(|r| -> Result<PendingTagJob, sqlx::Error> {
+            Ok(PendingTagJob {
+                thought_id: ThoughtId::from(r.try_get::<Uuid, _>("thought_id")?),
+                tagger_model_id: r.try_get("tagger_model_id")?,
+                tag_job_generation_id: r.try_get("tag_job_generation_id")?,
+                attempts: r.try_get("attempts")?,
+            })
         })
-        .collect())
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(jobs)
 }
 
 /// Remove a tag job from the queue after a successful tagger.tag() call.
-pub async fn complete_tag_job(pool: &PgPool, thought_id: ThoughtId) -> Result<(), StorageError> {
-    sqlx::query!(
-        r#"DELETE FROM pending_tags WHERE thought_id = $1"#,
-        thought_id.into_uuid(),
+pub async fn complete_tag_job(
+    pool: &PgPool,
+    thought_id: ThoughtId,
+    generation_id: Uuid,
+) -> Result<bool, StorageError> {
+    let result = sqlx::query(
+        r#"DELETE FROM pending_tags WHERE thought_id = $1 AND tag_job_generation_id = $2"#,
     )
+    .bind(thought_id.into_uuid())
+    .bind(generation_id)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
 /// Bump the `attempts` counter on a pending tag job after a soft failure.
@@ -4476,14 +4487,20 @@ pub async fn complete_tag_job(pool: &PgPool, thought_id: ThoughtId) -> Result<()
 pub async fn increment_tag_job_attempts(
     pool: &PgPool,
     thought_id: ThoughtId,
-) -> Result<(), StorageError> {
-    sqlx::query!(
-        r#"UPDATE pending_tags SET attempts = attempts + 1 WHERE thought_id = $1"#,
-        thought_id.into_uuid(),
+    generation_id: Uuid,
+) -> Result<bool, StorageError> {
+    let result = sqlx::query(
+        r#"
+        UPDATE pending_tags
+        SET attempts = attempts + 1
+        WHERE thought_id = $1 AND tag_job_generation_id = $2
+        "#,
     )
+    .bind(thought_id.into_uuid())
+    .bind(generation_id)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
 /// Walk thoughts that need tagging — either never-tagged (`tags_extractor_version
@@ -4700,58 +4717,42 @@ pub async fn insert_link(
     source: LinkSource,
     note: Option<&str>,
 ) -> Result<(LinkId, bool), StorageError> {
-    let to_thought_id = target.as_thought_id().map(|id| *id.as_uuid());
-    let to_entity = target.as_entity();
-    let to_person = target.as_person();
-    let to_url = target.as_url();
-
-    let row = sqlx::query!(
-        r#"
-        INSERT INTO thought_links
-            (from_thought_id, relation, to_kind, to_thought_id, to_entity, to_person, to_url, source, note)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        ON CONFLICT (from_thought_id, relation, to_kind, to_value) WHERE deleted_at IS NULL
-        DO NOTHING
-        RETURNING id
-        "#,
-        from.into_uuid(),
-        relation.as_str(),
-        target.kind_str(),
-        to_thought_id,
-        to_entity,
-        to_person,
-        to_url,
-        source.as_str(),
-        note,
+    let was_live = lookup_link_status(pool, from, relation, target).await? == LinkStatus::Live;
+    let operation = serde_json::json!([{
+        "action": "create",
+        "from_thought_id": from.to_string(),
+        "relation": relation.as_str(),
+        "to_kind": target.kind_str(),
+        "to_value": target.value_str(),
+        "source": source.as_str(),
+        "note": note,
+    }]);
+    let request_id = Uuid::new_v4().to_string();
+    let metadata = serde_json::json!({"compatibility_surface": "insert_link"});
+    let result = corpus_hygiene::mutate_thought_relations_serialized(
+        pool,
+        corpus_hygiene::RelationMutationRequest {
+            operations: &operation,
+            source_event_namespace: "kengram/storage-compat",
+            source_event_ref: &request_id,
+            source_event_payload_hash: &request_id,
+            request_metadata: &metadata,
+            claimed_producer_class: None,
+        },
     )
-    .fetch_optional(pool)
     .await?;
-
-    if let Some(r) = row {
-        return Ok((LinkId::from(r.id), true));
-    }
-
-    // ON CONFLICT path: fetch the existing live row's id.
-    let value = target.value_str();
-    let existing = sqlx::query!(
-        r#"
-        SELECT id
-        FROM thought_links
-        WHERE from_thought_id = $1
-          AND relation = $2
-          AND to_kind = $3
-          AND to_value = $4
-          AND deleted_at IS NULL
-        "#,
-        from.into_uuid(),
-        relation.as_str(),
-        target.kind_str(),
-        value,
-    )
-    .fetch_one(pool)
-    .await?;
-
-    Ok((LinkId::from(existing.id), false))
+    let id = result
+        .get("link_ids")
+        .and_then(|ids| ids.as_array())
+        .and_then(|ids| ids.first())
+        .and_then(|id| id.as_str())
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .ok_or_else(|| {
+            StorageError::Database(sqlx::Error::Protocol(format!(
+                "serialized link mutation returned no link id: {result}"
+            )))
+        })?;
+    Ok((LinkId::from(id), !was_live))
 }
 
 /// Determine the live/soft-deleted/never-existed status of an edge
@@ -4808,25 +4809,50 @@ pub async fn delete_link(
     target: &LinkTarget,
 ) -> Result<Option<LinkId>, StorageError> {
     let value = target.value_str();
-    let row = sqlx::query!(
+    let row = sqlx::query(
         r#"
-        UPDATE thought_links
-        SET deleted_at = NOW()
+        SELECT id
+        FROM thought_links
         WHERE from_thought_id = $1
           AND relation = $2
           AND to_kind = $3
           AND to_value = $4
           AND deleted_at IS NULL
-        RETURNING id
         "#,
-        from.into_uuid(),
-        relation.as_str(),
-        target.kind_str(),
-        value,
     )
+    .bind(from.into_uuid())
+    .bind(relation.as_str())
+    .bind(target.kind_str())
+    .bind(&value)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|r| LinkId::from(r.id)))
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let id: Uuid = row.try_get("id")?;
+    let operation = serde_json::json!([{
+        "action": "delete",
+        "from_thought_id": from.to_string(),
+        "relation": relation.as_str(),
+        "to_kind": target.kind_str(),
+        "to_value": value,
+        "source": "agent",
+    }]);
+    let request_id = Uuid::new_v4().to_string();
+    let metadata = serde_json::json!({"compatibility_surface": "delete_link"});
+    corpus_hygiene::mutate_thought_relations_serialized(
+        pool,
+        corpus_hygiene::RelationMutationRequest {
+            operations: &operation,
+            source_event_namespace: "kengram/storage-compat",
+            source_event_ref: &request_id,
+            source_event_payload_hash: &request_id,
+            request_metadata: &metadata,
+            claimed_producer_class: None,
+        },
+    )
+    .await?;
+    Ok(Some(LinkId::from(id)))
 }
 
 /// Soft-delete all live (`deleted_at IS NULL`) edges where this thought is
@@ -4841,19 +4867,32 @@ pub async fn soft_delete_tagger_edges_for_thought(
     pool: &PgPool,
     from_thought_id: ThoughtId,
 ) -> Result<i64, StorageError> {
-    let result = sqlx::query!(
-        r#"
-        UPDATE thought_links
-        SET deleted_at = NOW()
-        WHERE from_thought_id = $1
-          AND source = 'tagger'
-          AND deleted_at IS NULL
-        "#,
-        from_thought_id.into_uuid(),
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM thought_links WHERE from_thought_id = $1 AND source = 'tagger' AND deleted_at IS NULL",
     )
-    .execute(pool)
+    .bind(from_thought_id.into_uuid())
+    .fetch_one(pool)
     .await?;
-    Ok(result.rows_affected() as i64)
+    let operation = serde_json::json!([{
+        "action": "replace_tagger_set",
+        "from_thought_id": from_thought_id.to_string(),
+        "relations": [],
+    }]);
+    let request_id = Uuid::new_v4().to_string();
+    let metadata = serde_json::json!({"compatibility_surface": "soft_delete_tagger_edges"});
+    corpus_hygiene::mutate_thought_relations_serialized(
+        pool,
+        corpus_hygiene::RelationMutationRequest {
+            operations: &operation,
+            source_event_namespace: "kengram/storage-compat",
+            source_event_ref: &request_id,
+            source_event_payload_hash: &request_id,
+            request_metadata: &metadata,
+            claimed_producer_class: None,
+        },
+    )
+    .await?;
+    Ok(count)
 }
 
 /// Walk edges from a given thought. `direction` selects whether to
@@ -5308,9 +5347,10 @@ pub async fn query_migration_audit(
 /// Result of `retract_thought`. Distinguishes "actually retracted this row"
 /// from "row didn't exist or was already retracted." Post-M4: no more
 /// `facts_superseded` field since the facts table is gone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetractThoughtOutcome {
     pub retracted: bool,
+    pub status: String,
 }
 
 /// Mark a thought as retracted. Retracted thoughts are excluded from
@@ -5325,20 +5365,19 @@ pub async fn retract_thought(
     thought_id: ThoughtId,
     reason: Option<&str>,
 ) -> Result<RetractThoughtOutcome, StorageError> {
-    let updated = sqlx::query!(
-        r#"
-        UPDATE thoughts
-        SET retracted_at = NOW(), retracted_reason = $2
-        WHERE id = $1 AND retracted_at IS NULL
-        "#,
-        thought_id.into_uuid(),
-        reason,
-    )
-    .execute(pool)
-    .await?;
-
+    let result =
+        corpus_hygiene::retract_thought_serialized(pool, thought_id.into_uuid(), reason, None)
+            .await?;
     Ok(RetractThoughtOutcome {
-        retracted: updated.rows_affected() == 1,
+        retracted: result
+            .get("retracted")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        status: result
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
     })
 }
 
@@ -7074,6 +7113,16 @@ mod tests {
         let (inserted, _) = insert_thought(pool, new_thought(&scope, &source, &metadata, content))
             .await
             .unwrap();
+        // The production gate atomically enqueues BGE for no-vector writes.
+        // Storage unit fixtures manage queue state explicitly, so reset only
+        // that automatically-created row here.
+        sqlx::query(
+            "DELETE FROM pending_embeddings WHERE target_kind = 'thought' AND target_id = $1",
+        )
+        .bind(inserted.id.into_uuid())
+        .execute(pool)
+        .await
+        .unwrap();
         inserted.id
     }
 
@@ -7088,6 +7137,13 @@ mod tests {
         let (inserted, _) = insert_thought(pool, new_thought(&scope, &source, &metadata, content))
             .await
             .unwrap();
+        sqlx::query(
+            "DELETE FROM pending_embeddings WHERE target_kind = 'thought' AND target_id = $1",
+        )
+        .bind(inserted.id.into_uuid())
+        .execute(pool)
+        .await
+        .unwrap();
         inserted.id
     }
 
@@ -8801,8 +8857,10 @@ mod tests {
     async fn complete_tag_job_removes_from_queue(pool: PgPool) {
         let id = insert_test_thought(&pool, "to tag", "global").await;
         enqueue_tag_job(&pool, id, "v1").await.unwrap();
+        let generation_id =
+            fetch_pending_tag_jobs(&pool, 1).await.unwrap()[0].tag_job_generation_id;
 
-        complete_tag_job(&pool, id).await.unwrap();
+        complete_tag_job(&pool, id, generation_id).await.unwrap();
 
         let jobs = fetch_pending_tag_jobs(&pool, 10).await.unwrap();
         assert!(jobs.is_empty());
@@ -8812,9 +8870,15 @@ mod tests {
     async fn increment_tag_job_attempts_bumps_counter(pool: PgPool) {
         let id = insert_test_thought(&pool, "to tag", "global").await;
         enqueue_tag_job(&pool, id, "v1").await.unwrap();
+        let generation_id =
+            fetch_pending_tag_jobs(&pool, 1).await.unwrap()[0].tag_job_generation_id;
 
-        increment_tag_job_attempts(&pool, id).await.unwrap();
-        increment_tag_job_attempts(&pool, id).await.unwrap();
+        increment_tag_job_attempts(&pool, id, generation_id)
+            .await
+            .unwrap();
+        increment_tag_job_attempts(&pool, id, generation_id)
+            .await
+            .unwrap();
 
         let jobs = fetch_pending_tag_jobs(&pool, 10).await.unwrap();
         assert_eq!(jobs.len(), 1);
@@ -9493,7 +9557,10 @@ mod tests {
         insert_link(
             &pool,
             a,
-            RelationKind::Refines,
+            // Supersession endpoints are intentionally protected from
+            // ordinary retraction; use a non-chain edge for this read-shape
+            // fixture.
+            RelationKind::References,
             &t(b),
             LinkSource::Agent,
             None,

@@ -1,23 +1,12 @@
-//! The `capture` operation: write a thought row and enqueue embedding +
-//! tag jobs.
+//! Capture orchestration for migration 0030's database gate.
 //!
-//! Capture does **not** call the embedder or tagger. It records the thought
-//! (durable), enqueues a job in `pending_embeddings` (and, when a tagger is
-//! configured, in `pending_tags`), and returns immediately with
-//! `embedding_status: "pending"`. The `kengram worker` process drains both
-//! queues and writes results on its next tick.
-//!
-//! M4: content_fingerprint dedup. We SHA-256 the content client-side before
-//! the DB write so we can carry the fingerprint into `insert_thought`, which
-//! does an `INSERT ... ON CONFLICT (content_fingerprint) DO NOTHING`. On
-//! conflict the storage layer returns the pre-existing thought_id; we surface
-//! that as `is_duplicate: true` and skip the enqueue calls so we don't
-//! re-embed/re-tag content that already exists.
+//! The database derives producer policy from `session_user`, computes the
+//! fingerprint from stored content, performs exact/semantic decisions, and
+//! atomically records source-event, queue, relation, and gate evidence.
 
 use kengram_core::{EmbeddingStatus, Metadata, Scope, Source, ThoughtId};
-use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
-use uuid::Uuid;
+use sqlx::PgPool;
+use time::OffsetDateTime;
 
 /// Hard upper bound on a single thought's content. Enforced before the DB
 /// write so callers get a clean rejection.
@@ -30,6 +19,20 @@ pub struct CaptureRequest {
     pub scope: Option<Scope>,
     pub metadata: Option<Metadata>,
     pub argus_source_event: Option<ArgusSourceEventRequest>,
+}
+
+/// Gate-only inputs used by callers that can supply source time, a
+/// synchronous semantic vector, or atomic relation intents. Keeping these
+/// separate preserves the established basic capture request for internal
+/// queue/search fixtures.
+#[derive(Debug, Clone, Default)]
+pub struct CaptureGateOptions {
+    pub source_created_at: Option<OffsetDateTime>,
+    pub candidate_embedding: Option<Vec<f32>>,
+    pub bypass_reason: Option<serde_json::Value>,
+    pub relation_intents: Vec<serde_json::Value>,
+    pub claimed_producer_class: Option<String>,
+    pub correlation_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +63,11 @@ pub struct CaptureResponse {
     /// was inserted.
     pub is_duplicate: bool,
     pub argus_source_event: Option<ArgusSourceEventResponse>,
+    pub dedup_kind: Option<String>,
+    pub matched_thought_id: Option<ThoughtId>,
+    pub similarity: Option<f64>,
+    pub relation_results: serde_json::Value,
+    pub gate_event_id: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -77,18 +85,9 @@ pub enum CaptureError {
     Storage(#[from] kengram_storage::StorageError),
 }
 
-/// Compute the SHA-256 of `content` as a 32-byte array. Mirrors what the
-/// storage tests do when constructing `NewThought` directly.
-fn fingerprint_of(content: &str) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
-    hasher.finalize().into()
-}
-
-/// Capture a thought. Inserts the `thoughts` row (deduping by content
-/// fingerprint), and — only on a fresh insert — enqueues an embedding job
-/// and (when `tagger_model_id` is `Some`) a tag job. Always returns
-/// `EmbeddingStatus::Pending`.
+/// Capture through the one database chokepoint.  A caller without a
+/// synchronous candidate embedding must provide (or receives) a structured
+/// bypass reason; shadow/enforce failures then keep and queue the thought.
 ///
 /// `embedder_model_id` is the active embedder's identity (e.g.
 /// `"bge-m3:1024"`). The worker uses it to pair the row with the right
@@ -104,6 +103,23 @@ pub async fn capture(
     tagger_model_id: Option<&str>,
     request: CaptureRequest,
 ) -> Result<CaptureResponse, CaptureError> {
+    capture_with_gate_options(
+        pool,
+        embedder_model_id,
+        tagger_model_id,
+        request,
+        CaptureGateOptions::default(),
+    )
+    .await
+}
+
+pub async fn capture_with_gate_options(
+    pool: &PgPool,
+    embedder_model_id: &str,
+    tagger_model_id: Option<&str>,
+    request: CaptureRequest,
+    options: CaptureGateOptions,
+) -> Result<CaptureResponse, CaptureError> {
     if request.content.is_empty() {
         return Err(CaptureError::EmptyContent);
     }
@@ -114,301 +130,121 @@ pub async fn capture(
         });
     }
 
-    if request.argus_source_event.is_some() {
-        return capture_with_argus_source_event(pool, embedder_model_id, tagger_model_id, request)
-            .await;
-    }
-
     let scope = request.scope.unwrap_or_default();
     let metadata = request.metadata.unwrap_or_default();
-    let fingerprint = fingerprint_of(&request.content);
+    let source_event = request.argus_source_event;
+    if let Some(event) = &source_event {
+        if event.namespace.trim().is_empty() {
+            return Err(CaptureError::InvalidArgusSourceEvent(
+                "namespace is required",
+            ));
+        }
+        if event.source_ref.trim().is_empty() {
+            return Err(CaptureError::InvalidArgusSourceEvent(
+                "source_ref is required",
+            ));
+        }
+        if event.payload_hash.trim().is_empty() {
+            return Err(CaptureError::InvalidArgusSourceEvent(
+                "payload_hash is required",
+            ));
+        }
+    }
 
-    let (inserted, is_new) = kengram_storage::insert_thought(
+    let source_event_metadata = source_event
+        .as_ref()
+        .and_then(|event| event.metadata.as_ref())
+        .map(Metadata::as_value);
+    let relation_intents = serde_json::Value::Array(options.relation_intents);
+    let default_bypass = serde_json::json!({
+        "code": "candidate_embedding_unavailable",
+        "detail": "capture caller did not provide a synchronous bge-m3 vector"
+    });
+    let bypass_reason = if options.candidate_embedding.is_none() {
+        Some(options.bypass_reason.as_ref().unwrap_or(&default_bypass))
+    } else {
+        options.bypass_reason.as_ref()
+    };
+    let source_created_at = options
+        .source_created_at
+        .or_else(|| Some(OffsetDateTime::now_utc()));
+
+    let result = kengram_storage::corpus_hygiene::capture_thought_gated(
         pool,
-        kengram_storage::NewThought {
-            scope: &scope,
+        kengram_storage::corpus_hygiene::GatedCaptureRequest {
+            scope: scope.as_str(),
             content: &request.content,
-            source: &request.source,
-            metadata: &metadata,
-            content_fingerprint: fingerprint,
+            source: request.source.as_str(),
+            metadata: metadata.as_value(),
+            source_created_at,
+            candidate_embedding: options.candidate_embedding.as_deref(),
+            embedding_model_id: Some(embedder_model_id),
+            embedding_model_version: Some(1),
+            bypass_reason,
+            source_event_namespace: source_event.as_ref().map(|event| event.namespace.as_str()),
+            source_event_ref: source_event.as_ref().map(|event| event.source_ref.as_str()),
+            source_event_payload_hash: source_event
+                .as_ref()
+                .map(|event| event.payload_hash.as_str()),
+            source_event_metadata,
+            relation_intents: &relation_intents,
+            tagger_model_id,
+            claimed_producer_class: options.claimed_producer_class.as_deref(),
+            correlation_id: options.correlation_id.as_deref(),
+            force_keep_token: None,
         },
     )
     .await?;
-
-    if is_new {
-        kengram_storage::enqueue_embedding(
-            pool,
-            kengram_storage::target::THOUGHT,
-            inserted.id.into_uuid(),
-            embedder_model_id,
-        )
-        .await?;
-        if let Some(tagger_id) = tagger_model_id {
-            kengram_storage::enqueue_tag_job(pool, inserted.id, tagger_id).await?;
+    // A conflicting replay does not select a new corpus row, but the source
+    // event ledger still identifies the original thought for the established
+    // MCP conflict response.
+    let thought_id = result
+        .thought_id
+        .or(result.matched_thought_id)
+        .ok_or_else(|| {
+            CaptureError::Storage(kengram_storage::StorageError::Database(
+                sqlx::Error::Protocol(format!(
+                    "capture gate returned action={} without thought_id",
+                    result.action
+                )),
+            ))
+        })?;
+    let thought_id = ThoughtId::from(thought_id);
+    let is_duplicate = matches!(
+        result.action.as_str(),
+        "exact_duplicate" | "semantic_duplicate"
+    );
+    let argus_source_event = source_event.map(|event| {
+        let action = match result.source_event_action.as_deref() {
+            // Preserve the established MCP response contract while the gate
+            // records the more precise replay disposition in its ledger.
+            Some("replay") => "duplicate_skip".to_string(),
+            Some(action) => action.to_string(),
+            None => result.action.clone(),
+        };
+        ArgusSourceEventResponse {
+            action,
+            namespace: event.namespace,
+            source_ref: event.source_ref,
+            payload_hash: event.payload_hash,
+            status: result
+                .source_event_status
+                .clone()
+                .unwrap_or_else(|| "stored".to_string()),
+            thought_id: Some(thought_id),
         }
-    }
-
-    Ok(CaptureResponse {
-        thought_id: inserted.id,
-        embedding_status: EmbeddingStatus::Pending,
-        is_duplicate: !is_new,
-        argus_source_event: None,
-    })
-}
-
-async fn capture_with_argus_source_event(
-    pool: &PgPool,
-    embedder_model_id: &str,
-    tagger_model_id: Option<&str>,
-    request: CaptureRequest,
-) -> Result<CaptureResponse, CaptureError> {
-    let source_event = request
-        .argus_source_event
-        .ok_or(CaptureError::InvalidArgusSourceEvent(
-            "missing source event",
-        ))?;
-    if source_event.namespace.trim().is_empty() {
-        return Err(CaptureError::InvalidArgusSourceEvent(
-            "namespace is required",
-        ));
-    }
-    if source_event.source_ref.trim().is_empty() {
-        return Err(CaptureError::InvalidArgusSourceEvent(
-            "source_ref is required",
-        ));
-    }
-    if source_event.payload_hash.trim().is_empty() {
-        return Err(CaptureError::InvalidArgusSourceEvent(
-            "payload_hash is required",
-        ));
-    }
-
-    let scope = request.scope.unwrap_or_default();
-    let metadata = request.metadata.unwrap_or_default();
-    let source_event_metadata = source_event.metadata.unwrap_or_default();
-    let fingerprint = fingerprint_of(&request.content);
-    let fingerprint_slice: &[u8] = &fingerprint;
-
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(kengram_storage::StorageError::from)?;
-
-    let existing = sqlx::query(
-        r#"
-        SELECT payload_hash, status, thought_id
-        FROM argus_source_events
-        WHERE namespace = $1 AND source_ref = $2
-        FOR UPDATE
-        "#,
-    )
-    .bind(&source_event.namespace)
-    .bind(&source_event.source_ref)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(kengram_storage::StorageError::from)?;
-
-    if let Some(row) = existing {
-        let existing_hash: String = row
-            .try_get("payload_hash")
-            .map_err(kengram_storage::StorageError::from)?;
-        let existing_status: String = row
-            .try_get("status")
-            .map_err(kengram_storage::StorageError::from)?;
-        let existing_thought_id: Option<Uuid> = row
-            .try_get("thought_id")
-            .map_err(kengram_storage::StorageError::from)?;
-
-        if existing_hash == source_event.payload_hash {
-            sqlx::query(
-                r#"
-                UPDATE argus_source_events
-                SET last_seen_at = NOW()
-                WHERE namespace = $1 AND source_ref = $2
-                "#,
-            )
-            .bind(&source_event.namespace)
-            .bind(&source_event.source_ref)
-            .execute(&mut *tx)
-            .await
-            .map_err(kengram_storage::StorageError::from)?;
-            tx.commit()
-                .await
-                .map_err(kengram_storage::StorageError::from)?;
-
-            let thought_id = existing_thought_id.map(ThoughtId::from);
-            return Ok(CaptureResponse {
-                thought_id: thought_id.unwrap_or_default(),
-                embedding_status: EmbeddingStatus::Pending,
-                is_duplicate: true,
-                argus_source_event: Some(ArgusSourceEventResponse {
-                    action: "duplicate_skip".to_string(),
-                    namespace: source_event.namespace,
-                    source_ref: source_event.source_ref,
-                    payload_hash: source_event.payload_hash,
-                    status: existing_status,
-                    thought_id,
-                }),
-            });
-        }
-
-        let conflict_metadata = serde_json::json!({
-            "conflict": {
-                "incoming_payload_sha256": source_event.payload_hash,
-                "prior_payload_sha256": existing_hash
-            }
-        });
-        sqlx::query(
-            r#"
-            UPDATE argus_source_events
-            SET status = 'conflict',
-                error = 'payload_hash_conflict',
-                last_seen_at = NOW(),
-                metadata = metadata || $3::jsonb
-            WHERE namespace = $1 AND source_ref = $2
-            "#,
-        )
-        .bind(&source_event.namespace)
-        .bind(&source_event.source_ref)
-        .bind(conflict_metadata)
-        .execute(&mut *tx)
-        .await
-        .map_err(kengram_storage::StorageError::from)?;
-        tx.commit()
-            .await
-            .map_err(kengram_storage::StorageError::from)?;
-
-        let thought_id = existing_thought_id.map(ThoughtId::from);
-        return Ok(CaptureResponse {
-            thought_id: thought_id.unwrap_or_default(),
-            embedding_status: EmbeddingStatus::Pending,
-            is_duplicate: true,
-            argus_source_event: Some(ArgusSourceEventResponse {
-                action: "conflict".to_string(),
-                namespace: source_event.namespace,
-                source_ref: source_event.source_ref,
-                payload_hash: source_event.payload_hash,
-                status: "conflict".to_string(),
-                thought_id,
-            }),
-        });
-    }
-
-    sqlx::query(
-        r#"
-        INSERT INTO argus_source_events (namespace, source_ref, payload_hash, status, metadata)
-        VALUES ($1, $2, $3, 'pending', $4::jsonb)
-        "#,
-    )
-    .bind(&source_event.namespace)
-    .bind(&source_event.source_ref)
-    .bind(&source_event.payload_hash)
-    .bind(source_event_metadata.as_value())
-    .execute(&mut *tx)
-    .await
-    .map_err(kengram_storage::StorageError::from)?;
-
-    let inserted = sqlx::query(
-        r#"
-        INSERT INTO thoughts (scope, content, source, metadata, content_fingerprint)
-        VALUES ($1, $2, $3, $4::jsonb, $5)
-        ON CONFLICT (content_fingerprint) DO NOTHING
-        RETURNING id
-        "#,
-    )
-    .bind(scope.as_str())
-    .bind(&request.content)
-    .bind(request.source.as_str())
-    .bind(metadata.as_value())
-    .bind(fingerprint_slice)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(kengram_storage::StorageError::from)?;
-
-    let (thought_id, is_new) = if let Some(row) = inserted {
-        let id: Uuid = row
-            .try_get("id")
-            .map_err(kengram_storage::StorageError::from)?;
-        (ThoughtId::from(id), true)
-    } else {
-        let row = sqlx::query(
-            r#"
-            SELECT id
-            FROM thoughts
-            WHERE content_fingerprint = $1
-            "#,
-        )
-        .bind(fingerprint_slice)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(kengram_storage::StorageError::from)?;
-        let id: Uuid = row
-            .try_get("id")
-            .map_err(kengram_storage::StorageError::from)?;
-        (ThoughtId::from(id), false)
-    };
-
-    if is_new {
-        sqlx::query(
-            r#"
-            INSERT INTO pending_embeddings (target_kind, target_id, model_id)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (target_kind, target_id, model_id) DO NOTHING
-            "#,
-        )
-        .bind(kengram_storage::target::THOUGHT)
-        .bind(thought_id.into_uuid())
-        .bind(embedder_model_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(kengram_storage::StorageError::from)?;
-
-        if let Some(tagger_id) = tagger_model_id {
-            sqlx::query(
-                r#"
-                INSERT INTO pending_tags (thought_id, tagger_model_id)
-                VALUES ($1, $2)
-                ON CONFLICT (thought_id) DO NOTHING
-                "#,
-            )
-            .bind(thought_id.into_uuid())
-            .bind(tagger_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(kengram_storage::StorageError::from)?;
-        }
-    }
-
-    sqlx::query(
-        r#"
-        UPDATE argus_source_events
-        SET thought_id = $3, status = 'stored', last_seen_at = NOW()
-        WHERE namespace = $1 AND source_ref = $2
-        "#,
-    )
-    .bind(&source_event.namespace)
-    .bind(&source_event.source_ref)
-    .bind(thought_id.into_uuid())
-    .execute(&mut *tx)
-    .await
-    .map_err(kengram_storage::StorageError::from)?;
-
-    tx.commit()
-        .await
-        .map_err(kengram_storage::StorageError::from)?;
+    });
 
     Ok(CaptureResponse {
         thought_id,
         embedding_status: EmbeddingStatus::Pending,
-        is_duplicate: !is_new,
-        argus_source_event: Some(ArgusSourceEventResponse {
-            action: "stored".to_string(),
-            namespace: source_event.namespace,
-            source_ref: source_event.source_ref,
-            payload_hash: source_event.payload_hash,
-            status: "stored".to_string(),
-            thought_id: Some(thought_id),
-        }),
+        is_duplicate,
+        argus_source_event,
+        dedup_kind: is_duplicate.then(|| result.action.clone()),
+        matched_thought_id: result.matched_thought_id.map(ThoughtId::from),
+        similarity: result.similarity,
+        relation_results: result.relation_results,
+        gate_event_id: result.gate_event_id,
     })
 }
 
@@ -417,6 +253,7 @@ mod tests {
     use super::*;
     use kengram_core::EmbeddingModel;
     use serde_json::json;
+    use sqlx::Row;
 
     const TEST_EMBEDDER_MODEL_ID: &str = "bge-m3:1024";
     const TEST_TAGGER_MODEL_ID: &str = "fake/tagger";
@@ -740,5 +577,106 @@ mod tests {
             .await
             .unwrap();
         assert!(tag_jobs.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn invalid_candidate_model_queues_bge_and_audits_derived_bypass(pool: PgPool) {
+        let metadata = json!({});
+        let intents = json!([]);
+        let candidate = vec![0.25_f32; 1024];
+        let result = kengram_storage::corpus_hygiene::capture_thought_gated(
+            &pool,
+            kengram_storage::corpus_hygiene::GatedCaptureRequest {
+                scope: "agents/model-probe",
+                content: "A candidate with an unauthenticated model assertion must queue the reviewed BGE model.",
+                source: "test",
+                metadata: &metadata,
+                source_created_at: Some(OffsetDateTime::now_utc()),
+                candidate_embedding: Some(&candidate),
+                embedding_model_id: Some("wrong-model"),
+                embedding_model_version: Some(7),
+                bypass_reason: None,
+                source_event_namespace: None,
+                source_event_ref: None,
+                source_event_payload_hash: None,
+                source_event_metadata: None,
+                relation_intents: &intents,
+                tagger_model_id: None,
+                claimed_producer_class: None,
+                correlation_id: Some("wrong-model-probe"),
+                force_keep_token: None,
+            },
+        )
+        .await
+        .unwrap();
+        let thought_id = result.thought_id.unwrap();
+        let queued_model: String = sqlx::query_scalar(
+            "SELECT model_id FROM pending_embeddings WHERE target_kind='thought' AND target_id=$1",
+        )
+        .bind(thought_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(queued_model, "bge-m3:1024");
+        let bypass_code: String = sqlx::query_scalar(
+            "SELECT bypass_reason->>'code' FROM thought_ingest_gate_events WHERE id=$1",
+        )
+        .bind(result.gate_event_id.unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(bypass_code, "candidate_embedding_contract_mismatch");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_relation_intent_cannot_override_from_endpoint(pool: PgPool) {
+        let metadata = json!({});
+        let bypass = json!({"code": "fixture"});
+        let event_metadata = json!({});
+        let intents = json!([{
+            "action": "create",
+            "from_thought_id": uuid::Uuid::new_v4(),
+            "relation": "supports",
+            "to_kind": "thought",
+            "to_value": uuid::Uuid::new_v4(),
+            "source": "agent"
+        }]);
+        let error = kengram_storage::corpus_hygiene::capture_thought_gated(
+            &pool,
+            kengram_storage::corpus_hygiene::GatedCaptureRequest {
+                scope: "agents/relation-probe",
+                content: "A capture caller cannot redirect its atomic relation away from the gated thought.",
+                source: "test",
+                metadata: &metadata,
+                source_created_at: Some(OffsetDateTime::now_utc()),
+                candidate_embedding: None,
+                embedding_model_id: Some("bge-m3:1024"),
+                embedding_model_version: None,
+                bypass_reason: Some(&bypass),
+                source_event_namespace: Some("tests/capture-relations"),
+                source_event_ref: Some("forged-from-endpoint"),
+                source_event_payload_hash: Some("forged-from-endpoint"),
+                source_event_metadata: Some(&event_metadata),
+                relation_intents: &intents,
+                tagger_model_id: None,
+                claimed_producer_class: None,
+                correlation_id: None,
+                force_keep_token: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid_capture_relation_intent")
+        );
+        let counts: (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM thoughts), (SELECT COUNT(*) FROM argus_source_events), (SELECT COUNT(*) FROM thought_ingest_gate_events)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(counts, (0, 0, 0));
     }
 }

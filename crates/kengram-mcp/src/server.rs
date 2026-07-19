@@ -28,9 +28,11 @@ use serde::Deserialize;
 use sqlx::PgPool;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::capture::{self, CaptureError, CaptureRequest, MAX_CONTENT_LEN};
-use crate::link::{self, LinkError, LinkThoughtsRequest, MAX_LINK_NOTE_LEN};
+use crate::link::{self, LinkError, MAX_LINK_NOTE_LEN};
 use crate::query_expansion::QueryExpansionProvider;
 use crate::relate::{self, GetRelatedThoughtsRequest, RelateError};
 use crate::retract::{self, RetractError, RetractThoughtRequest};
@@ -68,6 +70,19 @@ pub struct CaptureArgs {
         description = "Optional Argus source-event idempotency gate. When present, capture is keyed by (namespace, source_ref) with payload_hash conflict detection before the thought row is written."
     )]
     pub argus_source_event: Option<ArgusSourceEventArgs>,
+
+    #[schemars(
+        description = "Optional RFC3339 source creation time. Historical producers must supply it; real-time native MCP captures normally omit it."
+    )]
+    pub source_created_at: Option<String>,
+
+    #[schemars(
+        description = "Optional relations created atomically with the captured thought. Every relation intent requires argus_source_event identity; replaces/refines force a keep before semantic comparison."
+    )]
+    pub relation_intents: Option<Vec<CaptureRelationIntentArgs>>,
+
+    #[schemars(description = "Optional caller correlation id recorded in the durable gate event.")]
+    pub correlation_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -83,6 +98,16 @@ pub struct ArgusSourceEventArgs {
 
     #[schemars(description = "Optional metadata stored on argus_source_events.metadata.")]
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CaptureRelationIntentArgs {
+    pub relation: String,
+    pub to_thought_id: Option<String>,
+    pub to_entity: Option<String>,
+    pub to_person: Option<String>,
+    pub to_url: Option<String>,
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -210,6 +235,28 @@ pub struct LinkThoughtsArgs {
         description = "Optional free-text annotation explaining the link (e.g. 'refines after probe 2B dogfood'). Stored on thought_links.note; max 1000 chars."
     )]
     pub note: Option<String>,
+
+    #[schemars(
+        description = "Mandatory durable request identity for relation replay/conflict handling."
+    )]
+    pub source_event: RelationSourceEventArgs,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RelationSourceEventArgs {
+    #[schemars(description = "Stable producer namespace used with source_ref as the replay key.")]
+    pub namespace: String,
+
+    #[schemars(description = "Stable producer request reference; retries must reuse it.")]
+    pub source_ref: String,
+
+    #[schemars(
+        description = "SHA-256 of the canonical request payload; reusing the identity with a different hash is rejected as a conflict."
+    )]
+    pub payload_hash: String,
+
+    #[schemars(description = "Optional metadata stored with the durable relation request.")]
+    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -241,6 +288,11 @@ pub struct UnlinkThoughtsArgs {
         description = "Target URL when the edge being removed targeted a URL. Mutually exclusive with `to_thought_id`, `to_entity`, `to_person`."
     )]
     pub to_url: Option<String>,
+
+    #[schemars(
+        description = "Mandatory durable request identity for relation replay/conflict handling."
+    )]
+    pub source_event: RelationSourceEventArgs,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -454,6 +506,93 @@ impl KengramServer {
             .map(serde_json::Value::Object)
             .map(Metadata::from);
 
+        let source_created_at = args
+            .source_created_at
+            .as_deref()
+            .map(|value| {
+                OffsetDateTime::parse(value, &Rfc3339)
+                    .map_err(|e| format!("invalid source_created_at RFC3339 value: {e}"))
+            })
+            .transpose()?;
+
+        let relation_intents = args
+            .relation_intents
+            .unwrap_or_default()
+            .into_iter()
+            .map(|intent| {
+                let relation: RelationKind = intent
+                    .relation
+                    .parse()
+                    .map_err(|e: kengram_core::UnknownRelationKind| e.to_string())?;
+                let target = parse_link_target(
+                    intent.to_thought_id.as_deref(),
+                    intent.to_entity,
+                    intent.to_person,
+                    intent.to_url,
+                )?;
+                link::validate_target(&target).map_err(map_link_error)?;
+                Ok(serde_json::json!({
+                    "action": "create",
+                    "relation": relation.as_str(),
+                    "to_kind": target.kind_str(),
+                    "to_value": target.value_str(),
+                    "source": "agent",
+                    "note": intent.note,
+                }))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        if !relation_intents.is_empty() && args.argus_source_event.is_none() {
+            return Err("relation_intents require argus_source_event identity".to_string());
+        }
+
+        // Obtain the candidate vector before entering the gate transaction.
+        // Only the reviewed BGE identity can participate in semantic compare;
+        // every other outcome becomes a structured fail-open reason.
+        let (candidate_embedding, bypass_reason) = if self.embedder.model().id == "bge-m3:1024"
+            && self.embedder.model().dimensions == 1024
+        {
+            let texts = vec![args.content.clone()];
+            match tokio::time::timeout(Duration::from_secs(1), self.embedder.embed(&texts)).await {
+                Ok(Ok(vectors)) if vectors.len() == 1 && vectors[0].len() == 1024 => (
+                    Some(vectors.into_iter().next().expect("length checked")),
+                    None,
+                ),
+                Ok(Ok(vectors)) => (
+                    None,
+                    Some(serde_json::json!({
+                        "code": "embedding_dimension_mismatch",
+                        "returned_vectors": vectors.len(),
+                        "expected_dimensions": 1024
+                    })),
+                ),
+                Ok(Err(error)) => (
+                    None,
+                    Some(serde_json::json!({
+                        "code": "embedding_unavailable",
+                        "detail": error.to_string()
+                    })),
+                ),
+                Err(_) => (
+                    None,
+                    Some(serde_json::json!({
+                        "code": "embedding_timeout",
+                        "timeout_ms": 1000
+                    })),
+                ),
+            }
+        } else {
+            (
+                None,
+                Some(serde_json::json!({
+                    "code": "embedding_model_mismatch",
+                    "model_id": self.embedder.model().id,
+                    "dimensions": self.embedder.model().dimensions,
+                    "required": "bge-m3:1024"
+                })),
+            )
+        };
+
         let request = CaptureRequest {
             content: args.content,
             source,
@@ -472,11 +611,24 @@ impl KengramServer {
             }),
         };
 
-        let resp = capture::capture(
+        let resp = capture::capture_with_gate_options(
             &self.pool,
-            &self.embedder.model().id,
+            // Invalid/unavailable candidates always queue the reviewed BGE
+            // model, independent of a stale server embedder configuration.
+            "bge-m3:1024",
             self.tagger_model_id.as_deref(),
             request,
+            capture::CaptureGateOptions {
+                source_created_at,
+                candidate_embedding,
+                bypass_reason,
+                relation_intents,
+                // The database derives the authenticated producer class from
+                // session_user. Leaving this optional assertion unset also
+                // keeps the reviewed break-glass/admin-DSN rollback usable.
+                claimed_producer_class: None,
+                correlation_id: args.correlation_id,
+            },
         )
         .await
         .map_err(map_capture_error)?;
@@ -485,6 +637,11 @@ impl KengramServer {
             "thought_id": resp.thought_id.to_string(),
             "embedding_status": resp.embedding_status,
             "is_duplicate": resp.is_duplicate,
+            "dedup_kind": resp.dedup_kind,
+            "matched_thought_id": resp.matched_thought_id.map(|id| id.to_string()),
+            "similarity": resp.similarity,
+            "relation_results": resp.relation_results,
+            "gate_event_id": resp.gate_event_id,
             "argus_source_event": resp.argus_source_event.map(|event| {
                 serde_json::json!({
                     "action": event.action,
@@ -640,7 +797,7 @@ impl KengramServer {
     }
 
     #[tool(
-        description = "Create a relation from a thought to a polymorphic target in the kengram graph layer. Asserts an edge with one of seven closed-vocabulary relations: replaces, requires, references, supports, belongs_to, decided_by, refines. The target side can be: another thought (`to_thought_id`), a free-text entity name (`to_entity` — for experiments, projects, sessions, abstract concepts), a person name (`to_person` — for attribution like `decided_by`), or a URL (`to_url` — for external resources). Supply exactly one of the four target fields. Idempotent on the (from, relation, to_kind, to_value) quadruple — re-asserting the same live edge returns is_new=false and the existing link_id. If the edge was previously soft-deleted via `unlink_thoughts`, a fresh live row is inserted and is_new=true. Validates that thought endpoints exist (from + to_thought_id), that from != to_thought_id when targeting a thought, that to_url starts with http:// or https://, and that to_entity/to_person aren't empty; returns clear error strings otherwise."
+        description = "Create a relation from a thought to a polymorphic target in the kengram graph layer. Requires `source_event` with a stable namespace/source_ref replay key and canonical payload SHA-256; retry the same request with the same identity, while identity reuse with a different hash is rejected. Asserts an edge with one of seven closed-vocabulary relations: replaces, requires, references, supports, belongs_to, decided_by, refines. The target side can be: another thought (`to_thought_id`), a free-text entity name (`to_entity` — for experiments, projects, sessions, abstract concepts), a person name (`to_person` — for attribution like `decided_by`), or a URL (`to_url` — for external resources). Supply exactly one of the four target fields. Idempotent on the (from, relation, to_kind, to_value) quadruple — re-asserting the same live edge returns is_new=false and the existing link_id. If the edge was previously soft-deleted via `unlink_thoughts`, a fresh live row is inserted and is_new=true. Validates that thought endpoints exist (from + to_thought_id), that from != to_thought_id when targeting a thought, that to_url starts with http:// or https://, and that to_entity/to_person aren't empty; returns clear error strings otherwise."
     )]
     async fn link_thoughts(
         &self,
@@ -661,11 +818,22 @@ impl KengramServer {
 
         let resp = link::link_thoughts(
             &self.pool,
-            LinkThoughtsRequest {
+            link::LinkThoughtsRequest {
                 from_thought_id: from,
                 relation,
                 target,
                 note: args.note,
+                source_event: link::RelationSourceEventRequest {
+                    namespace: args.source_event.namespace,
+                    source_ref: args.source_event.source_ref,
+                    payload_hash: args.source_event.payload_hash,
+                    metadata: args
+                        .source_event
+                        .metadata
+                        .map(serde_json::Value::Object)
+                        .unwrap_or_else(|| serde_json::json!({})),
+                },
+                claimed_producer_class: None,
             },
         )
         .await
@@ -683,7 +851,7 @@ impl KengramServer {
     }
 
     #[tool(
-        description = "Soft-delete a link by its (from, relation, target) triple. Returns a three-way status discriminator: `deleted_now` (the edge was live and was just removed), `already_deleted` (the edge previously existed but had already been soft-deleted), or `never_existed` (no edge with this triple ever existed). Soft-deleted edges sit inert in the table — re-creating the same edge via `link_thoughts` succeeds (fresh row). Supply the target the same way as `link_thoughts` (exactly one of `to_thought_id`, `to_entity`, `to_person`, `to_url`)."
+        description = "Soft-delete a link by its (from, relation, target) triple. Requires `source_event` with a stable namespace/source_ref replay key and canonical payload SHA-256; retry the same request with the same identity, while identity reuse with a different hash is rejected. Returns a three-way status discriminator: `deleted_now` (the edge was live and was just removed), `already_deleted` (the edge previously existed but had already been soft-deleted), or `never_existed` (no edge with this triple ever existed). Soft-deleted edges sit inert in the table — re-creating the same edge via `link_thoughts` succeeds (fresh row). Supply the target the same way as `link_thoughts` (exactly one of `to_thought_id`, `to_entity`, `to_person`, `to_url`)."
     )]
     async fn unlink_thoughts(
         &self,
@@ -702,9 +870,25 @@ impl KengramServer {
             args.to_url,
         )?;
 
-        let resp = link::unlink_thoughts(&self.pool, from, relation, &target)
-            .await
-            .map_err(map_link_error)?;
+        let resp = link::unlink_thoughts(
+            &self.pool,
+            from,
+            relation,
+            &target,
+            link::RelationSourceEventRequest {
+                namespace: args.source_event.namespace,
+                source_ref: args.source_event.source_ref,
+                payload_hash: args.source_event.payload_hash,
+                metadata: args
+                    .source_event
+                    .metadata
+                    .map(serde_json::Value::Object)
+                    .unwrap_or_else(|| serde_json::json!({})),
+            },
+            None,
+        )
+        .await
+        .map_err(map_link_error)?;
 
         let body = serde_json::json!({
             "status": resp.status.as_str(),
@@ -877,6 +1061,10 @@ fn map_link_error(err: LinkError) -> String {
             format!("to_url target too long: {got} bytes (max {max})")
         }
         LinkError::InvalidUrl => "to_url must start with http:// or https://".to_string(),
+        LinkError::InvalidSourceEvent(reason) => {
+            format!("invalid relation source event: {reason}")
+        }
+        LinkError::SourceEventConflict => "relation source-event conflict".to_string(),
         LinkError::Storage(e) => {
             tracing::error!(error = %e, "link/unlink storage error");
             "internal database error".to_string()
@@ -1180,8 +1368,8 @@ Top-level keys AND together; array values match by subset containment.
 Relations (M5+): thoughts can be linked with a closed-vocabulary `(from, relation, target)` edge. Seven relations (M5 shipped 6; M5.1 added `supports` after dogfood):
   replaces, requires, references, supports, belongs_to, decided_by, refines
 Distinguish `references` (prose-level citation / contextual mention) from `supports` (evidential / corroborative — the newer thought confirms a claim made in the older one). The `from` side is always a thought; the `to` side can be a thought, an entity name, a person name, or a URL (M5.2). Use:
-  - `link_thoughts(from_thought_id, relation, {to_thought_id | to_entity | to_person | to_url}, note?)` → supply exactly one of the four target fields. Idempotent on the (from, relation, to_kind, to_value) quadruple; returns `is_new` + the `link_id` + the `to_kind`/`to_value` discriminator.
-  - `unlink_thoughts(from_thought_id, relation, {one-of-four-targets})` → soft-delete; returns a three-way `status`: `deleted_now`, `already_deleted`, or `never_existed`.
+  - `link_thoughts(from_thought_id, relation, {to_thought_id | to_entity | to_person | to_url}, source_event, note?)` → supply exactly one of the four target fields plus a durable source identity. Idempotent on that request identity and the (from, relation, to_kind, to_value) quadruple; returns `is_new` + the `link_id` + the `to_kind`/`to_value` discriminator.
+  - `unlink_thoughts(from_thought_id, relation, {one-of-four-targets}, source_event)` → soft-delete with a durable source identity; returns a three-way `status`: `deleted_now`, `already_deleted`, or `never_existed`.
   - `get_related_thoughts(thought_id, relations?, target_kinds?, direction?)` → grouped `outbound` + `inbound` arrays. Each hit carries `to_kind`/`to_value`; thought-target hits also include `thought_id`, `scope`, `content_preview`, and `retracted`. Non-thought-target hits leave those fields null.
 Edges survive thought retraction (retracted thoughts surface with `retracted: true`); to fully sever a link, use `unlink_thoughts`.
 
@@ -1195,10 +1383,10 @@ mod tests {
     use kengram_core::{EmbeddingModel, TagKind, Tags};
     use kengram_embed::FakeEmbedder;
 
-    const TEST_EMBEDDER_MODEL_ID: &str = "qwen3-embedding";
+    const TEST_EMBEDDER_MODEL_ID: &str = "bge-m3:1024";
 
     fn test_embedder() -> FakeEmbedder {
-        FakeEmbedder::with_model(EmbeddingModel::new(TEST_EMBEDDER_MODEL_ID, 4096))
+        FakeEmbedder::with_model(EmbeddingModel::new(TEST_EMBEDDER_MODEL_ID, 1024))
     }
 
     fn server(pool: PgPool) -> KengramServer {
@@ -1522,6 +1710,9 @@ mod tests {
                 scope: None,
                 metadata: None,
                 argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
             }))
             .await
             .unwrap();
@@ -1541,6 +1732,9 @@ mod tests {
                 scope: None,
                 metadata: None,
                 argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
             }))
             .await
             .unwrap_err();
@@ -1557,6 +1751,9 @@ mod tests {
                 scope: None,
                 metadata: None,
                 argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
             }))
             .await
             .unwrap();
@@ -1570,6 +1767,9 @@ mod tests {
                 scope: None,
                 metadata: None,
                 argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
             }))
             .await
             .unwrap();
@@ -1587,6 +1787,9 @@ mod tests {
             scope: None,
             metadata: None,
             argus_source_event: None,
+            source_created_at: None,
+            relation_intents: None,
+            correlation_id: None,
         }))
         .await
         .unwrap();
@@ -1630,6 +1833,9 @@ mod tests {
                 scope: None,
                 metadata: None,
                 argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
             }))
             .await
             .unwrap();
@@ -1681,6 +1887,9 @@ mod tests {
                 scope: None,
                 metadata: None,
                 argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
             }))
             .await
             .unwrap();
@@ -1691,6 +1900,9 @@ mod tests {
                 scope: None,
                 metadata: None,
                 argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
             }))
             .await
             .unwrap();
@@ -1740,6 +1952,9 @@ mod tests {
             scope: None,
             metadata: None,
             argus_source_event: None,
+            source_created_at: None,
+            relation_intents: None,
+            correlation_id: None,
         }))
         .await
         .unwrap();
@@ -1778,6 +1993,9 @@ mod tests {
             scope: None,
             metadata: None,
             argus_source_event: None,
+            source_created_at: None,
+            relation_intents: None,
+            correlation_id: None,
         }))
         .await
         .unwrap();
@@ -1787,6 +2005,9 @@ mod tests {
             scope: None,
             metadata: None,
             argus_source_event: None,
+            source_created_at: None,
+            relation_intents: None,
+            correlation_id: None,
         }))
         .await
         .unwrap();
@@ -1805,7 +2026,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn get_thought_tool_returns_thought_and_pending_provenance(pool: PgPool) {
+    async fn get_thought_tool_returns_synchronously_indexed_provenance(pool: PgPool) {
         let s = server(pool);
         let cap_raw = s
             .capture(Parameters(CaptureArgs {
@@ -1814,6 +2035,9 @@ mod tests {
                 scope: None,
                 metadata: None,
                 argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
             }))
             .await
             .unwrap();
@@ -1827,8 +2051,8 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(json["thought"].is_object());
         assert_eq!(json["thought"]["content"], "hello");
-        assert_eq!(json["provenance"]["embedding_status"], "pending");
-        assert!(json["provenance"]["embedded_at"].is_null());
+        assert_eq!(json["provenance"]["embedding_status"], "indexed");
+        assert!(json["provenance"]["embedded_at"].is_string());
         // No linked_facts field post-M4.
         assert!(json["provenance"].get("linked_facts").is_none());
         // Tag fields exist (empty defaults).
@@ -1848,6 +2072,9 @@ mod tests {
                 scope: None,
                 metadata: None,
                 argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
             }))
             .await
             .unwrap();
@@ -1902,6 +2129,9 @@ mod tests {
                 scope: None,
                 metadata: None,
                 argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
             }))
             .await
             .unwrap();
@@ -1942,6 +2172,9 @@ mod tests {
                 scope: None,
                 metadata: None,
                 argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
             }))
             .await
             .unwrap();
@@ -1979,8 +2212,10 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn capture_then_drain_makes_thought_indexed_via_get_thought(pool: PgPool) {
-        // Capture → worker drains → get_thought reports embedding_status=indexed.
+    async fn capture_with_bge_candidate_needs_no_redundant_drain(pool: PgPool) {
+        // The synchronous BGE candidate is persisted atomically. The legacy
+        // capture response retains `pending`, while authoritative provenance
+        // is already indexed and no queue row exists.
         let s = server(pool.clone());
 
         let cap_raw = s
@@ -1990,6 +2225,9 @@ mod tests {
                 scope: None,
                 metadata: None,
                 argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
             }))
             .await
             .unwrap();
@@ -2000,7 +2238,8 @@ mod tests {
         let report = crate::drain::drain_pending_embeddings(&pool, s.embedder.as_ref(), 16)
             .await
             .unwrap();
-        assert_eq!(report.embedded, 1);
+        assert_eq!(report.found, 0);
+        assert_eq!(report.embedded, 0);
         assert_eq!(report.failed, 0);
 
         let raw = s
@@ -2021,6 +2260,9 @@ mod tests {
             scope: None,
             metadata: None,
             argus_source_event: None,
+            source_created_at: None,
+            relation_intents: None,
+            correlation_id: None,
         }))
         .await
         .unwrap();
@@ -2041,6 +2283,9 @@ mod tests {
             scope: None,
             metadata: None,
             argus_source_event: None,
+            source_created_at: None,
+            relation_intents: None,
+            correlation_id: None,
         }))
         .await
         .unwrap();

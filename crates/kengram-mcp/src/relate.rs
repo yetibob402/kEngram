@@ -199,6 +199,13 @@ mod tests {
                 relation: rel,
                 target,
                 note: None,
+                source_event: crate::link::RelationSourceEventRequest {
+                    namespace: "tests/relate".to_string(),
+                    source_ref: uuid::Uuid::new_v4().to_string(),
+                    payload_hash: uuid::Uuid::new_v4().to_string(),
+                    metadata: serde_json::json!({}),
+                },
+                claimed_producer_class: None,
             },
         )
         .await
@@ -306,7 +313,9 @@ mod tests {
     async fn get_related_thoughts_surfaces_retracted_state(pool: PgPool) {
         let a = cap(&pool, "A").await;
         let b = cap(&pool, "B").await;
-        link(&pool, a, RelationKind::Refines, LinkTarget::Thought(b)).await;
+        // Use a non-supersession edge: replaces/refines participants are
+        // intentionally protected from ordinary retraction.
+        link(&pool, a, RelationKind::References, LinkTarget::Thought(b)).await;
         kengram_storage::retract_thought(&pool, b, Some("test"))
             .await
             .unwrap();

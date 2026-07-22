@@ -867,6 +867,7 @@ mod tests {
                 embeddings_count: 42,
                 thought_links_live: 15,
                 scopes_count: 7,
+                ann_projection_posture: "present".to_string(),
             },
             includes_embeddings: true,
         }
@@ -881,6 +882,20 @@ mod tests {
         // derive PartialEq (OffsetDateTime equality is tricky).
         let reserialized = serde_json::to_string_pretty(&parsed).unwrap();
         assert_eq!(json, reserialized);
+    }
+
+    #[test]
+    fn manifest_without_posture_field_still_parses() {
+        // Pre-ann_projection_posture archives must stay deserializable:
+        // serde(default) fills the missing field with an empty string.
+        let mut v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&sample_manifest()).unwrap()).unwrap();
+        v["corpus"]
+            .as_object_mut()
+            .unwrap()
+            .remove("ann_projection_posture");
+        let parsed: BackupManifest = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed.corpus.ann_projection_posture, "");
     }
 
     #[test]

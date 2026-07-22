@@ -39,10 +39,14 @@ pub const MAX_SEARCH_LIMIT: usize = 100;
 pub const DEFAULT_TOP_K_PER_LEG: usize = 50;
 pub const DEFAULT_LEXICAL_TOP_K: usize = DEFAULT_TOP_K_PER_LEG;
 pub const DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS: u64 = 300;
-/// Historical default `candidate_pool` for the rerank stage. The bounded
-/// trigram matrix showed narrowing regressed recall; hold this value unless
-/// the GOLD eval explicitly supports a change.
-pub const DEFAULT_RERANK_CANDIDATE_POOL: usize = 32;
+/// Default `candidate_pool` for the rerank stage. 32 -> 16 on 2026-07-22 per
+/// the GOLD config-sensitivity matrix (yeti state/kengram-gold-slo/
+/// matrix-20260722/matrix-report-20260722.md): quality >= pool-32 on every
+/// metric (pass@10 0.710 vs 0.700, MRR 0.398 vs 0.386) with p95 cut 65%
+/// (12786 -> 4528 ms). The earlier trigram-era finding that narrowing
+/// regressed recall predates the FTS + full-pipeline legs; re-run the GOLD
+/// matrix before changing this again.
+pub const DEFAULT_RERANK_CANDIDATE_POOL: usize = 16;
 const RERANK_BACKEND_MAX_BATCH: usize = 32;
 const PAIRWISE_MAX_SUBQUERIES: usize = 8;
 const PAIRWISE_PER_SUBQUERY_TOP_K: usize = 25;

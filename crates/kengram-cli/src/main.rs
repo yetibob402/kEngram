@@ -1516,6 +1516,9 @@ async fn run_stats(
             .collect();
         println!("  ANN cover:   {}", parts.join("; "));
     }
+    if stats.ann_projection_posture != "present" {
+        println!("  ANN cover:   {}", stats.ann_projection_posture);
+    }
     println!(
         "  Links:       {} live, {} soft-deleted",
         stats.links.live, stats.links.soft_deleted

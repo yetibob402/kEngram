@@ -81,13 +81,17 @@ pub struct TaggerInfo {
     pub version: i32,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CorpusSummary {
     pub thoughts_live: i64,
     pub thoughts_retracted: i64,
     pub embeddings_count: i64,
     pub thought_links_live: i64,
     pub scopes_count: i64,
+    /// ANN projection coverage posture ("present" or the documented
+    /// absent marker). `default` keeps pre-field archives deserializable.
+    #[serde(default)]
+    pub ann_projection_posture: String,
 }
 
 /// Comparison outcome between the source's schema head version and the
@@ -666,6 +670,7 @@ async fn build_manifest(
             embeddings_count,
             thought_links_live: stats.links.live,
             scopes_count: stats.scopes.len() as i64,
+            ann_projection_posture: stats.ann_projection_posture.clone(),
         },
         includes_embeddings,
     })

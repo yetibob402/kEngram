@@ -6559,11 +6559,20 @@ fn lexical_rows_to_hits(rows: Vec<LexicalSearchRow>) -> Result<Vec<Hit>, Storage
 // pg_database_size, which means corpus_stats can't move out of the
 // Postgres-only storage layer.
 
+/// Posture marker for a corpus where the ANN projection coverage sidecar
+/// is absent: the 2026-06-25 qwen3 decommission dropped the projection
+/// tables on prod out-of-chain, so absence is an expected, documented
+/// posture rather than an error.
+pub const ANN_PROJECTION_ABSENT_POSTURE: &str = "absent (decommissioned 2026-06-25)";
+
 #[derive(Debug, Clone)]
 pub struct CorpusStats {
     pub thoughts: ThoughtStats,
     pub embeddings: Vec<EmbeddingModelCount>,
     pub ann_projections: Vec<AnnProjectionCoverage>,
+    /// "present" when the coverage sidecar exists, else
+    /// [`ANN_PROJECTION_ABSENT_POSTURE`].
+    pub ann_projection_posture: String,
     pub links: LinkStats,
     pub queues: QueueStats,
     pub scopes: Vec<ScopeSummary>,
@@ -6698,46 +6707,58 @@ pub async fn corpus_stats(
 
     // 3. ANN projection coverage metrics. Populated by migration/startup and
     // periodically refreshed by the worker; this is the operator-visible
-    // metric/SLO for projection drift.
-    let ann_rows: Vec<(String, String, i32, i64, i64, i64, String)> = sqlx::query_as(
-        r#"
-        SELECT
-            projection_id,
-            model_id,
-            model_version,
-            embedding_count,
-            projection_count,
-            missing_count,
-            status
-        FROM embedding_ann_projection_coverage
-        ORDER BY projection_id
-        "#,
+    // metric/SLO for projection drift. The coverage sidecar can be
+    // legitimately absent (the 2026-06-25 qwen3 decommission dropped it on
+    // prod out-of-chain), so observe posture via to_regclass instead of
+    // erroring the whole stats pass.
+    let ann_coverage_present: bool = sqlx::query_scalar(
+        "SELECT to_regclass('public.embedding_ann_projection_coverage') IS NOT NULL",
     )
-    .fetch_all(pool)
+    .fetch_one(pool)
     .await?;
-    let ann_projections = ann_rows
-        .into_iter()
-        .map(
-            |(
+    let ann_projections = if ann_coverage_present {
+        let ann_rows: Vec<(String, String, i32, i64, i64, i64, String)> = sqlx::query_as(
+            r#"
+            SELECT
                 projection_id,
                 model_id,
                 model_version,
                 embedding_count,
                 projection_count,
                 missing_count,
-                status,
-            )| AnnProjectionCoverage {
-                projection_id,
-                model_id,
-                model_version,
-                embedding_count,
-                projection_count,
-                missing_count,
-                inserted_missing: 0,
-                status,
-            },
+                status
+            FROM embedding_ann_projection_coverage
+            ORDER BY projection_id
+            "#,
         )
-        .collect();
+        .fetch_all(pool)
+        .await?;
+        ann_rows
+            .into_iter()
+            .map(
+                |(
+                    projection_id,
+                    model_id,
+                    model_version,
+                    embedding_count,
+                    projection_count,
+                    missing_count,
+                    status,
+                )| AnnProjectionCoverage {
+                    projection_id,
+                    model_id,
+                    model_version,
+                    embedding_count,
+                    projection_count,
+                    missing_count,
+                    inserted_missing: 0,
+                    status,
+                },
+            )
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // 4. Link stats — live/soft-deleted counts + group-by aggregates.
     let l_row = sqlx::query!(
@@ -6848,6 +6869,11 @@ pub async fn corpus_stats(
         thoughts,
         embeddings,
         ann_projections,
+        ann_projection_posture: if ann_coverage_present {
+            "present".to_string()
+        } else {
+            ANN_PROJECTION_ABSENT_POSTURE.to_string()
+        },
         links,
         queues,
         scopes,

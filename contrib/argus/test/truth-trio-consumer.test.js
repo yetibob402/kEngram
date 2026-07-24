@@ -257,6 +257,24 @@ async function main() {
   process.env.NATS_LIB_DIR = path.join(TEST_DIR, "nats-stub");
   process.env.KENGRAM_GENERAL_RUN_TELEGRAM = "0";
 
+  // Deployed-client contract (Neo B1): the consumer's gate calls must run on
+  // the same psql major as the deployment host (yeti ships psql 14.x).
+  const psql14 = process.env.M4_PSQL14 || "/opt/homebrew/opt/postgresql@14/bin/psql";
+  if (!process.env.KENGRAM_PSQL_BIN && fs.existsSync(psql14)) {
+    process.env.KENGRAM_PSQL_BIN = psql14;
+  }
+  const gateClient = process.env.KENGRAM_PSQL_BIN || "psql";
+  const gateClientVersion = execFileSync(gateClient, ["--version"], {
+    encoding: "utf8",
+    env: Object.assign({}, process.env, { PATH: "/opt/homebrew/bin:" + (process.env.PATH || "") }),
+  }).trim();
+  console.log(`[client] consumer gate calls use: ${gateClientVersion} (${gateClient})`);
+  if (!/PostgreSQL\) 14\./.test(gateClientVersion)) {
+    console.log(
+      "[client] EMULATION DISCLOSURE: no psql 14 client available — receipts were NOT produced on the deployed client generation"
+    );
+  }
+
   const consumer = require(path.join(REPO_ROOT, "contrib/argus/bin/argus-kengram-consumer.js"));
   const base = consumer.baseAdapter;
   const sessionDlq = path.join(process.env.KENGRAM_GENERAL_STATE_DIR, "session-adapter-dlq.jsonl");
@@ -285,6 +303,11 @@ async function main() {
     );
     assert.strictEqual(row, "stored\tt", "gate must write the source-event row as stored");
     assert.strictEqual(count(`SELECT count(*) FROM thoughts WHERE scope = 'sessions/testa'`), 1);
+    assert.strictEqual(
+      count(`SELECT count(*) FROM thought_ingest_gate_events WHERE source_event_ref = '${e1.source_ref}'`),
+      1,
+      "gate event inserted exactly once for the ACKed first delivery"
+    );
   });
 
   // --- S2 exact replay ------------------------------------------------------
@@ -477,6 +500,28 @@ async function main() {
     }
   });
 
+  // --- S8b malformed embed response (Neo B2 RED/GREEN) ----------------------
+  await scenario("S8b malformed embed response (1024 nulls) -> structured fail_open_insert + ACK", async () => {
+    const m1 = sessionEnvelope(base, "testa", {
+      summary: "harness event whose embedder response is a full vector of nulls",
+      key_facts: ["malformed embedder output must fail open with a structured bypass"],
+    });
+    const mContent = consumer.sessionAdapter.buildThoughtContent({ payload: m1.payload });
+    vectorByContent.set(mContent, new Array(1024).fill(null)); // right length, no finite numbers
+    const s = freshSessionStats(consumer);
+    const msg = fakeMsg(m1.subject, m1);
+    await consumer.processSessionMessage(msg, s);
+    assert.deepStrictEqual(msg.calls, ["ack"], "malformed embed vector must fail open and ACK, never term");
+    assert.strictEqual(s.stored, 1);
+    assert.strictEqual(s.gate_fail_open, 1, "gate must classify fail_open_insert");
+    assert.strictEqual(s.embed_bypass, 1, "malformed response counts as a bypass for coverage");
+    const bypass = psql(
+      ADMIN_DSN,
+      `SELECT bypass_reason->>'code' || ':' || (bypass_reason->>'detail') FROM thought_ingest_gate_events WHERE source_event_ref = '${m1.source_ref}'`
+    );
+    assert.strictEqual(bypass, "embedding_unavailable:malformed_vector_elements", "structured bypass receipt");
+  });
+
   // --- S9 a2a lane through the gate -----------------------------------------
   psql(ADMIN_DSN, `UPDATE corpus_hygiene_gate_settings SET mode = 'off' WHERE principal_name = '${RT_ROLE}'`);
   await scenario("S9 a2a lane -> gate-routed stored + replay duplicate_skip", async () => {
@@ -523,7 +568,11 @@ async function main() {
         `(enforce flip requires >= 95%; fail-open rows carry no semantic verdict and are excluded from the would-be-skip denominator)`
     );
     assert.ok(coverage > 0 && coverage < 1, "harness window must show both covered and bypassed calls");
-    assert.strictEqual(Number(cov[1]) - Number(cov[0]), 1, "exactly the one controlled embed-down call is uncovered");
+    assert.strictEqual(
+      Number(cov[1]) - Number(cov[0]),
+      2,
+      "exactly the embed-down and malformed-vector calls are uncovered"
+    );
   });
 
   embedServer.close();

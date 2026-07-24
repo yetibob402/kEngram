@@ -315,6 +315,15 @@ async function embedCandidate(content) {
         },
       };
     }
+    // B2: every element must be a finite number (rejects null/NaN/Inf/strings).
+    // A malformed response is an embed failure and takes the structured
+    // fail-open path, mirroring the Rust reference's numeric deserialization.
+    if (!vectors[0].every(Number.isFinite)) {
+      return {
+        vector: null,
+        bypass: { code: "embedding_unavailable", detail: "malformed_vector_elements" },
+      };
+    }
     return { vector: vectors[0], bypass: null };
   } catch (err) {
     if (err && err.name === "AbortError") {
@@ -332,17 +341,24 @@ async function embedCandidate(content) {
   }
 }
 
-function psqlAsync(dbUrl, sql) {
+// KENGRAM_PSQL_BIN lets the test harness pin the exact deployed client
+// generation; unset in deployment, where PATH resolves the host psql.
+const PSQL_BIN = process.env.KENGRAM_PSQL_BIN || "psql";
+
+function psqlAsync(dbUrl, sql, envExtra) {
   return new Promise((resolve, reject) => {
     execFile(
-      "psql",
+      PSQL_BIN,
       [baseAdapter.requireDbUrl(dbUrl), "-X", "-v", "ON_ERROR_STOP=1", "-t", "-A", "-c", sql],
       {
         encoding: "utf8",
         maxBuffer: 8 * 1024 * 1024,
-        env: Object.assign({}, process.env, {
-          PATH: "/opt/homebrew/bin:" + (process.env.PATH || ""),
-        }),
+        env: Object.assign(
+          {},
+          process.env,
+          { PATH: "/opt/homebrew/bin:" + (process.env.PATH || "") },
+          envExtra || {}
+        ),
       },
       (err, stdout, stderr) => {
         if (!err) return resolve(String(stdout).trim());
@@ -409,9 +425,13 @@ async function captureRecordGated(opts) {
   // ponytail: content/metadata travel as one psql -c argument like every
   // existing adapter call — same ARG_MAX ceiling as today; parameter binding
   // via a driver is the upgrade path if content ever nears 1 MiB.
+  //
+  // B1: ONE statement only, psql-14-safe by construction — a multi-statement
+  // -c on the deployed client returns only the FINAL statement's result, so
+  // the result-bearing SELECT must be the sole command. The gate function is
+  // a single atomic statement (its own transaction); the 400 ms bound rides
+  // PGOPTIONS instead of SET LOCAL.
   const sql =
-    "BEGIN;\n" +
-    "SET LOCAL statement_timeout = '" + GATE_STATEMENT_TIMEOUT + "';\n" +
     "SELECT row_to_json(g) FROM public.capture_thought_gated(\n" +
     "  " + sqlLit(opts.scope) + ",\n" +
     "  " + sqlLit(opts.content) + ",\n" +
@@ -429,11 +449,12 @@ async function captureRecordGated(opts) {
     "  '[]'::jsonb,\n" +
     "  " + sqlLit(baseAdapter.TAGGER_MODEL_ID) + ",\n" +
     "  NULL, NULL, NULL\n" +
-    ") AS g;\n" +
-    "COMMIT;";
-  const out = await psqlAsync(opts.dbUrl, sql);
-  // psql prints BEGIN/SET/COMMIT command tags even under -t; the gate row is
-  // the one JSON line.
+    ") AS g";
+  const out = await psqlAsync(opts.dbUrl, sql, {
+    PGOPTIONS: "-c statement_timeout=" + GATE_STATEMENT_TIMEOUT,
+  });
+  // Single-statement -t -A output is exactly the one JSON row; keep the
+  // JSON-line filter as a belt against client chatter.
   const line = out
     .split("\n")
     .map((s) => s.trim())
@@ -445,6 +466,9 @@ async function captureRecordGated(opts) {
   } catch (_) {
     const e = new Error("gate result unparseable");
     e.error_class = "gate_result_unparseable";
+    // B1: the gate may already have committed — never term. NAK; the
+    // redelivery resolves through the gate's replay path (duplicate_skip).
+    e.transient = true;
     throw e;
   }
   return Object.assign(mapGateResult(row, opts.sourceRef), {

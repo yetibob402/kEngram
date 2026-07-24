@@ -7,11 +7,26 @@
  * contract for running telegram + session lanes from one yeti-side writer.
  * It intentionally does not run as a daemon loop; launchd StartInterval calls
  * --once just like the existing telegram consumer.
+ *
+ * M4 truth-trio rev4 slice C (spec dd21d8f9): the session and a2a lanes no
+ * longer perform their own argus_source_events preflight SELECT/UPDATE or a
+ * raw INSERT INTO thoughts. Every validated event now:
+ *   1. embeds synchronously (bge-m3:1024, same service/config/timeout as the
+ *      MCP synchronous embed; failure -> structured fail-open bypass), then
+ *   2. calls public.capture_thought_gated() under the runtime role
+ *      (kengram_rt_session via KENGRAM_CONSUMER_DB_URL), which owns
+ *      replay/conflict/dedup state atomically, then
+ *   3. maps the raw gate result to ack/DLQ using the kengram-mcp
+ *      capture.rs:213-236 vocabulary (replay -> duplicate_skip; stored,
+ *      shadow and fail-open outcomes ACK; conflict -> DLQ path; semantic
+ *      skip ACKs without creating a thought).
+ * The telegram lane is explicitly out of scope this slice and unchanged.
  */
 
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { execFile } = require("child_process");
 
 const NATS_LIB_DIR =
   process.env.NATS_LIB_DIR || path.join(__dirname, "nats-shadow/node_modules/nats");
@@ -27,7 +42,6 @@ const {
 } = require(NATS_LIB_DIR);
 const SC = StringCodec();
 
-const telegramConsumer = require("./argus-telegram-kengram-consumer.js");
 const sessionAdapter = require("../lib/argus-session-kengram-adapter.js");
 const baseAdapter = require("../lib/argus-telegram-kengram-adapter.js");
 
@@ -193,12 +207,334 @@ function classifyError(err) {
   return { transient: false, error_class: sessionAdapter.errorClass(err) };
 }
 
+// ---------------------------------------------------------------------------
+// rev4 C1 — synchronous bge-m3 candidate embed + capture_thought_gated().
+//
+// The consumer holds no replay/conflict DML of its own (rev4 C1c): the
+// SECURITY DEFINER gate owns argus_source_events atomically, and the runtime
+// role the consumer connects as (kengram_rt_session) holds SELECT +
+// EXECUTE-on-gate only — any residual outer DML would fail loudly.
+// ---------------------------------------------------------------------------
+
+// Parity constants — same bounds the MCP synchronous embed path uses
+// (kengram-mcp server.rs CAPTURE_EMBEDDING_TIMEOUT, kengram-storage
+// corpus_hygiene.rs CAPTURE_GATE_STATEMENT_TIMEOUT).
+const EMBED_TIMEOUT_MS = 500;
+const GATE_STATEMENT_TIMEOUT = "400ms";
+const BGE_MODEL_ID = "bge-m3:1024";
+const BGE_MODEL_VERSION = 1;
+const KENGRAM_CONFIG_TOML =
+  process.env.KENGRAM_CONFIG_TOML || "/Users/yetibob/argus/kengram/config/kengram.prod.toml";
+
+let embedderConfigCache;
+function loadEmbedderConfig() {
+  if (embedderConfigCache !== undefined) return embedderConfigCache;
+  // ponytail: line-oriented [embedder]-section scan, not a TOML parser — the
+  // kengram config keeps flat key = "value" pairs in that section; swap in a
+  // real parser only if the config ever grows TOML exotica.
+  let text;
+  try {
+    text = fs.readFileSync(KENGRAM_CONFIG_TOML, "utf8");
+  } catch (_) {
+    embedderConfigCache = null;
+    return null;
+  }
+  let section = null;
+  const out = {};
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const sec = trimmed.match(/^\[([^\]]+)\]$/);
+    if (sec) {
+      section = sec[1];
+      continue;
+    }
+    if (section !== "embedder") continue;
+    const kv = trimmed.match(/^([A-Za-z_]+)\s*=\s*(.+?)\s*$/);
+    if (!kv) continue;
+    let value = kv[2];
+    const quoted = value.match(/^"([^"]*)"/);
+    value = quoted ? quoted[1] : value.replace(/\s*#.*$/, "");
+    out[kv[1]] = value;
+  }
+  embedderConfigCache = out;
+  return out;
+}
+
+// Bypass-reason vocabulary mirrors the MCP capture embed path exactly
+// (kengram-mcp server.rs:554-600): embedding_model_mismatch /
+// embedding_unavailable / embedding_timeout / embedding_dimension_mismatch.
+async function embedCandidate(content) {
+  const cfg = loadEmbedderConfig();
+  if (!cfg || !cfg.endpoint || !cfg.model) {
+    return {
+      vector: null,
+      bypass: { code: "embedding_unavailable", detail: "embedder_config_unreadable" },
+    };
+  }
+  if (cfg.model_id !== BGE_MODEL_ID || Number(cfg.dimensions) !== 1024) {
+    return {
+      vector: null,
+      bypass: {
+        code: "embedding_model_mismatch",
+        model_id: cfg.model_id || null,
+        dimensions: Number(cfg.dimensions) || null,
+        required: BGE_MODEL_ID,
+      },
+    };
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), EMBED_TIMEOUT_MS);
+  try {
+    const res = await fetch(cfg.endpoint.replace(/\/+$/, "") + "/embeddings", {
+      method: "POST",
+      headers: Object.assign(
+        { "content-type": "application/json" },
+        cfg.api_key ? { authorization: `Bearer ${cfg.api_key}` } : {}
+      ),
+      body: JSON.stringify({ model: cfg.model, input: [content] }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      return {
+        vector: null,
+        bypass: { code: "embedding_unavailable", detail: `http_${res.status}` },
+      };
+    }
+    const body = await res.json();
+    const vectors = Array.isArray(body && body.data)
+      ? body.data.map((item) => item && item.embedding)
+      : [];
+    if (vectors.length !== 1 || !Array.isArray(vectors[0]) || vectors[0].length !== 1024) {
+      return {
+        vector: null,
+        bypass: {
+          code: "embedding_dimension_mismatch",
+          returned_vectors: vectors.length,
+          expected_dimensions: 1024,
+        },
+      };
+    }
+    return { vector: vectors[0], bypass: null };
+  } catch (err) {
+    if (err && err.name === "AbortError") {
+      return {
+        vector: null,
+        bypass: { code: "embedding_timeout", timeout_ms: EMBED_TIMEOUT_MS },
+      };
+    }
+    return {
+      vector: null,
+      bypass: { code: "embedding_unavailable", detail: "request_failed" },
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function psqlAsync(dbUrl, sql) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "psql",
+      [baseAdapter.requireDbUrl(dbUrl), "-X", "-v", "ON_ERROR_STOP=1", "-t", "-A", "-c", sql],
+      {
+        encoding: "utf8",
+        maxBuffer: 8 * 1024 * 1024,
+        env: Object.assign({}, process.env, {
+          PATH: "/opt/homebrew/bin:" + (process.env.PATH || ""),
+        }),
+      },
+      (err, stdout, stderr) => {
+        if (!err) return resolve(String(stdout).trim());
+        // Secret hygiene: never surface raw stderr; classify to a stable
+        // error class only. Transient DB trouble -> NAK/redeliver; a gate
+        // rejection is permanent -> term + DLQ.
+        const text = String(stderr || err.message || "");
+        const e = new Error("psql_failed");
+        if (/could not connect|connection to server|Connection refused|timeout|too many clients|deadlock/i.test(text)) {
+          e.transient = true;
+          e.error_class = "db_unavailable";
+        } else {
+          e.error_class = "capture_gate_rejected";
+        }
+        reject(e);
+      }
+    );
+  });
+}
+
+function sqlLit(value) {
+  return value === null || value === undefined ? "NULL" : baseAdapter.sqlString(value);
+}
+
+function sourceTime(value) {
+  const parsed = Date.parse(String(value || ""));
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+}
+
+// Vocabulary normalization per kengram-mcp capture.rs:213-236: the raw gate
+// source_event_action "replay" becomes "duplicate_skip"; any other raw action
+// passes through; a missing source-event action falls back to the gate action.
+// Mapped consumer outcomes:
+//   duplicate_skip        -> ACK, no thought mutation
+//   conflict  (-> _dlq)   -> ACK + metadata-only DLQ row (existing DLQ path)
+//   semantic_skip         -> ACK, no thought created
+//   stored (inserted / out_of_family_insert / fail_open_insert /
+//           shadow_candidate / relation_intent_keep / exact_duplicate) -> ACK
+function mapGateResult(row, sourceRef) {
+  const raw = row.source_event_action || row.action;
+  const normalized = raw === "replay" ? "duplicate_skip" : raw;
+  const base = {
+    gate_action: row.action,
+    source_ref: sourceRef,
+    thought_id: row.thought_id || row.matched_thought_id || null,
+    similarity: row.similarity === undefined ? null : row.similarity,
+  };
+  if (normalized === "conflict") return Object.assign(base, { action: "conflict_dlq" });
+  if (normalized === "duplicate_skip") return Object.assign(base, { action: "duplicate_skip" });
+  if (normalized === "semantic_skip") return Object.assign(base, { action: "semantic_skip" });
+  return Object.assign(base, { action: "stored" });
+}
+
+async function captureRecordGated(opts) {
+  const embed = await embedCandidate(opts.content);
+  // The gate enforces exactly-one-of vector/bypass
+  // (candidate_vector_or_structured_bypass_required).
+  const vectorLiteral = embed.vector
+    ? "'[" + embed.vector.join(",") + "]'::vector"
+    : "NULL::vector";
+  const bypassLiteral = embed.bypass
+    ? sqlLit(JSON.stringify(embed.bypass)) + "::jsonb"
+    : "NULL::jsonb";
+  // ponytail: content/metadata travel as one psql -c argument like every
+  // existing adapter call — same ARG_MAX ceiling as today; parameter binding
+  // via a driver is the upgrade path if content ever nears 1 MiB.
+  const sql =
+    "BEGIN;\n" +
+    "SET LOCAL statement_timeout = '" + GATE_STATEMENT_TIMEOUT + "';\n" +
+    "SELECT row_to_json(g) FROM public.capture_thought_gated(\n" +
+    "  " + sqlLit(opts.scope) + ",\n" +
+    "  " + sqlLit(opts.content) + ",\n" +
+    "  " + sqlLit(opts.source) + ",\n" +
+    "  " + sqlLit(JSON.stringify(opts.metadata || {})) + "::jsonb,\n" +
+    "  " + (opts.sourceCreatedAt ? sqlLit(opts.sourceCreatedAt) + "::timestamptz" : "NULL::timestamptz") + ",\n" +
+    "  " + vectorLiteral + ",\n" +
+    "  " + sqlLit(BGE_MODEL_ID) + ",\n" +
+    "  " + String(BGE_MODEL_VERSION) + ",\n" +
+    "  " + bypassLiteral + ",\n" +
+    "  " + sqlLit(opts.namespace) + ",\n" +
+    "  " + sqlLit(opts.sourceRef) + ",\n" +
+    "  " + sqlLit(opts.payloadHash) + ",\n" +
+    "  " + sqlLit(JSON.stringify(opts.sourceEventMetadata || {})) + "::jsonb,\n" +
+    "  '[]'::jsonb,\n" +
+    "  " + sqlLit(baseAdapter.TAGGER_MODEL_ID) + ",\n" +
+    "  NULL, NULL, NULL\n" +
+    ") AS g;\n" +
+    "COMMIT;";
+  const out = await psqlAsync(opts.dbUrl, sql);
+  // psql prints BEGIN/SET/COMMIT command tags even under -t; the gate row is
+  // the one JSON line.
+  const line = out
+    .split("\n")
+    .map((s) => s.trim())
+    .filter((s) => s.startsWith("{"))
+    .pop();
+  let row;
+  try {
+    row = JSON.parse(line);
+  } catch (_) {
+    const e = new Error("gate result unparseable");
+    e.error_class = "gate_result_unparseable";
+    throw e;
+  }
+  return Object.assign(mapGateResult(row, opts.sourceRef), {
+    vector_attached: !!embed.vector,
+    embed_bypass: embed.bypass || null,
+  });
+}
+
+// Metadata-only conflict DLQ row (never payload text). The prior payload hash
+// now lives in the gate-maintained argus_source_events.metadata.conflict blob.
+function writeConflictDlq(dlqPath, namespace, sourceRef, incomingHash) {
+  if (!dlqPath) {
+    const e = new Error("dlqPath required to record a conflict");
+    e.error_class = "missing_dlq_path";
+    throw e;
+  }
+  append0600(dlqPath, {
+    ts: new Date().toISOString(),
+    reason: "payload_hash_conflict",
+    namespace,
+    source_ref: sourceRef,
+    incoming_payload_sha256: incomingHash,
+  });
+}
+
+// Session lane, gated. Validation and content/metadata rendering are the
+// existing session-adapter semantics; only the write path changed (rev4 C1c
+// deleted the adapter's preflight SELECT/UPDATE + raw-INSERT transaction).
+async function processSessionRecordGated(envelope, options) {
+  options = options || {};
+  const validation = sessionAdapter.validateRecord(envelope);
+  if (validation.skip) {
+    return { action: "skipped", reason: validation.reason, source_ref: envelope.source_ref };
+  }
+  const record = validation.record;
+  const payloadHash =
+    record.payload_sha256 || baseAdapter.sha256Hex(baseAdapter.canonicalJson(record.payload));
+  const content = sessionAdapter.buildThoughtContent(record);
+  // Mirrors argus-session-kengram-adapter storeRecord metadata byte-for-byte.
+  const metadata = {
+    adapter_version: sessionAdapter.ADAPTER_VERSION,
+    namespace: record.namespace,
+    source_ref: record.source_ref,
+    kind: record.kind,
+    author: record.author,
+    agent: record.agent,
+    source_kind: sessionAdapter.SESSION_SOURCE_KIND,
+    subject: record.subject,
+    payload_sha256: payloadHash,
+    structured_payload: record.payload,
+    envelope: {
+      schema_version: record.schema_version,
+      event_id: record.event_id,
+      dedupe_key: record.dedupe_key,
+      subject: record.subject,
+      source_kind: record.source_kind,
+      producer: record.producer,
+      host: record.host,
+      session_id: record.session_id,
+      batch_id: record.batch_id,
+      created_at: record.created_at,
+      published_at: record.published_at,
+    },
+    provenance: record.provenance || {},
+  };
+  const mapped = await captureRecordGated({
+    dbUrl: options.dbUrl,
+    scope: record.namespace,
+    content,
+    source: "session-batcher",
+    metadata,
+    sourceCreatedAt: sourceTime(record.created_at),
+    namespace: record.namespace,
+    sourceRef: record.source_ref,
+    payloadHash,
+    sourceEventMetadata: metadata,
+  });
+  if (mapped.action === "conflict_dlq") {
+    writeConflictDlq(options.dlqPath, record.namespace, record.source_ref, payloadHash);
+  }
+  return mapped;
+}
+
 function sessionStats() {
   return {
     fetched: 0,
     stored: 0,
     dup: 0,
     skipped: 0,
+    semantic_skip: 0,
     conflict: 0,
     invalid: 0,
     dry_run_valid: 0,
@@ -206,6 +542,10 @@ function sessionStats() {
     acked: 0,
     termed: 0,
     naked: 0,
+    embed_ok: 0,
+    embed_bypass: 0,
+    gate_fail_open: 0,
+    gate_shadow_candidate: 0,
   };
 }
 
@@ -249,6 +589,14 @@ function validSubjectForEnvelope(envelope, subject) {
     envelope.subject === subject &&
     subject.startsWith(`${prefix}.${String(envelope.agent || "")}.`)
   );
+}
+
+function recordEmbedStats(stats, result) {
+  if (!result) return;
+  if (result.vector_attached === true) stats.embed_ok++;
+  else if (result.embed_bypass) stats.embed_bypass++;
+  if (result.gate_action === "fail_open_insert") stats.gate_fail_open++;
+  if (result.gate_action === "shadow_candidate") stats.gate_shadow_candidate++;
 }
 
 async function processSessionMessage(msg, stats) {
@@ -317,7 +665,7 @@ async function processSessionMessage(msg, stats) {
 
   let result;
   try {
-    result = sessionAdapter.processRecord(envelope, {
+    result = await processSessionRecordGated(envelope, {
       dbUrl: CONFIG.dbUrl,
       dlqPath: path.join(CONFIG.stateDir, "session-adapter-dlq.jsonl"),
     });
@@ -344,6 +692,7 @@ async function processSessionMessage(msg, stats) {
     return;
   }
 
+  recordEmbedStats(stats, result);
   if (!result || result.action === "stored") {
     stats.stored++;
     stats.acked++;
@@ -352,6 +701,12 @@ async function processSessionMessage(msg, stats) {
   }
   if (result.action === "duplicate_skip") {
     stats.dup++;
+    stats.acked++;
+    msg.ack();
+    return;
+  }
+  if (result.action === "semantic_skip") {
+    stats.semantic_skip++;
     stats.acked++;
     msg.ack();
     return;
@@ -438,9 +793,10 @@ async function runSessionOnce() {
   const metrics = writeSessionMetrics(stats, info, startedAt);
   console.log(
     `[argus-kengram-consumer] session once: fetched=${metrics.fetched} stored=${metrics.stored} ` +
-      `dup=${metrics.dup} skipped=${metrics.skipped} conflict=${metrics.conflict} invalid=${metrics.invalid} ` +
+      `dup=${metrics.dup} skipped=${metrics.skipped} semantic_skip=${metrics.semantic_skip} conflict=${metrics.conflict} invalid=${metrics.invalid} ` +
       `dry_run_valid=${metrics.dry_run_valid} ` +
       `held=${metrics.held} acked=${metrics.acked} termed=${metrics.termed} naked=${metrics.naked} ` +
+      `embed_ok=${metrics.embed_ok} embed_bypass=${metrics.embed_bypass} fail_open=${metrics.gate_fail_open} shadow=${metrics.gate_shadow_candidate} ` +
       `pending=${metrics.consumer_num_pending} ack_floor=${metrics.consumer_ack_floor}`
   );
   return stats;
@@ -454,6 +810,7 @@ function a2aStats() {
     skipped: 0,
     skipped_system_events: 0,
     skipped_telegram_passthrough: 0,
+    semantic_skip: 0,
     conflict: 0,
     invalid: 0,
     dry_run_valid: 0,
@@ -461,6 +818,10 @@ function a2aStats() {
     acked: 0,
     termed: 0,
     naked: 0,
+    embed_ok: 0,
+    embed_bypass: 0,
+    gate_fail_open: 0,
+    gate_shadow_candidate: 0,
   };
 }
 
@@ -576,9 +937,9 @@ function normalizeA2AEnvelope(envelope, msgID, subject) {
 
 function buildA2AThoughtContent(record) {
   // Embedded content = message substance only (subject + text). from/to/type/
-  // priority/source_ref live in metadata (see storeA2ARecord) — never duplicate
-  // the envelope into content or it poisons the embedding/FTS with repeated
-  // "Agent-to-agent…/From:/To:" boilerplate + slugs. (Bob 2026-06-22.)
+  // priority/source_ref live in metadata (see processA2ARecord) — never
+  // duplicate the envelope into content or it poisons the embedding/FTS with
+  // repeated "Agent-to-agent…/From:/To:" boilerplate + slugs. (Bob 2026-06-22.)
   const parts = [
     record.re ? String(record.re).trim() : "",
     record.text ? String(record.text).trim() : "",
@@ -586,8 +947,17 @@ function buildA2AThoughtContent(record) {
   return parts.filter(Boolean).join("\n\n").trim();
 }
 
-function storeA2ARecord(psql, record, payloadHash) {
+// A2A lane, gated (rev4 C1c: the preflight readExisting/markConflict and the
+// raw three-table storeA2ARecord transaction are deleted; the gate owns
+// replay/conflict/dedup atomically).
+async function processA2ARecord(record, options) {
+  options = options || {};
   const content = buildA2AThoughtContent(record);
+  if (!content) {
+    // The gate fail-closes on empty content; an a2a envelope with no re/text
+    // carries nothing worth remembering. Skip (ACK) instead of poisoning DLQ.
+    return { action: "skipped", reason: "empty_content", source_ref: record.source_ref };
+  }
   const scope = `agents/${record.from}`;
   const metadata = {
     adapter_version: "argus-a2a-kengram-adapter-v0.1",
@@ -603,108 +973,27 @@ function storeA2ARecord(psql, record, payloadHash) {
     delivery: "nats",
     msg_id: record.msg_id,
     subject: record.subject,
-    payload_sha256: payloadHash,
+    payload_sha256: record.payload_sha256,
     envelope: {
       created_at: record.created_at || null,
     },
   };
-
-  const sql =
-    "\nBEGIN;\n" +
-    "INSERT INTO argus_source_events (namespace, source_ref, payload_hash, status, metadata)\n" +
-    "VALUES (" +
-    baseAdapter.sqlString(record.namespace) +
-    ", " +
-    baseAdapter.sqlString(record.source_ref) +
-    ", " +
-    baseAdapter.sqlString(payloadHash) +
-    ", 'pending', " +
-    baseAdapter.sqlString(JSON.stringify(metadata)) +
-    "::jsonb);\n" +
-    "\nWITH upserted AS (\n" +
-    "  INSERT INTO thoughts (scope, content, source, metadata, content_fingerprint)\n" +
-    "  VALUES (" +
-    baseAdapter.sqlString(scope) +
-    ", " +
-    baseAdapter.sqlString(content) +
-    ", 'agent-comms', " +
-    baseAdapter.sqlString(JSON.stringify(metadata)) +
-    "::jsonb, digest(" +
-    baseAdapter.sqlString(content) +
-    ", 'sha256'))\n" +
-    "  ON CONFLICT (content_fingerprint) DO UPDATE SET metadata = thoughts.metadata\n" +
-    "  RETURNING id\n" +
-    "), queued AS (\n" +
-    "  INSERT INTO pending_embeddings (target_kind, target_id, model_id)\n" +
-    "  SELECT 'thought', id, " +
-    baseAdapter.sqlString(baseAdapter.EMBEDDER_MODEL_ID) +
-    " FROM upserted\n" +
-    "  ON CONFLICT (target_kind, target_id, model_id) DO NOTHING\n" +
-    "  RETURNING 1\n" +
-    "), queued_tags AS (\n" +
-    "  INSERT INTO pending_tags (thought_id, tagger_model_id)\n" +
-    "  SELECT u.id, " +
-    baseAdapter.sqlString(baseAdapter.TAGGER_MODEL_ID) +
-    " FROM upserted u\n" +
-    "  WHERE NOT EXISTS (\n" +
-    "    SELECT 1 FROM thoughts t\n" +
-    "    WHERE t.id = u.id\n" +
-    "      AND (t.tags_extractor_model IS NOT NULL OR COALESCE(t.tags, '{}'::jsonb) <> '{}'::jsonb)\n" +
-    "  )\n" +
-    "  ON CONFLICT (thought_id) DO NOTHING\n" +
-    "  RETURNING 1\n" +
-    "), queue_counts AS (\n" +
-    "  SELECT (SELECT count(*) FROM queued) AS embedding_rows, (SELECT count(*) FROM queued_tags) AS tag_rows\n" +
-    ")\n" +
-    "UPDATE argus_source_events\n" +
-    "SET thought_id = (SELECT id FROM upserted), status = 'stored', last_seen_at = NOW()\n" +
-    "FROM queue_counts\n" +
-    "WHERE namespace = " +
-    baseAdapter.sqlString(record.namespace) +
-    " AND source_ref = " +
-    baseAdapter.sqlString(record.source_ref) +
-    ";\n" +
-    "COMMIT;\n" +
-    "SELECT thought_id::text FROM argus_source_events WHERE namespace = " +
-    baseAdapter.sqlString(record.namespace) +
-    " AND source_ref = " +
-    baseAdapter.sqlString(record.source_ref) +
-    ";\n";
-  const out = psql(sql);
-  return out.split("\n").filter(Boolean).pop();
-}
-
-function processA2ARecord(record, options) {
-  options = options || {};
-  const psql = options.psql || baseAdapter.makePsql(options.dbUrl);
-  const dlqPath = options.dlqPath || null;
-  const existing = baseAdapter.readExisting(psql, record.namespace, record.source_ref);
-  if (existing) {
-    if (existing.hash === record.payload_sha256) {
-      psql(
-        "UPDATE argus_source_events SET last_seen_at = NOW() WHERE namespace = " +
-          baseAdapter.sqlString(record.namespace) +
-          " AND source_ref = " +
-          baseAdapter.sqlString(record.source_ref),
-        false
-      );
-      return { action: "duplicate_skip", source_ref: record.source_ref, thought_id: existing.thoughtId };
-    }
-    if (!dlqPath) {
-      const e = new Error("dlqPath required to record a conflict");
-      e.error_class = "missing_dlq_path";
-      throw e;
-    }
-    baseAdapter.markConflict(psql, record, record.payload_sha256, existing.hash, dlqPath);
-    return { action: "conflict_dlq", source_ref: record.source_ref };
+  const mapped = await captureRecordGated({
+    dbUrl: options.dbUrl,
+    scope,
+    content,
+    source: "agent-comms",
+    metadata,
+    sourceCreatedAt: sourceTime(record.created_at),
+    namespace: record.namespace,
+    sourceRef: record.source_ref,
+    payloadHash: record.payload_sha256,
+    sourceEventMetadata: metadata,
+  });
+  if (mapped.action === "conflict_dlq") {
+    writeConflictDlq(options.dlqPath, record.namespace, record.source_ref, record.payload_sha256);
   }
-  const thoughtId = storeA2ARecord(psql, record, record.payload_sha256);
-  return {
-    action: "stored",
-    source_ref: record.source_ref,
-    thought_id: thoughtId,
-    payload_sha256: record.payload_sha256,
-  };
+  return mapped;
 }
 
 function a2aConsumerConfig() {
@@ -800,7 +1089,7 @@ async function processA2AMessage(msg, stats) {
 
   let result;
   try {
-    result = processA2ARecord(normalized.record, {
+    result = await processA2ARecord(normalized.record, {
       dbUrl: CONFIG.dbUrl,
       dlqPath: path.join(CONFIG.stateDir, "a2a-adapter-dlq.jsonl"),
     });
@@ -827,6 +1116,7 @@ async function processA2AMessage(msg, stats) {
     return;
   }
 
+  recordEmbedStats(stats, result);
   if (!result || result.action === "stored") {
     stats.stored++;
     stats.acked++;
@@ -835,6 +1125,12 @@ async function processA2AMessage(msg, stats) {
   }
   if (result.action === "duplicate_skip") {
     stats.dup++;
+    stats.acked++;
+    msg.ack();
+    return;
+  }
+  if (result.action === "semantic_skip") {
+    stats.semantic_skip++;
     stats.acked++;
     msg.ack();
     return;
@@ -921,9 +1217,10 @@ async function runA2AOnce() {
   const metrics = writeA2AMetrics(stats, info, startedAt);
   console.log(
     `[argus-kengram-consumer] a2a once: fetched=${metrics.fetched} stored=${metrics.stored} ` +
-      `dup=${metrics.dup} skipped=${metrics.skipped} skipped_system_events=${metrics.skipped_system_events} skipped_telegram_passthrough=${metrics.skipped_telegram_passthrough} conflict=${metrics.conflict} invalid=${metrics.invalid} ` +
+      `dup=${metrics.dup} skipped=${metrics.skipped} skipped_system_events=${metrics.skipped_system_events} skipped_telegram_passthrough=${metrics.skipped_telegram_passthrough} semantic_skip=${metrics.semantic_skip} conflict=${metrics.conflict} invalid=${metrics.invalid} ` +
       `dry_run_valid=${metrics.dry_run_valid} held=${metrics.held} acked=${metrics.acked} ` +
-      `termed=${metrics.termed} naked=${metrics.naked} pending=${metrics.consumer_num_pending} ` +
+      `termed=${metrics.termed} naked=${metrics.naked} embed_ok=${metrics.embed_ok} embed_bypass=${metrics.embed_bypass} ` +
+      `fail_open=${metrics.gate_fail_open} shadow=${metrics.gate_shadow_candidate} pending=${metrics.consumer_num_pending} ` +
       `ack_floor=${metrics.consumer_ack_floor}`
   );
   return stats;
@@ -937,6 +1234,9 @@ async function run() {
   }
   const result = {};
   if (CONFIG.runTelegram) {
+    // Lazy: the telegram lane is out of scope this slice and its consumer
+    // module lives beside the deployed copy, not in this repo checkout.
+    const telegramConsumer = require("./argus-telegram-kengram-consumer.js");
     result.telegram = await telegramConsumer.run();
   }
   if (CONFIG.runSession) {
@@ -958,6 +1258,11 @@ module.exports = {
   sha256Hex,
   validSubjectForEnvelope,
   ensureSessionStream,
+  loadEmbedderConfig,
+  embedCandidate,
+  mapGateResult,
+  captureRecordGated,
+  processSessionRecordGated,
   processSessionMessage,
   runSessionOnce,
   normalizeA2AEnvelope,

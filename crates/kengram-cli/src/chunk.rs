@@ -86,6 +86,10 @@ pub(crate) struct ChunkSelectArgs {
     /// precise enough as thoughts.
     #[arg(long, default_value_t = DEFAULT_MIN_WORDS)]
     pub min_parent_words: usize,
+    /// Emit one whole-parent chunk when sentence-aware chunking would otherwise
+    /// skip a parent as short or single-span.
+    #[arg(long, default_value_t = false)]
+    pub include_single_span: bool,
     /// Newline-delimited UUIDs of parent thoughts that must never be selected.
     /// Used for mechanically enforcing protected-gold canary exclusions.
     #[arg(long, value_name = "PATH")]
@@ -305,7 +309,12 @@ fn propose_chunks(parents: &[ParentRow], args: &ChunkSelectArgs) -> Vec<Proposed
             args.max_words,
             args.overlap_words,
         );
-        if spans.len() <= 1 {
+        let spans = if spans.len() <= 1 && args.include_single_span {
+            whole_parent_span(&parent.content).into_iter().collect()
+        } else {
+            spans
+        };
+        if spans.is_empty() || spans.len() == 1 && !args.include_single_span {
             continue;
         }
         let artifact_id = deterministic_uuid(parent.id, "chunk-artifact");
@@ -392,6 +401,20 @@ fn chunk_spans(
     }
 
     chunks
+}
+
+fn whole_parent_span(text: &str) -> Option<ChunkSpan> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let leading = text.len() - text.trim_start().len();
+    let trailing = text.trim_end().len();
+    Some(ChunkSpan {
+        start_char: leading,
+        end_char: trailing,
+        word_count: word_spans(trimmed).len(),
+    })
 }
 
 fn word_spans(text: &str) -> Vec<(usize, usize)> {
@@ -613,6 +636,10 @@ fn select_args_map(args: &ChunkSelectArgs) -> BTreeMap<String, serde_json::Value
             serde_json::json!(args.min_parent_words),
         ),
         (
+            "include_single_span".to_string(),
+            serde_json::json!(args.include_single_span),
+        ),
+        (
             "exclude_thought_ids_file".to_string(),
             serde_json::json!(
                 args.exclude_thought_ids_file
@@ -701,5 +728,13 @@ mod tests {
     fn short_parents_do_not_chunk() {
         let text = "short thought with enough meaning";
         assert!(chunk_spans(text, 160, 280, 420, 55).is_empty());
+    }
+
+    #[test]
+    fn whole_parent_span_trims_but_preserves_offsets() {
+        let span = whole_parent_span("  alpha beta gamma\n").expect("span");
+        assert_eq!(span.start_char, 2);
+        assert_eq!(span.end_char, 18);
+        assert_eq!(span.word_count, 3);
     }
 }

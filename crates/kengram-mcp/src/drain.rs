@@ -90,7 +90,7 @@ impl std::fmt::Display for EmbedJobError {
                 "job model_id={got} does not match active embedder model={expected}"
             ),
             Self::UnsupportedTargetKind(k) => write!(f, "unsupported target_kind: {k}"),
-            Self::SourceMissing => f.write_str("source thought no longer exists"),
+            Self::SourceMissing => f.write_str("embedding source no longer exists"),
             Self::Embedder(e) => write!(f, "embedder: {e}"),
             Self::Embedding(e) => write!(f, "embedding: {e}"),
             Self::Storage(e) => write!(f, "storage: {e}"),
@@ -112,7 +112,8 @@ async fn process_embed_job(
         });
     }
 
-    // M4: only thoughts are embeddable; facts are gone.
+    // Facts are gone; artifact chunks are now first-class embedding targets
+    // for the recall-surgery pipeline.
     let text = match job.target_kind.as_str() {
         kengram_storage::target::THOUGHT => {
             let thought_id = ThoughtId::from(job.target_id);
@@ -121,6 +122,12 @@ async fn process_embed_job(
                 .map_err(EmbedJobError::Storage)?
                 .ok_or(EmbedJobError::SourceMissing)?;
             thought.content
+        }
+        kengram_storage::target::ARTIFACT_CHUNK => {
+            kengram_storage::fetch_artifact_chunk_content(pool, job.target_id)
+                .await
+                .map_err(EmbedJobError::Storage)?
+                .ok_or(EmbedJobError::SourceMissing)?
         }
         _ => {
             return Err(EmbedJobError::UnsupportedTargetKind(
@@ -138,9 +145,27 @@ async fn process_embed_job(
     let embedding =
         Embedding::new(embedder.model().clone(), vector).map_err(EmbedJobError::Embedding)?;
 
-    kengram_storage::insert_thought_embedding(pool, ThoughtId::from(job.target_id), &embedding)
-        .await
-        .map_err(EmbedJobError::Storage)?;
+    match job.target_kind.as_str() {
+        kengram_storage::target::THOUGHT => {
+            kengram_storage::insert_thought_embedding(
+                pool,
+                ThoughtId::from(job.target_id),
+                &embedding,
+            )
+            .await
+            .map_err(EmbedJobError::Storage)?;
+        }
+        kengram_storage::target::ARTIFACT_CHUNK => {
+            kengram_storage::insert_artifact_chunk_embedding(pool, job.target_id, &embedding)
+                .await
+                .map_err(EmbedJobError::Storage)?;
+        }
+        _ => {
+            return Err(EmbedJobError::UnsupportedTargetKind(
+                job.target_kind.clone(),
+            ));
+        }
+    }
 
     kengram_storage::mark_embedded(pool, job.id)
         .await
@@ -488,6 +513,78 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drain_processes_artifact_chunk_pending_to_embedding(pool: PgPool) {
+        let parent_id = capture_one(&pool, "parent for chunk").await;
+        let artifact_id = uuid::Uuid::new_v4();
+        let chunk_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (id, scope, kind, title, metadata)
+            VALUES ($1, 'global', 'thought_chunks', 'test artifact', '{}')
+            "#,
+        )
+        .bind(artifact_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO artifact_chunks (
+                id,
+                artifact_id,
+                source_thought_id,
+                chunk_index,
+                content,
+                content_fingerprint,
+                chunker_id,
+                token_estimate
+            )
+            VALUES ($1,$2,$3,0,'chunk content to embed',$4,'test',5)
+            "#,
+        )
+        .bind(chunk_id)
+        .bind(artifact_id)
+        .bind(parent_id.into_uuid())
+        .bind(vec![7_u8; 32])
+        .execute(&pool)
+        .await
+        .unwrap();
+        kengram_storage::enqueue_embedding(
+            &pool,
+            kengram_storage::target::ARTIFACT_CHUNK,
+            chunk_id,
+            TEST_EMBEDDER_MODEL_ID,
+        )
+        .await
+        .unwrap();
+
+        let good = test_embedder();
+        let report = drain_pending_embeddings(&pool, &good, 10).await.unwrap();
+        assert_eq!(report.found, 2);
+        assert_eq!(report.embedded, 2);
+        assert_eq!(report.failed, 0);
+        assert_eq!(kengram_storage::count_pending(&pool).await.unwrap(), 0);
+
+        let row: (bool,) = sqlx::query_as(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM embeddings
+                WHERE target_kind = 'artifact_chunk'
+                  AND target_id = $1
+                  AND model_id = $2
+            )
+            "#,
+        )
+        .bind(chunk_id)
+        .bind(TEST_EMBEDDER_MODEL_ID)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(row.0);
     }
 
     #[sqlx::test(migrations = "../../migrations")]

@@ -7,6 +7,7 @@
 
 mod backup;
 mod bench;
+mod chunk;
 mod config;
 mod eval;
 
@@ -132,6 +133,13 @@ enum Command {
     Eval {
         #[command(subcommand)]
         action: eval::EvalAction,
+    },
+    /// Batch chunking pipeline: dry-run, apply, and enqueue artifact chunks
+    /// for embedding. Corpus surgery is operator-gated and resumable; dry-run
+    /// first, apply only after sample audit.
+    Chunk {
+        #[command(subcommand)]
+        action: chunk::ChunkAction,
     },
     /// Print corpus + storage telemetry: thought counts, embeddings,
     /// links, per-scope summary, per-table heap/index/total sizes.
@@ -1039,6 +1047,7 @@ async fn main() -> anyhow::Result<()> {
                 eval::export::run_export_cli(config, args).await
             }
         },
+        Command::Chunk { action } => chunk::run_chunk_cli(config, action).await,
         Command::Stats {
             scope_prefix,
             top_scopes,

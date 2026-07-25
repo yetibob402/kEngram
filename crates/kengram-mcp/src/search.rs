@@ -214,7 +214,7 @@ async fn search_thoughts_with_tuning(
     let scope_prefix_filter = request.scope_prefix.as_deref();
 
     // Vector leg (soft-fail to empty + flag).
-    let (vector_hits, vector_search_available) = match embedder
+    let (vector_hits, chunk_vector_hits, vector_search_available) = match embedder
         .embed(std::slice::from_ref(&query))
         .await
     {
@@ -222,7 +222,28 @@ async fn search_thoughts_with_tuning(
             let v = vectors
                 .pop()
                 .expect("non-empty input must yield at least one vector");
-            match kengram_storage::search_vector_knn(
+            let mut thought_vector_ok = false;
+            let vector_hits = match kengram_storage::search_vector_knn(
+                pool,
+                v.clone(),
+                embedder.model(),
+                scope_filter,
+                scope_prefix_filter,
+                DEFAULT_TOP_K_PER_LEG as i64,
+            )
+            .await
+            {
+                Ok(hits) => {
+                    thought_vector_ok = true;
+                    hits
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "vector kNN query failed; falling back to lexical only");
+                    vec![]
+                }
+            };
+            let mut chunk_vector_ok = false;
+            let chunk_vector_hits = match kengram_storage::search_artifact_chunks_vector_knn(
                 pool,
                 v,
                 embedder.model(),
@@ -232,16 +253,21 @@ async fn search_thoughts_with_tuning(
             )
             .await
             {
-                Ok(hits) => (hits, true),
-                Err(e) => {
-                    tracing::warn!(error = %e, "vector kNN query failed; falling back to lexical only");
-                    (vec![], false)
+                Ok(hits) => {
+                    chunk_vector_ok = true;
+                    hits
                 }
-            }
+                Err(e) => {
+                    tracing::warn!(error = %e, "artifact-chunk vector kNN query failed; continuing without chunk vector hits");
+                    vec![]
+                }
+            };
+            let vector_available = thought_vector_ok || chunk_vector_ok;
+            (vector_hits, chunk_vector_hits, vector_available)
         }
         Err(e) => {
             tracing::warn!(error = %e, "embedder failed to embed query; falling back to lexical only");
-            (vec![], false)
+            (vec![], vec![], false)
         }
     };
 
@@ -257,9 +283,26 @@ async fn search_thoughts_with_tuning(
         lexical_timeout_ms,
     )
     .await;
+    let chunk_lexical_hits = bounded_artifact_chunk_fts_hits(
+        pool,
+        &query,
+        scope_filter,
+        scope_prefix_filter,
+        lexical_top_k,
+        lexical_timeout_ms,
+    )
+    .await;
 
     // RRF fuse → recency boost.
-    let mut fused = rrf_fuse(vec![vector_hits, lexical_hits], DEFAULT_RRF_K);
+    let mut fused = rrf_fuse(
+        vec![
+            chunk_vector_hits,
+            vector_hits,
+            chunk_lexical_hits,
+            lexical_hits,
+        ],
+        DEFAULT_RRF_K,
+    );
     let half_life = request
         .recency_half_life_days
         .unwrap_or(DEFAULT_RECENCY_HALF_LIFE_DAYS);
@@ -345,6 +388,37 @@ async fn bounded_fts_hits(
                 query_canceled = e.is_query_canceled(),
                 timeout_ms = lexical_timeout_ms,
                 "bounded FTS query failed; continuing with available search legs only",
+            );
+            vec![]
+        }
+    }
+}
+
+async fn bounded_artifact_chunk_fts_hits(
+    pool: &PgPool,
+    query: &str,
+    scope_filter: Option<&str>,
+    scope_prefix_filter: Option<&str>,
+    lexical_top_k: usize,
+    lexical_timeout_ms: u64,
+) -> Vec<Hit> {
+    match kengram_storage::search_artifact_chunks_fts_bounded(
+        pool,
+        query,
+        scope_filter,
+        scope_prefix_filter,
+        lexical_top_k as i64,
+        lexical_timeout_ms,
+    )
+    .await
+    {
+        Ok(hits) => hits,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                query_canceled = e.is_query_canceled(),
+                timeout_ms = lexical_timeout_ms,
+                "bounded artifact-chunk FTS query failed; continuing with available search legs only",
             );
             vec![]
         }

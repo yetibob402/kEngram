@@ -105,12 +105,15 @@ impl Default for DatabaseConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EmbedderConfig {
-    /// `"openai-compatible"` is the only provider in M1; covers Ollama,
-    /// TEI, OpenAI, and Voyage by varying `endpoint` and `model`.
+    /// `"openai-compatible"` covers Ollama, TEI, OpenAI, and Voyage by
+    /// varying `endpoint` and `model`. `"gemini"` uses Google's native
+    /// `batchEmbedContents` endpoint with retrieval document/query task types.
     pub provider: String,
     /// `/v1` base URL. For Ollama: `"http://localhost:11434/v1"`.
+    /// For Gemini: `"https://generativelanguage.googleapis.com/v1beta"`.
     pub endpoint: String,
-    /// Backend model name. For Ollama: `"bge-m3"`.
+    /// Backend model name. For Ollama: `"bge-m3"`. For Gemini:
+    /// `"models/gemini-embedding-001"`.
     pub model: String,
     /// Kengram-side model identity (`"bge-m3:1024"`). Must match the HNSW
     /// partial index in Postgres.

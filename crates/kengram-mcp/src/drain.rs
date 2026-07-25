@@ -138,7 +138,7 @@ async fn process_embed_job(
 
     let texts = vec![text];
     let mut vectors = embedder
-        .embed(&texts)
+        .embed_documents(&texts)
         .await
         .map_err(EmbedJobError::Embedder)?;
     let vector = vectors.pop().ok_or(EmbedJobError::EmptyEmbedderOutput)?;

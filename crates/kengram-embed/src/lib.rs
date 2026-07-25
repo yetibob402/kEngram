@@ -16,12 +16,14 @@
 
 pub mod fake;
 pub mod fake_reranker;
+pub mod gemini;
 pub mod openai_compatible;
 pub mod reranker;
 pub mod tei_reranker;
 
 pub use fake::{FakeBehavior, FakeEmbedder};
 pub use fake_reranker::{FakeReranker, FakeRerankerBehavior, FakeRerankerScoring, RecordedRerank};
+pub use gemini::{GeminiConfig, GeminiEmbedder};
 pub use openai_compatible::{OpenAICompatibleConfig, OpenAICompatibleEmbedder};
 pub use reranker::{RerankScore, Reranker, RerankerError};
 pub use tei_reranker::{TeiReranker, TeiRerankerConfig};

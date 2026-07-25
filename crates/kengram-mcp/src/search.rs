@@ -273,12 +273,8 @@ async fn search_thoughts_with_tuning(
 
     // Vector leg (soft-fail to empty + flag).
     let embedding_started = Instant::now();
-    let embedded_query = match embedder.embed(std::slice::from_ref(&query)).await {
-        Ok(mut vectors) => Some(
-            vectors
-                .pop()
-                .expect("non-empty input must yield at least one vector"),
-        ),
+    let embedded_query = match embedder.embed_query(&query).await {
+        Ok(vector) => Some(vector),
         Err(e) => {
             tracing::warn!(error = %e, "embedder failed to embed query; falling back to lexical only");
             None

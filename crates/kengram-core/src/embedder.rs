@@ -15,6 +15,26 @@ pub trait Embedder: Send + Sync {
     /// `self.model().dimensions`. The order of outputs matches the order of
     /// inputs.
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedderError>;
+
+    /// Embed texts for storage/retrieval as corpus documents. Backends that
+    /// distinguish query and document task types can override this.
+    async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedderError> {
+        self.embed(texts).await
+    }
+
+    /// Embed one query string. Backends that distinguish query and document
+    /// task types can override this.
+    async fn embed_query(&self, query: &str) -> Result<Vec<f32>, EmbedderError> {
+        let texts = vec![query.to_string()];
+        let mut vectors = self.embed(&texts).await?;
+        if vectors.len() != 1 {
+            return Err(EmbedderError::MalformedResponse(format!(
+                "expected 1 query embedding, got {}",
+                vectors.len()
+            )));
+        }
+        Ok(vectors.remove(0))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

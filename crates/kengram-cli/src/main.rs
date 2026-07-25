@@ -17,7 +17,8 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use kengram_core::{Embedder, EmbeddingModel, Tagger};
 use kengram_embed::{
-    OpenAICompatibleConfig, OpenAICompatibleEmbedder, Reranker, TeiReranker, TeiRerankerConfig,
+    GeminiConfig, GeminiEmbedder, OpenAICompatibleConfig, OpenAICompatibleEmbedder, Reranker,
+    TeiReranker, TeiRerankerConfig,
 };
 use kengram_extract::{OpenAICompatibleConfig as TaggerConfigBuilder, OpenAICompatibleTagger};
 use kengram_mcp::KengramServer;
@@ -240,7 +241,28 @@ fn build_embedder(c: &EmbedderConfig) -> anyhow::Result<Arc<dyn Embedder>> {
             .with_context(|| format!("constructing embedder for endpoint {}", c.endpoint))?;
             Ok(Arc::new(embedder))
         }
-        other => anyhow::bail!("unknown embedder provider: {other:?} (valid: 'openai-compatible')"),
+        "gemini" => {
+            let api_key = c
+                .api_key
+                .clone()
+                .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+                .or_else(|| std::env::var("GOOGLE_API_KEY").ok())
+                .context(
+                    "Gemini embedder requires [embedder].api_key, GEMINI_API_KEY, or GOOGLE_API_KEY",
+                )?;
+            let embedder = GeminiEmbedder::new(GeminiConfig {
+                endpoint: c.endpoint.clone(),
+                api_model: c.model.clone(),
+                model: EmbeddingModel::new(c.model_id.clone(), c.dimensions),
+                api_key,
+                timeout: Duration::from_secs(c.timeout_seconds),
+            })
+            .with_context(|| format!("constructing Gemini embedder for endpoint {}", c.endpoint))?;
+            Ok(Arc::new(embedder))
+        }
+        other => anyhow::bail!(
+            "unknown embedder provider: {other:?} (valid: 'openai-compatible' or 'gemini')"
+        ),
     }
 }
 

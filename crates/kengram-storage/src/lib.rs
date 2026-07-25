@@ -26,10 +26,9 @@ pub mod target {
 }
 
 mod ann {
-    pub const HALF_3072_DIMS: usize = 3072;
-    pub const HALF_3072_DIMS_I32: i32 = 3072;
+    pub const RAW_VECTOR_DIMS: usize = 4096;
+    pub const MAX_HALF_DIMS: usize = 3072;
     pub const HALF_3072_HNSW_EF_SEARCH: i32 = 1000;
-    pub const PROJECTION_SUFFIX: &str = "halfvec:3072";
 }
 
 mod bge {
@@ -66,13 +65,14 @@ fn ann_projection_for_model(model: &EmbeddingModel) -> Option<AnnProjection> {
     if is_bge_m3_1024(model) {
         return None;
     }
-    if model.dimensions < ann::HALF_3072_DIMS {
+    if model.dimensions == 0 {
         return None;
     }
 
+    let dimensions = model.dimensions.min(ann::MAX_HALF_DIMS);
     Some(AnnProjection {
-        projection_id: format!("{}:{}", model.id, ann::PROJECTION_SUFFIX),
-        dimensions: ann::HALF_3072_DIMS,
+        projection_id: format!("{}:halfvec:{}", model.id, dimensions),
+        dimensions,
     })
 }
 
@@ -80,7 +80,7 @@ fn is_bge_m3_1024(model: &EmbeddingModel) -> bool {
     model.id == bge::MODEL_ID && model.dimensions == bge::DIMS
 }
 
-fn project_halfvec_3072(
+fn project_halfvec(
     vector: &[f32],
     dimensions: usize,
 ) -> Result<pgvector::HalfVector, StorageError> {
@@ -107,6 +107,27 @@ fn project_halfvec_3072(
     };
 
     Ok(pgvector::HalfVector::from_f32_slice(&projected))
+}
+
+fn raw_embedding_vector_for_storage(
+    model: &EmbeddingModel,
+    vector: &[f32],
+) -> Result<pgvector::Vector, StorageError> {
+    if vector.len() > ann::RAW_VECTOR_DIMS {
+        return Err(StorageError::InvalidEmbeddingDimensions {
+            model_id: model.id.clone(),
+            expected: ann::RAW_VECTOR_DIMS,
+            got: vector.len(),
+        });
+    }
+
+    if vector.len() == ann::RAW_VECTOR_DIMS {
+        return Ok(pgvector::Vector::from(vector.to_vec()));
+    }
+
+    let mut padded = vec![0.0_f32; ann::RAW_VECTOR_DIMS];
+    padded[..vector.len()].copy_from_slice(vector);
+    Ok(pgvector::Vector::from(padded))
 }
 
 fn sql_literal(value: &str) -> String {
@@ -405,7 +426,7 @@ pub async fn insert_embedding(
     }
 
     let mut tx = pool.begin().await?;
-    let pgv = pgvector::Vector::from(vector.clone());
+    let pgv = raw_embedding_vector_for_storage(model, &vector)?;
     sqlx::query(
         r#"
         INSERT INTO embeddings (target_kind, target_id, model_id, model_version, vector)
@@ -514,7 +535,7 @@ async fn insert_ann_projection(
         return Ok(());
     };
 
-    let halfvec = project_halfvec_3072(vector, projection.dimensions)?;
+    let halfvec = project_halfvec(vector, projection.dimensions)?;
     sqlx::query(
         r#"
         INSERT INTO embedding_ann_projections (
@@ -553,7 +574,7 @@ async fn insert_ann_projection(
     .bind(&model.id)
     .bind(1_i32)
     .bind(&projection.projection_id)
-    .bind(ann::HALF_3072_DIMS_I32)
+    .bind(projection.dimensions as i32)
     .bind(halfvec)
     .execute(&mut **tx)
     .await?;
@@ -574,7 +595,8 @@ pub async fn reconcile_ann_projections(
         return Ok(None);
     };
 
-    let result = sqlx::query(
+    let dimensions = projection.dimensions as i32;
+    let sql = format!(
         r#"
         INSERT INTO embedding_ann_projections (
             source_embedding_id,
@@ -594,10 +616,10 @@ pub async fn reconcile_ann_projections(
             e.model_version,
             $2,
             $3,
-            (l2_normalize(subvector(e.vector, 1, 3072)::vector(3072)))::halfvec(3072)
+            (l2_normalize(subvector(e.vector, 1, {dimensions})::vector({dimensions})))::halfvec({dimensions})
         FROM embeddings e
         WHERE e.model_id = $1
-          AND vector_dims(e.vector) >= 3072
+          AND vector_dims(e.vector) >= $3
           AND NOT EXISTS (
               SELECT 1
               FROM embedding_ann_projections p
@@ -609,11 +631,12 @@ pub async fn reconcile_ann_projections(
             source_embedding_id = EXCLUDED.source_embedding_id,
             dimensions = EXCLUDED.dimensions,
             embedding = EXCLUDED.embedding
-        "#,
-    )
+        "#
+    );
+    let result = sqlx::query(&sql)
     .bind(&model.id)
     .bind(&projection.projection_id)
-    .bind(ann::HALF_3072_DIMS_I32)
+    .bind(dimensions)
     .execute(pool)
     .await?;
 
@@ -653,7 +676,7 @@ async fn record_ann_projection_coverage(
                 SELECT COUNT(*)
                 FROM embeddings e
                 WHERE e.model_id = $1
-                  AND vector_dims(e.vector) >= 3072
+                  AND vector_dims(e.vector) >= $3
             )::bigint AS embedding_count,
             (
                 SELECT COUNT(*)
@@ -665,7 +688,7 @@ async fn record_ann_projection_coverage(
                 SELECT COUNT(*)
                 FROM embeddings e
                 WHERE e.model_id = $1
-                  AND vector_dims(e.vector) >= 3072
+                  AND vector_dims(e.vector) >= $3
                   AND NOT EXISTS (
                       SELECT 1
                       FROM embedding_ann_projections p
@@ -677,6 +700,7 @@ async fn record_ann_projection_coverage(
     )
     .bind(&model.id)
     .bind(&projection.projection_id)
+    .bind(projection.dimensions as i32)
     .fetch_one(pool)
     .await?;
 
@@ -2738,7 +2762,15 @@ pub async fn search_artifact_chunks_vector_knn(
     limit: i64,
 ) -> Result<Vec<Hit>, StorageError> {
     if !is_bge_m3_1024(model) {
-        return Ok(Vec::new());
+        return search_artifact_chunks_ann_projection_knn(
+            pool,
+            query_vector,
+            model,
+            scope,
+            scope_prefix,
+            limit,
+        )
+        .await;
     }
     if query_vector.len() != bge::DIMS {
         return Err(StorageError::InvalidEmbeddingDimensions {
@@ -2816,6 +2848,118 @@ pub async fn search_artifact_chunks_vector_knn(
     chunk_vector_rows_to_hits(rows)
 }
 
+async fn search_artifact_chunks_ann_projection_knn(
+    pool: &PgPool,
+    query_vector: Vec<f32>,
+    model: &EmbeddingModel,
+    scope: Option<&str>,
+    scope_prefix: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Hit>, StorageError> {
+    let Some(projection) = ann_projection_for_model(model) else {
+        tracing::warn!(
+            model_id = %model.id,
+            dimensions = model.dimensions,
+            "artifact chunk vector search has no ANN projection for active model"
+        );
+        return Ok(Vec::new());
+    };
+
+    if !ann_projection_search_ready(pool, &projection.projection_id).await? {
+        tracing::warn!(
+            model_id = %model.id,
+            projection_id = %projection.projection_id,
+            "artifact chunk ANN projection coverage is not marked complete"
+        );
+        return Ok(Vec::new());
+    }
+
+    if ann_projection_filter_has_missing_artifact_chunks(
+        pool,
+        &projection.projection_id,
+        &model.id,
+        scope,
+        scope_prefix,
+    )
+    .await?
+    {
+        tracing::error!(
+            model_id = %model.id,
+            projection_id = %projection.projection_id,
+            scope = ?scope,
+            scope_prefix = ?scope_prefix,
+            "ANN projection coverage gap overlaps requested artifact chunk filter"
+        );
+        return Ok(Vec::new());
+    }
+
+    let halfvec = project_halfvec_3072(&query_vector, projection.dimensions)?;
+    let mut tx = pool.begin().await?;
+    set_ann_projection_ef_search(&mut tx).await?;
+    let rows: Vec<ChunkVectorSearchRow> = sqlx::query_as(
+        r#"
+        WITH candidates AS (
+            SELECT t.id,
+                   t.scope,
+                   t.content AS parent_content,
+                   t.source,
+                   t.created_at,
+                   t.metadata AS parent_metadata,
+                   t.content_fingerprint,
+                   t.tags,
+                   t.tags_extractor_model,
+                   t.tags_extractor_version,
+                   t.tags_extracted_at,
+                   ac.id AS chunk_id,
+                   ac.artifact_id,
+                   ac.source_thought_id,
+                   ac.chunk_index,
+                   ac.content AS chunk_content,
+                   ac.chunker_id,
+                   ac.chunker_version,
+                   ac.token_estimate,
+                   ac.start_char,
+                   ac.end_char,
+                   ac.metadata AS chunk_metadata,
+                   (p.embedding <=> $1) AS distance
+            FROM embedding_ann_projections p
+            JOIN artifact_chunks ac ON ac.id = p.target_id
+            JOIN thoughts t ON t.id = ac.source_thought_id
+            WHERE p.projection_id = $2
+              AND p.model_id = $3
+              AND p.target_kind = 'artifact_chunk'
+              AND ac.retracted_at IS NULL
+              AND ac.source_thought_id IS NOT NULL
+              AND t.retracted_at IS NULL
+              AND ($4::text IS NULL OR t.scope = $4)
+              AND ($5::text IS NULL OR t.scope LIKE $5 || '%')
+            ORDER BY p.embedding <=> $1
+            LIMIT GREATEST($6, $6 * 8)
+        ),
+        best_per_parent AS (
+            SELECT DISTINCT ON (id) *
+            FROM candidates
+            ORDER BY id, distance ASC, chunk_index ASC
+        )
+        SELECT *
+        FROM best_per_parent
+        ORDER BY distance ASC, created_at DESC, chunk_index ASC
+        LIMIT $6
+        "#,
+    )
+    .bind(halfvec)
+    .bind(&projection.projection_id)
+    .bind(&model.id)
+    .bind(scope)
+    .bind(scope_prefix)
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    chunk_vector_rows_to_hits(rows)
+}
+
 async fn ann_projection_search_ready(
     pool: &PgPool,
     projection_id: &str,
@@ -2856,6 +3000,50 @@ async fn ann_projection_filter_has_missing_rows(
              AND t.retracted_at IS NULL
             WHERE e.model_id = $1
               AND e.target_kind = 'thought'
+              AND vector_dims(e.vector) >= 3072
+              AND ($3::text IS NULL OR t.scope = $3)
+              AND ($4::text IS NULL OR t.scope LIKE $4 || '%')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM embedding_ann_projections p
+                  WHERE p.source_embedding_id = e.id
+                    AND p.projection_id = $2
+              )
+            LIMIT 1
+        )
+        "#,
+    )
+    .bind(model_id)
+    .bind(projection_id)
+    .bind(scope)
+    .bind(scope_prefix)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(exists)
+}
+
+async fn ann_projection_filter_has_missing_artifact_chunks(
+    pool: &PgPool,
+    projection_id: &str,
+    model_id: &str,
+    scope: Option<&str>,
+    scope_prefix: Option<&str>,
+) -> Result<bool, StorageError> {
+    let (exists,): (bool,) = sqlx::query_as(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM embeddings e
+            JOIN artifact_chunks ac
+              ON ac.id = e.target_id
+             AND ac.retracted_at IS NULL
+             AND ac.source_thought_id IS NOT NULL
+            JOIN thoughts t
+              ON t.id = ac.source_thought_id
+             AND t.retracted_at IS NULL
+            WHERE e.model_id = $1
+              AND e.target_kind = 'artifact_chunk'
               AND vector_dims(e.vector) >= 3072
               AND ($3::text IS NULL OR t.scope = $3)
               AND ($4::text IS NULL OR t.scope LIKE $4 || '%')

@@ -408,6 +408,7 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
         .bind
         .parse()
         .with_context(|| format!("parsing server.bind = {:?}", config.server.bind))?;
+    kengram_mcp::search::set_fts_pairwise_expansion_enabled(config.server.fts_pairwise_expansion);
 
     let pool_for_factory = pool.clone();
     let embedder_for_factory = embedder.clone();
@@ -460,6 +461,7 @@ async fn run_serve(config: Config) -> anyhow::Result<()> {
     tracing::info!(
         bind = %bind,
         allowed_hosts = %allowed_hosts_summary,
+        fts_pairwise_expansion = config.server.fts_pairwise_expansion,
         embedder_endpoint = %config.embedder.endpoint,
         model_id = %config.embedder.model_id,
         tagger = %match tagger_model_id.as_deref() {

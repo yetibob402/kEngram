@@ -65,6 +65,11 @@ pub struct ServerConfig {
     /// clients. Bypass-all (clearing the rmcp default entirely) is
     /// intentionally not exposed; if you need it, edit the source.
     pub allowed_hosts: Vec<String>,
+
+    /// Default-off server kill switch for bounded pairwise FTS expansion. The
+    /// operational override is the exact env var `KENGRAM_FTS_PAIRWISE_EXPANSION`;
+    /// no MCP request field or tool schema surface exists for this flag.
+    pub fts_pairwise_expansion: bool,
 }
 
 impl Default for ServerConfig {
@@ -72,6 +77,7 @@ impl Default for ServerConfig {
         Self {
             bind: "127.0.0.1:8080".to_string(),
             allowed_hosts: Vec::new(),
+            fts_pairwise_expansion: false,
         }
     }
 }
@@ -348,7 +354,33 @@ pub fn load(cli_config: Option<&Path>) -> anyhow::Result<Config> {
 
     figment = figment.merge(Env::prefixed("KENGRAM_").split("__"));
 
-    Ok(figment.extract()?)
+    let mut config: Config = figment.extract()?;
+    match std::env::var("KENGRAM_FTS_PAIRWISE_EXPANSION") {
+        Ok(value) => apply_fts_pairwise_env_override(&mut config, Some(&value))?,
+        Err(std::env::VarError::NotPresent) => {}
+        Err(e) => anyhow::bail!("reading KENGRAM_FTS_PAIRWISE_EXPANSION: {e}"),
+    }
+
+    Ok(config)
+}
+
+fn apply_fts_pairwise_env_override(config: &mut Config, value: Option<&str>) -> anyhow::Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    config.server.fts_pairwise_expansion =
+        parse_bool_env_flag("KENGRAM_FTS_PAIRWISE_EXPANSION", value)?;
+    Ok(())
+}
+
+fn parse_bool_env_flag(name: &str, value: &str) -> anyhow::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => {
+            anyhow::bail!("{name} must be one of 1/0, true/false, yes/no, or on/off; got {value:?}")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -362,6 +394,7 @@ mod tests {
         // Empty allowed_hosts = use rmcp's safe default (localhost-only).
         // Operator must extend this list when binding non-loopback.
         assert!(c.server.allowed_hosts.is_empty());
+        assert!(!c.server.fts_pairwise_expansion);
     }
 
     /// Operator-provided allowed_hosts round-trips through figment. Common
@@ -374,6 +407,7 @@ mod tests {
             [server]
             bind = "0.0.0.0:8081"
             allowed_hosts = ["localhost", "127.0.0.1", "::1", "repromax", "repromax:8081"]
+            fts_pairwise_expansion = true
         "#;
         let c: Config = Figment::new()
             .merge(Serialized::defaults(Config::default()))
@@ -388,6 +422,24 @@ mod tests {
                 .allowed_hosts
                 .contains(&"repromax:8081".to_string())
         );
+        assert!(c.server.fts_pairwise_expansion);
+    }
+
+    #[test]
+    fn fts_pairwise_expansion_exact_env_override_parses_truthy_values() {
+        let mut c = Config::default();
+        apply_fts_pairwise_env_override(&mut c, Some("1")).unwrap();
+        assert!(c.server.fts_pairwise_expansion);
+
+        apply_fts_pairwise_env_override(&mut c, Some("off")).unwrap();
+        assert!(!c.server.fts_pairwise_expansion);
+    }
+
+    #[test]
+    fn fts_pairwise_expansion_exact_env_override_rejects_invalid_values() {
+        let mut c = Config::default();
+        let err = apply_fts_pairwise_env_override(&mut c, Some("sometimes")).unwrap_err();
+        assert!(err.to_string().contains("KENGRAM_FTS_PAIRWISE_EXPANSION"));
     }
 
     #[test]

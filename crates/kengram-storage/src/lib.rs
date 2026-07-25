@@ -6,11 +6,15 @@
 //! the way of the macro (currently: only `insert_embedding`).
 
 use kengram_core::{
-    Embedding, EmbeddingModel, EmbeddingStatus, Hit, LinkDirection, LinkId, LinkSource, LinkTarget,
-    Metadata, RelationKind, Scope, ScopeError, ScopeVocab, Source, SourceError, Tags, Thought,
-    ThoughtId, UnknownLinkSource, UnknownRelationKind,
+    DEFAULT_RRF_K, Embedding, EmbeddingModel, EmbeddingStatus, Hit, LinkDirection, LinkId,
+    LinkSource, LinkTarget, Metadata, RelationKind, Scope, ScopeError, ScopeVocab, Source,
+    SourceError, Tags, Thought, ThoughtId, UnknownLinkSource, UnknownRelationKind,
 };
 use sqlx::{PgPool, PgTransaction};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -132,6 +136,318 @@ fn normalize_fts_query(query: &str) -> Option<String> {
     }
 
     Some(trimmed.to_string())
+}
+
+fn clean_pairwise_token(token: &str) -> &str {
+    token.trim_matches(|c: char| c.is_whitespace() || "'\"`()[]{}<>.,;!?".contains(c))
+}
+
+fn is_pairwise_token_start(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '#'
+}
+
+fn is_pairwise_token_continue(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | ':' | '#' | '-')
+}
+
+fn raw_pairwise_tokens(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+
+    for c in query.chars() {
+        if current.is_empty() {
+            if is_pairwise_token_start(c) {
+                current.push(c);
+            }
+        } else if is_pairwise_token_continue(c) {
+            current.push(c);
+        } else {
+            tokens.push(current);
+            current = String::new();
+        }
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+fn is_pairwise_stopword(value: &str) -> bool {
+    matches!(
+        value,
+        "a" | "about"
+            | "after"
+            | "all"
+            | "an"
+            | "and"
+            | "are"
+            | "as"
+            | "ask"
+            | "asked"
+            | "at"
+            | "be"
+            | "before"
+            | "by"
+            | "can"
+            | "could"
+            | "current"
+            | "did"
+            | "do"
+            | "does"
+            | "for"
+            | "from"
+            | "had"
+            | "has"
+            | "have"
+            | "how"
+            | "in"
+            | "into"
+            | "is"
+            | "it"
+            | "its"
+            | "me"
+            | "of"
+            | "on"
+            | "or"
+            | "right"
+            | "should"
+            | "so"
+            | "that"
+            | "the"
+            | "their"
+            | "there"
+            | "this"
+            | "to"
+            | "use"
+            | "used"
+            | "was"
+            | "were"
+            | "what"
+            | "when"
+            | "where"
+            | "which"
+            | "who"
+            | "why"
+            | "with"
+    )
+}
+
+fn pairwise_aliases(value: &str) -> &'static [&'static str] {
+    match value {
+        "a2a" => &["agent comms", "agent communication", "AGENT_COMMS"],
+        "fts" => &["full text search", "lexical search", "lexical"],
+        "kengram" => &["kEngram", "memory", "search_thoughts"],
+        "mcp" => &["tools call", "tools list", "model context protocol"],
+        "pr" => &["pull request"],
+        "reranker" => &["cross encoder", "cross-encoder", "TEI"],
+        "smith" => &["agents/smith"],
+        _ => &[],
+    }
+}
+
+fn is_pairwise_identifier(value: &str) -> bool {
+    let mut upper_count = 0;
+    let mut prev_lower = false;
+    let mut camel_case = false;
+
+    for c in value.chars() {
+        if c.is_ascii_uppercase() {
+            upper_count += 1;
+            if prev_lower {
+                camel_case = true;
+            }
+            prev_lower = false;
+        } else {
+            prev_lower = c.is_ascii_lowercase();
+        }
+    }
+
+    value.chars().any(|c| c.is_ascii_digit())
+        || value.contains('_')
+        || value.contains('/')
+        || value.contains('.')
+        || value.contains('-')
+        || value.contains('#')
+        || upper_count >= 2
+        || camel_case
+}
+
+pub fn pairwise_fts_query_is_high_signal(query: &str) -> bool {
+    let Some(query) = normalize_fts_query(query) else {
+        return false;
+    };
+
+    raw_pairwise_tokens(&query).into_iter().any(|raw| {
+        let token = clean_pairwise_token(&raw);
+        !token.is_empty()
+            && (is_pairwise_identifier(token)
+                || looks_like_file_path(token)
+                || token.starts_with('#') && token[1..].chars().all(|c| c.is_ascii_digit()))
+    })
+}
+
+fn looks_like_hash(value: &str) -> bool {
+    (7..=40).contains(&value.len()) && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn looks_like_file_path(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        ".md", ".json", ".toml", ".rs", ".ts", ".tsx", ".py", ".sql", ".yaml", ".yml", ".sh",
+    ]
+    .iter()
+    .any(|suffix| lower.ends_with(suffix))
+        || value.split('/').filter(|part| !part.is_empty()).count() > 1
+}
+
+fn looks_like_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 10
+        && bytes.get(4) == Some(&b'-')
+        && bytes.get(7) == Some(&b'-')
+        && bytes[0..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+}
+
+fn lexical_terms_for_pairwise_fts(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+
+    for raw in raw_pairwise_tokens(query) {
+        let token = clean_pairwise_token(&raw);
+        if token.is_empty() {
+            continue;
+        }
+
+        let parts: Vec<&str> = token
+            .split(|c| matches!(c, '/' | '_' | '.' | ':' | '#' | '-'))
+            .filter(|part| !part.is_empty())
+            .collect();
+        let mut candidates = vec![token];
+        if parts.len() > 1 {
+            candidates.extend(parts);
+        }
+
+        for candidate in candidates {
+            let candidate = clean_pairwise_token(candidate);
+            if candidate.is_empty() {
+                continue;
+            }
+            let lower = candidate.to_ascii_lowercase();
+            let is_identifier = is_pairwise_identifier(candidate);
+            if !is_identifier && (is_pairwise_stopword(&lower) || lower.len() < 3) {
+                continue;
+            }
+            if seen.insert(lower) {
+                terms.push(candidate.to_string());
+            }
+        }
+    }
+
+    for term in terms.clone() {
+        for alias in pairwise_aliases(&term.to_ascii_lowercase()) {
+            let lower = alias.to_ascii_lowercase();
+            if seen.insert(lower) {
+                terms.push((*alias).to_string());
+            }
+        }
+    }
+
+    terms.truncate(18);
+    terms
+}
+
+fn identifier_terms_for_pairwise_fts(query: &str) -> Vec<String> {
+    let lexical_terms = lexical_terms_for_pairwise_fts(query);
+    let mut terms = Vec::new();
+
+    let raw_tokens = raw_pairwise_tokens(query);
+    for idx in 0..raw_tokens.len() {
+        let token = clean_pairwise_token(&raw_tokens[idx]);
+        if token.is_empty() {
+            continue;
+        }
+
+        if token.eq_ignore_ascii_case("pr")
+            && let Some(next) = raw_tokens.get(idx + 1)
+        {
+            let next = clean_pairwise_token(next);
+            if next
+                .trim_start_matches('#')
+                .chars()
+                .all(|c| c.is_ascii_digit())
+            {
+                terms.push(format!("PR {next}"));
+            }
+        }
+
+        if token.starts_with('#') && token[1..].chars().all(|c| c.is_ascii_digit()) {
+            terms.push(token.to_string());
+        } else if looks_like_hash(token) || looks_like_file_path(token) || looks_like_date(token) {
+            terms.push(token.to_string());
+        }
+    }
+
+    for token in lexical_terms {
+        if is_pairwise_identifier(&token) {
+            terms.push(token);
+        }
+    }
+
+    let mut seen = HashSet::new();
+    terms.retain(|term| seen.insert(term.to_ascii_lowercase()));
+    terms.truncate(12);
+    terms
+}
+
+fn pairwise_fts_subqueries(query: &str, max_subqueries: usize) -> Vec<String> {
+    if max_subqueries == 0 {
+        return Vec::new();
+    }
+
+    let terms = lexical_terms_for_pairwise_fts(query);
+    let mut pairs = Vec::new();
+
+    for pair in terms.windows(2) {
+        let left = &pair[0];
+        let right = &pair[1];
+        if left.eq_ignore_ascii_case(right) {
+            continue;
+        }
+        pairs.push(format!("{left} {right}"));
+    }
+
+    let identifiers = identifier_terms_for_pairwise_fts(query);
+    for ident in identifiers.iter().take(4) {
+        for term in terms.iter().take(8) {
+            if ident.eq_ignore_ascii_case(term) {
+                continue;
+            }
+            pairs.push(format!("{ident} {term}"));
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for pair in pairs {
+        if seen.insert(pair.to_ascii_lowercase()) {
+            out.push(pair);
+        }
+        if out.len() == max_subqueries {
+            break;
+        }
+    }
+    out
+}
+
+pub fn pairwise_fts_subquery_count(query: &str, max_subqueries: usize) -> usize {
+    let Some(query) = normalize_fts_query(query) else {
+        return 0;
+    };
+    pairwise_fts_subqueries(&query, max_subqueries).len()
 }
 
 fn ann_projection_index_name(projection_id: &str) -> String {
@@ -1278,6 +1594,121 @@ pub async fn search_fts_bounded(
             Ok(Hit::from_lexical_leg(thought, r.rank))
         })
         .collect()
+}
+
+struct PairwiseFtsAccum {
+    hit: Hit,
+    expansion_score: f32,
+}
+
+/// Bounded pairwise FTS lexical expansion. Generates adjacent term pairs and
+/// identifier×term pairs, runs each through the same indexed FTS query as
+/// [`search_fts_bounded`], dedupes by thought id, and ranks the merged lexical
+/// leg with weighted reciprocal rank.
+pub async fn search_fts_pairwise_bounded(
+    pool: &PgPool,
+    query: &str,
+    scope: Option<&str>,
+    scope_prefix: Option<&str>,
+    limit: i64,
+    timeout_ms: u64,
+    max_subqueries: usize,
+    per_subquery_limit: i64,
+    weight: f32,
+) -> Result<Vec<Hit>, StorageError> {
+    let Some(query) = normalize_fts_query(query) else {
+        return Ok(Vec::new());
+    };
+    let subqueries = pairwise_fts_subqueries(&query, max_subqueries);
+    if subqueries.is_empty() || limit <= 0 || per_subquery_limit <= 0 {
+        return Ok(Vec::new());
+    }
+
+    let scope = scope.map(str::to_owned);
+    let scope_prefix = scope_prefix.map(str::to_owned);
+    let mut hit_sets = Vec::with_capacity(subqueries.len());
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for (subquery_idx, subquery) in subqueries.into_iter().enumerate() {
+        let pool = pool.clone();
+        let scope = scope.clone();
+        let scope_prefix = scope_prefix.clone();
+        join_set.spawn(async move {
+            let hits = search_fts_bounded(
+                &pool,
+                &subquery,
+                scope.as_deref(),
+                scope_prefix.as_deref(),
+                per_subquery_limit,
+                timeout_ms,
+            )
+            .await?;
+            Ok::<_, StorageError>((subquery_idx, hits))
+        });
+    }
+
+    while let Some(joined) = join_set.join_next().await {
+        match joined {
+            Ok(Ok(item)) => hit_sets.push(item),
+            Ok(Err(e)) => return Err(e),
+            Err(e) => {
+                return Err(StorageError::Database(sqlx::Error::Protocol(format!(
+                    "pairwise FTS task join error: {e}"
+                ))));
+            }
+        }
+    }
+
+    hit_sets.sort_by_key(|(subquery_idx, _)| *subquery_idx);
+
+    let mut by_id: HashMap<ThoughtId, PairwiseFtsAccum> = HashMap::new();
+    for (_, hits) in hit_sets {
+        for (idx, mut hit) in hits.into_iter().enumerate() {
+            let contribution = weight / (DEFAULT_RRF_K + (idx + 1) as f32);
+            match by_id.get_mut(&hit.thought.id) {
+                Some(existing) => {
+                    existing.expansion_score += contribution;
+                    let current_rank = existing.hit.lexical_score.unwrap_or(0.0);
+                    let hit_rank = hit.lexical_score.unwrap_or(0.0);
+                    if hit_rank > current_rank {
+                        existing.hit.lexical_score = Some(hit_rank);
+                        existing.hit.trigram_score = Some(hit_rank);
+                    }
+                }
+                None => {
+                    let thought_id = hit.thought.id;
+                    let hit_rank = hit.lexical_score.unwrap_or(0.0);
+                    hit.trigram_score = Some(hit_rank);
+                    by_id.insert(
+                        thought_id,
+                        PairwiseFtsAccum {
+                            hit,
+                            expansion_score: contribution,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    let mut hits: Vec<Hit> = by_id
+        .into_values()
+        .map(|mut item| {
+            item.hit.lexical_score = Some(item.expansion_score);
+            item.hit.trigram_score = Some(item.expansion_score);
+            item.hit
+        })
+        .collect();
+    hits.sort_by(|left, right| {
+        right
+            .lexical_score
+            .unwrap_or(0.0)
+            .partial_cmp(&left.lexical_score.unwrap_or(0.0))
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| right.thought.created_at.cmp(&left.thought.created_at))
+    });
+    hits.truncate(limit as usize);
+    Ok(hits)
 }
 
 /// Find thoughts that don't yet have an embedding row for the given model.
@@ -3443,6 +3874,95 @@ mod tests {
         assert!(hits.is_empty());
     }
 
+    #[test]
+    fn pairwise_fts_terms_preserve_identifiers_split_parts_and_drop_stopwords() {
+        let terms =
+            lexical_terms_for_pairwise_fts("the PR-540 foo_bar/baz.rs A2A should use kEngram FTS");
+
+        assert!(terms.contains(&"PR-540".to_string()));
+        assert!(terms.contains(&"540".to_string()));
+        assert!(terms.contains(&"foo_bar/baz.rs".to_string()));
+        assert!(terms.contains(&"foo".to_string()));
+        assert!(terms.contains(&"bar".to_string()));
+        assert!(terms.contains(&"A2A".to_string()));
+        assert!(terms.contains(&"agent comms".to_string()));
+        assert!(terms.contains(&"kEngram".to_string()));
+        assert!(terms.contains(&"search_thoughts".to_string()));
+        assert!(!terms.contains(&"the".to_string()));
+        assert!(!terms.contains(&"should".to_string()));
+    }
+
+    #[test]
+    fn pairwise_fts_identifier_detection_matches_reference_signals() {
+        for token in [
+            "PR-540",
+            "AAAB123",
+            "fooBar",
+            "src/lib.rs",
+            "#896",
+            "2026-06-23",
+            "a2a",
+        ] {
+            assert!(
+                is_pairwise_identifier(token),
+                "{token} should be an identifier"
+            );
+        }
+
+        for token in ["memory", "search", "the"] {
+            assert!(
+                !is_pairwise_identifier(token),
+                "{token} should not be an identifier"
+            );
+        }
+    }
+
+    #[test]
+    fn pairwise_fts_query_high_signal_classifier_matches_dispatch_contract() {
+        for query in [
+            "PR #540 hybrid lexical expansion",
+            "src/search.rs bounded_fts_hits",
+            "why did fooBar fallback",
+            "backup-verify temp spill",
+            "A2A routing failure",
+        ] {
+            assert!(
+                pairwise_fts_query_is_high_signal(query),
+                "{query} should be high-signal"
+            );
+        }
+
+        for query in [
+            "how should memory search work",
+            "find recent notes about strategy",
+            "explain the recall problem",
+            "what should we do next",
+        ] {
+            assert!(
+                !pairwise_fts_query_is_high_signal(query),
+                "{query} should not be high-signal"
+            );
+        }
+    }
+
+    #[test]
+    fn pairwise_fts_subqueries_emit_adjacent_identifier_pairs_and_cap_at_4() {
+        let pairs = pairwise_fts_subqueries(
+            "PR 540 hybrid lexical expansion Smith reranker MCP kEngram latency eval",
+            4,
+        );
+
+        assert_eq!(pairs.len(), 4);
+        assert_eq!(pairs[0], "PR 540");
+        assert_eq!(pairs[1], "540 hybrid");
+
+        let uncapped = pairwise_fts_subqueries(
+            "PR 540 hybrid lexical expansion Smith reranker MCP kEngram latency eval",
+            32,
+        );
+        assert!(uncapped.len() > pairs.len());
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn search_fts_finds_exact_match(pool: PgPool) {
         insert_test_thought(&pool, "remembering tcgplayer integration", "work").await;
@@ -3556,6 +4076,59 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].thought.content.contains("tcgplayer"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_fts_pairwise_bounded_matches_pairs_without_full_query(pool: PgPool) {
+        insert_test_thought(&pool, "alpha beta details", "work").await;
+
+        let single = search_fts_bounded(&pool, "alpha beta gamma", None, None, 10, 300)
+            .await
+            .unwrap();
+        assert!(single.is_empty());
+
+        let hits = search_fts_pairwise_bounded(
+            &pool,
+            "alpha beta gamma",
+            None,
+            None,
+            10,
+            300,
+            8,
+            25,
+            1.25,
+        )
+        .await
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].thought.content, "alpha beta details");
+        assert!(hits[0].lexical_score.unwrap() > 0.0);
+        assert_eq!(hits[0].trigram_score, hits[0].lexical_score);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_fts_pairwise_bounded_dedupes_by_thought_id(pool: PgPool) {
+        insert_test_thought(&pool, "alpha beta gamma", "work").await;
+
+        let hits = search_fts_pairwise_bounded(
+            &pool,
+            "alpha beta gamma",
+            None,
+            None,
+            10,
+            300,
+            8,
+            25,
+            1.25,
+        )
+        .await
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].thought.content, "alpha beta gamma");
+        assert!(
+            hits[0].lexical_score.unwrap() > 1.25 / (DEFAULT_RRF_K + 1.0),
+            "duplicate pair hits should accumulate weighted RRF contribution"
+        );
     }
 
     fn unit_vector_4096(pos: usize) -> Vec<f32> {

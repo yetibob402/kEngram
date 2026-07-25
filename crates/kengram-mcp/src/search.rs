@@ -24,6 +24,10 @@ use kengram_core::{
 };
 use kengram_embed::Reranker;
 use sqlx::PgPool;
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
+};
 use time::OffsetDateTime;
 
 pub const DEFAULT_SEARCH_LIMIT: usize = 10;
@@ -31,10 +35,28 @@ pub const MAX_SEARCH_LIMIT: usize = 100;
 pub const DEFAULT_TOP_K_PER_LEG: usize = 50;
 pub const DEFAULT_LEXICAL_TOP_K: usize = DEFAULT_TOP_K_PER_LEG;
 pub const DEFAULT_LEXICAL_STATEMENT_TIMEOUT_MS: u64 = 300;
+const FTS_PAIRWISE_BATCH_TIMEOUT_MS: u64 = 125;
+const FTS_PAIRWISE_MAX_SUBQUERIES: usize = 4;
+const FTS_PAIRWISE_PER_SUBQUERY_TOP_K: i64 = 20;
+const FTS_PAIRWISE_WEIGHT: f32 = 1.25;
 /// Historical default `candidate_pool` for the rerank stage. The bounded
 /// trigram matrix showed narrowing regressed recall; hold this value unless
 /// the GOLD eval explicitly supports a change.
 pub const DEFAULT_RERANK_CANDIDATE_POOL: usize = 32;
+
+static FTS_PAIRWISE_EXPANSION_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_fts_pairwise_expansion_enabled(enabled: bool) {
+    FTS_PAIRWISE_EXPANSION_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+fn fts_pairwise_expansion_enabled() -> bool {
+    FTS_PAIRWISE_EXPANSION_ENABLED.load(Ordering::Relaxed)
+}
+
+fn should_run_pairwise_expansion(pairwise_enabled: bool, query: &str) -> bool {
+    pairwise_enabled && kengram_storage::pairwise_fts_query_is_high_signal(query)
+}
 
 #[derive(Debug, Clone)]
 pub struct SearchRequest {
@@ -328,6 +350,110 @@ async fn bounded_fts_hits(
     lexical_top_k: usize,
     lexical_timeout_ms: u64,
 ) -> Vec<Hit> {
+    bounded_fts_hits_with_pairwise(
+        pool,
+        query,
+        scope_filter,
+        scope_prefix_filter,
+        lexical_top_k,
+        lexical_timeout_ms,
+        fts_pairwise_expansion_enabled(),
+    )
+    .await
+}
+
+async fn bounded_fts_hits_with_pairwise(
+    pool: &PgPool,
+    query: &str,
+    scope_filter: Option<&str>,
+    scope_prefix_filter: Option<&str>,
+    lexical_top_k: usize,
+    lexical_timeout_ms: u64,
+    pairwise_enabled: bool,
+) -> Vec<Hit> {
+    if should_run_pairwise_expansion(pairwise_enabled, query) {
+        let fallback = spawn_bounded_fts_fallback(
+            pool,
+            query,
+            scope_filter,
+            scope_prefix_filter,
+            lexical_top_k,
+            lexical_timeout_ms,
+        );
+        let subquery_count =
+            kengram_storage::pairwise_fts_subquery_count(query, FTS_PAIRWISE_MAX_SUBQUERIES);
+        let started = Instant::now();
+        let expansion = tokio::time::timeout(
+            Duration::from_millis(FTS_PAIRWISE_BATCH_TIMEOUT_MS),
+            kengram_storage::search_fts_pairwise_bounded(
+                pool,
+                query,
+                scope_filter,
+                scope_prefix_filter,
+                lexical_top_k as i64,
+                FTS_PAIRWISE_BATCH_TIMEOUT_MS,
+                FTS_PAIRWISE_MAX_SUBQUERIES,
+                FTS_PAIRWISE_PER_SUBQUERY_TOP_K,
+                FTS_PAIRWISE_WEIGHT,
+            ),
+        )
+        .await;
+
+        match expansion {
+            Ok(Ok(hits)) => {
+                tracing::info!(
+                    subquery_count,
+                    subquery_cap = FTS_PAIRWISE_MAX_SUBQUERIES,
+                    per_subquery_top_k = FTS_PAIRWISE_PER_SUBQUERY_TOP_K,
+                    batch_timeout_ms = FTS_PAIRWISE_BATCH_TIMEOUT_MS,
+                    weight = FTS_PAIRWISE_WEIGHT,
+                    high_signal = true,
+                    expansion_attempted = true,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    fallback_fired = false,
+                    hit_count = hits.len(),
+                    "bounded pairwise FTS expansion completed",
+                );
+                fallback.abort();
+                return hits;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    query_canceled = e.is_query_canceled(),
+                    subquery_count,
+                    timeout_ms = FTS_PAIRWISE_BATCH_TIMEOUT_MS,
+                    high_signal = true,
+                    expansion_attempted = true,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    fallback_fired = true,
+                    "bounded pairwise FTS expansion failed; falling back to single-query FTS",
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    subquery_count,
+                    timeout_ms = FTS_PAIRWISE_BATCH_TIMEOUT_MS,
+                    high_signal = true,
+                    expansion_attempted = true,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    fallback_fired = true,
+                    "bounded pairwise FTS expansion exceeded batch timeout; falling back to single-query FTS",
+                );
+            }
+        }
+        return await_bounded_fts_fallback(fallback, lexical_timeout_ms).await;
+    }
+
+    if pairwise_enabled {
+        tracing::info!(
+            high_signal = false,
+            expansion_attempted = false,
+            fallback_fired = false,
+            "bounded pairwise FTS expansion skipped for low-signal query",
+        );
+    }
+
     match kengram_storage::search_fts_bounded(
         pool,
         query,
@@ -345,6 +471,57 @@ async fn bounded_fts_hits(
                 query_canceled = e.is_query_canceled(),
                 timeout_ms = lexical_timeout_ms,
                 "bounded FTS query failed; continuing with available search legs only",
+            );
+            vec![]
+        }
+    }
+}
+
+fn spawn_bounded_fts_fallback(
+    pool: &PgPool,
+    query: &str,
+    scope_filter: Option<&str>,
+    scope_prefix_filter: Option<&str>,
+    lexical_top_k: usize,
+    lexical_timeout_ms: u64,
+) -> tokio::task::JoinHandle<Result<Vec<Hit>, kengram_storage::StorageError>> {
+    let pool = pool.clone();
+    let query = query.to_owned();
+    let scope_filter = scope_filter.map(str::to_owned);
+    let scope_prefix_filter = scope_prefix_filter.map(str::to_owned);
+    tokio::spawn(async move {
+        kengram_storage::search_fts_bounded(
+            &pool,
+            &query,
+            scope_filter.as_deref(),
+            scope_prefix_filter.as_deref(),
+            lexical_top_k as i64,
+            lexical_timeout_ms,
+        )
+        .await
+    })
+}
+
+async fn await_bounded_fts_fallback(
+    fallback: tokio::task::JoinHandle<Result<Vec<Hit>, kengram_storage::StorageError>>,
+    lexical_timeout_ms: u64,
+) -> Vec<Hit> {
+    match fallback.await {
+        Ok(Ok(hits)) => hits,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                error = %e,
+                query_canceled = e.is_query_canceled(),
+                timeout_ms = lexical_timeout_ms,
+                "bounded FTS query failed; continuing with available search legs only",
+            );
+            vec![]
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                timeout_ms = lexical_timeout_ms,
+                "bounded FTS fallback task failed; continuing with available search legs only",
             );
             vec![]
         }
@@ -669,6 +846,52 @@ mod tests {
                 && hit.trigram_score.is_none()),
             "outer search should still return vector results when FTS times out"
         );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn bounded_fts_pairwise_timeout_falls_back_to_single_query(pool: PgPool) {
+        let id = cap(
+            &pool,
+            "PR-540 tcgplayer integration was painful but important",
+            "work",
+        )
+        .await;
+
+        let hits = bounded_fts_hits_with_pairwise(
+            &pool,
+            "PR-540 tcgplayer integration",
+            None,
+            None,
+            DEFAULT_LEXICAL_TOP_K,
+            0,
+            true,
+        )
+        .await;
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].thought.id, id);
+        assert!(hits[0].lexical_score.is_some());
+    }
+
+    #[test]
+    fn pairwise_expansion_dispatches_only_high_signal_queries() {
+        assert!(should_run_pairwise_expansion(
+            true,
+            "PR #540 hybrid lexical"
+        ));
+        assert!(should_run_pairwise_expansion(
+            true,
+            "src/search.rs fallback"
+        ));
+        assert!(should_run_pairwise_expansion(true, "fooBar timeout"));
+        assert!(!should_run_pairwise_expansion(
+            true,
+            "how should memory search work"
+        ));
+        assert!(!should_run_pairwise_expansion(
+            false,
+            "PR #540 hybrid lexical"
+        ));
     }
 
     #[sqlx::test(migrations = "../../migrations")]

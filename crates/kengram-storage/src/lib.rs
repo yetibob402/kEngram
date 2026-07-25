@@ -134,6 +134,76 @@ fn normalize_fts_query(query: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+fn alias_aware_fts_sql() -> &'static str {
+    r#"
+    WITH fts AS (
+        SELECT websearch_to_tsquery('english', $1) AS tsq
+    ),
+    content_hits AS (
+        SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
+               t.content_fingerprint, t.tags,
+               t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at,
+               ts_rank_cd(to_tsvector('english', t.content), fts.tsq)::real AS rank
+        FROM thoughts t
+        CROSS JOIN fts
+        WHERE to_tsvector('english', t.content) @@ fts.tsq
+          AND ($2::text IS NULL OR t.scope = $2)
+          AND ($3::text IS NULL OR t.scope LIKE $3 || '%')
+          AND t.retracted_at IS NULL
+        ORDER BY rank DESC, t.created_at DESC
+        LIMIT $4
+    ),
+    alias_hits AS (
+        SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
+               t.content_fingerprint, t.tags,
+               t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at,
+               (1.25::real * ts_rank_cd(to_tsvector('english', COALESCE(alias_text.aliases, '')), fts.tsq))::real AS rank
+        FROM thoughts t
+        CROSS JOIN fts
+        CROSS JOIN LATERAL (
+            SELECT string_agg(alias, ' ') AS aliases
+            FROM jsonb_array_elements_text(
+                CASE
+                    WHEN jsonb_typeof(t.tags->'retrieval_aliases') = 'array'
+                        THEN t.tags->'retrieval_aliases'
+                    ELSE '[]'::jsonb
+                END
+            ) AS alias
+        ) AS alias_text
+        WHERE t.tags ? 'retrieval_aliases'
+          AND jsonb_typeof(t.tags->'retrieval_aliases') = 'array'
+          AND jsonb_array_length(t.tags->'retrieval_aliases') > 0
+          AND to_tsvector('english', COALESCE(alias_text.aliases, '')) @@ fts.tsq
+          AND ($2::text IS NULL OR t.scope = $2)
+          AND ($3::text IS NULL OR t.scope LIKE $3 || '%')
+          AND t.retracted_at IS NULL
+        ORDER BY rank DESC, t.created_at DESC
+        LIMIT $4
+    ),
+    all_hits AS (
+        SELECT * FROM content_hits
+        UNION ALL
+        SELECT * FROM alias_hits
+    ),
+    dedup AS (
+        SELECT DISTINCT ON (id)
+               id, scope, content, source, created_at, metadata,
+               content_fingerprint, tags,
+               tags_extractor_model, tags_extractor_version, tags_extracted_at,
+               rank
+        FROM all_hits
+        ORDER BY id, rank DESC, created_at DESC
+    )
+    SELECT id, scope, content, source, created_at, metadata,
+           content_fingerprint, tags,
+           tags_extractor_model, tags_extractor_version, tags_extracted_at,
+           rank
+    FROM dedup
+    ORDER BY rank DESC, created_at DESC
+    LIMIT $4
+    "#
+}
+
 fn ann_projection_index_name(projection_id: &str) -> String {
     let mut sanitized = projection_id
         .chars()
@@ -1146,51 +1216,15 @@ pub async fn search_fts(
         return Ok(Vec::new());
     };
 
-    let rows = sqlx::query!(
-        r#"
-        WITH fts AS (
-            SELECT websearch_to_tsquery('english', $1) AS tsq
-        )
-        SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
-               t.content_fingerprint, t.tags,
-               t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at,
-               ts_rank_cd(to_tsvector('english', t.content), fts.tsq) AS "rank!: f32"
-        FROM thoughts t
-        CROSS JOIN fts
-        WHERE to_tsvector('english', t.content) @@ fts.tsq
-          AND ($2::text IS NULL OR t.scope = $2)
-          AND ($3::text IS NULL OR t.scope LIKE $3 || '%')
-          AND t.retracted_at IS NULL
-        ORDER BY ts_rank_cd(to_tsvector('english', t.content), fts.tsq) DESC,
-                 t.created_at DESC
-        LIMIT $4
-        "#,
-        query,
-        scope,
-        scope_prefix,
-        limit,
-    )
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<LexicalSearchRow> = sqlx::query_as(alias_aware_fts_sql())
+        .bind(query)
+        .bind(scope)
+        .bind(scope_prefix)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
 
-    rows.into_iter()
-        .map(|r| {
-            let thought = Thought {
-                id: ThoughtId::from(r.id),
-                scope: Scope::new(r.scope)?,
-                content: r.content,
-                source: Source::new(r.source)?,
-                created_at: r.created_at,
-                metadata: Metadata::from(r.metadata),
-                content_fingerprint: fingerprint_from_bytes(r.content_fingerprint)?,
-                tags: tags_from_value(r.tags)?,
-                tags_extractor_model: r.tags_extractor_model,
-                tags_extractor_version: r.tags_extractor_version,
-                tags_extracted_at: r.tags_extracted_at,
-            };
-            Ok(Hit::from_lexical_leg(thought, r.rank))
-        })
-        .collect()
+    lexical_rows_to_hits(rows)
 }
 
 /// FTS lexical search bounded by a transaction-local statement timeout. This
@@ -1220,32 +1254,13 @@ pub async fn search_fts_bounded(
         return Err(e.into());
     }
 
-    let rows = match sqlx::query!(
-        r#"
-        WITH fts AS (
-            SELECT websearch_to_tsquery('english', $1) AS tsq
-        )
-        SELECT t.id, t.scope, t.content, t.source, t.created_at, t.metadata,
-               t.content_fingerprint, t.tags,
-               t.tags_extractor_model, t.tags_extractor_version, t.tags_extracted_at,
-               ts_rank_cd(to_tsvector('english', t.content), fts.tsq) AS "rank!: f32"
-        FROM thoughts t
-        CROSS JOIN fts
-        WHERE to_tsvector('english', t.content) @@ fts.tsq
-          AND ($2::text IS NULL OR t.scope = $2)
-          AND ($3::text IS NULL OR t.scope LIKE $3 || '%')
-          AND t.retracted_at IS NULL
-        ORDER BY ts_rank_cd(to_tsvector('english', t.content), fts.tsq) DESC,
-                 t.created_at DESC
-        LIMIT $4
-        "#,
-        query,
-        scope,
-        scope_prefix,
-        limit,
-    )
-    .fetch_all(&mut *tx)
-    .await
+    let rows: Vec<LexicalSearchRow> = match sqlx::query_as(alias_aware_fts_sql())
+        .bind(query)
+        .bind(scope)
+        .bind(scope_prefix)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await
     {
         Ok(rows) => rows,
         Err(e) => {
@@ -1260,24 +1275,7 @@ pub async fn search_fts_bounded(
     };
     tx.commit().await?;
 
-    rows.into_iter()
-        .map(|r| {
-            let thought = Thought {
-                id: ThoughtId::from(r.id),
-                scope: Scope::new(r.scope)?,
-                content: r.content,
-                source: Source::new(r.source)?,
-                created_at: r.created_at,
-                metadata: Metadata::from(r.metadata),
-                content_fingerprint: fingerprint_from_bytes(r.content_fingerprint)?,
-                tags: tags_from_value(r.tags)?,
-                tags_extractor_model: r.tags_extractor_model,
-                tags_extractor_version: r.tags_extractor_version,
-                tags_extracted_at: r.tags_extracted_at,
-            };
-            Ok(Hit::from_lexical_leg(thought, r.rank))
-        })
-        .collect()
+    lexical_rows_to_hits(rows)
 }
 
 /// Find thoughts that don't yet have an embedding row for the given model.
@@ -1722,6 +1720,15 @@ pub async fn increment_tag_job_attempts(
     Ok(())
 }
 
+/// Deterministic partition for large one-shot tag backfills. The CLI validates
+/// `0 <= index < count`; storage keeps this as a small value object so the SQL
+/// predicate can stay explicit at the callsite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TagBackfillShard {
+    pub index: i32,
+    pub count: i32,
+}
+
 /// Walk thoughts that need tagging — either never-tagged (`tags_extractor_version
 /// IS NULL`) or stale (`tags_extractor_version < target_tagger_version`, only
 /// when `rerun = true`). When `force = true`, every matching thought is walked
@@ -1740,6 +1747,38 @@ pub async fn find_untagged_or_stale_thoughts(
     since: Option<OffsetDateTime>,
     limit: i64,
 ) -> Result<Vec<Thought>, StorageError> {
+    find_untagged_or_stale_thoughts_sharded(
+        pool,
+        target_tagger_version,
+        rerun,
+        force,
+        scope,
+        scope_prefix,
+        since,
+        limit,
+        None,
+    )
+    .await
+}
+
+/// Sharded variant of `find_untagged_or_stale_thoughts` for parallel,
+/// resumable one-shot backfills. Sharding is stable on `thoughts.id`, so
+/// multiple CLI processes can run disjoint lanes without a long-held claim
+/// transaction. Version filtering remains the idempotency mechanism.
+#[allow(clippy::too_many_arguments)]
+pub async fn find_untagged_or_stale_thoughts_sharded(
+    pool: &PgPool,
+    target_tagger_version: i32,
+    rerun: bool,
+    force: bool,
+    scope: Option<&str>,
+    scope_prefix: Option<&str>,
+    since: Option<OffsetDateTime>,
+    limit: i64,
+    shard: Option<TagBackfillShard>,
+) -> Result<Vec<Thought>, StorageError> {
+    let shard_index = shard.map(|s| s.index);
+    let shard_count = shard.map(|s| s.count);
     let rows = sqlx::query!(
         r#"
         SELECT id, scope, content, source, created_at, metadata,
@@ -1755,6 +1794,11 @@ pub async fn find_untagged_or_stale_thoughts(
               OR tags_extractor_version IS NULL
               OR ($4::boolean AND tags_extractor_version < $5)
           )
+          AND (
+              $8::integer IS NULL
+              OR $9::integer IS NULL
+              OR mod(hashtext(id::text)::bigint + 2147483648, $9::bigint) = $8::bigint
+          )
         ORDER BY created_at ASC
         LIMIT $6
         "#,
@@ -1765,6 +1809,8 @@ pub async fn find_untagged_or_stale_thoughts(
         target_tagger_version,
         limit,
         force,
+        shard_index,
+        shard_count,
     )
     .fetch_all(pool)
     .await?;
@@ -1786,6 +1832,35 @@ pub async fn find_untagged_or_stale_thoughts(
             })
         })
         .collect()
+}
+
+/// Fetch a caller-selected set of non-retracted thoughts. Used for narrowly
+/// bounded operator retag gates where age/version walking would touch the
+/// wrong cohort.
+pub async fn fetch_nonretracted_thoughts_by_ids(
+    pool: &PgPool,
+    ids: &[ThoughtId],
+) -> Result<Vec<Thought>, StorageError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let uuid_ids = ids.iter().map(|id| *id.as_uuid()).collect::<Vec<Uuid>>();
+    let rows: Vec<ThoughtRow> = sqlx::query_as(
+        r#"
+        SELECT id, scope, content, source, created_at, metadata,
+               content_fingerprint, tags,
+               tags_extractor_model, tags_extractor_version, tags_extracted_at
+        FROM thoughts
+        WHERE id = ANY($1::uuid[])
+          AND retracted_at IS NULL
+        ORDER BY array_position($1::uuid[], id)
+        "#,
+    )
+    .bind(&uuid_ids)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(thought_row_to_thought).collect()
 }
 
 /// Compute the established topic + entity vocabulary for a given scope. Used
@@ -2758,6 +2833,22 @@ struct ThoughtRow {
     tags_extracted_at: Option<OffsetDateTime>,
 }
 
+#[derive(sqlx::FromRow)]
+struct LexicalSearchRow {
+    id: Uuid,
+    scope: String,
+    content: String,
+    source: String,
+    created_at: OffsetDateTime,
+    metadata: serde_json::Value,
+    content_fingerprint: Vec<u8>,
+    tags: serde_json::Value,
+    tags_extractor_model: Option<String>,
+    tags_extractor_version: Option<i32>,
+    tags_extracted_at: Option<OffsetDateTime>,
+    rank: f32,
+}
+
 fn thought_row_to_thought(r: ThoughtRow) -> Result<Thought, StorageError> {
     Ok(Thought {
         id: ThoughtId::from(r.id),
@@ -2772,6 +2863,27 @@ fn thought_row_to_thought(r: ThoughtRow) -> Result<Thought, StorageError> {
         tags_extractor_version: r.tags_extractor_version,
         tags_extracted_at: r.tags_extracted_at,
     })
+}
+
+fn lexical_rows_to_hits(rows: Vec<LexicalSearchRow>) -> Result<Vec<Hit>, StorageError> {
+    rows.into_iter()
+        .map(|r| {
+            let thought = Thought {
+                id: ThoughtId::from(r.id),
+                scope: Scope::new(r.scope)?,
+                content: r.content,
+                source: Source::new(r.source)?,
+                created_at: r.created_at,
+                metadata: Metadata::from(r.metadata),
+                content_fingerprint: fingerprint_from_bytes(r.content_fingerprint)?,
+                tags: tags_from_value(r.tags)?,
+                tags_extractor_model: r.tags_extractor_model,
+                tags_extractor_version: r.tags_extractor_version,
+                tags_extracted_at: r.tags_extracted_at,
+            };
+            Ok(Hit::from_lexical_leg(thought, r.rank))
+        })
+        .collect()
 }
 
 // -- M6.0: corpus stats (operator-facing telemetry) ---------------------
@@ -3084,6 +3196,8 @@ pub async fn corpus_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
     use kengram_core::{EmbeddingModel, LinkTarget, Metadata, Scope, Source, TagKind};
     use serde_json::json;
     use sha2::{Digest, Sha256};
@@ -4192,6 +4306,8 @@ mod tests {
             topics: vec!["meetings".into()],
             dates_mentioned: vec!["Thursday".into()],
             kind: Some(TagKind::Task),
+            retrieval_aliases: Vec::new(),
+            domain_scope: None,
         };
         update_thought_tags(&pool, id, &tags, "vllm/qwen3-coder:30b", 1)
             .await
@@ -4333,6 +4449,41 @@ mod tests {
         let scoped_ids: Vec<ThoughtId> = scoped.iter().map(|t| t.id).collect();
         assert!(scoped_ids.contains(&current_v2));
         assert!(!scoped_ids.contains(&other));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_untagged_or_stale_thoughts_shards_are_disjoint_and_complete(pool: PgPool) {
+        let mut expected = HashSet::new();
+        for i in 0..24 {
+            expected.insert(insert_test_thought(&pool, &format!("untagged {i}"), "global").await);
+        }
+
+        let mut seen = HashSet::new();
+        for index in 0..4 {
+            let shard = find_untagged_or_stale_thoughts_sharded(
+                &pool,
+                /*target_version*/ 1,
+                /*rerun*/ false,
+                /*force*/ false,
+                None,
+                None,
+                None,
+                100,
+                Some(TagBackfillShard { index, count: 4 }),
+            )
+            .await
+            .unwrap();
+
+            for thought in shard {
+                assert!(
+                    seen.insert(thought.id),
+                    "thought {} appeared in more than one shard",
+                    thought.id
+                );
+            }
+        }
+
+        assert_eq!(seen, expected);
     }
 
     #[sqlx::test(migrations = "../../migrations")]

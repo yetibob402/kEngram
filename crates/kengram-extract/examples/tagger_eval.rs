@@ -110,6 +110,11 @@ async fn main() -> ExitCode {
         temperature: 0.2,
         timeout: Duration::from_secs(timeout_secs),
         system_prompt: None,
+        num_ctx: None,
+        max_tokens: None,
+        ollama_native: false,
+        responses_api: false,
+        reasoning_effort: None,
     };
     let tagger = match OpenAICompatibleTagger::new(cfg) {
         Ok(t) => t,

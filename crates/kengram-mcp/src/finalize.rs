@@ -20,6 +20,9 @@ use kengram_core::{Metadata, Scope, ScopeVocab, Tags};
 /// 3. scope-identifier stripping from entities/people (v14)
 /// 4. relationship-noun stripping from people (v14)
 /// 5. `metadata.decision_type` → `decision_record` kind override (v14)
+/// 6. imported-archive action cleanup (v17)
+/// 7. path-like entity stripping + alias/domain cleanup (v17)
+/// 8. metadata-driven domain override (v17)
 ///
 /// `known_scopes` is the corpus's set of scope strings (from
 /// `kengram_storage::list_scopes`), fetched once per batch by the caller.
@@ -39,6 +42,11 @@ pub fn finalize_tags(
     crate::filters::strip_scope_identifiers(tags, own_scope, known_scopes);
     crate::filters::strip_relationship_nouns(tags);
     crate::filters::apply_decision_type_override(tags, metadata);
+    crate::filters::apply_imported_archive_guard(tags, metadata);
+    crate::filters::strip_path_like_entities(tags);
+    crate::filters::clean_retrieval_aliases(tags);
+    crate::filters::normalize_domain_scope(tags);
+    crate::filters::apply_metadata_domain_override(tags, metadata);
 }
 
 #[cfg(test)]
@@ -124,5 +132,39 @@ mod tests {
         assert_eq!(t.people, vec!["Ron".to_string()]);
         assert_eq!(t.entities, vec!["pgvector".to_string()]);
         assert_eq!(t.kind, Some(TagKind::DecisionRecord));
+    }
+
+    #[test]
+    fn applies_v17_alias_domain_and_path_filters() {
+        let mut t = Tags {
+            entities: vec![
+                "/api/auth/delete-user.js".to_string(),
+                "kengram".to_string(),
+            ],
+            action_items: vec!["ship the old report followup".to_string()],
+            kind: Some(TagKind::Task),
+            retrieval_aliases: vec![
+                " memory search ".to_string(),
+                "memory search".to_string(),
+                "/api/auth/delete-user.js".to_string(),
+            ],
+            domain_scope: Some("sessions/knox".to_string()),
+            ..Default::default()
+        };
+        finalize_tags(
+            &mut t,
+            &Metadata::from(serde_json::json!({
+                "import": "kengram_macbook_air_archive_2026_06",
+                "project": "MyLakeAccess"
+            })),
+            &scope("agents/knox"),
+            None,
+            &[],
+        );
+        assert_eq!(t.entities, vec!["kengram".to_string()]);
+        assert!(t.action_items.is_empty());
+        assert_eq!(t.kind, Some(TagKind::Reference));
+        assert_eq!(t.retrieval_aliases, vec!["memory search".to_string()]);
+        assert_eq!(t.domain_scope.as_deref(), Some("apps/mylakeaccess"));
     }
 }

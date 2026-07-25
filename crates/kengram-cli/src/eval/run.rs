@@ -671,6 +671,7 @@ mod tests {
             topics: vec!["tagging".to_string()],
             dates_mentioned: vec!["tomorrow".to_string()],
             kind: Some(TagKind::Task),
+            ..Default::default()
         };
         let fake = FakeTagger::with_substring(vec![
             (

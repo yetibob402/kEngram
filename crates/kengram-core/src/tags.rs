@@ -29,6 +29,10 @@ pub struct Tags {
     #[serde(default)]
     pub entities: Vec<String>,
     #[serde(default)]
+    pub retrieval_aliases: Vec<String>,
+    #[serde(default)]
+    pub domain_scope: Option<String>,
+    #[serde(default)]
     pub action_items: Vec<String>,
     #[serde(default)]
     pub topics: Vec<String>,
@@ -87,6 +91,8 @@ mod tests {
         // but the inverse direction below confirms `{}` is accepted as default.
         assert_eq!(json["people"], serde_json::json!([]));
         assert_eq!(json["entities"], serde_json::json!([]));
+        assert_eq!(json["retrieval_aliases"], serde_json::json!([]));
+        assert_eq!(json["domain_scope"], serde_json::Value::Null);
         assert_eq!(json["action_items"], serde_json::json!([]));
         assert_eq!(json["topics"], serde_json::json!([]));
         assert_eq!(json["dates_mentioned"], serde_json::json!([]));
@@ -106,6 +112,8 @@ mod tests {
         }"#;
         let t: Tags = serde_json::from_str(v1_json).unwrap();
         assert_eq!(t.entities, Vec::<String>::new());
+        assert_eq!(t.retrieval_aliases, Vec::<String>::new());
+        assert_eq!(t.domain_scope, None);
         assert_eq!(t.topics, vec!["rust".to_string()]);
         assert_eq!(t.kind, Some(TagKind::Observation));
     }
@@ -121,6 +129,8 @@ mod tests {
         let t = Tags {
             people: vec!["Sarah".to_string(), "Ron".to_string()],
             entities: vec!["kengram".to_string(), "pgvector".to_string()],
+            retrieval_aliases: vec!["semantic memory".to_string()],
+            domain_scope: Some("infra".to_string()),
             action_items: vec!["fix the login bug".to_string()],
             topics: vec!["rust".to_string(), "build-systems".to_string()],
             dates_mentioned: vec!["next Thursday".to_string(), "Q3".to_string()],

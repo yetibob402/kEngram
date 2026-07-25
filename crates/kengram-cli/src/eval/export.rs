@@ -332,7 +332,7 @@ mod tests {
             corpus.provenance.draft_tagger_model.as_deref(),
             Some("test/model")
         );
-        assert_eq!(corpus.provenance.draft_tagger_version, Some(16));
+        assert_eq!(corpus.provenance.draft_tagger_version, Some(17));
         // The corpus round-trips through the loader's validation rules.
         let json = serde_json::to_string(&corpus).unwrap();
         let reparsed: Corpus = serde_json::from_str(&json).unwrap();

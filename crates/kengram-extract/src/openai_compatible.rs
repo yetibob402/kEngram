@@ -1,7 +1,7 @@
-//! `OpenAICompatibleTagger` — talks to any backend that implements the
-//! OpenAI `/v1/chat/completions` API with `response_format: json_schema`.
-//! That covers vLLM (production), OpenRouter (cloud fallback), and OpenAI
-//! itself, distinguished only by config.
+//! `OpenAICompatibleTagger` — talks to backends that implement OpenAI-style
+//! structured output APIs. The default path uses `/v1/chat/completions` with
+//! `response_format: json_schema`; OpenAI gpt-5-class models can opt into the
+//! `/v1/responses` path with `text.format`.
 //!
 //! Endpoint convention: the configured `endpoint` is the `/v1` base, and
 //! the tagger appends `/chat/completions`. For local vLLM that's
@@ -11,7 +11,23 @@ use async_trait::async_trait;
 use kengram_core::{ExtractedRelation, ScopeVocab, TagOutput, Tagger, TaggerError, Tags};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{
+    fs::{self, OpenOptions},
+    io::{BufRead, BufReader, Write},
+    path::PathBuf,
+    sync::{Mutex, OnceLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+const USAGE_JSONL_ENV: &str = "KENGRAM_TAGGER_USAGE_JSONL";
+const COST_ABORT_USD_ENV: &str = "KENGRAM_TAGGER_COST_ABORT_USD";
+const PRICE_INPUT_USD_PER_MTOK_ENV: &str = "KENGRAM_TAGGER_PRICE_INPUT_USD_PER_MTOK";
+const PRICE_CACHED_INPUT_USD_PER_MTOK_ENV: &str = "KENGRAM_TAGGER_PRICE_CACHED_INPUT_USD_PER_MTOK";
+const PRICE_OUTPUT_USD_PER_MTOK_ENV: &str = "KENGRAM_TAGGER_PRICE_OUTPUT_USD_PER_MTOK";
+
+const DEFAULT_INPUT_USD_PER_MTOK: f64 = 5.0;
+const DEFAULT_CACHED_INPUT_USD_PER_MTOK: f64 = 0.5;
+const DEFAULT_OUTPUT_USD_PER_MTOK: f64 = 30.0;
 
 #[derive(Debug, Clone)]
 pub struct OpenAICompatibleConfig {
@@ -42,6 +58,25 @@ pub struct OpenAICompatibleConfig {
     /// meaningful provenance. A WARN is emitted at construction when this
     /// is `Some(_)`.
     pub system_prompt: Option<String>,
+    /// Optional Ollama chat option. Only serialized when configured, so
+    /// non-Ollama OpenAI-compatible backends do not see an unknown field.
+    pub num_ctx: Option<u32>,
+    /// Optional completion cap. Serialized as `max_tokens` for
+    /// OpenAI-compatible endpoints and `options.num_predict` for native
+    /// Ollama.
+    pub max_tokens: Option<u32>,
+    /// Use Ollama's native `/api/chat` endpoint instead of its OpenAI
+    /// compatibility shim. Needed when large JSON schemas require Ollama
+    /// options such as `num_ctx` to reach llama.cpp reliably.
+    pub ollama_native: bool,
+    /// Use OpenAI's `/v1/responses` API instead of `/chat/completions`.
+    /// This is materially faster for gpt-5-class structured-output tagger
+    /// calls because it can pin reasoning effort low and avoids hidden
+    /// reasoning-token overrun in Chat Completions.
+    pub responses_api: bool,
+    /// Optional Responses API reasoning effort, e.g. `"low"`. Only serialized
+    /// when `responses_api = true`.
+    pub reasoning_effort: Option<String>,
 }
 
 impl OpenAICompatibleConfig {
@@ -57,6 +92,11 @@ impl OpenAICompatibleConfig {
             timeout: Duration::from_secs(60),
             temperature: 0.2,
             system_prompt: None,
+            num_ctx: None,
+            max_tokens: None,
+            ollama_native: false,
+            responses_api: false,
+            reasoning_effort: None,
         }
     }
 
@@ -74,8 +114,241 @@ impl OpenAICompatibleConfig {
             timeout: Duration::from_secs(60),
             temperature: 0.2,
             system_prompt: None,
+            num_ctx: None,
+            max_tokens: None,
+            ollama_native: false,
+            responses_api: false,
+            reasoning_effort: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UsageRates {
+    input_usd_per_mtok: f64,
+    cached_input_usd_per_mtok: f64,
+    output_usd_per_mtok: f64,
+}
+
+impl UsageRates {
+    fn from_env() -> Self {
+        Self {
+            input_usd_per_mtok: env_f64(PRICE_INPUT_USD_PER_MTOK_ENV, DEFAULT_INPUT_USD_PER_MTOK),
+            cached_input_usd_per_mtok: env_f64(
+                PRICE_CACHED_INPUT_USD_PER_MTOK_ENV,
+                DEFAULT_CACHED_INPUT_USD_PER_MTOK,
+            ),
+            output_usd_per_mtok: env_f64(
+                PRICE_OUTPUT_USD_PER_MTOK_ENV,
+                DEFAULT_OUTPUT_USD_PER_MTOK,
+            ),
+        }
+    }
+
+    fn cost_usd(self, usage: ResponseUsage) -> f64 {
+        let cached = usage.cached_input_tokens.min(usage.input_tokens);
+        let uncached = usage.input_tokens.saturating_sub(cached);
+        (uncached as f64 * self.input_usd_per_mtok
+            + cached as f64 * self.cached_input_usd_per_mtok
+            + usage.output_tokens as f64 * self.output_usd_per_mtok)
+            / 1_000_000.0
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResponseUsage {
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+    reasoning_tokens: u64,
+    total_tokens: u64,
+}
+
+#[derive(Debug)]
+struct UsageMeter {
+    path: Option<PathBuf>,
+    abort_usd: Option<f64>,
+    rates: UsageRates,
+    cumulative_usd: f64,
+}
+
+impl UsageMeter {
+    fn from_env() -> Self {
+        let path = std::env::var_os(USAGE_JSONL_ENV).map(PathBuf::from);
+        let cumulative_usd = path
+            .as_ref()
+            .map(load_existing_cumulative_usd)
+            .unwrap_or_default();
+        Self {
+            path,
+            abort_usd: std::env::var(COST_ABORT_USD_ENV)
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok()),
+            rates: UsageRates::from_env(),
+            cumulative_usd,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.path.is_some()
+    }
+
+    fn abort_reached(&self) -> bool {
+        self.abort_usd
+            .map(|limit| self.cumulative_usd >= limit)
+            .unwrap_or(false)
+    }
+
+    fn record(
+        &mut self,
+        api: &str,
+        model_name: &str,
+        model_id: &str,
+        response_id: Option<&str>,
+        usage: ResponseUsage,
+    ) -> Result<(), TaggerError> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let usd = self.rates.cost_usd(usage);
+        self.cumulative_usd += usd;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                TaggerError::Misconfigured(format!(
+                    "creating tagger usage ledger directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| {
+                TaggerError::Misconfigured(format!(
+                    "opening tagger usage ledger {}: {e}",
+                    path.display()
+                ))
+            })?;
+        let record = serde_json::json!({
+            "ts_unix": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default(),
+            "api": api,
+            "model": model_name,
+            "model_id": model_id,
+            "response_id": response_id,
+            "input_tokens": usage.input_tokens,
+            "cached_input_tokens": usage.cached_input_tokens,
+            "billable_input_tokens": usage.input_tokens.saturating_sub(usage.cached_input_tokens.min(usage.input_tokens)),
+            "output_tokens": usage.output_tokens,
+            "reasoning_tokens": usage.reasoning_tokens,
+            "total_tokens": usage.total_tokens,
+            "price_input_usd_per_mtok": self.rates.input_usd_per_mtok,
+            "price_cached_input_usd_per_mtok": self.rates.cached_input_usd_per_mtok,
+            "price_output_usd_per_mtok": self.rates.output_usd_per_mtok,
+            "usd": usd,
+            "cumulative_usd": self.cumulative_usd,
+            "abort_usd": self.abort_usd,
+        });
+        serde_json::to_writer(&mut file, &record).map_err(|e| {
+            TaggerError::Misconfigured(format!(
+                "writing tagger usage ledger {}: {e}",
+                path.display()
+            ))
+        })?;
+        file.write_all(b"\n").map_err(|e| {
+            TaggerError::Misconfigured(format!(
+                "writing tagger usage ledger newline {}: {e}",
+                path.display()
+            ))
+        })?;
+        Ok(())
+    }
+}
+
+static USAGE_METER: OnceLock<Mutex<UsageMeter>> = OnceLock::new();
+
+fn usage_meter() -> &'static Mutex<UsageMeter> {
+    USAGE_METER.get_or_init(|| Mutex::new(UsageMeter::from_env()))
+}
+
+/// Returns true when metered tagger calls have reached the configured spend
+/// ceiling. The CLI checks this between thoughts so a full retag can stop
+/// cleanly before the next paid request.
+pub fn tagger_metering_cost_abort_reached() -> bool {
+    usage_meter()
+        .lock()
+        .map(|meter| meter.enabled() && meter.abort_reached())
+        .unwrap_or(true)
+}
+
+fn env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(default)
+}
+
+fn load_existing_cumulative_usd(path: &PathBuf) -> f64 {
+    let Ok(file) = fs::File::open(path) else {
+        return 0.0;
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
+        .filter_map(|v| v.get("usd").and_then(|usd| usd.as_f64()))
+        .sum()
+}
+
+fn responses_usage(v: &serde_json::Value) -> Option<ResponseUsage> {
+    let usage = v.get("usage")?;
+    let input_tokens = usage.get("input_tokens")?.as_u64()?;
+    let output_tokens = usage.get("output_tokens")?.as_u64()?;
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(input_tokens + output_tokens);
+    let cached_input_tokens = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(|x| x.as_u64())
+        .unwrap_or_default();
+    let reasoning_tokens = usage
+        .get("output_tokens_details")
+        .and_then(|details| details.get("reasoning_tokens"))
+        .and_then(|x| x.as_u64())
+        .unwrap_or_default();
+    Some(ResponseUsage {
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        total_tokens,
+    })
+}
+
+fn record_responses_usage(
+    api: &str,
+    model_name: &str,
+    model_id: &str,
+    parsed: &serde_json::Value,
+) -> Result<(), TaggerError> {
+    let mut meter = usage_meter()
+        .lock()
+        .map_err(|_| TaggerError::Misconfigured("tagger usage meter mutex was poisoned".into()))?;
+    if !meter.enabled() {
+        return Ok(());
+    }
+    let usage = responses_usage(parsed).ok_or_else(|| {
+        TaggerError::MalformedResponse(
+            "metering was requested but the response had no usage object".into(),
+        )
+    })?;
+    let response_id = parsed.get("id").and_then(|id| id.as_str());
+    meter.record(api, model_name, model_id, response_id, usage)
 }
 
 /// Version of the bundled tagger prompt + response schema. Paired with the
@@ -232,7 +505,13 @@ impl OpenAICompatibleConfig {
 /// ceiling; every emitted entity was prose-present). The surface-only rule,
 /// not the cap, is the anti-hallucination gate. The ordering clause stays
 /// (harmless, and "emit them all" is now achievable for ≤15-name thoughts).
-pub const BUNDLED_TAGGER_VERSION: i32 = 16;
+/// **v17 (Argus recall pass)** adds `retrieval_aliases` and `domain_scope`.
+/// Retrieval aliases are grounded alternate query phrases / identifiers for
+/// representation-blocked misses; domain scope is a second routing axis
+/// distinct from the historical agent scope. Also tightens operational-archive
+/// noise: source paths are not entities, and historical audit recommendations
+/// are not future action_items unless the thought itself is a live task.
+pub const BUNDLED_TAGGER_VERSION: i32 = 17;
 
 #[derive(Debug, Clone)]
 pub struct OpenAICompatibleTagger {
@@ -250,6 +529,11 @@ pub struct OpenAICompatibleTagger {
     /// actual configured value (the reqwest client owns the same duration
     /// internally but doesn't expose it).
     timeout_seconds: u64,
+    num_ctx: Option<u32>,
+    max_tokens: Option<u32>,
+    ollama_native: bool,
+    responses_api: bool,
+    reasoning_effort: Option<String>,
     client: Client,
 }
 
@@ -263,6 +547,11 @@ impl OpenAICompatibleTagger {
         if config.model_name.is_empty() {
             return Err(TaggerError::Misconfigured(
                 "tagger model_name must not be empty".into(),
+            ));
+        }
+        if config.ollama_native && config.responses_api {
+            return Err(TaggerError::Misconfigured(
+                "tagger cannot enable both ollama_native and responses_api".into(),
             ));
         }
 
@@ -314,6 +603,11 @@ impl OpenAICompatibleTagger {
             temperature: config.temperature,
             system_prompt,
             timeout_seconds: config.timeout.as_secs(),
+            num_ctx: config.num_ctx,
+            max_tokens: config.max_tokens,
+            ollama_native: config.ollama_native,
+            responses_api: config.responses_api,
+            reasoning_effort: config.reasoning_effort,
             client,
         })
     }
@@ -347,7 +641,7 @@ When a thought is itself ABOUT names, tags, or other thoughts (meta-discussion),
 Apply this check FIRST. Then proceed to the field rules below.
 
 # Output shape
-{ \"people\": [...], \"entities\": [...], \"kind\": \"...\", \"action_items\": [...], \"topics\": [...], \"dates_mentioned\": [...], \"relations\": [...] }
+{ \"people\": [...], \"entities\": [...], \"retrieval_aliases\": [...], \"domain_scope\": \"...\", \"kind\": \"...\", \"action_items\": [...], \"topics\": [...], \"dates_mentioned\": [...], \"relations\": [...] }
 
 # Field semantics
 
@@ -362,6 +656,10 @@ Apply this check FIRST. Then proceed to the field rules below.
   Ordering and selection: list entities most-relevant-first — the names most central to the thought's point come first, in descending relevance. A thought that legitimately names many distinct things (a tech-stack inventory, a tool comparison) should emit them all; one that only mentions a couple in passing stays short. When more candidates exist than you can keep, prefer specific, distinctive names over generic or descriptive phrases.
 
   Before you emit: re-read the thought. Verify each entity in your output appears (by name or close paraphrase) in the prose. Remove any that don't.
+
+- retrieval_aliases: default to []. Short query phrases, exact identifiers, acronyms, alternate names, or operator search terms that should retrieve this thought when the user's query uses different wording. Aliases must be grounded in the thought's content — copied from the prose, obvious abbreviations/expansions, or a concise synonym for the same concept. Do NOT invent unrelated keywords. Do NOT emit filesystem paths or API route paths as aliases unless the path itself is the named object the thought is about. Prefer 0-6 aliases, each under 80 characters.
+
+- domain_scope: a single normalized domain axis for retrieval routing, or null when no durable domain is clear. Use lowercase slash paths. Preferred forms: `apps/{name}` for product/app/project memories, `customers/{slug}` for customer-specific memories, `decisions` for settled decision records, `infra` for Argus/kEngram/fleet/ops/platform memories. Keep the existing agent scope separate — do NOT emit `knox`, `agents/knox`, `sessions/knox`, or other agent-scope variants as `domain_scope`; normalize those drifted agent-scope mentions to the relevant domain (`infra` for agent/fleet/kEngram operations, `decisions` for decisions).
 
 - kind: a single closed-enum classification of what the thought DOES. Pick exactly one of: observation | task | idea | reference | person_note | session | decision_record | null. Walk this decision tree in order and pick the FIRST kind that fits — do NOT default to observation:
 
@@ -413,6 +711,7 @@ Apply this check FIRST. Then proceed to the field rules below.
 # Rules
 
 - Entities require explicit surface mention. Topics may be inferred from context. Kind is intrinsic-shape only.
+- File paths, URL paths, API routes, and stack traces are evidence, not named entities. Only emit them as aliases when the thought is specifically about that identifier.
 - Empty arrays are correct when there's no content. Empty arrays are NOT a tagger-failure signal; over-emission is.
 - One kind only; if genuinely ambiguous, return null.
 - This is a tagging pass, not a paraphrase. Do not rephrase content; only emit metadata.
@@ -425,27 +724,27 @@ These show how to apply the rules above. Pay attention to use-mention discipline
 
 Example 1 — parenthetical mention does not extract:
 Thought: 'The Bob-as-verb pattern (e.g., \"Bob the index rebuild\") needs investigation in the next sprint.'
-Output: {\"people\": [], \"entities\": [], \"action_items\": [\"investigate the Bob-as-verb pattern\"], \"topics\": [\"linguistics\"], \"dates_mentioned\": [\"next sprint\"], \"kind\": \"task\", \"relations\": []}
+Output: {\"people\": [], \"entities\": [], \"retrieval_aliases\": [\"Bob-as-verb pattern\"], \"domain_scope\": null, \"action_items\": [\"investigate the Bob-as-verb pattern\"], \"topics\": [\"linguistics\"], \"dates_mentioned\": [\"next sprint\"], \"kind\": \"task\", \"relations\": []}
 
 Example 2 — demonstrative list of names does not extract:
 Thought: 'Common verb-as-name first names include: Bob, Mark, Rob, Frank.'
-Output: {\"people\": [], \"entities\": [], \"action_items\": [], \"topics\": [\"linguistics\"], \"dates_mentioned\": [], \"kind\": \"observation\", \"relations\": []}
+Output: {\"people\": [], \"entities\": [], \"retrieval_aliases\": [], \"domain_scope\": null, \"action_items\": [], \"topics\": [\"linguistics\"], \"dates_mentioned\": [], \"kind\": \"observation\", \"relations\": []}
 
 Example 3 — real references DO extract (contrast with Example 2):
 Thought: 'Sarah and Bob agreed on the migration plan after this morning's standup.'
-Output: {\"people\": [\"Sarah\", \"Bob\"], \"entities\": [], \"action_items\": [], \"topics\": [\"project-management\"], \"dates_mentioned\": [\"this morning\"], \"kind\": \"observation\", \"relations\": []}
+Output: {\"people\": [\"Sarah\", \"Bob\"], \"entities\": [], \"retrieval_aliases\": [\"migration plan\"], \"domain_scope\": null, \"action_items\": [], \"topics\": [\"project-management\"], \"dates_mentioned\": [\"this morning\"], \"kind\": \"observation\", \"relations\": []}
 
 Example 4 — quoted directives are citations of language, not directives THIS thought makes:
 Thought: 'The probe should use prompts like \"evaluate options A through F\" and \"pick one\" to test how the tagger handles list-shaped instructions.'
-Output: {\"people\": [], \"entities\": [], \"action_items\": [\"test how the tagger handles list-shaped instructions\"], \"topics\": [\"tagging-systems\"], \"dates_mentioned\": [], \"kind\": \"task\", \"relations\": []}
+Output: {\"people\": [], \"entities\": [], \"retrieval_aliases\": [\"list-shaped instructions\"], \"domain_scope\": \"infra\", \"action_items\": [\"test how the tagger handles list-shaped instructions\"], \"topics\": [\"tagging-systems\"], \"dates_mentioned\": [], \"kind\": \"task\", \"relations\": []}
 
 Example 5 — meta-discussion: when a thought is ABOUT other thoughts and lists names as illustrative cases, those names are mentions, not people:
 Thought: 'Thought abc123 mentions Ron, Sarah, and Bob only as examples of contamination cases — none of them are referenced as actors in this thought.'
-Output: {\"people\": [], \"entities\": [], \"action_items\": [], \"topics\": [\"tagging-systems\"], \"dates_mentioned\": [], \"kind\": \"observation\", \"relations\": []}
+Output: {\"people\": [], \"entities\": [], \"retrieval_aliases\": [], \"domain_scope\": \"infra\", \"action_items\": [], \"topics\": [\"tagging-systems\"], \"dates_mentioned\": [], \"kind\": \"observation\", \"relations\": []}
 
 Example 6 — meta-discussion of tagger behavior: when prose describes a previous tagger's behavior on a different thought, the names in that description are mentions of what was tagged, not extractions for THIS thought:
 Thought: 'Probe E at v11 emitted Sarah in both people and entities. The disjointness validator catches this contamination pattern.'
-Output: {\"people\": [], \"entities\": [], \"action_items\": [], \"topics\": [\"tagging-systems\"], \"dates_mentioned\": [], \"kind\": \"observation\", \"relations\": []}
+Output: {\"people\": [], \"entities\": [], \"retrieval_aliases\": [\"disjointness validator\"], \"domain_scope\": \"infra\", \"action_items\": [], \"topics\": [\"tagging-systems\"], \"dates_mentioned\": [], \"kind\": \"observation\", \"relations\": []}
 
 Key signal: if the prose explicitly says \"as examples,\" \"only as mentions,\" \"not referenced as actors,\" or describes what a name was tagged-as in another context, the name is a mention. Do not extract.
 
@@ -488,6 +787,56 @@ struct ChatRequestBody<'a> {
     temperature: f32,
     messages: Vec<ChatMessage<'a>>,
     response_format: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<ChatOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct ChatOptions {
+    num_ctx: u32,
+}
+
+#[derive(Serialize)]
+struct OllamaChatRequestBody<'a> {
+    model: &'a str,
+    stream: bool,
+    messages: Vec<ChatMessage<'a>>,
+    format: serde_json::Value,
+    options: OllamaChatOptions,
+}
+
+#[derive(Serialize)]
+struct OllamaChatOptions {
+    temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_ctx: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_predict: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct ResponsesRequestBody<'a> {
+    model: &'a str,
+    input: Vec<ChatMessage<'a>>,
+    text: ResponsesTextFormat,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ResponsesReasoning<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct ResponsesTextFormat {
+    format: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct ResponsesReasoning<'a> {
+    effort: &'a str,
 }
 
 #[derive(Serialize)]
@@ -499,6 +848,11 @@ struct ChatMessage<'a> {
 #[derive(Deserialize)]
 struct ChatResponseBody {
     choices: Vec<ChatChoice>,
+}
+
+#[derive(Deserialize)]
+struct OllamaChatResponseBody {
+    message: ChatChoiceMessage,
 }
 
 #[derive(Deserialize)]
@@ -547,8 +901,6 @@ impl Tagger for OpenAICompatibleTagger {
         thought_content: &str,
         vocab: Option<&ScopeVocab>,
     ) -> Result<TagOutput, TaggerError> {
-        let url = format!("{}/chat/completions", self.endpoint.trim_end_matches('/'));
-
         let system_content = {
             let vocab_section = render_vocab_section(vocab);
             if vocab_section.is_empty() {
@@ -569,11 +921,63 @@ impl Tagger for OpenAICompatibleTagger {
                 content: thought_content.to_string(),
             },
         ];
+        let content = if self.ollama_native {
+            self.send_ollama_native(messages).await?
+        } else if self.responses_api {
+            self.send_responses_api(messages).await?
+        } else {
+            self.send_openai_compatible(messages).await?
+        };
+
+        // Parse the LLM response into a transient document with both
+        // Tags fields AND relations. Split into TagOutput; the Tags
+        // portion gets persisted to thoughts.tags JSONB, the relations
+        // portion gets routed to thought_links by the drainer.
+        // Backends that honor `json_schema` return bare JSON; some (e.g. Ollama
+        // models) wrap it in a Markdown fence. Tolerate both. The error still
+        // reports the original `content` so a genuinely bad response is legible.
+        let payload = strip_json_code_fence(&content);
+        let doc: TaggerResponseDoc = serde_json::from_str(payload).map_err(|e| {
+            TaggerError::MalformedResponse(format!(
+                "decoding tags payload (content={content:?}): {e}"
+            ))
+        })?;
+
+        Ok(TagOutput {
+            tags: doc.tags,
+            relations: doc.relations,
+        })
+    }
+}
+
+impl OpenAICompatibleTagger {
+    async fn send_openai_compatible(
+        &self,
+        messages: Vec<ChatMessage<'_>>,
+    ) -> Result<String, TaggerError> {
+        let url = format!("{}/chat/completions", self.endpoint.trim_end_matches('/'));
+        let uses_max_completion_tokens =
+            self.model_name.starts_with("gpt-5") || self.endpoint.contains("api.openai.com");
         let body = ChatRequestBody {
             model: &self.model_name,
-            temperature: self.temperature,
+            temperature: if uses_max_completion_tokens {
+                1.0
+            } else {
+                self.temperature
+            },
             messages,
             response_format: tags_response_format(),
+            options: self.num_ctx.map(|num_ctx| ChatOptions { num_ctx }),
+            max_tokens: if uses_max_completion_tokens {
+                None
+            } else {
+                self.max_tokens
+            },
+            max_completion_tokens: if uses_max_completion_tokens {
+                self.max_tokens
+            } else {
+                None
+            },
         };
 
         let mut req = self.client.post(&url).json(&body);
@@ -598,32 +1002,104 @@ impl Tagger for OpenAICompatibleTagger {
             TaggerError::MalformedResponse(format!("decoding chat completions response: {e}"))
         })?;
 
-        let content = parsed
+        parsed
             .choices
             .into_iter()
             .next()
-            .ok_or_else(|| TaggerError::MalformedResponse("response had zero choices".into()))?
-            .message
-            .content;
+            .map(|choice| choice.message.content)
+            .ok_or_else(|| TaggerError::MalformedResponse("response had zero choices".into()))
+    }
 
-        // Parse the LLM response into a transient document with both
-        // Tags fields AND relations. Split into TagOutput; the Tags
-        // portion gets persisted to thoughts.tags JSONB, the relations
-        // portion gets routed to thought_links by the drainer.
-        // Backends that honor `json_schema` return bare JSON; some (e.g. Ollama
-        // models) wrap it in a Markdown fence. Tolerate both. The error still
-        // reports the original `content` so a genuinely bad response is legible.
-        let payload = strip_json_code_fence(&content);
-        let doc: TaggerResponseDoc = serde_json::from_str(payload).map_err(|e| {
-            TaggerError::MalformedResponse(format!(
-                "decoding tags payload (content={content:?}): {e}"
-            ))
+    async fn send_responses_api(
+        &self,
+        messages: Vec<ChatMessage<'_>>,
+    ) -> Result<String, TaggerError> {
+        let url = format!("{}/responses", self.endpoint.trim_end_matches('/'));
+        let body = ResponsesRequestBody {
+            model: &self.model_name,
+            input: messages,
+            text: ResponsesTextFormat {
+                format: tags_responses_text_format(),
+            },
+            reasoning: self
+                .reasoning_effort
+                .as_deref()
+                .map(|effort| ResponsesReasoning { effort }),
+            max_output_tokens: self.max_tokens,
+        };
+
+        let mut req = self.client.post(&url).json(&body);
+        if let Some(key) = &self.api_key {
+            req = req.bearer_auth(key);
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| map_send_error(e, self.timeout_seconds))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(TaggerError::Backend {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let parsed: serde_json::Value = resp.json().await.map_err(|e| {
+            TaggerError::MalformedResponse(format!("decoding responses response: {e}"))
         })?;
-
-        Ok(TagOutput {
-            tags: doc.tags,
-            relations: doc.relations,
+        record_responses_usage("responses", &self.model_name, &self.model_id, &parsed)?;
+        extract_responses_output_text(&parsed).ok_or_else(|| {
+            TaggerError::MalformedResponse(format!(
+                "responses response had no output_text: {parsed}"
+            ))
         })
+    }
+
+    async fn send_ollama_native(
+        &self,
+        messages: Vec<ChatMessage<'_>>,
+    ) -> Result<String, TaggerError> {
+        let mut base = self.endpoint.trim_end_matches('/').to_string();
+        if let Some(stripped) = base.strip_suffix("/v1") {
+            base = stripped.to_string();
+        }
+        let url = format!("{base}/api/chat");
+        let body = OllamaChatRequestBody {
+            model: &self.model_name,
+            stream: false,
+            messages,
+            format: tags_response_format()["json_schema"]["schema"].clone(),
+            options: OllamaChatOptions {
+                temperature: self.temperature,
+                num_ctx: self.num_ctx,
+                num_predict: self.max_tokens,
+            },
+        };
+
+        let mut req = self.client.post(&url).json(&body);
+        if let Some(key) = &self.api_key {
+            req = req.bearer_auth(key);
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| map_send_error(e, self.timeout_seconds))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(TaggerError::Backend {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let parsed: OllamaChatResponseBody = resp.json().await.map_err(|e| {
+            TaggerError::MalformedResponse(format!("decoding ollama chat response: {e}"))
+        })?;
+        Ok(parsed.message.content)
     }
 }
 
@@ -654,12 +1130,14 @@ fn tags_response_format() -> serde_json::Value {
                 "type": "object",
                 "additionalProperties": false,
                 "required": [
-                    "people", "entities", "action_items", "topics", "dates_mentioned",
-                    "kind", "relations"
+                    "people", "entities", "retrieval_aliases", "domain_scope",
+                    "action_items", "topics", "dates_mentioned", "kind", "relations"
                 ],
                 "properties": {
                     "people": { "type": "array", "items": { "type": "string" } },
                     "entities": { "type": "array", "items": { "type": "string" }, "maxItems": 15 },
+                    "retrieval_aliases": { "type": "array", "items": { "type": "string" }, "maxItems": 6 },
+                    "domain_scope": { "type": ["string", "null"] },
                     "action_items": { "type": "array", "items": { "type": "string" } },
                     "topics": { "type": "array", "items": { "type": "string" }, "maxItems": 3 },
                     "dates_mentioned": { "type": "array", "items": { "type": "string" } },
@@ -706,20 +1184,53 @@ fn tags_response_format() -> serde_json::Value {
     })
 }
 
+fn tags_responses_text_format() -> serde_json::Value {
+    let response_format = tags_response_format();
+    let json_schema = &response_format["json_schema"];
+    serde_json::json!({
+        "type": "json_schema",
+        "name": json_schema["name"].clone(),
+        "strict": json_schema["strict"].clone(),
+        "schema": json_schema["schema"].clone()
+    })
+}
+
+fn extract_responses_output_text(v: &serde_json::Value) -> Option<String> {
+    v.get("output")?
+        .as_array()?
+        .iter()
+        .flat_map(|item| {
+            item.get("content")
+                .and_then(|c| c.as_array())
+                .into_iter()
+                .flatten()
+        })
+        .find_map(|content| {
+            match (
+                content.get("type").and_then(|t| t.as_str()),
+                content.get("text").and_then(|t| t.as_str()),
+            ) {
+                (Some("output_text"), Some(text)) => Some(text.to_string()),
+                _ => None,
+            }
+        })
+}
+
 fn map_send_error(e: reqwest::Error, timeout_seconds: u64) -> TaggerError {
+    let details = format!("{e:?}");
     if e.is_timeout() {
         TaggerError::Timeout {
             seconds: timeout_seconds,
         }
     } else if e.is_connect() {
-        TaggerError::Unreachable(e.to_string())
+        TaggerError::Unreachable(details)
     } else if let Some(status) = e.status() {
         TaggerError::Backend {
             status: status.as_u16(),
-            body: e.to_string(),
+            body: details,
         }
     } else {
-        TaggerError::Unreachable(e.to_string())
+        TaggerError::Unreachable(details)
     }
 }
 
@@ -728,7 +1239,7 @@ mod tests {
     use super::*;
     use kengram_core::TagKind;
     use serde_json::json;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn config_for(endpoint: String, api_key: Option<String>) -> OpenAICompatibleConfig {
@@ -743,6 +1254,11 @@ mod tests {
             timeout: Duration::from_secs(2),
             temperature: 0.0,
             system_prompt: None,
+            num_ctx: None,
+            max_tokens: None,
+            ollama_native: false,
+            responses_api: false,
+            reasoning_effort: None,
         }
     }
 
@@ -755,6 +1271,26 @@ mod tests {
                 "index": 0,
                 "message": {"role": "assistant", "content": content},
                 "finish_reason": "stop"
+            }]
+        })
+    }
+
+    fn responses_response_with_tags(tags: serde_json::Value) -> serde_json::Value {
+        let content = serde_json::to_string(&tags).unwrap();
+        json!({
+            "id": "resp_test",
+            "object": "response",
+            "status": "completed",
+            "output": [{
+                "id": "msg_test",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": content,
+                    "annotations": []
+                }]
             }]
         })
     }
@@ -803,6 +1339,167 @@ mod tests {
         );
         assert_eq!(output.tags.kind, Some(TagKind::Task));
         assert!(output.relations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn num_ctx_option_is_serialized_when_configured() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(json!({
+                "options": {
+                    "num_ctx": 65536
+                },
+                "max_tokens": 768
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_response_with_tags(json!({
+                    "people": [],
+                    "entities": [],
+                    "action_items": [],
+                    "topics": [],
+                    "dates_mentioned": [],
+                    "kind": "reference",
+                    "relations": []
+                }))),
+            )
+            .mount(&server)
+            .await;
+
+        let mut cfg = config_for(format!("{}/v1", server.uri()), None);
+        cfg.num_ctx = Some(65_536);
+        cfg.max_tokens = Some(768);
+        let t = OpenAICompatibleTagger::new(cfg).unwrap();
+        t.tag("anything", None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gpt5_uses_max_completion_tokens_instead_of_max_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(chat_response_with_tags(json!({
+                    "people": [],
+                    "entities": [],
+                    "action_items": [],
+                    "topics": [],
+                    "dates_mentioned": [],
+                    "kind": "reference",
+                    "relations": []
+                }))),
+            )
+            .mount(&server)
+            .await;
+
+        let mut cfg = config_for(format!("{}/v1", server.uri()), None);
+        cfg.model_name = "gpt-5.5".to_string();
+        cfg.max_tokens = Some(768);
+        cfg.temperature = 0.2;
+        let t = OpenAICompatibleTagger::new(cfg).unwrap();
+        t.tag("anything", None).await.unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(body["temperature"], 1.0);
+        assert_eq!(body["max_completion_tokens"], 768);
+        assert!(
+            body.get("max_tokens").is_none(),
+            "gpt-5 models reject max_tokens; request must omit it"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_api_posts_responses_with_schema_and_reasoning() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(body_partial_json(json!({
+                "model": "gpt-5.5",
+                "reasoning": {
+                    "effort": "low"
+                },
+                "max_output_tokens": 4096,
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "kengram_tags",
+                        "strict": true
+                    }
+                }
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(responses_response_with_tags(json!({
+                    "people": [],
+                    "entities": ["kengram"],
+                    "retrieval_aliases": ["agent memory search"],
+                    "domain_scope": "infra",
+                    "action_items": [],
+                    "topics": ["memory-systems"],
+                    "dates_mentioned": [],
+                    "kind": "reference",
+                    "relations": []
+                }))),
+            )
+            .mount(&server)
+            .await;
+
+        let mut cfg = config_for(format!("{}/v1", server.uri()), Some("secret".to_string()));
+        cfg.model_name = "gpt-5.5".to_string();
+        cfg.max_tokens = Some(4096);
+        cfg.responses_api = true;
+        cfg.reasoning_effort = Some("low".to_string());
+        let t = OpenAICompatibleTagger::new(cfg).unwrap();
+        let output = t.tag("anything", None).await.unwrap();
+        assert_eq!(output.tags.entities, vec!["kengram".to_string()]);
+        assert_eq!(
+            output.tags.retrieval_aliases,
+            vec!["agent memory search".to_string()]
+        );
+        assert_eq!(output.tags.domain_scope.as_deref(), Some("infra"));
+
+        let received = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert!(body.get("temperature").is_none());
+        assert_eq!(body["text"]["format"]["schema"]["type"], "object");
+    }
+
+    #[tokio::test]
+    async fn ollama_native_mode_posts_api_chat_with_schema_and_options() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_partial_json(json!({
+                "stream": false,
+                "options": {
+                    "num_ctx": 65536,
+                    "num_predict": 768,
+                    "temperature": 0.0
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {
+                    "role": "assistant",
+                    "content": serde_json::to_string(&json!({
+                        "people": [],
+                        "entities": [],
+                        "action_items": [],
+                        "topics": [],
+                        "dates_mentioned": [],
+                        "kind": "reference",
+                        "relations": []
+                    })).unwrap()
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut cfg = config_for(format!("{}/v1", server.uri()), None);
+        cfg.num_ctx = Some(65_536);
+        cfg.max_tokens = Some(768);
+        cfg.ollama_native = true;
+        let t = OpenAICompatibleTagger::new(cfg).unwrap();
+        t.tag("anything", None).await.unwrap();
     }
 
     #[tokio::test]
@@ -1285,7 +1982,7 @@ mod tests {
         );
 
         // Presets track BUNDLED_TAGGER_VERSION.
-        assert_eq!(BUNDLED_TAGGER_VERSION, 16);
+        assert_eq!(BUNDLED_TAGGER_VERSION, 17);
         let cfg = OpenAICompatibleConfig::vllm_local();
         assert_eq!(cfg.model_version, BUNDLED_TAGGER_VERSION);
         let cfg = OpenAICompatibleConfig::open_router("k".into(), "m".into());
@@ -1303,6 +2000,8 @@ mod tests {
             vec![
                 "people",
                 "entities",
+                "retrieval_aliases",
+                "domain_scope",
                 "action_items",
                 "topics",
                 "dates_mentioned",
@@ -1312,7 +2011,13 @@ mod tests {
         );
         assert_eq!(schema["properties"]["topics"]["maxItems"], 3);
         assert_eq!(schema["properties"]["entities"]["maxItems"], 15);
+        assert_eq!(schema["properties"]["retrieval_aliases"]["maxItems"], 6);
         assert_eq!(schema["properties"]["relations"]["maxItems"], 5);
+        let domain_type = &schema["properties"]["domain_scope"]["type"];
+        assert!(
+            domain_type.as_array().unwrap().iter().any(|x| x == "null"),
+            "domain_scope must be nullable: {domain_type:?}"
+        );
         // `kind` must allow null on the wire.
         let kind_type = &schema["properties"]["kind"]["type"];
         assert!(
@@ -1654,6 +2359,11 @@ mod tests {
             timeout: Duration::from_secs(180),
             temperature: 0.2,
             system_prompt: None,
+            num_ctx: None,
+            max_tokens: None,
+            ollama_native: false,
+            responses_api: false,
+            reasoning_effort: None,
         };
         OpenAICompatibleTagger::new(cfg).expect("OpenAICompatibleTagger::new should succeed")
     }
@@ -1738,6 +2448,11 @@ mod tests {
             timeout: Duration::from_secs(180),
             temperature: 0.2,
             system_prompt: None,
+            num_ctx: None,
+            max_tokens: None,
+            ollama_native: false,
+            responses_api: false,
+            reasoning_effort: None,
         };
         let t =
             OpenAICompatibleTagger::new(cfg).expect("OpenAICompatibleTagger::new should succeed");

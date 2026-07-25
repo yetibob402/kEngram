@@ -897,6 +897,46 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
+    async fn search_thoughts_finds_retrieval_aliases(pool: PgPool) {
+        let alias_id = cap_with_tags(
+            &pool,
+            "opaque production memory row",
+            Tags {
+                retrieval_aliases: vec!["phase zero latency foundation".into()],
+                ..Tags::default()
+            },
+        )
+        .await;
+
+        let bad = FakeEmbedder::always_failing(test_embedding_model(), FakeBehavior::Unreachable);
+        let resp = search_thoughts(
+            &pool,
+            &bad,
+            None,
+            SearchRequest {
+                query: "phase zero latency foundation".to_string(),
+                scope: None,
+                scope_prefix: None,
+                limit: Some(10),
+                recency_half_life_days: Some(0.0),
+                rerank: Some(false),
+                candidate_pool: None,
+                tag_filter: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!resp.vector_search_available);
+        let hit = resp
+            .results
+            .iter()
+            .find(|h| h.thought_id == alias_id)
+            .expect("alias-only lexical hit should be returned");
+        assert!(hit.lexical_score.is_some());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
     async fn search_thoughts_empty_tag_filter_is_noop(pool: PgPool) {
         let embedder = test_embedder();
         cap(&pool, "alpha keyword", "global").await;

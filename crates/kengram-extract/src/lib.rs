@@ -23,4 +23,5 @@ pub use fake_tagger::{FakeBehavior, FakeTagger, FakeTaggerOutput, RecordedTag};
 pub use http_tagger::{HttpTagger, HttpTaggerConfig};
 pub use openai_compatible::{
     BUNDLED_TAGGER_PROMPT, BUNDLED_TAGGER_VERSION, OpenAICompatibleConfig, OpenAICompatibleTagger,
+    tagger_metering_cost_abort_reached,
 };

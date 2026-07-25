@@ -79,6 +79,175 @@ pub fn apply_decision_type_override(tags: &mut Tags, metadata: &Metadata) {
     }
 }
 
+fn metadata_str<'a>(metadata: &'a Metadata, key: &str) -> Option<&'a str> {
+    metadata.as_value().get(key).and_then(|v| v.as_str())
+}
+
+fn slugify_domain_part(s: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in s.trim().chars().flat_map(|c| c.to_lowercase()) {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            last_dash = false;
+        } else if (ch == '-' || ch == '_' || ch == ' ' || ch == '.')
+            && !last_dash
+            && !out.is_empty()
+        {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn is_imported_archive(metadata: &Metadata) -> bool {
+    [
+        metadata_str(metadata, "import"),
+        metadata_str(metadata, "source_file"),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|s| {
+        let s = s.to_lowercase();
+        s.contains("archive") || s.contains("macbook_air_archive")
+    })
+}
+
+/// Imported historical archive digests often contain sections like
+/// "Open Followups" from months-old subagent reports. They are useful
+/// reference material, but they are not live commitments or newly-authored
+/// decisions for the current operator. Strip action_items and avoid live
+/// task/decision kind unless source metadata explicitly says it is a
+/// decision artifact.
+pub fn apply_imported_archive_guard(tags: &mut Tags, metadata: &Metadata) {
+    if !is_imported_archive(metadata) {
+        return;
+    }
+    tags.action_items.clear();
+    tags.people.retain(|p| !looks_like_lowercase_handle(p));
+    let explicit_decision =
+        metadata_str(metadata, "decision_type").is_some_and(|s| !s.trim().is_empty());
+    if !explicit_decision && matches!(tags.kind, Some(TagKind::Task | TagKind::DecisionRecord)) {
+        tags.kind = Some(TagKind::Reference);
+    }
+}
+
+fn looks_like_lowercase_handle(s: &str) -> bool {
+    let trimmed = s.trim();
+    trimmed.len() >= 3
+        && !trimmed.contains(char::is_whitespace)
+        && trimmed.chars().any(|ch| ch.is_ascii_alphabetic())
+        && trimmed.chars().all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-' || ch == '.'
+        })
+}
+
+fn looks_like_path_or_route(s: &str) -> bool {
+    let trimmed = s.trim();
+    trimmed.starts_with('/')
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("../")
+        || trimmed.contains("/api/")
+        || trimmed.contains("/src/")
+        || trimmed.contains("/crates/")
+        || trimmed.ends_with(".rs")
+        || trimmed.ends_with(".ts")
+        || trimmed.ends_with(".tsx")
+        || trimmed.ends_with(".js")
+        || trimmed.ends_with(".jsx")
+        || trimmed.ends_with(".py")
+        || trimmed.ends_with(".sql")
+        || trimmed.ends_with(".toml")
+        || trimmed.ends_with(".json")
+        || trimmed.ends_with(".md")
+}
+
+/// Strip filesystem paths and API route paths from entities. They are usually
+/// evidence inside an operational report, not named objects with durable
+/// identity. Retrieval aliases may still carry explicit identifiers, but the
+/// alias cleaner below applies a tighter cap.
+pub fn strip_path_like_entities(tags: &mut Tags) {
+    tags.entities.retain(|e| !looks_like_path_or_route(e));
+}
+
+/// Clean retrieval aliases into short grounded query terms. The prompt already
+/// asks for this; this guard keeps noisy model output from bloating JSONB and
+/// future retrieval filters.
+pub fn clean_retrieval_aliases(tags: &mut Tags) {
+    let mut seen = HashSet::new();
+    tags.retrieval_aliases.retain(|alias| {
+        let trimmed = alias.trim();
+        if trimmed.is_empty() || trimmed.len() > 80 || looks_like_path_or_route(trimmed) {
+            return false;
+        }
+        seen.insert(trimmed.to_lowercase())
+    });
+    for alias in &mut tags.retrieval_aliases {
+        *alias = alias.trim().to_string();
+    }
+    tags.retrieval_aliases.truncate(6);
+}
+
+/// Normalize the second routing axis. This is deliberately conservative:
+/// unknown free-form domains are nulled rather than persisted as drift.
+pub fn normalize_domain_scope(tags: &mut Tags) {
+    let Some(raw) = tags.domain_scope.as_deref() else {
+        return;
+    };
+    let normalized = raw.trim().to_lowercase().replace('_', "-");
+    let normalized = normalized.trim_matches('/').to_string();
+    let mapped = if normalized.is_empty()
+        || normalized == "knox"
+        || normalized == "agents/knox"
+        || normalized == "sessions/knox"
+        || normalized.starts_with("agents/")
+        || normalized.starts_with("sessions/")
+    {
+        None
+    } else if normalized == "argus"
+        || normalized == "kengram"
+        || normalized == "memory"
+        || normalized == "fleet"
+        || normalized == "ops"
+        || normalized == "platform"
+        || normalized.starts_with("infra/")
+    {
+        Some("infra".to_string())
+    } else if normalized == "decision" || normalized == "decision-records" {
+        Some("decisions".to_string())
+    } else if normalized == "decisions"
+        || normalized == "infra"
+        || normalized.starts_with("apps/")
+        || normalized.starts_with("customers/")
+    {
+        Some(normalized)
+    } else {
+        None
+    };
+    tags.domain_scope = mapped;
+}
+
+/// Authoritative metadata beats the model for domain routing. Imported
+/// archive digests commonly carry `metadata.project`; customer ingests may
+/// carry `customer`, `client`, or `customer_slug`.
+pub fn apply_metadata_domain_override(tags: &mut Tags, metadata: &Metadata) {
+    if let Some(customer) = ["customer_slug", "customer", "client"]
+        .into_iter()
+        .filter_map(|k| metadata_str(metadata, k))
+        .find_map(slugify_domain_part)
+    {
+        tags.domain_scope = Some(format!("customers/{customer}"));
+        return;
+    }
+    if let Some(project) = metadata_str(metadata, "project").and_then(slugify_domain_part) {
+        tags.domain_scope = Some(format!("apps/{project}"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +377,70 @@ mod tests {
     }
 
     #[test]
+    fn imported_archive_guard_strips_historical_action_items() {
+        let mut t = Tags {
+            action_items: vec!["implement distributed rate limiting".to_string()],
+            kind: Some(TagKind::Task),
+            ..Default::default()
+        };
+        apply_imported_archive_guard(
+            &mut t,
+            &Metadata::from(json!({"import": "kengram_macbook_air_archive_2026_06"})),
+        );
+        assert!(t.action_items.is_empty());
+        assert_eq!(t.kind, Some(TagKind::Reference));
+    }
+
+    #[test]
+    fn imported_archive_guard_demotes_unreviewed_archive_decision_records() {
+        let mut t = Tags {
+            action_items: vec!["follow up".to_string()],
+            kind: Some(TagKind::DecisionRecord),
+            ..Default::default()
+        };
+        apply_imported_archive_guard(
+            &mut t,
+            &Metadata::from(json!({"source_file": "old/archive/session.jsonl"})),
+        );
+        assert!(t.action_items.is_empty());
+        assert_eq!(t.kind, Some(TagKind::Reference));
+    }
+
+    #[test]
+    fn imported_archive_guard_preserves_explicit_decision_metadata() {
+        let mut t = Tags {
+            action_items: vec!["follow up".to_string()],
+            kind: Some(TagKind::DecisionRecord),
+            ..Default::default()
+        };
+        apply_imported_archive_guard(
+            &mut t,
+            &Metadata::from(
+                json!({"source_file": "old/archive/session.jsonl", "decision_type": "build-spec"}),
+            ),
+        );
+        assert!(t.action_items.is_empty());
+        assert_eq!(t.kind, Some(TagKind::DecisionRecord));
+    }
+
+    #[test]
+    fn imported_archive_guard_strips_lowercase_operator_handles() {
+        let mut t = Tags {
+            people: vec![
+                "hrbekr".to_string(),
+                "Bob".to_string(),
+                "Sarah Jane".to_string(),
+            ],
+            ..Default::default()
+        };
+        apply_imported_archive_guard(
+            &mut t,
+            &Metadata::from(json!({"import": "kengram_macbook_air_archive_2026_06"})),
+        );
+        assert_eq!(t.people, vec!["Bob".to_string(), "Sarah Jane".to_string()]);
+    }
+
+    #[test]
     fn empty_or_non_string_decision_type_leaves_kind() {
         let mut t = Tags {
             kind: Some(TagKind::Task),
@@ -217,5 +450,79 @@ mod tests {
         assert_eq!(t.kind, Some(TagKind::Task));
         apply_decision_type_override(&mut t, &Metadata::from(json!({"decision_type": true})));
         assert_eq!(t.kind, Some(TagKind::Task));
+    }
+
+    #[test]
+    fn path_like_entities_are_stripped() {
+        let mut t = Tags {
+            entities: vec![
+                "/api/auth/delete-user.js".to_string(),
+                "kengram".to_string(),
+                "crates/kengram-core/src/tags.rs".to_string(),
+            ],
+            ..Default::default()
+        };
+        strip_path_like_entities(&mut t);
+        assert_eq!(t.entities, vec!["kengram".to_string()]);
+    }
+
+    #[test]
+    fn retrieval_aliases_are_deduped_capped_and_path_filtered() {
+        let mut t = Tags {
+            retrieval_aliases: vec![
+                " semantic memory ".to_string(),
+                "semantic memory".to_string(),
+                "/api/auth/delete-user.js".to_string(),
+                "x".repeat(81),
+                "operator recall".to_string(),
+            ],
+            ..Default::default()
+        };
+        clean_retrieval_aliases(&mut t);
+        assert_eq!(
+            t.retrieval_aliases,
+            vec!["semantic memory".to_string(), "operator recall".to_string()]
+        );
+    }
+
+    #[test]
+    fn domain_scope_is_normalized_conservatively() {
+        let mut t = Tags {
+            domain_scope: Some("kEngram".to_string()),
+            ..Default::default()
+        };
+        normalize_domain_scope(&mut t);
+        assert_eq!(t.domain_scope.as_deref(), Some("infra"));
+
+        t.domain_scope = Some("agents/knox".to_string());
+        normalize_domain_scope(&mut t);
+        assert_eq!(t.domain_scope, None);
+
+        t.domain_scope = Some("apps/Kengram".to_string());
+        normalize_domain_scope(&mut t);
+        assert_eq!(t.domain_scope.as_deref(), Some("apps/kengram"));
+    }
+
+    #[test]
+    fn metadata_project_overrides_domain_scope() {
+        let mut t = Tags {
+            domain_scope: Some("infra".to_string()),
+            ..Default::default()
+        };
+        apply_metadata_domain_override(&mut t, &Metadata::from(json!({"project": "MyLakeAccess"})));
+        assert_eq!(t.domain_scope.as_deref(), Some("apps/mylakeaccess"));
+    }
+
+    #[test]
+    fn metadata_customer_overrides_project_domain_scope() {
+        let mut t = Tags {
+            domain_scope: Some("apps/foo".to_string()),
+            ..Default::default()
+        };
+        apply_metadata_domain_override(
+            &mut t,
+            &Metadata::from(json!({"project": "MLA", "customer": "Blue Water"})),
+        );
+        assert_eq!(t.domain_scope.as_deref(), Some("customers/blue-water"));
     }
 }

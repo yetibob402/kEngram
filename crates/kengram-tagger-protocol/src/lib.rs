@@ -226,6 +226,8 @@ mod tests {
                 topics: vec!["memory-systems".to_string()],
                 dates_mentioned: vec!["next Friday".to_string()],
                 kind: Some(TagKind::Task),
+                retrieval_aliases: Vec::new(),
+                domain_scope: None,
             },
             relations: vec![],
         };

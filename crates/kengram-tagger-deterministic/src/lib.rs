@@ -368,6 +368,8 @@ impl Tagger for DeterministicTagger {
                 // pollution was the primary motivation for dropping the
                 // field. See docs/tagger-improvements.md.
                 entities: Vec::new(),
+                retrieval_aliases: Vec::new(),
+                domain_scope: None,
             },
             // Deterministic backend doesn't extract LLM-style relations.
             // Relations are still added by the existing graph tools

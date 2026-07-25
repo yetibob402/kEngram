@@ -10,15 +10,18 @@ mod bench;
 mod config;
 mod eval;
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashSet, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use kengram_core::{Embedder, EmbeddingModel, Tagger};
+use kengram_core::{Embedder, EmbeddingModel, Tagger, ThoughtId};
 use kengram_embed::{
     OpenAICompatibleConfig, OpenAICompatibleEmbedder, Reranker, TeiReranker, TeiRerankerConfig,
 };
-use kengram_extract::{OpenAICompatibleConfig as TaggerConfigBuilder, OpenAICompatibleTagger};
+use kengram_extract::{
+    OpenAICompatibleConfig as TaggerConfigBuilder, OpenAICompatibleTagger,
+    tagger_metering_cost_abort_reached,
+};
 use kengram_mcp::KengramServer;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -87,6 +90,19 @@ enum Command {
         /// Max thoughts to process this run. Defaults to 200.
         #[arg(long, default_value_t = 200)]
         limit: i64,
+        /// Tag exactly the non-retracted thought IDs listed in this file
+        /// (one UUID per line). This is for bounded eval/canary retag gates;
+        /// when set, the normal stale/version walk is skipped.
+        #[arg(long)]
+        ids_file: Option<PathBuf>,
+        /// Zero-based shard index for deterministic parallel tag backfills.
+        /// Must be used with --shard-count.
+        #[arg(long)]
+        shard_index: Option<i32>,
+        /// Total number of deterministic tag-backfill shards. Must be used
+        /// with --shard-index.
+        #[arg(long)]
+        shard_count: Option<i32>,
         /// Re-tag thoughts whose `tags_extractor_version` is older than the
         /// configured `[tagger].model_version`. Without this, only
         /// never-tagged thoughts are walked.
@@ -317,6 +333,11 @@ fn build_tagger(c: &TaggerConfig) -> anyhow::Result<ResolvedTagger> {
         model_id = %c.model_id,
         model_version = c.model_version,
         timeout_seconds = c.timeout_seconds,
+        num_ctx = ?c.num_ctx,
+        max_tokens = ?c.max_tokens,
+        ollama_native = c.ollama_native,
+        responses_api = c.responses_api,
+        reasoning_effort = ?c.reasoning_effort,
         "tagger: resolved config",
     );
 
@@ -344,6 +365,11 @@ fn build_tagger(c: &TaggerConfig) -> anyhow::Result<ResolvedTagger> {
                 timeout: Duration::from_secs(c.timeout_seconds),
                 temperature: c.temperature,
                 system_prompt,
+                num_ctx: c.num_ctx,
+                max_tokens: c.max_tokens,
+                ollama_native: c.ollama_native,
+                responses_api: c.responses_api,
+                reasoning_effort: c.reasoning_effort.clone(),
             })
             .with_context(|| format!("constructing tagger for endpoint {}", c.endpoint))?;
             Ok(ResolvedTagger {
@@ -784,6 +810,34 @@ fn snapshot_rows_to_json(rows: &[kengram_storage::TagSnapshotRow]) -> Vec<serde_
         .collect()
 }
 
+fn load_ids_file(path: &PathBuf) -> anyhow::Result<Vec<ThoughtId>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading ids file {}", path.display()))?;
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    for (line_no, line) in text.lines().enumerate() {
+        let cleaned = line.split('#').next().unwrap_or("").trim();
+        if cleaned.is_empty() {
+            continue;
+        }
+        let token = cleaned.split_whitespace().next().unwrap_or(cleaned);
+        let id = token.parse::<ThoughtId>().with_context(|| {
+            format!(
+                "parsing thought id on line {} of {}",
+                line_no + 1,
+                path.display()
+            )
+        })?;
+        if seen.insert(id) {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        anyhow::bail!("ids file {} contained no thought IDs", path.display());
+    }
+    Ok(ids)
+}
+
 // Args mirror the `Command::Tag` clap flags 1:1; grouping them into a struct
 // would just move the same fields behind one more name. Same rationale as the
 // wide query helpers in kengram-storage.
@@ -793,11 +847,18 @@ async fn run_tag(
     scope: Option<String>,
     scope_prefix: Option<String>,
     limit: i64,
+    ids_file: Option<PathBuf>,
+    shard_index: Option<i32>,
+    shard_count: Option<i32>,
     rerun: bool,
     force: bool,
     since: Option<String>,
     snapshot: Option<Option<PathBuf>>,
 ) -> anyhow::Result<()> {
+    if limit < 0 {
+        anyhow::bail!("--limit must be non-negative");
+    }
+
     let parsed_since = match since {
         Some(s) => Some(
             time::OffsetDateTime::parse(&s, &time::format_description::well_known::Rfc3339)
@@ -850,6 +911,7 @@ async fn run_tag(
     } = build_tagger(&config.tagger)?;
     let tagger = tagger
         .context("`kengram tag` requires a configured `[tagger]` section; see DEVELOPMENT.md")?;
+    let model_id = tagger.model_id().to_string();
 
     // Mirror the worker's scope-vocab resolution so one-shot tagging applies
     // the same controlled-vocabulary behavior the drainer would.
@@ -864,11 +926,42 @@ async fn run_tag(
     // empty-string-as-None normalisation applied elsewhere).
     let scope_filter = scope.filter(|s| !s.is_empty());
     let scope_prefix_filter = scope_prefix.filter(|s| !s.is_empty());
+    if ids_file.is_some()
+        && (scope_filter.is_some()
+            || scope_prefix_filter.is_some()
+            || parsed_since.is_some()
+            || shard_index.is_some()
+            || shard_count.is_some())
+    {
+        anyhow::bail!(
+            "--ids-file cannot be combined with --scope, --scope-prefix, --since, --shard-index, or --shard-count"
+        );
+    }
+
+    let shard = match (shard_index, shard_count) {
+        (None, None) => None,
+        (Some(index), Some(count)) if count > 0 && index >= 0 && index < count => {
+            Some(kengram_storage::TagBackfillShard { index, count })
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!("--shard-index and --shard-count must be supplied together")
+        }
+        (Some(index), Some(count)) => {
+            anyhow::bail!(
+                "invalid tag shard: expected 0 <= --shard-index < --shard-count, got index={} count={}",
+                index,
+                count
+            )
+        }
+    };
 
     tracing::info!(
         scope = ?scope_filter,
         scope_prefix = ?scope_prefix_filter,
         limit,
+        ids_file = ?ids_file.as_ref().map(|p| p.display().to_string()),
+        shard_index = ?shard.map(|s| s.index),
+        shard_count = ?shard.map(|s| s.count),
         rerun,
         force,
         since = ?parsed_since,
@@ -877,23 +970,56 @@ async fn run_tag(
         "kengram tag starting",
     );
 
-    let candidates = kengram_storage::find_untagged_or_stale_thoughts(
-        &pool,
-        tagger_version,
-        rerun,
-        force,
-        scope_filter.as_deref(),
-        scope_prefix_filter.as_deref(),
-        parsed_since,
-        limit,
-    )
-    .await
-    .context("walking untagged-or-stale thoughts")?;
+    let candidates = if let Some(path) = ids_file.as_ref() {
+        let ids = load_ids_file(path)?;
+        let limited_ids = ids.into_iter().take(limit as usize).collect::<Vec<_>>();
+        let mut thoughts = kengram_storage::fetch_nonretracted_thoughts_by_ids(&pool, &limited_ids)
+            .await
+            .with_context(|| format!("fetching thought IDs from {}", path.display()))?;
+        if thoughts.len() != limited_ids.len() {
+            tracing::warn!(
+                requested = limited_ids.len(),
+                found = thoughts.len(),
+                path = %path.display(),
+                "kengram tag: ids-file contained missing or retracted thoughts",
+            );
+        }
+        if !rerun && !force {
+            let before_skip = thoughts.len();
+            thoughts.retain(|t| {
+                t.tags_extractor_model.as_deref() != Some(model_id.as_str())
+                    || t.tags_extractor_version != Some(tagger_version)
+            });
+            tracing::info!(
+                requested = limited_ids.len(),
+                found = before_skip,
+                skipped_current = before_skip.saturating_sub(thoughts.len()),
+                remaining = thoughts.len(),
+                model_id = %model_id,
+                tagger_version,
+                "kengram tag: ids-file resume filter applied",
+            );
+        }
+        thoughts
+    } else {
+        kengram_storage::find_untagged_or_stale_thoughts_sharded(
+            &pool,
+            tagger_version,
+            rerun,
+            force,
+            scope_filter.as_deref(),
+            scope_prefix_filter.as_deref(),
+            parsed_since,
+            limit,
+            shard,
+        )
+        .await
+        .context("walking untagged-or-stale thoughts")?
+    };
 
     let n_candidates = candidates.len();
     let mut tagged = 0usize;
     let mut failed = 0usize;
-    let model_id = tagger.model_id().to_string();
 
     // Corpus scope set, fetched once (mirrors the worker drainer) so the
     // scope-identifier filter in `finalize` runs without a per-thought query.
@@ -907,6 +1033,12 @@ async fn run_tag(
         .unwrap_or_default();
 
     for t in candidates {
+        if tagger_metering_cost_abort_reached() {
+            anyhow::bail!(
+                "tagger metering cost abort reached before thought {}; no further paid calls made",
+                t.id
+            );
+        }
         let vocab = match scope_vocab_limit {
             Some(n) if n > 0 => {
                 match kengram_storage::fetch_scope_vocab(&pool, t.scope.as_str(), n).await {
@@ -1006,6 +1138,9 @@ async fn main() -> anyhow::Result<()> {
             scope,
             scope_prefix,
             limit,
+            ids_file,
+            shard_index,
+            shard_count,
             rerun,
             force,
             since,
@@ -1016,6 +1151,9 @@ async fn main() -> anyhow::Result<()> {
                 scope,
                 scope_prefix,
                 limit,
+                ids_file,
+                shard_index,
+                shard_count,
                 rerun,
                 force,
                 since,

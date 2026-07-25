@@ -51,6 +51,23 @@ pub(crate) struct ArmSpec {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
+    /// Optional Ollama context-window override, passed as
+    /// `options.num_ctx` on OpenAI-compatible arms only.
+    #[serde(default)]
+    pub num_ctx: Option<u32>,
+    /// Optional completion cap for noisy/verbose arms.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// Use Ollama's native `/api/chat` endpoint instead of its OpenAI
+    /// compatibility shim for this arm.
+    #[serde(default)]
+    pub ollama_native: bool,
+    /// Use OpenAI's `/v1/responses` API instead of `/chat/completions`.
+    #[serde(default)]
+    pub responses_api: bool,
+    /// Optional Responses API reasoning effort, e.g. `"low"`.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     /// Optional system-prompt override for prompt A/B runs. Requires
     /// `model_version` (the production provenance binding rejects a custom
     /// prompt under the bundled version number).
@@ -158,6 +175,11 @@ pub(crate) fn build_arm(spec: &ArmSpec) -> anyhow::Result<BuiltArm> {
                 timeout,
                 temperature: spec.temperature.unwrap_or(DEFAULT_TEMPERATURE),
                 system_prompt,
+                num_ctx: spec.num_ctx,
+                max_tokens: spec.max_tokens,
+                ollama_native: spec.ollama_native,
+                responses_api: spec.responses_api,
+                reasoning_effort: spec.reasoning_effort.clone(),
             };
             let tagger = OpenAICompatibleTagger::new(config)
                 .with_context(|| format!("constructing arm {:?}", spec.name))?;
@@ -326,6 +348,11 @@ temprature = 0.0
             api_key_env: Some("KENGRAM_EVAL_TEST_UNSET_VAR".to_string()),
             temperature: None,
             timeout_seconds: None,
+            num_ctx: None,
+            max_tokens: None,
+            ollama_native: false,
+            responses_api: false,
+            reasoning_effort: None,
             system_prompt_file: None,
             model_version: None,
         };
@@ -347,6 +374,11 @@ temprature = 0.0
             api_key_env: None,
             temperature: None,
             timeout_seconds: None,
+            num_ctx: None,
+            max_tokens: None,
+            ollama_native: false,
+            responses_api: false,
+            reasoning_effort: None,
             system_prompt_file: Some(prompt),
             model_version: None, // defaults to BUNDLED_TAGGER_VERSION -> must be rejected
         };

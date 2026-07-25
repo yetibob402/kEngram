@@ -208,7 +208,7 @@ pub struct TaggerConfig {
     /// Conventionally `<vendor>/<model>`. Defaults to `"vllm/qwen3-coder:30b"`.
     pub model_id: String,
     /// Schema-version for `thoughts.tags_extractor_version`. Default tracks
-    /// `kengram_extract::BUNDLED_TAGGER_VERSION` (currently 16 — ten
+    /// `kengram_extract::BUNDLED_TAGGER_VERSION` (currently 17 — eleven
     /// post-M6.1 dogfood iterations: v6 rebalanced kind classification +
     /// added entity surface-only rule + tightened URL emission but
     /// repeated the v3→v4 backfire by listing adjectival phrases as
@@ -249,6 +249,22 @@ pub struct TaggerConfig {
     pub api_key: Option<String>,
     pub timeout_seconds: u64,
     pub temperature: f32,
+    /// Optional Ollama context-window override for OpenAI-compatible
+    /// taggers. Serialized as `options.num_ctx` only when configured.
+    pub num_ctx: Option<u32>,
+    /// Optional completion cap. Serialized as `max_tokens` for
+    /// OpenAI-compatible endpoints and `options.num_predict` for native
+    /// Ollama.
+    pub max_tokens: Option<u32>,
+    /// Use Ollama's native `/api/chat` endpoint instead of the OpenAI
+    /// compatibility shim. Default false for vLLM/OpenRouter compatibility.
+    pub ollama_native: bool,
+    /// Use OpenAI's `/v1/responses` API instead of `/chat/completions`.
+    /// Intended for gpt-5-class structured-output runs where low reasoning
+    /// effort materially improves latency and cost.
+    pub responses_api: bool,
+    /// Optional Responses API reasoning effort, e.g. `"low"`.
+    pub reasoning_effort: Option<String>,
     /// Path to a file containing the tagger system prompt. `None` means
     /// use `kengram_extract::BUNDLED_TAGGER_PROMPT` (recommended). Operators
     /// who supply a custom prompt are responsible for also bumping
@@ -321,6 +337,11 @@ impl Default for TaggerConfig {
             api_key: None,
             timeout_seconds: 60,
             temperature: 0.2,
+            num_ctx: None,
+            max_tokens: None,
+            ollama_native: false,
+            responses_api: false,
+            reasoning_effort: None,
             system_prompt_file: None,
             scope_vocab_enabled: true,
             scope_vocab_size: 50,
@@ -429,6 +450,11 @@ mod tests {
         assert_eq!(c.tagger.model_id, "vllm/qwen3-coder:30b");
         assert_eq!(c.tagger.model_version, BUNDLED_TAGGER_VERSION);
         assert!(c.tagger.api_key.is_none());
+        assert!(c.tagger.num_ctx.is_none());
+        assert!(c.tagger.max_tokens.is_none());
+        assert!(!c.tagger.ollama_native);
+        assert!(!c.tagger.responses_api);
+        assert!(c.tagger.reasoning_effort.is_none());
         // Default is the bundled prompt — no file override.
         assert!(c.tagger.system_prompt_file.is_none());
         // Scope vocabulary injection is enabled by default at 50 terms each.
@@ -478,6 +504,10 @@ mod tests {
         let toml = r#"
             [tagger]
             provider = "openai-compatible"
+            num_ctx = 65536
+            max_tokens = 768
+            ollama_native = true
+            responses_api = false
         "#;
         let c: Config = Figment::new()
             .merge(Serialized::defaults(Config::default()))
@@ -487,6 +517,32 @@ mod tests {
         assert_eq!(c.tagger.provider, "openai-compatible");
         assert_eq!(c.tagger.endpoint, "http://localhost:8000/v1");
         assert_eq!(c.tagger.model_version, BUNDLED_TAGGER_VERSION);
+        assert_eq!(c.tagger.num_ctx, Some(65_536));
+        assert_eq!(c.tagger.max_tokens, Some(768));
+        assert!(c.tagger.ollama_native);
+        assert!(!c.tagger.responses_api);
+    }
+
+    #[test]
+    fn tagger_responses_api_overrides_round_trip_from_toml() {
+        let toml = r#"
+            [tagger]
+            provider = "openai-compatible"
+            endpoint = "https://api.openai.com/v1"
+            model_name = "gpt-5.5"
+            responses_api = true
+            reasoning_effort = "low"
+            max_tokens = 4096
+        "#;
+        let c: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap();
+        assert!(c.tagger.responses_api);
+        assert_eq!(c.tagger.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(c.tagger.max_tokens, Some(4096));
+        assert!(!c.tagger.ollama_native);
     }
 
     /// Operator can disable scope-vocabulary injection or tune its size via

@@ -13,6 +13,7 @@ import csv
 import hashlib
 import json
 import math
+import os
 import subprocess
 import sys
 import tempfile
@@ -29,6 +30,12 @@ MODEL_ID = "bge-m3:sparse"
 MODEL_VERSION = 1
 SOURCE_MODEL = "BAAI/bge-m3"
 VOCAB_SIZE = 250_002
+SPARSEVEC_INDEX_MAX_NONZERO = 1_000
+CAP_ALARM_EXIT_CODE = 42
+DEFAULT_CAP_ALARM_BATCH_RATE = 0.10
+DEFAULT_CAP_ALARM_BATCH_MIN_SIZE = 20
+DEFAULT_CAP_ALARM_CUMULATIVE_RATE = 0.02
+DEFAULT_CAP_ALARM_CUMULATIVE_MIN_PROCESSED = 200
 GENERATOR = "FlagEmbedding.BGEM3FlagModel"
 SOURCE_FILE_DENY_REGEX = (
     "kengram-recall-97|kengram-gold|gold100|gold-100|miss-analysis|"
@@ -147,7 +154,7 @@ def fetch_docs(db_url: str, target: str, denied_ids: list[str], limit: int | Non
     return [json.loads(line) for line in psql(db_url, sql).splitlines() if line.strip()]
 
 
-def sparsevec_literal(weights: dict[str, Any]) -> tuple[str, int]:
+def sparsevec_literal(weights: dict[str, Any]) -> tuple[str, int, dict[str, Any]]:
     merged: dict[int, float] = {}
     for token_id_raw, weight_raw in weights.items():
         token_id = int(token_id_raw)
@@ -161,11 +168,30 @@ def sparsevec_literal(weights: dict[str, Any]) -> tuple[str, int]:
     items = [(idx, weight) for idx, weight in sorted(merged.items()) if weight]
     if not items:
         raise ValueError("producer emitted no nonzero sparse weights")
+    original_nonzero_count = len(items)
+    cap_applied = original_nonzero_count > SPARSEVEC_INDEX_MAX_NONZERO
+    if cap_applied:
+        # pgvector sparse HNSW/IVFFlat indexes reject rows above 1000 nnz.
+        # Keep the highest-signal SPLADE terms by absolute weight magnitude.
+        top_items = sorted(items, key=lambda item: (-abs(item[1]), item[0]))[
+            :SPARSEVEC_INDEX_MAX_NONZERO
+        ]
+        items = sorted(top_items)
     body = ",".join(f"{idx}:{weight:.9g}" for idx, weight in items)
-    return f"{{{body}}}/{VOCAB_SIZE}", len(items)
+    cap_metadata = {
+        "sparse_original_nonzero_count": original_nonzero_count,
+        "sparse_capped_nonzero_count": len(items),
+        "sparse_cap_applied": cap_applied,
+        "sparse_cap_limit": SPARSEVEC_INDEX_MAX_NONZERO,
+        "sparse_cap_rule": "top_abs_weight",
+        "sparse_dropped_nonzero_count": original_nonzero_count - len(items),
+    }
+    return f"{{{body}}}/{VOCAB_SIZE}", len(items), cap_metadata
 
 
-def encode_sparse(model: Any, docs: list[dict[str, Any]], batch_size: int) -> list[tuple[str, int]]:
+def encode_sparse(
+    model: Any, docs: list[dict[str, Any]], batch_size: int
+) -> list[tuple[str, int, dict[str, Any]]]:
     texts = [doc["content"] for doc in docs]
     out = model.encode(
         texts,
@@ -181,15 +207,19 @@ def encode_sparse(model: Any, docs: list[dict[str, Any]], batch_size: int) -> li
 def write_batch(
     db_url: str,
     docs: list[dict[str, Any]],
-    encoded: list[tuple[str, int]],
+    encoded: list[tuple[str, int, dict[str, Any]]],
     generator_version: str,
     producer_metadata: dict[str, Any],
 ) -> None:
     tmp = tempfile.NamedTemporaryFile("w", delete=False)
     try:
         writer = csv.writer(tmp, delimiter="\t", lineterminator="\n")
-        metadata_json = json.dumps(producer_metadata, sort_keys=True, separators=(",", ":"))
-        for doc, (literal, nonzero_count) in zip(docs, encoded):
+        for doc, (literal, nonzero_count, cap_metadata) in zip(docs, encoded):
+            metadata_json = json.dumps(
+                {**producer_metadata, **cap_metadata},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
             writer.writerow(
                 [
                     doc["target_kind"],
@@ -269,10 +299,169 @@ def write_batch(
         Path(tmp.name).unlink(missing_ok=True)
 
 
-def append_progress(path: Path, event: dict[str, Any]) -> None:
+def append_jsonl(path: Path, event: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as f:
         f.write(json.dumps(event, sort_keys=True) + "\n")
+
+
+def candidate_key(doc: dict[str, Any]) -> tuple[str, str]:
+    return str(doc["target_kind"]), str(doc["id"])
+
+
+def load_candidate_ids(path: Path) -> list[tuple[str, str]]:
+    keys: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for line in path.read_text().splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        if raw.startswith("{"):
+            row = json.loads(raw)
+            key = str(row["target_kind"]), str(row["id"])
+        else:
+            parts = raw.replace(",", "\t").split()
+            if len(parts) != 2:
+                raise SystemExit(
+                    f"ids-file line must be JSON or two fields target_kind id: {raw}"
+                )
+            key = parts[0], parts[1]
+        if key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+    return keys
+
+
+def apply_candidate_ids(
+    docs: list[dict[str, Any]], ids_file: Path | None
+) -> list[dict[str, Any]]:
+    if not ids_file:
+        return docs
+    requested = load_candidate_ids(ids_file)
+    by_key = {candidate_key(doc): doc for doc in docs}
+    return [by_key[key] for key in requested if key in by_key]
+
+
+def dump_candidate_ids(path: Path, docs: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        for doc in docs:
+            f.write(
+                json.dumps(
+                    {"target_kind": doc["target_kind"], "id": doc["id"]},
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+
+
+def default_jsonl_sidecar(progress: Path, suffix: str) -> Path:
+    base = progress.name[: -len(progress.suffix)] if progress.suffix else progress.name
+    return progress.with_name(f"{base}-{suffix}.jsonl")
+
+
+def cap_alarm_config(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "batch_rate_threshold": args.cap_alarm_batch_rate,
+        "batch_min_size": args.cap_alarm_batch_min_size,
+        "cumulative_rate_threshold": args.cap_alarm_cumulative_rate,
+        "cumulative_min_processed": args.cap_alarm_cumulative_min_processed,
+        "halt_exit_code": CAP_ALARM_EXIT_CODE,
+    }
+
+
+def capped_row_events(
+    batch_no: int,
+    docs: list[dict[str, Any]],
+    encoded: list[tuple[str, int, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for doc, (_, _, metadata) in zip(docs, encoded):
+        if not metadata["sparse_cap_applied"]:
+            continue
+        events.append(
+            {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "event": "sparse_cap_row",
+                "batch_no": batch_no,
+                "target_kind": doc["target_kind"],
+                "target_id": doc["id"],
+                "original_nnz": metadata["sparse_original_nonzero_count"],
+                "capped_nnz": metadata["sparse_capped_nonzero_count"],
+                "dropped_nnz": metadata["sparse_dropped_nonzero_count"],
+                "cap_rule": metadata["sparse_cap_rule"],
+                "cap_limit": metadata["sparse_cap_limit"],
+            }
+        )
+    return events
+
+
+def build_cap_alarm(
+    args: argparse.Namespace,
+    batch_no: int,
+    batch_size: int,
+    capped_rows_batch: int,
+    processed_before: int,
+    capped_rows_before: int,
+) -> dict[str, Any] | None:
+    processed_after = processed_before + batch_size
+    capped_rows_after = capped_rows_before + capped_rows_batch
+    batch_rate = capped_rows_batch / batch_size if batch_size else 0.0
+    cumulative_rate = capped_rows_after / processed_after if processed_after else 0.0
+    reasons: list[str] = []
+    if (
+        batch_size >= args.cap_alarm_batch_min_size
+        and batch_rate > args.cap_alarm_batch_rate
+    ):
+        reasons.append("batch_cap_rate_exceeded")
+    if (
+        processed_after >= args.cap_alarm_cumulative_min_processed
+        and cumulative_rate > args.cap_alarm_cumulative_rate
+    ):
+        reasons.append("cumulative_cap_rate_exceeded")
+    if not reasons:
+        return None
+    return {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "event": "sparse_cap_alarm",
+        "status": "halt_before_write",
+        "reasons": reasons,
+        "batch_no": batch_no,
+        "batch_size": batch_size,
+        "capped_rows_batch": capped_rows_batch,
+        "batch_cap_rate": batch_rate,
+        "processed_before": processed_before,
+        "processed_after_if_written": processed_after,
+        "capped_rows_before": capped_rows_before,
+        "capped_rows_after_if_written": capped_rows_after,
+        "cumulative_cap_rate_if_written": cumulative_rate,
+        "thresholds": cap_alarm_config(args),
+    }
+
+
+def run_alarm_alert_command(command: str | None, alarm: dict[str, Any]) -> dict[str, Any]:
+    if not command:
+        return {"configured": False}
+    payload = json.dumps(alarm, sort_keys=True)
+    env = os.environ.copy()
+    env["CAP_ALARM_JSON"] = payload
+    proc = subprocess.run(
+        command,
+        input=payload + "\n",
+        text=True,
+        shell=True,
+        env=env,
+        capture_output=True,
+        check=False,
+    )
+    return {
+        "configured": True,
+        "command": command,
+        "returncode": proc.returncode,
+        "stdout": proc.stdout.strip(),
+        "stderr": proc.stderr.strip(),
+    }
 
 
 def chunks(rows: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]]:
@@ -283,27 +472,98 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db-url", default=DEFAULT_DB_URL)
     ap.add_argument("--target", choices=["thoughts", "chunks", "both"], default="both")
+    ap.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Skip this many candidates after the target query and before --limit.",
+    )
     ap.add_argument("--limit", type=int)
+    ap.add_argument(
+        "--ids-file",
+        type=Path,
+        help="Process only target_kind/id pairs listed in this JSONL or two-column file.",
+    )
+    ap.add_argument(
+        "--dump-candidates",
+        type=Path,
+        help="Write the selected candidates as target_kind/id JSONL before encoding.",
+    )
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--denylist", type=Path, default=DEFAULT_DENYLIST)
     ap.add_argument("--require-denylist-sha-prefix", default="a9d0fae5")
     ap.add_argument("--progress", type=Path, default=Path("artifacts/bge-m3-sparsevec-backfill-progress.jsonl"))
+    ap.add_argument("--cap-events", type=Path)
+    ap.add_argument("--cap-alarm-log", type=Path)
+    ap.add_argument("--cap-alarm-batch-rate", type=float, default=DEFAULT_CAP_ALARM_BATCH_RATE)
+    ap.add_argument("--cap-alarm-batch-min-size", type=int, default=DEFAULT_CAP_ALARM_BATCH_MIN_SIZE)
+    ap.add_argument("--cap-alarm-cumulative-rate", type=float, default=DEFAULT_CAP_ALARM_CUMULATIVE_RATE)
+    ap.add_argument(
+        "--cap-alarm-cumulative-min-processed",
+        type=int,
+        default=DEFAULT_CAP_ALARM_CUMULATIVE_MIN_PROCESSED,
+    )
+    ap.add_argument("--cap-alarm-alert-command")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
+    if args.offset < 0:
+        raise SystemExit("offset must be non-negative")
+    if args.limit is not None and args.limit < 1:
+        raise SystemExit("limit must be positive when provided")
+    if args.ids_file and not args.ids_file.exists():
+        raise SystemExit(f"ids-file does not exist: {args.ids_file}")
+    if args.cap_alarm_batch_rate < 0 or args.cap_alarm_cumulative_rate < 0:
+        raise SystemExit("cap alarm rates must be non-negative")
+    if args.cap_alarm_batch_min_size < 1 or args.cap_alarm_cumulative_min_processed < 1:
+        raise SystemExit("cap alarm minimum sample sizes must be positive")
+    args.cap_events = args.cap_events or default_jsonl_sidecar(args.progress, "cap-events")
+    args.cap_alarm_log = args.cap_alarm_log or default_jsonl_sidecar(args.progress, "cap-alarm")
 
     denied_ids, denylist_sha = load_denylist(args.denylist, args.require_denylist_sha_prefix)
     assert_schema(args.db_url)
+    append_jsonl(
+        args.cap_alarm_log,
+        {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "sparse_cap_alarm_config",
+            "status": "armed",
+            "thresholds": cap_alarm_config(args),
+            "cap_events": str(args.cap_events),
+            "progress": str(args.progress),
+        },
+    )
 
     targets = ["thoughts", "chunks"] if args.target == "both" else [args.target]
     docs: list[dict[str, Any]] = []
     per_target_limit = args.limit if len(targets) == 1 else None
     for target in targets:
         docs.extend(fetch_docs(args.db_url, target, denied_ids, per_target_limit))
+    fetched_docs_count = len(docs)
+    docs = apply_candidate_ids(docs, args.ids_file)
+    if args.offset:
+        docs = docs[args.offset :]
     if args.limit and len(targets) > 1:
         docs = docs[: args.limit]
+    if args.dump_candidates:
+        dump_candidate_ids(args.dump_candidates, docs)
 
     if args.dry_run:
-        print(json.dumps({"dry_run": True, "candidate_count": len(docs), "first_ids": [d["id"] for d in docs[:5]]}))
+        print(
+            json.dumps(
+                {
+                    "dry_run": True,
+                    "candidate_count": len(docs),
+                    "fetched_candidate_count": fetched_docs_count,
+                    "ids_file": str(args.ids_file) if args.ids_file else None,
+                    "offset": args.offset,
+                    "limit": args.limit,
+                    "dump_candidates": str(args.dump_candidates)
+                    if args.dump_candidates
+                    else None,
+                    "first_ids": [d["id"] for d in docs[:5]],
+                }
+            )
+        )
         return 0
 
     from FlagEmbedding import BGEM3FlagModel
@@ -317,16 +577,66 @@ def main() -> int:
         "generator_version": generator_version,
         "device": "mps",
         "denylist_sha256": denylist_sha,
+        "ids_file": str(args.ids_file) if args.ids_file else None,
+        "candidate_offset": args.offset,
+        "candidate_limit": args.limit,
     }
 
     started = time.time()
     processed = 0
+    capped_rows_total = 0
+    dropped_nonzero_total = 0
+    max_original_nonzero_count = 0
     for batch_no, batch in enumerate(chunks(docs, args.batch_size), start=1):
         t0 = time.time()
         encoded = encode_sparse(model, batch, args.batch_size)
+        batch_cap_metadata = [row[2] for row in encoded]
+        capped_rows_batch = sum(1 for row in batch_cap_metadata if row["sparse_cap_applied"])
+        dropped_nonzero_batch = sum(row["sparse_dropped_nonzero_count"] for row in batch_cap_metadata)
+        batch_max_original = max(
+            (row["sparse_original_nonzero_count"] for row in batch_cap_metadata),
+            default=0,
+        )
+        for event in capped_row_events(batch_no, batch, encoded):
+            append_jsonl(args.cap_events, event)
+        alarm = build_cap_alarm(
+            args,
+            batch_no,
+            len(batch),
+            capped_rows_batch,
+            processed,
+            capped_rows_total,
+        )
+        if alarm:
+            alarm["alert"] = run_alarm_alert_command(args.cap_alarm_alert_command, alarm)
+            append_jsonl(args.cap_alarm_log, alarm)
+            append_jsonl(
+                args.progress,
+                {
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "batch_no": batch_no,
+                    "batch_size": len(batch),
+                    "processed": processed,
+                    "total": len(docs),
+                    "fetched_candidate_count": fetched_docs_count,
+                    "ids_file": str(args.ids_file) if args.ids_file else None,
+                    "candidate_offset": args.offset,
+                    "candidate_limit": args.limit,
+                    "halted": True,
+                    "halt_reason": "sparse_cap_alarm",
+                    "alarm_log": str(args.cap_alarm_log),
+                    "cap_events": str(args.cap_events),
+                    "alarm": alarm,
+                },
+            )
+            print(json.dumps({"ok": False, "halted": True, "alarm": alarm}), file=sys.stderr)
+            return CAP_ALARM_EXIT_CODE
         write_batch(args.db_url, batch, encoded, generator_version, producer_metadata)
+        capped_rows_total += capped_rows_batch
+        dropped_nonzero_total += dropped_nonzero_batch
+        max_original_nonzero_count = max(max_original_nonzero_count, batch_max_original)
         processed += len(batch)
-        append_progress(
+        append_jsonl(
             args.progress,
             {
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -334,13 +644,51 @@ def main() -> int:
                 "batch_size": len(batch),
                 "processed": processed,
                 "total": len(docs),
+                "fetched_candidate_count": fetched_docs_count,
+                "ids_file": str(args.ids_file) if args.ids_file else None,
+                "candidate_offset": args.offset,
+                "candidate_limit": args.limit,
                 "batch_elapsed_s": round(time.time() - t0, 3),
                 "rate_per_hour": round(processed / max(1.0, time.time() - started) * 3600, 2),
                 "denylist_sha256": denylist_sha,
+                "sparse_cap_limit": SPARSEVEC_INDEX_MAX_NONZERO,
+                "sparse_cap_rule": "top_abs_weight",
+                "capped_rows_batch": capped_rows_batch,
+                "capped_rows_cumulative": capped_rows_total,
+                "dropped_nonzero_batch": dropped_nonzero_batch,
+                "dropped_nonzero_cumulative": dropped_nonzero_total,
+                "max_original_nonzero_count_batch": batch_max_original,
+                "max_original_nonzero_count_cumulative": max_original_nonzero_count,
+                "cap_events": str(args.cap_events),
+                "cap_alarm_log": str(args.cap_alarm_log),
+                "cap_alarm_thresholds": cap_alarm_config(args),
             },
         )
 
-    print(json.dumps({"ok": True, "processed": processed, "total": len(docs), "denylist_sha256": denylist_sha}))
+    cap_fraction = capped_rows_total / processed if processed else 0.0
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "processed": processed,
+                "total": len(docs),
+                "fetched_candidate_count": fetched_docs_count,
+                "ids_file": str(args.ids_file) if args.ids_file else None,
+                "candidate_offset": args.offset,
+                "candidate_limit": args.limit,
+                "denylist_sha256": denylist_sha,
+                "sparse_cap_limit": SPARSEVEC_INDEX_MAX_NONZERO,
+                "sparse_cap_rule": "top_abs_weight",
+                "capped_rows": capped_rows_total,
+                "cap_fraction": cap_fraction,
+                "dropped_nonzero_count": dropped_nonzero_total,
+                "max_original_nonzero_count": max_original_nonzero_count,
+                "cap_events": str(args.cap_events),
+                "cap_alarm_log": str(args.cap_alarm_log),
+                "cap_alarm_thresholds": cap_alarm_config(args),
+            }
+        )
+    )
     return 0
 
 

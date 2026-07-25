@@ -1,0 +1,38 @@
+[server]
+bind = "127.0.0.1:8098"
+allowed_hosts = ["localhost","127.0.0.1","::1","localhost:8098","127.0.0.1:8098"]
+
+[database]
+url = "postgres://kengram:kengram@127.0.0.1:5432/kengram_prod"
+max_connections = 10
+
+[embedder]
+provider = "openai-compatible"
+endpoint = "http://127.0.0.1:11434/v1"
+model = "bge-m3"
+model_id = "bge-m3:1024"
+dimensions = 1024
+timeout_seconds = 30
+
+[worker]
+tick_interval_seconds = 5
+batch_size = 1
+
+[search]
+chunk_serving_enabled = false
+
+[reranker]
+provider = "tei"
+endpoint = "http://127.0.0.1:8097"
+model_id = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+timeout_seconds = 30
+
+[tagger]
+provider = ""
+endpoint = "http://localhost:8000/v1"
+model_name = "qwen3-coder:30b"
+model_id = "vllm/qwen3-coder:30b"
+timeout_seconds = 60
+temperature = 0.2
+scope_vocab_enabled = true
+scope_vocab_size = 50

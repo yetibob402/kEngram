@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.yetiwks.kengram-mlx-reranker</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/yetibob/argus/neo/artifacts/kengram-mlx-rerank-spike-20260624/.venv/bin/python</string>
+    <string>/Users/yetibob/argus/kengram/services/mlx-reranker/mlx_minilm_reranker_service.py</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>8097</string>
+    <string>--max-batch-size</string>
+    <string>32</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/yetibob/argus/kengram</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <key>MLX_METAL_MEMORY_BUDGET</key>
+    <string>8589934592</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/yetibob/argus/kengram/logs/mlx-reranker.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/yetibob/argus/kengram/logs/mlx-reranker.err.log</string>
+</dict>
+</plist>

@@ -779,6 +779,66 @@ function writeSessionMetrics(stats, info, startedAt) {
   return metrics;
 }
 
+// ---------------------------------------------------------------------------
+// once-run deadline (lane a2a-consumer-dlq)
+//
+// launchd StartInterval is 60s and will NOT start a new instance while the old
+// one lives, so ONE unresolved await freezes the whole lane: metrics stop
+// advancing, staleness fires, and nothing anywhere reports an error.
+//
+// Every NAMED external call here is already bounded - embed 500ms via
+// AbortController (the body read is inside the guard), gate statement_timeout
+// 400ms, NATS connect 8s, fetch expires 5s. The wedge lives in the UNBOUNDED
+// post-connect NATS awaits: jetstreamManager, ensureStream, consumers.get,
+// consumers.info, and drain() in the finally block. drain is the prime suspect -
+// the client is built reconnect:false /
+// maxReconnectAttempts:0, so a half-open connection leaves drain awaiting a
+// flush that can never complete, forever, with the socket still ESTABLISHED.
+//
+// TWO LAYERS ON PURPOSE:
+//   withDeadline()   names WHICH call hung, so the next incident is diagnosable.
+//   process watchdog the guarantee. It covers calls nobody wrapped - including
+//                    ones added later - and is what makes a wedge EXIT rather
+//                    than sit. Same fail-loud doctrine as the coverage watcher:
+//                    a hung run and a healthy quiet run must not look alike.
+//
+// Swept across BOTH once-path lanes (session and a2a), not just the one that
+// bit: they share the identical unguarded shape. FIVE wrapped per lane.
+//
+// NOT wrapped, deliberately (neo PR55 r1 correction): consumer.fetch() and the
+// `for await` iteration. Installed NATS 2.29.3 PullConsumerImpl.fetch() already
+// arms a client timer at round(expires * 1.05) and closes the iterator when it
+// fires, so iteration is library-bounded; fetch() itself resolves immediately.
+// An earlier revision wrapped fetch() and CLAIMED that bounded iteration - it did
+// not, it wrapped an already-resolved promise. Do not re-add it: wrapping what the
+// library already bounds buys nothing and misreports where the boundary is. If a
+// separate iteration deadline is ever wanted, arm THAT boundary and test it.
+const ONCE_DEADLINE_MS = Number(process.env.KENGRAM_CONSUMER_ONCE_DEADLINE_MS || 45000);
+const NATS_CALL_DEADLINE_MS = Number(process.env.KENGRAM_CONSUMER_NATS_CALL_DEADLINE_MS || 10000);
+// exit codes in use: 0 ok, 1 fatal, 2 missing --once, 3 wrapper env perms.
+const EXIT_DEADLINE = 4;
+
+class DeadlineError extends Error {
+  constructor(label, ms) {
+    super(`deadline exceeded: ${label} did not settle within ${ms}ms`);
+    this.name = "DeadlineError";
+    this.error_class = "once_deadline_exceeded";
+    this.label = label;
+    this.deadline_ms = ms;
+  }
+}
+
+// Races a promise against a timer. The underlying promise is NOT cancellable -
+// deliberate: the point is to stop WAITING on it so the process can exit loudly,
+// not to pretend the socket was cleaned up.
+function withDeadline(promise, ms, label) {
+  let timer;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new DeadlineError(label, ms)), ms);
+  });
+  return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
+}
+
 async function runSessionOnce() {
   const startedAt = Date.now();
   const stats = sessionStats();
@@ -793,11 +853,12 @@ async function runSessionOnce() {
     ...(CONFIG.natsToken ? { user: CONFIG.natsUser, pass: CONFIG.natsToken } : {}),
   });
   let info = null;
+  let bodyErr = null;
   try {
-    const jsm = await nc.jetstreamManager();
-    await ensureSessionStream(jsm);
+    const jsm = await withDeadline(nc.jetstreamManager(), NATS_CALL_DEADLINE_MS, "nats.jetstreamManager");
+    await withDeadline(ensureSessionStream(jsm), NATS_CALL_DEADLINE_MS, "nats.ensureSessionStream");
     const js = nc.jetstream();
-    const consumer = await js.consumers.get(CONFIG.sessionStream, CONFIG.sessionDurable);
+    const consumer = await withDeadline(js.consumers.get(CONFIG.sessionStream, CONFIG.sessionDurable), NATS_CALL_DEADLINE_MS, "nats.consumers.get");
     const iter = await consumer.fetch({
       max_messages: CONFIG.sessionBatch,
       expires: CONFIG.sessionFetchExpiresMs,
@@ -807,12 +868,40 @@ async function runSessionOnce() {
       await processSessionMessage(msg, stats);
     }
     try {
-      info = await jsm.consumers.info(CONFIG.sessionStream, CONFIG.sessionDurable);
-    } catch (_) {
+      info = await withDeadline(jsm.consumers.info(CONFIG.sessionStream, CONFIG.sessionDurable), NATS_CALL_DEADLINE_MS, "nats.consumers.info");
+    } catch (e) {
+      // neo PR55 r2 blocker 2: best-effort stays for ORDINARY info errors (the census
+      // is observability and must not fail an otherwise good run), but a DeadlineError
+      // landing here became `info = null` and the wedged run exited 0 - the fail-loud
+      // contract undone by a pre-existing catch. Same swallow class as the r1 drain
+      // defect, one site further down the same function. Deadlines propagate.
+      if (e instanceof DeadlineError) throw e;
       info = null;
     }
+  } catch (e) {
+    bodyErr = e;
+    throw e;
   } finally {
-    await nc.drain();
+    // neo PR55 r1 blocker 1: this was `.catch()`-ed to undefined, which resolved the
+    // failed cleanup - so on the PRIME SUSPECT wedge the run fulfilled, the watchdog
+    // cleared, and the CLI exited 0. A failure path that reports success is the same
+    // defect shape as an alarm that reports "sent" without checking its return code.
+    //
+    // Policy: a drain deadline IS the failure when nothing else failed, so it must
+    // propagate and take the loud nonzero exit naming "nats.drain". When the body
+    // already failed, the body error stays primary and drain is logged only - a
+    // cleanup fault must never MASK the fault that caused it.
+    try {
+      await withDeadline(nc.drain(), NATS_CALL_DEADLINE_MS, "nats.drain");
+    } catch (drainErr) {
+      if (bodyErr) {
+        console.error(
+          `[argus-kengram-consumer] drain did not settle after a body error: ${drainErr.message}`
+        );
+      } else {
+        throw drainErr;
+      }
+    }
   }
   const metrics = writeSessionMetrics(stats, info, startedAt);
   console.log(
@@ -1217,11 +1306,12 @@ async function runA2AOnce() {
     ...(CONFIG.natsToken ? { user: CONFIG.natsUser, pass: CONFIG.natsToken } : {}),
   });
   let info = null;
+  let bodyErr = null;
   try {
-    const jsm = await nc.jetstreamManager();
-    await ensureA2AStream(jsm);
+    const jsm = await withDeadline(nc.jetstreamManager(), NATS_CALL_DEADLINE_MS, "nats.jetstreamManager");
+    await withDeadline(ensureA2AStream(jsm), NATS_CALL_DEADLINE_MS, "nats.ensureA2AStream");
     const js = nc.jetstream();
-    const consumer = await js.consumers.get(CONFIG.a2aStream, CONFIG.a2aDurable);
+    const consumer = await withDeadline(js.consumers.get(CONFIG.a2aStream, CONFIG.a2aDurable), NATS_CALL_DEADLINE_MS, "nats.consumers.get");
     const iter = await consumer.fetch({
       max_messages: CONFIG.a2aBatch,
       expires: CONFIG.a2aFetchExpiresMs,
@@ -1231,12 +1321,40 @@ async function runA2AOnce() {
       await processA2AMessage(msg, stats);
     }
     try {
-      info = await jsm.consumers.info(CONFIG.a2aStream, CONFIG.a2aDurable);
-    } catch (_) {
+      info = await withDeadline(jsm.consumers.info(CONFIG.a2aStream, CONFIG.a2aDurable), NATS_CALL_DEADLINE_MS, "nats.consumers.info");
+    } catch (e) {
+      // neo PR55 r2 blocker 2: best-effort stays for ORDINARY info errors (the census
+      // is observability and must not fail an otherwise good run), but a DeadlineError
+      // landing here became `info = null` and the wedged run exited 0 - the fail-loud
+      // contract undone by a pre-existing catch. Same swallow class as the r1 drain
+      // defect, one site further down the same function. Deadlines propagate.
+      if (e instanceof DeadlineError) throw e;
       info = null;
     }
+  } catch (e) {
+    bodyErr = e;
+    throw e;
   } finally {
-    await nc.drain();
+    // neo PR55 r1 blocker 1: this was `.catch()`-ed to undefined, which resolved the
+    // failed cleanup - so on the PRIME SUSPECT wedge the run fulfilled, the watchdog
+    // cleared, and the CLI exited 0. A failure path that reports success is the same
+    // defect shape as an alarm that reports "sent" without checking its return code.
+    //
+    // Policy: a drain deadline IS the failure when nothing else failed, so it must
+    // propagate and take the loud nonzero exit naming "nats.drain". When the body
+    // already failed, the body error stays primary and drain is logged only - a
+    // cleanup fault must never MASK the fault that caused it.
+    try {
+      await withDeadline(nc.drain(), NATS_CALL_DEADLINE_MS, "nats.drain");
+    } catch (drainErr) {
+      if (bodyErr) {
+        console.error(
+          `[argus-kengram-consumer] drain did not settle after a body error: ${drainErr.message}`
+        );
+      } else {
+        throw drainErr;
+      }
+    }
   }
   const metrics = writeA2AMetrics(stats, info, startedAt);
   console.log(
@@ -1296,6 +1414,10 @@ module.exports = {
   processA2AMessage,
   runA2AOnce,
   run,
+  withDeadline,
+  DeadlineError,
+  ONCE_DEADLINE_MS,
+  EXIT_DEADLINE,
   baseAdapter,
   sessionAdapter,
 };
@@ -1305,11 +1427,34 @@ if (require.main === module) {
     console.error("[argus-kengram-consumer] pass --once; launchd owns cadence");
     process.exit(2);
   }
+  // NOT unref'd - this timer is the whole point, it must be able to fire.
+  const watchdog = setTimeout(() => {
+    console.error(
+      `[argus-kengram-consumer] FATAL error_class=once_deadline_exceeded ` +
+        `deadline_ms=${ONCE_DEADLINE_MS} - run did not complete; exiting nonzero so ` +
+        `launchd can start a fresh cycle instead of waiting on a wedged one`
+    );
+    process.exit(EXIT_DEADLINE);
+  }, ONCE_DEADLINE_MS);
   run()
-    .then(() => process.exit(0))
+    .then(() => {
+      clearTimeout(watchdog);
+      process.exit(0);
+    })
     .catch((err) => {
+      clearTimeout(watchdog);
       const c = classifyError(err);
-      console.error(`[argus-kengram-consumer] FATAL error_class=${c.error_class}`);
-      process.exit(1);
+      // neo PR55 r2 blocker 3: the label was computed at every call site and then
+      // DISCARDED here, so every deadline printed the identical string and named
+      // nothing. The label is the whole diagnostic payload - it is what tells the next
+      // incident WHICH call hung, and it is the receipt that the deadline fired on a
+      // real wedge rather than the global watchdog.
+      console.error(
+        `[argus-kengram-consumer] FATAL error_class=${c.error_class}` +
+          (err instanceof DeadlineError
+            ? ` label=${err.label} deadline_ms=${err.deadline_ms}`
+            : "")
+      );
+      process.exit(err instanceof DeadlineError ? EXIT_DEADLINE : 1);
     });
 }

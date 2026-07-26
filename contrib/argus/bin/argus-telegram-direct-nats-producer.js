@@ -461,6 +461,25 @@ function normalizeRecord(record) {
   return { ...record, agent, chat_id: chatId, message_id: messageId, dedupe_key: dedupeKey };
 }
 
+// Sort key only: never throws. Invalid/missing times sort after valid ones so
+// buildWindows can hand windows to processWindow, where fail-closed timestamp
+// errors enter the existing attempt/DLQ/quarantine path (not file_error).
+function sourceTimeMsForSort(record, now) {
+  try {
+    const ms = Date.parse(tsOf(record, now));
+    return Number.isFinite(ms) ? ms : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function assertWindowSourceTimes(window, now) {
+  const records = (window && window.records) || [];
+  for (const record of records) {
+    tsOf(record, now);
+  }
+}
+
 function buildWindows(records, maxRecordsPerWindow = 12, now) {
   const groups = new Map();
   for (const record of records) {
@@ -471,8 +490,13 @@ function buildWindows(records, maxRecordsPerWindow = 12, now) {
   const windows = [];
   for (const [key, group] of groups.entries()) {
     group.sort((a, b) => {
-      const ta = Date.parse(tsOf(a, now));
-      const tb = Date.parse(tsOf(b, now));
+      const ta = sourceTimeMsForSort(a, now);
+      const tb = sourceTimeMsForSort(b, now);
+      if (ta == null && tb == null) {
+        return Number(messageIdOf(a)) - Number(messageIdOf(b));
+      }
+      if (ta == null) return 1;
+      if (tb == null) return -1;
       if (ta !== tb) return ta - tb;
       return Number(messageIdOf(a)) - Number(messageIdOf(b));
     });
@@ -992,6 +1016,10 @@ async function processWindow(config, window, seen, deps, attempts, context, dept
 
   let envelope = existing && existing.envelope;
   try {
+    // Validate represented source times inside processWindow so timestamp-class
+    // failures hit recordWindowAttempt / held DLQ / poison quarantine, not the
+    // buildWindows sort path (which must remain non-throwing).
+    assertWindowSourceTimes(window);
     if (envelope && existing.payload_sha256 && envelope.payload_sha256 !== existing.payload_sha256) {
       throw Object.assign(new Error("seen envelope payload hash mismatch"), { error_class: "seen_payload_mismatch" });
     }
@@ -1204,6 +1232,7 @@ async function runOnce(config = buildConfig(), overrides = {}) {
 module.exports = {
   PRODUCER,
   TIMESTAMP_ERROR_CLASSES,
+  POISON_ATTEMPTS,
   errorMessage,
   errorClass,
   buildDlqRow,
@@ -1219,6 +1248,8 @@ module.exports = {
   tsOf,
   windowSourceRef,
   normalizeRecord,
+  sourceTimeMsForSort,
+  assertWindowSourceTimes,
   buildWindows,
   buildEnvelope,
   validateEnvelope,
@@ -1231,6 +1262,8 @@ module.exports = {
   pruneAttemptState,
   seedCurrentEof,
   assertLiveSeed,
+  processWindow,
+  processFile,
   runOnce,
 };
 

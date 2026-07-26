@@ -298,6 +298,130 @@ check("telegram: present-empty/null/undefined stronger fields fail closed (no de
   );
 });
 
+checkAsync("telegram: invalid timestamp uses processWindow attempt/DLQ/quarantine (not file_error)", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kengram-tp-tg-attempt-"));
+  const config = {
+    producer: telegram.PRODUCER,
+    dlqFile: path.join(tmp, "dlq.jsonl"),
+    poisonFile: path.join(tmp, "poison.jsonl"),
+    seenFile: path.join(tmp, "seen.json"),
+    attemptsFile: path.join(tmp, "attempts.json"),
+    dryRun: true,
+    subjectPrefix: "ingest.telegram",
+    maxRecordsPerWindow: 12,
+    maxSummaryTokens: 24000,
+  };
+  const validOlder = {
+    agent: "smith",
+    chat_id: "42",
+    message_id: "1",
+    dedupe_key: "telegram:smith:42:1",
+    capture_ts: OLD_2025,
+  };
+  const validNewer = {
+    agent: "smith",
+    chat_id: "42",
+    message_id: "2",
+    dedupe_key: "telegram:smith:42:2",
+    capture_ts: NEWEST,
+  };
+  const invalid = {
+    agent: "smith",
+    chat_id: "42",
+    message_id: "3",
+    dedupe_key: "telegram:smith:42:3",
+    capture_ts: "not-a-timestamp",
+  };
+
+  // Window construction must not throw; valid records keep chronological order.
+  const windows = telegram.buildWindows([validNewer, invalid, validOlder], 12, FIXED_NOW);
+  assert.strictEqual(windows.length, 1);
+  assert.deepStrictEqual(
+    windows[0].records.map((r) => r.message_id),
+    ["1", "2", "3"]
+  );
+
+  let summarizeCalls = 0;
+  const deps = {
+    summarizeThread: async () => {
+      summarizeCalls += 1;
+      throw new Error("summarize must not run for timestamp-class failures");
+    },
+    renderBatch: () => "",
+    redactSecrets: (s) => s,
+    js: null,
+    StringCodec: null,
+  };
+  const attempts = {};
+  const seen = {};
+  const context = {
+    file: path.join(tmp, "capture.jsonl"),
+    stateKey: "smith|capture",
+    offset: 0,
+    nextOffset: 300,
+    sourceLineByRef: new Map([
+      [validOlder.dedupe_key, { startByte: 0, endByte: 100 }],
+      [validNewer.dedupe_key, { startByte: 100, endByte: 200 }],
+      [invalid.dedupe_key, { startByte: 200, endByte: 300 }],
+    ]),
+  };
+
+  const poisonLimit = telegram.POISON_ATTEMPTS;
+  assert.ok(poisonLimit >= 2);
+
+  // Held attempts: each advances the attempt counter and writes held DLQ; no publish.
+  for (let n = 1; n < poisonLimit; n += 1) {
+    let err = null;
+    try {
+      await telegram.processWindow(config, windows[0], seen, deps, attempts, context);
+    } catch (e) {
+      err = e;
+    }
+    assert.ok(err, `expected held throw on attempt ${n}`);
+    assert.strictEqual(err.error_class, "invalid_source_created_at");
+    assert.strictEqual(summarizeCalls, 0, "timestamp fail must not reach summarizer");
+    const attemptKeys = Object.keys(attempts);
+    assert.strictEqual(attemptKeys.length, 1);
+    assert.strictEqual(attempts[attemptKeys[0]].attempts, n);
+    assert.strictEqual(attempts[attemptKeys[0]].error_class, "invalid_source_created_at");
+    const dlq = fs.readFileSync(config.dlqFile, "utf8");
+    assert.ok(dlq.includes('"reason":"held"'), "held DLQ receipt required");
+    assert.ok(dlq.includes("invalid_source_created_at"));
+    assert.ok(!fs.existsSync(config.poisonFile), "poison file must not exist before poison limit");
+    const sourceRef = telegram.windowSourceRef("smith", "42", windows[0].records);
+    assert.ok(!seen[sourceRef] || seen[sourceRef].status !== "quarantined");
+  }
+
+  // Final attempt reaches existing quarantine machinery.
+  let finalErr = null;
+  try {
+    await telegram.processWindow(config, windows[0], seen, deps, attempts, context);
+  } catch (e) {
+    finalErr = e;
+  }
+  assert.ok(finalErr);
+  assert.strictEqual(finalErr.error_class, "invalid_source_created_at");
+  assert.strictEqual(summarizeCalls, 0);
+  const sourceRef = telegram.windowSourceRef("smith", "42", windows[0].records);
+  assert.strictEqual(seen[sourceRef].status, "quarantined");
+  assert.strictEqual(seen[sourceRef].error_class, "invalid_source_created_at");
+  const poison = fs.readFileSync(config.poisonFile, "utf8");
+  assert.ok(poison.includes("poison_window") || poison.includes('"reason":"poison_window"'));
+  assert.ok(poison.includes("invalid_source_created_at"));
+  assert.strictEqual(Object.keys(attempts).length, 0, "quarantine clears attempt entry");
+
+  // Replay of quarantined window skips without publish (bounded; not a poison loop).
+  const skip = await telegram.processWindow(config, windows[0], seen, deps, attempts, context);
+  assert.strictEqual(skip.published, 0);
+  assert.strictEqual(skip.skipped, windows[0].records.length);
+
+  try {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  } catch (_) {
+    /* best effort */
+  }
+});
+
 // ---------------------------------------------------------------------------
 // 4. Session/Codex fail-closed classes + session permanent offset + codex continue
 // ---------------------------------------------------------------------------

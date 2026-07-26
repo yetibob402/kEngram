@@ -383,10 +383,30 @@ function throwTimestampError(errorClass) {
   throw Object.assign(new Error(errorClass), { error_class: errorClass });
 }
 
+// ECMAScript TimeClip limit: abs(ms) > 8.64e15 is unrepresentable as Date.
+const MAX_REPRESENTABLE_DATE_MS = 8.64e15;
+
+function isoFromRepresentableMs(ms) {
+  if (!Number.isFinite(ms) || Math.abs(ms) > MAX_REPRESENTABLE_DATE_MS) {
+    throwTimestampError("invalid_source_created_at");
+  }
+  try {
+    const iso = new Date(ms).toISOString();
+    if (typeof iso !== "string" || !Number.isFinite(Date.parse(iso))) {
+      throwTimestampError("invalid_source_created_at");
+    }
+    return iso;
+  } catch (err) {
+    if (err && err.error_class) throw err;
+    throwTimestampError("invalid_source_created_at");
+  }
+}
+
 function finalizeSourceInstant(ms, nowMs) {
   if (!Number.isFinite(ms)) throwTimestampError("invalid_source_created_at");
+  const iso = isoFromRepresentableMs(ms);
   if (ms > nowMs + FUTURE_SKEW_MS) throwTimestampError("future_source_created_at");
-  return new Date(ms).toISOString();
+  return iso;
 }
 
 function parsePresentSourceTime(raw, nowMs) {
@@ -396,17 +416,34 @@ function parsePresentSourceTime(raw, nowMs) {
   let ms;
   if (typeof raw === "number") {
     ms = raw;
-  } else {
-    const s = String(raw).trim();
+  } else if (typeof raw === "string") {
+    const s = raw.trim();
     if (!s) throwTimestampError("invalid_source_created_at");
     ms = Date.parse(s);
+  } else {
+    // Booleans/arrays/objects must not coerce into instants.
+    throwTimestampError("invalid_source_created_at");
   }
   return finalizeSourceInstant(ms, nowMs);
 }
 
 function parsePresentTelegramDate(raw, nowMs) {
+  // Accept only finite number or non-empty numeric string (Unix seconds).
+  // Reject whitespace-only, booleans, arrays, objects (no broad Number() coercion).
   if (raw == null || raw === "") throwTimestampError("invalid_source_created_at");
-  const n = Number(raw);
+  let n;
+  if (typeof raw === "number") {
+    n = raw;
+  } else if (typeof raw === "string") {
+    const s = raw.trim();
+    if (!s) throwTimestampError("invalid_source_created_at");
+    if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(s)) {
+      throwTimestampError("invalid_source_created_at");
+    }
+    n = Number(s);
+  } else {
+    throwTimestampError("invalid_source_created_at");
+  }
   if (!Number.isFinite(n)) throwTimestampError("invalid_source_created_at");
   // Telegram date is Unix seconds.
   return finalizeSourceInstant(n * 1000, nowMs);

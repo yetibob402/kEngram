@@ -22,6 +22,8 @@ const OLD_2025 = "2025-06-15T10:00:00.000Z";
 const MID_2026 = "2026-03-01T08:30:00.000Z";
 const NEWEST = "2026-07-20T18:00:00.000Z";
 const FUTURE = "2026-07-26T12:10:00.000Z"; // +10 min past FIXED_NOW
+// Finite but outside ECMAScript TimeClip (±8.64e15 ms) → unrepresentable Date.
+const OUT_OF_RANGE_MS = -8.64e15 - 1;
 
 let failed = 0;
 let passed = 0;
@@ -295,6 +297,102 @@ check("telegram: present-empty/null/undefined stronger fields fail closed (no de
   assert.strictEqual(
     telegram.tsOf({ normalized_event: { ts: MID_2026 }, capture_ts: NEWEST }, FIXED_NOW),
     MID_2026
+  );
+});
+
+check("session/codex/telegram/adapter: out-of-range finite ms is invalid_source_created_at", () => {
+  const profile = { name: "smith", profilePath: "/tmp/profile" };
+  const sbase = sessionRecords()[0];
+  const cbase = codexRecords()[0];
+
+  expectTimestampError(
+    () =>
+      session.buildEnvelope(
+        profile,
+        "/tmp/s.jsonl",
+        0,
+        10,
+        [{ ...sbase, capture_ts: OUT_OF_RANGE_MS }],
+        emptySummary(),
+        FIXED_NOW
+      ),
+    "invalid_source_created_at"
+  );
+  expectTimestampError(
+    () =>
+      codex.buildEnvelope(
+        "smith",
+        "s",
+        0,
+        1,
+        [{ ...cbase, capture_ts: OUT_OF_RANGE_MS }],
+        emptySummary(),
+        FIXED_NOW
+      ),
+    "invalid_source_created_at"
+  );
+  expectTimestampError(
+    () => telegram.tsOf({ capture_ts: OUT_OF_RANGE_MS }, FIXED_NOW),
+    "invalid_source_created_at"
+  );
+  expectTimestampError(
+    () => adapter.validateSourceCreatedAt(OUT_OF_RANGE_MS, FIXED_NOW),
+    "invalid_source_created_at"
+  );
+
+  // Must not surface as RangeError / unclassified throw.
+  for (const fn of [
+    () => session.parseUsableSourceInstant(OUT_OF_RANGE_MS, FIXED_NOW),
+    () => codex.parseUsableSourceInstant(OUT_OF_RANGE_MS, FIXED_NOW),
+    () => telegram.tsOf({ capture_ts: OUT_OF_RANGE_MS }, FIXED_NOW),
+    () => adapter.validateSourceCreatedAt(OUT_OF_RANGE_MS, FIXED_NOW),
+  ]) {
+    let err = null;
+    try {
+      fn();
+    } catch (e) {
+      err = e;
+    }
+    assert.ok(err);
+    assert.strictEqual(err.error_class, "invalid_source_created_at");
+    assert.notStrictEqual(err.name, "RangeError");
+  }
+});
+
+check("telegram: whitespace/boolean/object telegram_date fail closed without coercion demotion", () => {
+  const weaker = {
+    normalized_event: { ts: MID_2026 },
+    capture_ts: NEWEST,
+  };
+  expectTimestampError(
+    () => telegram.tsOf({ telegram_date: "   ", ...weaker }, FIXED_NOW),
+    "invalid_source_created_at"
+  );
+  expectTimestampError(
+    () => telegram.tsOf({ telegram_date: true, ...weaker }, FIXED_NOW),
+    "invalid_source_created_at"
+  );
+  expectTimestampError(
+    () => telegram.tsOf({ telegram_date: false, ...weaker }, FIXED_NOW),
+    "invalid_source_created_at"
+  );
+  expectTimestampError(
+    () => telegram.tsOf({ telegram_date: [], ...weaker }, FIXED_NOW),
+    "invalid_source_created_at"
+  );
+  expectTimestampError(
+    () => telegram.tsOf({ telegram_date: {}, ...weaker }, FIXED_NOW),
+    "invalid_source_created_at"
+  );
+  // Valid numeric string and number still work.
+  const tdUnix = Math.floor(Date.parse("2026-01-10T09:00:00.000Z") / 1000);
+  assert.strictEqual(
+    telegram.tsOf({ telegram_date: String(tdUnix), capture_ts: NEWEST }, FIXED_NOW),
+    "2026-01-10T09:00:00.000Z"
+  );
+  assert.strictEqual(
+    telegram.tsOf({ telegram_date: tdUnix, capture_ts: NEWEST }, FIXED_NOW),
+    "2026-01-10T09:00:00.000Z"
   );
 });
 

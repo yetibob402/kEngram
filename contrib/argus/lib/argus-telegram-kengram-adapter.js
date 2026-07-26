@@ -55,6 +55,25 @@ function throwTimestampError(errorClass) {
   throw e;
 }
 
+// ECMAScript TimeClip limit: abs(ms) > 8.64e15 is unrepresentable as Date.
+const MAX_REPRESENTABLE_DATE_MS = 8.64e15;
+
+function isoFromRepresentableMs(ms) {
+  if (!Number.isFinite(ms) || Math.abs(ms) > MAX_REPRESENTABLE_DATE_MS) {
+    throwTimestampError("invalid_source_created_at");
+  }
+  try {
+    const iso = new Date(ms).toISOString();
+    if (typeof iso !== "string" || !Number.isFinite(Date.parse(iso))) {
+      throwTimestampError("invalid_source_created_at");
+    }
+    return iso;
+  } catch (err) {
+    if (err && err.error_class) throw err;
+    throwTimestampError("invalid_source_created_at");
+  }
+}
+
 function validateSourceCreatedAt(raw, now) {
   const nowMs = resolveNowMs(now);
   if (raw == null) throwTimestampError("missing_source_created_at");
@@ -68,8 +87,9 @@ function validateSourceCreatedAt(raw, now) {
     ms = Date.parse(s);
   }
   if (!Number.isFinite(ms)) throwTimestampError("invalid_source_created_at");
+  const iso = isoFromRepresentableMs(ms);
   if (ms > nowMs + FUTURE_SKEW_MS) throwTimestampError("future_source_created_at");
-  return new Date(ms).toISOString();
+  return iso;
 }
 
 // ---------------------------------------------------------------------------

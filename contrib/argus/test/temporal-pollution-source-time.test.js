@@ -214,6 +214,90 @@ check("telegram: telegram_date beats later capture_ts; normalized_event.ts beats
   assert.strictEqual(telegram.tsOf(recNorm, FIXED_NOW), MID_2026);
 });
 
+check("telegram: present-empty/null/undefined stronger fields fail closed (no demotion)", () => {
+  // Empty telegram_date is present-invalid; must not demote to normalized_event.ts or capture_ts.
+  expectTimestampError(
+    () =>
+      telegram.tsOf(
+        {
+          telegram_date: "",
+          normalized_event: { ts: MID_2026 },
+          capture_ts: NEWEST,
+        },
+        FIXED_NOW
+      ),
+    "invalid_source_created_at"
+  );
+  expectTimestampError(
+    () =>
+      telegram.tsOf(
+        {
+          telegram_date: null,
+          normalized_event: { ts: MID_2026 },
+          capture_ts: NEWEST,
+        },
+        FIXED_NOW
+      ),
+    "invalid_source_created_at"
+  );
+  expectTimestampError(
+    () =>
+      telegram.tsOf(
+        {
+          telegram_date: undefined,
+          capture_ts: NEWEST,
+        },
+        FIXED_NOW
+      ),
+    "invalid_source_created_at"
+  );
+
+  // Empty normalized_event.ts is present-invalid; must not demote to capture_ts.
+  expectTimestampError(
+    () =>
+      telegram.tsOf(
+        {
+          normalized_event: { ts: "" },
+          capture_ts: NEWEST,
+        },
+        FIXED_NOW
+      ),
+    "invalid_source_created_at"
+  );
+  expectTimestampError(
+    () =>
+      telegram.tsOf(
+        {
+          normalized_event: { ts: null },
+          capture_ts: NEWEST,
+        },
+        FIXED_NOW
+      ),
+    "invalid_source_created_at"
+  );
+  expectTimestampError(
+    () =>
+      telegram.tsOf(
+        {
+          normalized_event: { ts: undefined },
+          capture_ts: NEWEST,
+        },
+        FIXED_NOW
+      ),
+    "invalid_source_created_at"
+  );
+
+  // Absence of stronger keys still allows valid weaker fallback.
+  assert.strictEqual(
+    telegram.tsOf({ capture_ts: NEWEST }, FIXED_NOW),
+    NEWEST
+  );
+  assert.strictEqual(
+    telegram.tsOf({ normalized_event: { ts: MID_2026 }, capture_ts: NEWEST }, FIXED_NOW),
+    MID_2026
+  );
+});
+
 // ---------------------------------------------------------------------------
 // 4. Session/Codex fail-closed classes + session permanent offset + codex continue
 // ---------------------------------------------------------------------------

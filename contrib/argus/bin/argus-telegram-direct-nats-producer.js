@@ -412,15 +412,21 @@ function parsePresentTelegramDate(raw, nowMs) {
   return finalizeSourceInstant(n * 1000, nowMs);
 }
 
+// True when key is own or inherited on obj (distinguishes present-null/empty from absence).
+function fieldPresent(obj, key) {
+  return obj != null && Object(obj) === obj && key in obj;
+}
+
 // Precedence: valid telegram_date → valid normalized_event.ts → valid capture_ts.
 // A present but invalid stronger field fails closed (no demotion, no wall clock).
+// Present includes explicitly empty/null/undefined values; only a missing key demotes.
 function tsOf(record, now) {
   const nowMs = resolveNowMs(now);
   const rec = record || {};
-  if (rec.telegram_date != null && rec.telegram_date !== "") {
+  if (fieldPresent(rec, "telegram_date")) {
     return parsePresentTelegramDate(rec.telegram_date, nowMs);
   }
-  if (rec.normalized_event && rec.normalized_event.ts != null && rec.normalized_event.ts !== "") {
+  if (fieldPresent(rec.normalized_event, "ts")) {
     return parsePresentSourceTime(rec.normalized_event.ts, nowMs);
   }
   if (rec.capture_ts != null && rec.capture_ts !== "") {

@@ -32,6 +32,65 @@ const EMBEDDER_MODEL_ID = process.env.KENGRAM_EMBEDDER_MODEL_ID || "bge-m3:1024"
 const TAGGER_MODEL_ID = process.env.KENGRAM_TAGGER_MODEL_ID || "ollama/gemma3:12b";
 const ADAPTER_VERSION = "trinity-telegram-kengram-adapter-v0.1";
 const TELEGRAM_NAMESPACE = "conversations/telegram-yetiwerks";
+const FUTURE_SKEW_MS = 5 * 60 * 1000;
+
+function resolveNowMs(now) {
+  if (now == null) return Date.now();
+  if (typeof now === "function") return resolveNowMs(now());
+  if (typeof now === "number" && Number.isFinite(now)) return now;
+  if (now instanceof Date) {
+    const ms = now.getTime();
+    if (Number.isFinite(ms)) return ms;
+  }
+  if (typeof now === "string" && now.trim()) {
+    const ms = Date.parse(now);
+    if (Number.isFinite(ms)) return ms;
+  }
+  return Date.now();
+}
+
+function throwTimestampError(errorClass) {
+  const e = new Error(errorClass);
+  e.error_class = errorClass;
+  throw e;
+}
+
+// ECMAScript TimeClip limit: abs(ms) > 8.64e15 is unrepresentable as Date.
+const MAX_REPRESENTABLE_DATE_MS = 8.64e15;
+
+function isoFromRepresentableMs(ms) {
+  if (!Number.isFinite(ms) || Math.abs(ms) > MAX_REPRESENTABLE_DATE_MS) {
+    throwTimestampError("invalid_source_created_at");
+  }
+  try {
+    const iso = new Date(ms).toISOString();
+    if (typeof iso !== "string" || !Number.isFinite(Date.parse(iso))) {
+      throwTimestampError("invalid_source_created_at");
+    }
+    return iso;
+  } catch (err) {
+    if (err && err.error_class) throw err;
+    throwTimestampError("invalid_source_created_at");
+  }
+}
+
+function validateSourceCreatedAt(raw, now) {
+  const nowMs = resolveNowMs(now);
+  if (raw == null) throwTimestampError("missing_source_created_at");
+  if (typeof raw === "string" && raw.trim() === "") throwTimestampError("missing_source_created_at");
+  let ms;
+  if (typeof raw === "number") {
+    ms = raw;
+  } else {
+    const s = String(raw).trim();
+    if (!s) throwTimestampError("missing_source_created_at");
+    ms = Date.parse(s);
+  }
+  if (!Number.isFinite(ms)) throwTimestampError("invalid_source_created_at");
+  const iso = isoFromRepresentableMs(ms);
+  if (ms > nowMs + FUTURE_SKEW_MS) throwTimestampError("future_source_created_at");
+  return iso;
+}
 
 // ---------------------------------------------------------------------------
 // canonicalJson — byte-identical to the producer
@@ -127,7 +186,8 @@ function makePsql(dbUrl) {
 // The argus.ingest.v1 branch normalizes the envelope then recurses.
 // payload:null / missing payload is rejected (compact kept out of write path).
 // ---------------------------------------------------------------------------
-function validate(record) {
+function validate(record, options) {
+  options = options || {};
   if (record.schema_version === "argus.ingest.v1") {
     if (record.source_kind !== "telegram") throw new Error("unsupported source_kind: " + record.source_kind);
     if (record.namespace !== TELEGRAM_NAMESPACE) {
@@ -165,6 +225,7 @@ function validate(record) {
         throw e;
       }
     }
+    const sourceCreatedAt = validateSourceCreatedAt(record.created_at, options.now);
     const payload = record.payload || {};
     const normalized = {
       namespace: record.namespace,
@@ -197,12 +258,12 @@ function validate(record) {
         message_id: record.message_id,
         session_id: record.session_id,
         batch_id: record.batch_id,
-        created_at: record.created_at,
+        created_at: sourceCreatedAt,
         published_at: record.published_at,
       },
       provenance: record.provenance || {},
     };
-    return validate(normalized);
+    return validate(normalized, options);
   }
 
   const required = ["namespace", "source_ref", "topic_key", "kind", "author", "summary"];
@@ -219,8 +280,8 @@ function validate(record) {
 }
 
 // Alias retained for callers preferring normalize() naming.
-function normalize(record) {
-  return validate(record);
+function normalize(record, options) {
+  return validate(record, options);
 }
 
 function stringList(record, key) {
@@ -319,6 +380,12 @@ function markConflict(psql, record, payloadHash, priorHash, dlqPath) {
 function storeRecord(psql, record, payloadHash) {
   const content = buildThoughtContent(record);
   const scope = scopeFor(record);
+  const createdAt =
+    record.envelope && record.envelope.created_at
+      ? validateSourceCreatedAt(record.envelope.created_at)
+      : (() => {
+          throwTimestampError("missing_source_created_at");
+        })();
   const metadata = {
     adapter_version: ADAPTER_VERSION,
     namespace: record.namespace,
@@ -350,8 +417,8 @@ function storeRecord(psql, record, payloadHash) {
 "VALUES (" + sqlString(record.namespace) + ", " + sqlString(record.source_ref) + ", " + sqlString(payloadHash) + ", 'pending', " + sqlString(JSON.stringify(metadata)) + "::jsonb);\n" +
 "\n" +
 "WITH upserted AS (\n" +
-"  INSERT INTO thoughts (scope, content, source, metadata, content_fingerprint)\n" +
-"  VALUES (" + sqlString(scope) + ", " + sqlString(content) + ", 'telegram-batcher', " + sqlString(JSON.stringify(metadata)) + "::jsonb, digest(" + sqlString(content) + ", 'sha256'))\n" +
+"  INSERT INTO thoughts (scope, content, source, metadata, content_fingerprint, created_at)\n" +
+"  VALUES (" + sqlString(scope) + ", " + sqlString(content) + ", 'telegram-batcher', " + sqlString(JSON.stringify(metadata)) + "::jsonb, digest(" + sqlString(content) + ", 'sha256'), " + sqlString(createdAt) + "::timestamptz)\n" +
 "  ON CONFLICT (content_fingerprint) DO UPDATE SET metadata = thoughts.metadata\n" +
 "  RETURNING id\n" +
 "),\n" +
@@ -393,7 +460,7 @@ function processRecord(record, options) {
   const psql = options.psql || makePsql(options.dbUrl); // makePsql enforces dbUrl
   const dlqPath = options.dlqPath || null;
 
-  const validation = validate(record);
+  const validation = validate(record, options);
   record = validation.record || record;
   if (validation.skip) return { action: "skipped", reason: validation.reason, source_ref: record.source_ref };
 
@@ -429,6 +496,7 @@ module.exports = {
   errorClass,
   requireDbUrl,
   makePsql,
+  validateSourceCreatedAt,
   validate,
   normalize,
   buildThoughtContent,

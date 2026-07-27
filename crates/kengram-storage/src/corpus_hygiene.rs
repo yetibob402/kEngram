@@ -23,11 +23,26 @@ use uuid::Uuid;
 /// Serializes tests that mutate process-global capture timeout injectors.
 static CAPTURE_TIMEOUT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// Task-local ownership: injectors only apply on the async task that armed them.
+/// Prevents parallel tests from observing another test's process-global flags.
+tokio::task_local! {
+    static CAPTURE_INJECTOR_TASK_ACTIVE: bool;
+}
+
 /// Acquire exclusive access for injector-backed capture-timeout tests.
 pub fn test_lock_capture_timeout_injectors() -> MutexGuard<'static, ()> {
     CAPTURE_TIMEOUT_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Run `fut` with capture-timeout injectors visible only on this task.
+/// Prefer this over bare arming so default-parallel test runs stay isolated.
+pub async fn with_capture_injectors<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    CAPTURE_INJECTOR_TASK_ACTIVE.scope(true, fut).await
 }
 
 /// Leaves the MCP caller enough of its one-second end-to-end budget to commit
@@ -84,7 +99,11 @@ pub fn test_arm_capture_timeout_injectors() {
 }
 
 fn injectors_armed() -> bool {
-    TEST_INJECTORS_ARMED.load(Ordering::SeqCst)
+    // Must be both globally armed and owned by this async task (parallel-safe).
+    let task_owns = CAPTURE_INJECTOR_TASK_ACTIVE
+        .try_with(|v| *v)
+        .unwrap_or(false);
+    task_owns && TEST_INJECTORS_ARMED.load(Ordering::SeqCst)
 }
 
 pub fn test_clear_capture_timeout_injectors() {

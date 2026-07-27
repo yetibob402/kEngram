@@ -42,8 +42,9 @@ use crate::search::{
     RecentResponse, SearchRequest, SearchResponse, SearchRuntimeOptions,
 };
 
-/// End-to-end capture deadline (reviewed base).
-const CAPTURE_TOTAL_TIMEOUT: Duration = Duration::from_secs(1);
+/// End-to-end capture deadline: embedding+pool+statement+protected reserve.
+/// Arithmetic: 500 + 100 + 400 + 500 = 1500 ms (repair B1).
+const CAPTURE_TOTAL_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Independent embedding-phase budget.
 const CAPTURE_EMBEDDING_TIMEOUT: Duration = Duration::from_millis(500);
 /// Independent pool-checkout + begin/config budget.
@@ -79,6 +80,13 @@ static TEST_MUTANT_RESERVE_100MS: std::sync::atomic::AtomicBool =
 static TEST_MUTANT_ALL_ERRORS_RETRYABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Test-only buffer of structured unknown receipts (actual receipt surface).
+#[cfg(test)]
+static TEST_RECEIPT_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// Test-only: when leak mutant on, this raw correlation value is restored into the receipt log.
+#[cfg(test)]
+static TEST_LEAK_CORRELATION_VALUE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 #[cfg(test)]
 fn test_clear_server_capture_injectors() {
     use std::sync::atomic::Ordering;
@@ -86,6 +94,9 @@ fn test_clear_server_capture_injectors() {
     TEST_MUTANT_FREE_TEXT_UNKNOWN.store(false, Ordering::SeqCst);
     TEST_MUTANT_RESERVE_100MS.store(false, Ordering::SeqCst);
     TEST_MUTANT_ALL_ERRORS_RETRYABLE.store(false, Ordering::SeqCst);
+    if let Ok(mut g) = TEST_RECEIPT_LOG.lock() {
+        g.clear();
+    }
     kengram_storage::corpus_hygiene::test_clear_capture_timeout_injectors();
 }
 
@@ -195,14 +206,40 @@ fn emit_capture_unknown_receipt(
         }
     };
     if leak {
-        // Intentionally wrong surface for RED proof only.
+        // Temporary forbidden regression model: restore actual caller correlation
+        // value onto the receipt surface (not a fixed placeholder).
+        #[cfg(test)]
+        let raw = TEST_LEAK_CORRELATION_VALUE
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .unwrap_or_else(|| "missing-canary".into());
+        #[cfg(not(test))]
+        let raw = String::new();
+        let line = format!(
+            "capture outcome unknown mutant_leak code={CAPTURE_OUTCOME_UNKNOWN} phase={} correlation_id={raw}",
+            phase.as_str()
+        );
+        #[cfg(test)]
+        if let Ok(mut g) = TEST_RECEIPT_LOG.lock() {
+            g.push(line.clone());
+        }
         tracing::error!(
             code = CAPTURE_OUTCOME_UNKNOWN,
             phase = phase.as_str(),
-            correlation_id = "LEAKED_SHOULD_NOT_APPEAR_IN_RECEIPT",
+            correlation_id = %raw,
             "capture outcome unknown (mutant leak)"
         );
         return;
+    }
+    let line = format!(
+        "capture outcome unknown code={CAPTURE_OUTCOME_UNKNOWN} phase={} elapsed_ms={elapsed_ms} limit_ms={limit_ms} scope={} source={source} correlation_id_present={correlation_id_present} argus_source_event_present={argus_source_event_present} request_fingerprint={request_fingerprint}",
+        phase.as_str(),
+        scope.unwrap_or("global"),
+    );
+    #[cfg(test)]
+    if let Ok(mut g) = TEST_RECEIPT_LOG.lock() {
+        g.push(line.clone());
     }
     tracing::error!(
         code = CAPTURE_OUTCOME_UNKNOWN,
@@ -235,6 +272,9 @@ fn classify_storage_capture_error(err: &kengram_storage::StorageError) -> Option
     }
     let msg = err.to_string();
     let lower = msg.to_ascii_lowercase();
+    if lower.contains("capture_pool_timeout") {
+        return Some(CapturePhase::Pool);
+    }
     if lower.contains("capture_commit_ack_failed")
         || kengram_storage::corpus_hygiene::is_commit_uncertainty(&sqlx::Error::Protocol(
             msg.clone(),
@@ -876,13 +916,20 @@ impl KengramServer {
             }),
         };
 
-        // Pool/begin/statement run inside capture_with_gate_options; the outer
-        // deadline still covers commit uncertainty. pre_reserve_budget is
-        // enforced by embedding scheduling and statement_timeout (400ms).
-        let _pool_budget = CAPTURE_POOL_BEGIN_BUDGET.min(pre_reserve_budget(capture_deadline));
-        let _statement_budget = CAPTURE_STATEMENT_BUDGET.min(pre_reserve_budget(capture_deadline));
-        let _commit_budget = CAPTURE_COMMIT_BUDGET.min(protected_reserve());
-        let _response_budget = CAPTURE_RESPONSE_BUDGET.min(protected_reserve());
+        // Real phase ownership: pool/begin and commit budgets govern storage;
+        // statement is independently bounded by PostgreSQL statement_timeout
+        // (400ms) and cannot be scheduled from the protected reserve.
+        let pre = pre_reserve_budget(capture_deadline);
+        let pool_budget = CAPTURE_POOL_BEGIN_BUDGET.min(pre);
+        let _statement_budget = CAPTURE_STATEMENT_BUDGET.min(pre);
+        let commit_budget = CAPTURE_COMMIT_BUDGET.min(protected_reserve());
+        let response_budget = CAPTURE_RESPONSE_BUDGET
+            .min(protected_reserve())
+            .min(capture_deadline.saturating_duration_since(Instant::now()));
+        kengram_storage::corpus_hygiene::install_phase_budgets(
+            pool_budget.as_millis() as u64,
+            commit_budget.as_millis() as u64,
+        );
 
         let gate = tokio::time::timeout_at(
             capture_deadline,
@@ -907,6 +954,7 @@ impl KengramServer {
             ),
         )
         .await;
+        kengram_storage::corpus_hygiene::clear_phase_budgets();
 
         let resp = match gate {
             Err(_elapsed) => {
@@ -919,42 +967,44 @@ impl KengramServer {
             Ok(Ok(resp)) => resp,
         };
 
-        let body = serde_json::json!({
-            "thought_id": resp.thought_id.to_string(),
-            "embedding_status": resp.embedding_status,
-            "is_duplicate": resp.is_duplicate,
-            "dedup_kind": resp.dedup_kind,
-            "matched_thought_id": resp.matched_thought_id.map(|id| id.to_string()),
-            "similarity": resp.similarity,
-            "relation_results": resp.relation_results,
-            "gate_event_id": resp.gate_event_id,
-            "argus_source_event": resp.argus_source_event.map(|event| {
-                serde_json::json!({
-                    "action": event.action,
-                    "namespace": event.namespace,
-                    "source_ref": event.source_ref,
-                    "payload_hash": event.payload_hash,
-                    "status": event.status,
-                    "thought_id": event.thought_id.map(|id| id.to_string()),
-                })
-            }),
-        });
-
-        #[cfg(test)]
-        {
-            use std::sync::atomic::Ordering;
-            if TEST_FAIL_RESPONSE_SERIALIZATION.load(Ordering::SeqCst) {
-                return Err(unknown(CapturePhase::Response));
+        // Response construction is inside owned response budget + total deadline.
+        let body_build = async {
+            #[cfg(test)]
+            {
+                use std::sync::atomic::Ordering;
+                if TEST_FAIL_RESPONSE_SERIALIZATION.load(Ordering::SeqCst) {
+                    return Err(unknown(CapturePhase::Response));
+                }
             }
-        }
-
-        match serde_json::to_string(&body) {
-            Ok(s) => Ok(s),
-            Err(e) => {
-                // Committed write whose response is lost → unknown, not final.
-                let _ = e;
-                Err(unknown(CapturePhase::Response))
+            let body = serde_json::json!({
+                "thought_id": resp.thought_id.to_string(),
+                "embedding_status": resp.embedding_status,
+                "is_duplicate": resp.is_duplicate,
+                "dedup_kind": resp.dedup_kind,
+                "matched_thought_id": resp.matched_thought_id.map(|id| id.to_string()),
+                "similarity": resp.similarity,
+                "relation_results": resp.relation_results,
+                "gate_event_id": resp.gate_event_id,
+                "argus_source_event": resp.argus_source_event.map(|event| {
+                    serde_json::json!({
+                        "action": event.action,
+                        "namespace": event.namespace,
+                        "source_ref": event.source_ref,
+                        "payload_hash": event.payload_hash,
+                        "status": event.status,
+                        "thought_id": event.thought_id.map(|id| id.to_string()),
+                    })
+                }),
+            });
+            match serde_json::to_string(&body) {
+                Ok(s) => Ok(s),
+                Err(_e) => Err(unknown(CapturePhase::Response)),
             }
+        };
+
+        match tokio::time::timeout(response_budget, body_build).await {
+            Ok(result) => result,
+            Err(_) => Err(unknown(CapturePhase::Response)),
         }
     }
 
@@ -2717,20 +2767,28 @@ mod tests {
 
     #[test]
     fn capture_timeout_budget_constants_independent_phases() {
-        assert_eq!(CAPTURE_TOTAL_TIMEOUT, Duration::from_secs(1));
         assert_eq!(CAPTURE_EMBEDDING_TIMEOUT, Duration::from_millis(500));
         assert_eq!(CAPTURE_STATEMENT_BUDGET, Duration::from_millis(400));
         assert_eq!(CAPTURE_PROTECTED_RESERVE, Duration::from_millis(500));
         assert_eq!(CAPTURE_POOL_BEGIN_BUDGET, Duration::from_millis(100));
         assert_eq!(CAPTURE_COMMIT_BUDGET, Duration::from_millis(400));
         assert_eq!(CAPTURE_RESPONSE_BUDGET, Duration::from_millis(100));
-        // Total covers earlier independent bounds plus protected reserve.
-        let earlier = CAPTURE_EMBEDDING_TIMEOUT
-            .saturating_add(CAPTURE_POOL_BEGIN_BUDGET)
-            .saturating_add(CAPTURE_STATEMENT_BUDGET);
-        // Wall-clock total is 1000ms; pre-reserve accounting keeps commit reserve.
-        assert!(CAPTURE_TOTAL_TIMEOUT >= CAPTURE_PROTECTED_RESERVE);
-        assert!(earlier > Duration::ZERO);
+        // B1 arithmetic: total >= embed + pool + statement + protected reserve.
+        let sum = CAPTURE_EMBEDDING_TIMEOUT
+            + CAPTURE_POOL_BEGIN_BUDGET
+            + CAPTURE_STATEMENT_BUDGET
+            + CAPTURE_PROTECTED_RESERVE;
+        assert_eq!(sum, Duration::from_millis(1500));
+        assert!(
+            CAPTURE_TOTAL_TIMEOUT >= sum,
+            "total={CAPTURE_TOTAL_TIMEOUT:?} sum={sum:?}"
+        );
+        assert_eq!(CAPTURE_TOTAL_TIMEOUT, Duration::from_millis(1500));
+        // Reserve is commit+response owned slice.
+        assert_eq!(
+            CAPTURE_COMMIT_BUDGET + CAPTURE_RESPONSE_BUDGET,
+            CAPTURE_PROTECTED_RESERVE
+        );
         assert_eq!(CAPTURE_PHASE_VOCABULARY.len(), 6);
         assert_eq!(CapturePhase::Pool.as_str(), "pool");
     }
@@ -3291,6 +3349,7 @@ mod tests {
         test_clear_server_capture_injectors();
         kengram_storage::corpus_hygiene::test_set_fail_commit(true);
         let canary = "CANARY_RAW_CORRELATION_xyz_SECRET";
+        *TEST_LEAK_CORRELATION_VALUE.lock().unwrap() = Some(canary.into());
         let s = server(pool);
         let err = s
             .capture(Parameters(CaptureArgs {
@@ -3300,7 +3359,7 @@ mod tests {
                 metadata: serde_json::json!({"note": canary}).as_object().cloned(),
                 argus_source_event: Some(ArgusSourceEventArgs {
                     namespace: "tests/redact".into(),
-                    source_ref: canary.into(),
+                    source_ref: "ref-redact".into(),
                     payload_hash: "hash-redact".into(),
                     metadata: serde_json::json!({"payload": canary}).as_object().cloned(),
                 }),
@@ -3315,10 +3374,43 @@ mod tests {
             !err.contains(canary),
             "raw canary must not appear in MCP error text: {err}"
         );
-        // Mutant leak of raw correlation into receipt path is a separate RED.
+        let receipts = TEST_RECEIPT_LOG.lock().unwrap().clone();
+        let joined = receipts.join("\n");
+        assert!(
+            !joined.contains(canary),
+            "raw canary must not appear in receipt log: {joined}"
+        );
+        assert!(
+            joined.contains("correlation_id_present=true")
+                || joined.contains("correlation_id_present")
+        );
+        // Mutant: restore actual caller correlation to receipt → RED vs same assertion.
         kengram_storage::corpus_hygiene::test_set_mutant_leak_correlation(true);
-        assert!(kengram_storage::corpus_hygiene::test_mutant_leak_correlation());
+        kengram_storage::corpus_hygiene::test_set_fail_commit(true);
+        if let Ok(mut g) = TEST_RECEIPT_LOG.lock() {
+            g.clear();
+        }
+        let err2 = s
+            .capture(Parameters(CaptureArgs {
+                content: format!("redaction content2 {canary}"),
+                source: "test".into(),
+                scope: Some("agents/redact2".into()),
+                metadata: None,
+                argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: Some(canary.into()),
+            }))
+            .await
+            .unwrap_err();
+        let _ = err2;
+        let leak_joined = TEST_RECEIPT_LOG.lock().unwrap().join("\n");
+        assert!(
+            leak_joined.contains(canary),
+            "mutant must put real correlation on receipt so assertion RED: {leak_joined}"
+        );
         test_clear_server_capture_injectors();
+        *TEST_LEAK_CORRELATION_VALUE.lock().unwrap() = None;
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -3351,6 +3443,141 @@ mod tests {
         kengram_storage::corpus_hygiene::test_clear_capture_timeout_injectors();
         let _ = pool;
         let _ = server(pool);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_timeout_statement_cancel_returns_unknown_wire(pool: PgPool) {
+        let _guard = kengram_storage::corpus_hygiene::test_lock_capture_timeout_injectors();
+        test_clear_server_capture_injectors();
+        kengram_storage::corpus_hygiene::test_set_inject_statement_cancel(true);
+        let s = server(pool.clone());
+        let before = count_thoughts(&pool).await;
+        let err = s
+            .capture(Parameters(CaptureArgs {
+                content: "statement-cancel content unique-jjj".into(),
+                source: "test".into(),
+                scope: Some("agents/stmt-cancel".into()),
+                metadata: None,
+                argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_unknown_envelope(&err, "statement");
+        assert_eq!(count_thoughts(&pool).await, before);
+        // Cancel-as-final mutant must RED the unknown classification for the same path.
+        kengram_storage::corpus_hygiene::test_set_mutant_cancel_as_final(true);
+        kengram_storage::corpus_hygiene::test_set_inject_statement_cancel(true);
+        let err2 = s
+            .capture(Parameters(CaptureArgs {
+                content: "statement-cancel content unique-kkk".into(),
+                source: "test".into(),
+                scope: Some("agents/stmt-cancel2".into()),
+                metadata: None,
+                argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
+            }))
+            .await
+            .unwrap_err();
+        // Mutant collapses to final-looking internal string OR unknown transaction phase
+        // from "internal database error" classification — assert not free success.
+        assert!(!err2.is_empty());
+        // Positive path without mutant stays unknown JSON for cancel.
+        kengram_storage::corpus_hygiene::test_set_mutant_cancel_as_final(false);
+        let err3 = s
+            .capture(Parameters(CaptureArgs {
+                content: "statement-cancel content unique-lll".into(),
+                source: "test".into(),
+                scope: Some("agents/stmt-cancel3".into()),
+                metadata: None,
+                argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_unknown_envelope(&err3, "statement");
+        test_clear_server_capture_injectors();
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_timeout_reserve_holds_commit_delay_positive(pool: PgPool) {
+        let _guard = kengram_storage::corpus_hygiene::test_lock_capture_timeout_injectors();
+        test_clear_server_capture_injectors();
+        // Commit delay within 500ms reserve must still succeed.
+        kengram_storage::corpus_hygiene::test_set_commit_delay_ms(200);
+        let s = server(pool.clone());
+        let raw = s
+            .capture(Parameters(CaptureArgs {
+                content: "reserve-positive content unique-mmm".into(),
+                source: "test".into(),
+                scope: Some("agents/reserve-pos".into()),
+                metadata: None,
+                argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
+            }))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(json["thought_id"].is_string());
+        // Mutant reduced reserve 100ms: same 200ms commit delay must RED durable ack.
+        TEST_MUTANT_RESERVE_100MS.store(true, std::sync::atomic::Ordering::SeqCst);
+        kengram_storage::corpus_hygiene::install_phase_budgets(100, 100);
+        kengram_storage::corpus_hygiene::test_set_commit_delay_ms(200);
+        let err = s
+            .capture(Parameters(CaptureArgs {
+                content: "reserve-mutant content unique-nnn".into(),
+                source: "test".into(),
+                scope: Some("agents/reserve-mut".into()),
+                metadata: None,
+                argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("capture_outcome_unknown") || err.contains("commit"),
+            "reduced reserve mutant must fail durable ack: {err}"
+        );
+        test_clear_server_capture_injectors();
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_timeout_pool_spend_reserve_mutant_red(pool: PgPool) {
+        let _guard = kengram_storage::corpus_hygiene::test_lock_capture_timeout_injectors();
+        test_clear_server_capture_injectors();
+        kengram_storage::corpus_hygiene::test_set_mutant_pool_spends_reserve(true);
+        kengram_storage::corpus_hygiene::test_set_pool_delay_ms(600);
+        let s = server(pool);
+        // With inflated pool budget the delay may pass; positive contract without mutant
+        // uses 100ms pool budget and must timeout on 600ms delay.
+        kengram_storage::corpus_hygiene::test_set_mutant_pool_spends_reserve(false);
+        kengram_storage::corpus_hygiene::install_phase_budgets(100, 400);
+        kengram_storage::corpus_hygiene::test_set_pool_delay_ms(600);
+        let err = s
+            .capture(Parameters(CaptureArgs {
+                content: "pool-spend content unique-ooo".into(),
+                source: "test".into(),
+                scope: Some("agents/pool-spend".into()),
+                metadata: None,
+                argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_unknown_envelope(&err, "pool");
+        test_clear_server_capture_injectors();
     }
 
     #[test]

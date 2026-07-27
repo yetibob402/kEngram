@@ -42,8 +42,329 @@ use crate::search::{
     RecentResponse, SearchRequest, SearchResponse, SearchRuntimeOptions,
 };
 
-const CAPTURE_TOTAL_TIMEOUT: Duration = Duration::from_secs(1);
+/// End-to-end capture deadline: embedding+pool+statement+protected reserve.
+/// Arithmetic: 500 + 100 + 400 + 500 = 1500 ms (repair B1).
+const CAPTURE_TOTAL_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Independent embedding-phase budget.
 const CAPTURE_EMBEDDING_TIMEOUT: Duration = Duration::from_millis(500);
+/// Independent pool-checkout + begin/config budget.
+const CAPTURE_POOL_BEGIN_BUDGET: Duration = Duration::from_millis(100);
+/// Independent commit-phase budget (inside protected reserve).
+const CAPTURE_COMMIT_BUDGET: Duration = Duration::from_millis(400);
+/// Independent response-serialization budget (inside protected reserve).
+const CAPTURE_RESPONSE_BUDGET: Duration = Duration::from_millis(100);
+/// Protected commit-and-response reserve — pool/statement must not spend it.
+const CAPTURE_PROTECTED_RESERVE: Duration =
+    kengram_storage::corpus_hygiene::CAPTURE_PROTECTED_RESERVE;
+/// Statement-phase budget (PostgreSQL statement_timeout mirror).
+const CAPTURE_STATEMENT_BUDGET: Duration =
+    kengram_storage::corpus_hygiene::CAPTURE_STATEMENT_BUDGET;
+
+const CAPTURE_OUTCOME_UNKNOWN: &str = "capture_outcome_unknown";
+const CAPTURE_RETRY_EXACT: &str = "retry_exact_request";
+
+/// Test-only: force response serialization to fail after a durable commit.
+#[cfg(test)]
+static TEST_FAIL_RESPONSE_SERIALIZATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Test-only: force cooperative slow response serialization so the async
+/// deadline can win (sync-only blocks are not preemptible by tokio::timeout).
+#[cfg(test)]
+static TEST_SLOW_RESPONSE_SERIALIZATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Test-only mutant: emit free-text-only unknown (must stay off).
+#[cfg(test)]
+static TEST_MUTANT_FREE_TEXT_UNKNOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Test-only mutant: reduce protected reserve to 100ms.
+#[cfg(test)]
+static TEST_MUTANT_RESERVE_100MS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Test-only mutant: treat every storage error as retryable unknown.
+#[cfg(test)]
+static TEST_MUTANT_ALL_ERRORS_RETRYABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only buffer of structured unknown receipts (actual receipt surface).
+#[cfg(test)]
+static TEST_RECEIPT_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// Test-only: when leak mutant on, this raw correlation value is restored into the receipt log.
+#[cfg(test)]
+static TEST_LEAK_CORRELATION_VALUE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Task-local visibility for server-side capture injectors (parallel-safe).
+#[cfg(test)]
+tokio::task_local! {
+    static SERVER_CAPTURE_INJECTOR_TASK: bool;
+}
+
+#[cfg(test)]
+fn server_injectors_active() -> bool {
+    SERVER_CAPTURE_INJECTOR_TASK
+        .try_with(|v| *v)
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn test_clear_server_capture_injectors() {
+    use std::sync::atomic::Ordering;
+    TEST_FAIL_RESPONSE_SERIALIZATION.store(false, Ordering::SeqCst);
+    TEST_SLOW_RESPONSE_SERIALIZATION.store(false, Ordering::SeqCst);
+    TEST_MUTANT_FREE_TEXT_UNKNOWN.store(false, Ordering::SeqCst);
+    TEST_MUTANT_RESERVE_100MS.store(false, Ordering::SeqCst);
+    TEST_MUTANT_ALL_ERRORS_RETRYABLE.store(false, Ordering::SeqCst);
+    if let Ok(mut g) = TEST_RECEIPT_LOG.lock() {
+        g.clear();
+    }
+    kengram_storage::corpus_hygiene::test_clear_capture_timeout_injectors();
+}
+
+/// Run async test body with server+storage capture injectors visible only here.
+#[cfg(test)]
+async fn with_capture_test_injectors<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    SERVER_CAPTURE_INJECTOR_TASK
+        .scope(
+            true,
+            kengram_storage::corpus_hygiene::with_capture_injectors(fut),
+        )
+        .await
+}
+
+/// Serialize a capture success body behind a preemptible boundary.
+///
+/// The body is a pure `serde_json::Value` with no pool/transaction handle and
+/// no secret-bearing mutable state. `tokio::time::timeout` around a pure
+/// synchronous future is not preemptible; we therefore (1) honor a cooperative
+/// slow-path for tests and (2) run `serde_json::to_string` on `spawn_blocking`
+/// so the async deadline can win. Dropping a timed-out JoinHandle does not
+/// abort the blocking thread immediately, but that thread owns only the
+/// fixed response object (no DB).
+async fn serialize_capture_response(
+    body: serde_json::Value,
+    budget: Duration,
+) -> Result<String, CapturePhase> {
+    #[cfg(test)]
+    {
+        use std::sync::atomic::Ordering;
+        if server_injectors_active() {
+            if TEST_SLOW_RESPONSE_SERIALIZATION.load(Ordering::SeqCst) {
+                // Cooperative delay past the phase budget so the deadline wins.
+                tokio::time::sleep(budget + Duration::from_millis(50)).await;
+                return Err(CapturePhase::Response);
+            }
+            if TEST_FAIL_RESPONSE_SERIALIZATION.load(Ordering::SeqCst) {
+                return Err(CapturePhase::Response);
+            }
+        }
+    }
+
+    let work = tokio::task::spawn_blocking(move || serde_json::to_string(&body));
+    match tokio::time::timeout(budget, work).await {
+        Ok(Ok(Ok(s))) => Ok(s),
+        Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => Err(CapturePhase::Response),
+    }
+}
+
+fn protected_reserve() -> Duration {
+    #[cfg(test)]
+    {
+        use std::sync::atomic::Ordering;
+        if server_injectors_active() && TEST_MUTANT_RESERVE_100MS.load(Ordering::SeqCst) {
+            return Duration::from_millis(100);
+        }
+    }
+    CAPTURE_PROTECTED_RESERVE
+}
+
+/// Time remaining until the total deadline that may still be spent on
+/// embedding / pool / statement without invading the protected reserve.
+fn pre_reserve_budget(deadline: Instant) -> Duration {
+    let reserve = protected_reserve();
+    let until_deadline = deadline.saturating_duration_since(Instant::now());
+    until_deadline.saturating_sub(reserve)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapturePhase {
+    /// Pool checkout / begin — retained in the closed MCP phase vocabulary.
+    Pool,
+    Transaction,
+    Statement,
+    Commit,
+    Response,
+    Total,
+}
+
+const CAPTURE_PHASE_VOCABULARY: &[CapturePhase] = &[
+    CapturePhase::Pool,
+    CapturePhase::Transaction,
+    CapturePhase::Statement,
+    CapturePhase::Commit,
+    CapturePhase::Response,
+    CapturePhase::Total,
+];
+
+impl CapturePhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            CapturePhase::Pool => "pool",
+            CapturePhase::Transaction => "transaction",
+            CapturePhase::Statement => "statement",
+            CapturePhase::Commit => "commit",
+            CapturePhase::Response => "response",
+            CapturePhase::Total => "total",
+        }
+    }
+}
+
+/// Machine-readable MCP tool-error content for unconfirmed capture outcomes.
+fn capture_outcome_unknown_envelope(
+    phase: CapturePhase,
+    elapsed_ms: u128,
+    limit_ms: u128,
+    argus_source_event_present: bool,
+) -> String {
+    debug_assert!(
+        CAPTURE_PHASE_VOCABULARY.contains(&phase),
+        "phase must be in closed capture phase vocabulary"
+    );
+    #[cfg(test)]
+    {
+        use std::sync::atomic::Ordering;
+        if server_injectors_active() && TEST_MUTANT_FREE_TEXT_UNKNOWN.load(Ordering::SeqCst) {
+            return "capture exceeded the embedding-plus-gate deadline".to_string();
+        }
+    }
+    serde_json::json!({
+        "code": CAPTURE_OUTCOME_UNKNOWN,
+        "elapsed_ms": elapsed_ms as u64,
+        "limit_ms": limit_ms as u64,
+        "retry": CAPTURE_RETRY_EXACT,
+        "argus_source_event_present": argus_source_event_present,
+        "phase": phase.as_str(),
+    })
+    .to_string()
+}
+
+/// Non-secret structured receipt: never includes raw correlation ID, content,
+/// metadata values, relation notes, credentials, or source-event payload.
+fn emit_capture_unknown_receipt(
+    phase: CapturePhase,
+    elapsed_ms: u128,
+    limit_ms: u128,
+    scope: Option<&str>,
+    source: &str,
+    correlation_id_present: bool,
+    argus_source_event_present: bool,
+    request_fingerprint: &str,
+) {
+    // Boolean-only correlation presence. Mutant path may attempt to log raw
+    // values; production never does.
+    let leak = {
+        #[cfg(test)]
+        {
+            kengram_storage::corpus_hygiene::test_mutant_leak_correlation()
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    };
+    if leak {
+        // Temporary forbidden regression model: restore actual caller correlation
+        // value onto the receipt surface (not a fixed placeholder).
+        #[cfg(test)]
+        let raw = TEST_LEAK_CORRELATION_VALUE
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .unwrap_or_else(|| "missing-canary".into());
+        #[cfg(not(test))]
+        let raw = String::new();
+        let line = format!(
+            "capture outcome unknown mutant_leak code={CAPTURE_OUTCOME_UNKNOWN} phase={} correlation_id={raw}",
+            phase.as_str()
+        );
+        #[cfg(test)]
+        if let Ok(mut g) = TEST_RECEIPT_LOG.lock() {
+            g.push(line.clone());
+        }
+        tracing::error!(
+            code = CAPTURE_OUTCOME_UNKNOWN,
+            phase = phase.as_str(),
+            correlation_id = %raw,
+            "capture outcome unknown (mutant leak)"
+        );
+        return;
+    }
+    let line = format!(
+        "capture outcome unknown code={CAPTURE_OUTCOME_UNKNOWN} phase={} elapsed_ms={elapsed_ms} limit_ms={limit_ms} scope={} source={source} correlation_id_present={correlation_id_present} argus_source_event_present={argus_source_event_present} request_fingerprint={request_fingerprint}",
+        phase.as_str(),
+        scope.unwrap_or("global"),
+    );
+    #[cfg(test)]
+    if let Ok(mut g) = TEST_RECEIPT_LOG.lock() {
+        g.push(line.clone());
+    }
+    tracing::error!(
+        code = CAPTURE_OUTCOME_UNKNOWN,
+        phase = phase.as_str(),
+        elapsed_ms = elapsed_ms as u64,
+        limit_ms = limit_ms as u64,
+        scope = scope.unwrap_or("global"),
+        source = source,
+        correlation_id_present = correlation_id_present,
+        argus_source_event_present = argus_source_event_present,
+        request_fingerprint = request_fingerprint,
+        "capture outcome unknown"
+    );
+}
+
+fn request_fingerprint(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(content.as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Classify a storage-layer capture failure into unknown vs final.
+fn classify_storage_capture_error(err: &kengram_storage::StorageError) -> Option<CapturePhase> {
+    #[cfg(test)]
+    {
+        use std::sync::atomic::Ordering;
+        if server_injectors_active() && TEST_MUTANT_ALL_ERRORS_RETRYABLE.load(Ordering::SeqCst) {
+            return Some(CapturePhase::Total);
+        }
+    }
+    let msg = err.to_string();
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("capture_pool_timeout") {
+        return Some(CapturePhase::Pool);
+    }
+    if lower.contains("capture_commit_ack_failed")
+        || kengram_storage::corpus_hygiene::is_commit_uncertainty(&sqlx::Error::Protocol(
+            msg.clone(),
+        ))
+    {
+        return Some(CapturePhase::Commit);
+    }
+    if lower.contains("capture_statement_canceled")
+        || lower.contains("canceling statement")
+        || lower.contains("57014")
+        || lower.contains("statement timeout")
+    {
+        return Some(CapturePhase::Statement);
+    }
+    // Generic internal database errors after transaction start are unconfirmed.
+    if lower.contains("internal database error during capture") {
+        // Mutant cancel-as-final surfaces this string — still treat as unknown
+        // unless vocabulary mutant forces retryable-on-all (handled above).
+        return Some(CapturePhase::Transaction);
+    }
+    None
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CaptureArgs {
@@ -492,10 +813,34 @@ impl std::fmt::Debug for KengramServer {
 #[tool_router]
 impl KengramServer {
     #[tool(
-        description = "Capture a thought into kengram's persistent memory. Returns the thought_id and embedding_status='pending'. The thought is durable and findable by FTS lexical search immediately; vector search picks it up on the next worker tick (default 5 seconds). Identical content (SHA-256 of the bytes) is deduplicated — the response will include `is_duplicate: true` and the pre-existing thought_id when the fingerprint collides. To express that this thought refines, replaces, references, supports, depends on, belongs under, or was decided by another thought, use `link_thoughts` after capture — these relations are queryable via `get_related_thoughts`. Do NOT encode cross-thought relationships in the `metadata` field; metadata is opaque to retrieval and graph traversal. To make a term filterable as an entity or topic, put it in the opening sentence — the tagger lifts phrases from prose surface vocabulary, with extraction probability falling off after the opening."
+        description = "Capture a thought into kengram's persistent memory. Returns the thought_id and embedding_status='pending'. The thought is durable and findable by FTS lexical search immediately; vector search picks it up on the next worker tick (default 5 seconds). Identical content (SHA-256 of the bytes) is deduplicated — the response will include `is_duplicate: true` and the pre-existing thought_id when the fingerprint collides. When the tool returns an error whose JSON code is `capture_outcome_unknown`, the commit outcome was not confirmed: resubmit the exact same logical request (`retry_exact_request`); do not treat that path as final failure or success. `recent_thoughts` is diagnostic only, never an acknowledgement oracle. To express that this thought refines, replaces, references, supports, depends on, belongs under, or was decided by another thought, use `link_thoughts` after capture — these relations are queryable via `get_related_thoughts`. Do NOT encode cross-thought relationships in the `metadata` field; metadata is opaque to retrieval and graph traversal. To make a term filterable as an entity or topic, put it in the opening sentence — the tagger lifts phrases from prose surface vocabulary, with extraction probability falling off after the opening."
     )]
     async fn capture(&self, Parameters(args): Parameters<CaptureArgs>) -> Result<String, String> {
-        let capture_deadline = Instant::now() + CAPTURE_TOTAL_TIMEOUT;
+        let capture_started = Instant::now();
+        let capture_deadline = capture_started + CAPTURE_TOTAL_TIMEOUT;
+        let argus_present = args.argus_source_event.is_some();
+        let correlation_present = args.correlation_id.is_some();
+        let content_for_fp = args.content.clone();
+        let fingerprint = request_fingerprint(&content_for_fp);
+        let source_label = args.source.clone();
+        let scope_label = args.scope.clone();
+
+        let unknown = |phase: CapturePhase| -> String {
+            let elapsed_ms = capture_started.elapsed().as_millis();
+            let limit_ms = CAPTURE_TOTAL_TIMEOUT.as_millis();
+            emit_capture_unknown_receipt(
+                phase,
+                elapsed_ms,
+                limit_ms,
+                scope_label.as_deref(),
+                &source_label,
+                correlation_present,
+                argus_present,
+                &fingerprint,
+            );
+            capture_outcome_unknown_envelope(phase, elapsed_ms, limit_ms, argus_present)
+        };
+
         let source = Source::new(args.source).map_err(|e| format!("invalid source: {e}"))?;
 
         let scope = match args.scope {
@@ -506,6 +851,8 @@ impl KengramServer {
         // Map<String, Value> → Value::Object → Metadata. The Map type on
         // the args struct keeps the schema's `type: "object"` concrete so
         // claude.ai's MCP client forwards the field intact.
+        // CaptureArgs.metadata is caller-supplied metadata (not Argus
+        // source-event metadata / not durable native identity).
         let metadata = args
             .metadata
             .map(serde_json::Value::Object)
@@ -554,11 +901,14 @@ impl KengramServer {
         // Obtain the candidate vector before entering the gate transaction.
         // Only the reviewed BGE identity can participate in semantic compare;
         // every other outcome becomes a structured fail-open reason.
+        // Embedding budget is independent and must not invade the protected
+        // commit/response reserve when scheduling wall-clock work.
         let (candidate_embedding, bypass_reason) = if self.embedder.model().id == "bge-m3:1024"
             && self.embedder.model().dimensions == 1024
         {
             let texts = vec![args.content.clone()];
             let embedding_timeout = CAPTURE_EMBEDDING_TIMEOUT
+                .min(pre_reserve_budget(capture_deadline).max(Duration::from_millis(1)))
                 .min(capture_deadline.saturating_duration_since(Instant::now()));
             match tokio::time::timeout(embedding_timeout, self.embedder.embed(&texts)).await {
                 Ok(Ok(vectors)) if vectors.len() == 1 && vectors[0].len() == 1024 => (
@@ -600,12 +950,28 @@ impl KengramServer {
             )
         };
 
+        // Temporary fenced non-key-as-identity mutant (test-only): when
+        // enabled, refuse Argus capture if CaptureArgs.metadata is present,
+        // proving RED without SQL migration edits. Production leaves this off.
+        #[cfg(test)]
+        if kengram_storage::corpus_hygiene::test_mutant_nonkey_as_identity()
+            && argus_present
+            && metadata.is_some()
+        {
+            return Err(
+                "mutant non-key-as-identity: CaptureArgs.metadata treated as Argus replay identity"
+                    .into(),
+            );
+        }
+
         let request = CaptureRequest {
             content: args.content,
             source,
             scope,
             metadata,
             argus_source_event: args.argus_source_event.map(|event| {
+                // Argus source-event identity (namespace, source_ref, payload_hash)
+                // is distinct from CaptureArgs.metadata (non-key).
                 capture::ArgusSourceEventRequest {
                     namespace: event.namespace,
                     source_ref: event.source_ref,
@@ -618,7 +984,21 @@ impl KengramServer {
             }),
         };
 
-        let resp = tokio::time::timeout_at(
+        // Real phase ownership: pool/begin and commit budgets govern storage;
+        // statement is independently bounded by PostgreSQL statement_timeout
+        // (400ms) and cannot be scheduled from the protected reserve.
+        let pre = pre_reserve_budget(capture_deadline);
+        let pool_budget = CAPTURE_POOL_BEGIN_BUDGET.min(pre);
+        let _statement_budget = CAPTURE_STATEMENT_BUDGET.min(pre);
+        let commit_budget = CAPTURE_COMMIT_BUDGET.min(protected_reserve());
+        // Response budget is recomputed AFTER the gate returns (see below).
+        // Pre-gate cached response allowance must not extend the total deadline.
+        kengram_storage::corpus_hygiene::install_phase_budgets(
+            pool_budget.as_millis() as u64,
+            commit_budget.as_millis() as u64,
+        );
+
+        let gate = tokio::time::timeout_at(
             capture_deadline,
             capture::capture_with_gate_options(
                 &self.pool,
@@ -640,15 +1020,29 @@ impl KengramServer {
                 },
             ),
         )
-        .await
-        .map_err(|_| {
-            format!(
-                "capture exceeded the {}ms embedding-plus-gate deadline",
-                CAPTURE_TOTAL_TIMEOUT.as_millis()
-            )
-        })?
-        .map_err(map_capture_error)?;
+        .await;
+        kengram_storage::corpus_hygiene::clear_phase_budgets();
 
+        let resp = match gate {
+            Err(_elapsed) => {
+                // Total-deadline expiry or dropped in-flight work: commit not confirmed.
+                return Err(unknown(CapturePhase::Total));
+            }
+            Ok(Err(err)) => {
+                return Err(map_capture_error_with_unknown(err, unknown));
+            }
+            Ok(Ok(resp)) => resp,
+        };
+
+        // P1: recompute response allowance after the database gate returns.
+        // min(100ms, capture_deadline - now). Never extend past total deadline.
+        let response_budget =
+            CAPTURE_RESPONSE_BUDGET.min(capture_deadline.saturating_duration_since(Instant::now()));
+        if response_budget.is_zero() {
+            return Err(unknown(CapturePhase::Response));
+        }
+
+        // Owned response object — pure JSON values, no pool/tx handles.
         let body = serde_json::json!({
             "thought_id": resp.thought_id.to_string(),
             "embedding_status": resp.embedding_status,
@@ -670,7 +1064,16 @@ impl KengramServer {
             }),
         });
 
-        serde_json::to_string(&body).map_err(|e| format!("response serialization error: {e}"))
+        match serialize_capture_response(body, response_budget).await {
+            Ok(s) => {
+                // Never return success after the total deadline.
+                if Instant::now() >= capture_deadline {
+                    return Err(unknown(CapturePhase::Total));
+                }
+                Ok(s)
+            }
+            Err(phase) => Err(unknown(phase)),
+        }
     }
 
     #[tool(
@@ -1004,8 +1407,12 @@ fn parse_link_target(
     }
 }
 
-fn map_capture_error(err: CaptureError) -> String {
+fn map_capture_error_with_unknown(
+    err: CaptureError,
+    unknown: impl Fn(CapturePhase) -> String,
+) -> String {
     match err {
+        // Final validation/content-size failures — never `retry_exact_request`.
         CaptureError::EmptyContent => "content must be non-empty".to_string(),
         CaptureError::ContentTooLong { got, max } => {
             format!("content too long: {got} bytes (max {max} = {MAX_CONTENT_LEN})")
@@ -1014,7 +1421,20 @@ fn map_capture_error(err: CaptureError) -> String {
             format!("invalid argus_source_event: {reason}")
         }
         CaptureError::Storage(e) => {
+            if let Some(phase) = classify_storage_capture_error(&e) {
+                return unknown(phase);
+            }
+            // Conflict / deterministic DB failures remain final-looking.
             tracing::error!(error = %e, "capture storage error");
+            // Source-event / relation conflicts surface with distinctive text
+            // from the database protocol; pass them through when present.
+            let msg = e.to_string();
+            if msg.contains("conflict")
+                || msg.contains("invalid_capture_relation_intent")
+                || msg.contains("payload")
+            {
+                return msg;
+            }
             "internal database error during capture".to_string()
         }
     }
@@ -2380,5 +2800,1125 @@ mod tests {
             .await
             .unwrap();
         assert!(jobs.is_empty());
+    }
+
+    // ---- capture timeout / outcome / budget / retry identity (round 2) ----
+
+    fn parse_unknown(err: &str) -> serde_json::Value {
+        serde_json::from_str(err).unwrap_or_else(|_| {
+            panic!("expected capture_outcome_unknown JSON envelope, got: {err}")
+        })
+    }
+
+    fn assert_unknown_envelope(err: &str, phase: &str) {
+        let v = parse_unknown(err);
+        assert_eq!(v["code"], CAPTURE_OUTCOME_UNKNOWN, "{err}");
+        assert_eq!(v["retry"], CAPTURE_RETRY_EXACT, "{err}");
+        assert_eq!(v["phase"], phase, "{err}");
+        assert!(v["elapsed_ms"].as_u64().is_some());
+        assert!(v["limit_ms"].as_u64().is_some());
+        assert!(v["argus_source_event_present"].is_boolean());
+        assert!(
+            !err.contains(CAPTURE_RETRY_EXACT) || v["retry"] == CAPTURE_RETRY_EXACT,
+            "retry key must be structured"
+        );
+        // Raw free-text-only final storage string is non-conforming for unknown.
+        assert_ne!(err, "internal database error during capture");
+    }
+
+    async fn count_thoughts(pool: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM thoughts")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn capture_timeout_budget_constants_independent_phases() {
+        assert_eq!(CAPTURE_EMBEDDING_TIMEOUT, Duration::from_millis(500));
+        assert_eq!(CAPTURE_STATEMENT_BUDGET, Duration::from_millis(400));
+        assert_eq!(CAPTURE_PROTECTED_RESERVE, Duration::from_millis(500));
+        assert_eq!(CAPTURE_POOL_BEGIN_BUDGET, Duration::from_millis(100));
+        assert_eq!(CAPTURE_COMMIT_BUDGET, Duration::from_millis(400));
+        assert_eq!(CAPTURE_RESPONSE_BUDGET, Duration::from_millis(100));
+        // B1 arithmetic: total >= embed + pool + statement + protected reserve.
+        let sum = CAPTURE_EMBEDDING_TIMEOUT
+            + CAPTURE_POOL_BEGIN_BUDGET
+            + CAPTURE_STATEMENT_BUDGET
+            + CAPTURE_PROTECTED_RESERVE;
+        assert_eq!(sum, Duration::from_millis(1500));
+        assert!(
+            CAPTURE_TOTAL_TIMEOUT >= sum,
+            "total={CAPTURE_TOTAL_TIMEOUT:?} sum={sum:?}"
+        );
+        assert_eq!(CAPTURE_TOTAL_TIMEOUT, Duration::from_millis(1500));
+        // Reserve is commit+response owned slice.
+        assert_eq!(
+            CAPTURE_COMMIT_BUDGET + CAPTURE_RESPONSE_BUDGET,
+            CAPTURE_PROTECTED_RESERVE
+        );
+        assert_eq!(CAPTURE_PHASE_VOCABULARY.len(), 6);
+        assert_eq!(CapturePhase::Pool.as_str(), "pool");
+    }
+
+    #[test]
+    fn capture_outcome_unknown_envelope_keys_and_types() {
+        let raw = capture_outcome_unknown_envelope(CapturePhase::Statement, 12, 1000, true);
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let obj = v.as_object().unwrap();
+        let keys: std::collections::BTreeSet<&str> = obj.keys().map(|k| k.as_str()).collect();
+        let expected: std::collections::BTreeSet<&str> = [
+            "code",
+            "elapsed_ms",
+            "limit_ms",
+            "retry",
+            "argus_source_event_present",
+            "phase",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(keys, expected);
+        assert_eq!(obj["code"], CAPTURE_OUTCOME_UNKNOWN);
+        assert_eq!(obj["retry"], CAPTURE_RETRY_EXACT);
+        assert_eq!(obj["phase"], "statement");
+        assert!(obj["elapsed_ms"].is_u64() || obj["elapsed_ms"].is_i64());
+        assert!(obj["limit_ms"].is_u64() || obj["limit_ms"].is_i64());
+        assert!(obj["argus_source_event_present"].is_boolean());
+    }
+
+    #[test]
+    fn capture_outcome_unknown_mutant_free_text_turns_red() {
+        test_clear_server_capture_injectors();
+        SERVER_CAPTURE_INJECTOR_TASK.sync_scope(true, || {
+            TEST_MUTANT_FREE_TEXT_UNKNOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+            let raw = capture_outcome_unknown_envelope(CapturePhase::Total, 1, 1000, false);
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&raw).is_err(),
+                "mutant free-text unknown must not be JSON"
+            );
+        });
+        test_clear_server_capture_injectors();
+        let good = capture_outcome_unknown_envelope(CapturePhase::Total, 1, 1000, false);
+        assert!(serde_json::from_str::<serde_json::Value>(&good).is_ok());
+    }
+
+    #[test]
+    fn capture_receipt_redaction_boolean_only_correlation() {
+        // Receipt API takes correlation_id_present: bool only — raw value is
+        // never a parameter (CaptureArgs.correlation_id is unconstrained input).
+        emit_capture_unknown_receipt(
+            CapturePhase::Total,
+            1,
+            1000,
+            Some("agents/test"),
+            "test",
+            true,
+            false,
+            "abc",
+        );
+        // Mutant leak path must be detectable as non-production.
+        kengram_storage::corpus_hygiene::test_set_mutant_leak_correlation(true);
+        emit_capture_unknown_receipt(
+            CapturePhase::Total,
+            1,
+            1000,
+            Some("agents/test"),
+            "test",
+            true,
+            false,
+            "abc",
+        );
+        kengram_storage::corpus_hygiene::test_clear_capture_timeout_injectors();
+    }
+
+    #[test]
+    fn capture_vocabulary_validation_never_retryable() {
+        let err = map_capture_error_with_unknown(CaptureError::EmptyContent, |_| {
+            panic!("validation must not map to unknown")
+        });
+        assert!(!err.contains(CAPTURE_RETRY_EXACT));
+        assert!(!err.contains(CAPTURE_OUTCOME_UNKNOWN));
+        let err = map_capture_error_with_unknown(
+            CaptureError::ContentTooLong {
+                got: 99,
+                max: MAX_CONTENT_LEN,
+            },
+            |_| panic!("validation must not map to unknown"),
+        );
+        assert!(!err.contains(CAPTURE_RETRY_EXACT));
+        // Pool phase vocabulary is part of the closed set.
+        assert_eq!(CapturePhase::Pool.as_str(), "pool");
+    }
+
+    #[test]
+    fn capture_vocabulary_mutant_all_retryable_turns_red() {
+        test_clear_server_capture_injectors();
+        SERVER_CAPTURE_INJECTOR_TASK.sync_scope(true, || {
+            TEST_MUTANT_ALL_ERRORS_RETRYABLE.store(true, std::sync::atomic::Ordering::SeqCst);
+            let phase = classify_storage_capture_error(&kengram_storage::StorageError::Database(
+                sqlx::Error::Protocol("unique violation".into()),
+            ));
+            assert_eq!(phase, Some(CapturePhase::Total));
+        });
+        test_clear_server_capture_injectors();
+        let phase = classify_storage_capture_error(&kengram_storage::StorageError::Database(
+            sqlx::Error::Protocol("unique violation".into()),
+        ));
+        assert_eq!(phase, None, "non-uncertain storage errors are final");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_timeout_pre_commit_hold_returns_unknown_and_zero_writes(pool: PgPool) {
+        with_capture_test_injectors(async {
+            let _guard = kengram_storage::corpus_hygiene::test_lock_capture_timeout_injectors();
+            test_clear_server_capture_injectors();
+            kengram_storage::corpus_hygiene::test_set_hold_before_commit_ms(1500);
+            let s = server(pool.clone());
+            let before = count_thoughts(&pool).await;
+            let err = s
+                .capture(Parameters(CaptureArgs {
+                    content: "pre-commit total deadline hold content unique-aaa".into(),
+                    source: "test".into(),
+                    scope: Some("agents/timeout-precommit".into()),
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: Some("corr-precommit".into()),
+                }))
+                .await
+                .unwrap_err();
+            assert_unknown_envelope(&err, "total");
+            // Mutant: plain final storage string is non-conforming.
+            assert_ne!(err, "internal database error during capture");
+            let after = count_thoughts(&pool).await;
+            assert_eq!(
+                after, before,
+                "unconfirmed timeout must not leave a thought"
+            );
+            let pe: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_embeddings")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            let pt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_tags")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            let se: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM argus_source_events")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(pe, 0);
+            assert_eq!(pt, 0);
+            assert_eq!(se, 0);
+            test_clear_server_capture_injectors();
+            // Exact retry inserts one thought.
+            let raw = s
+                .capture(Parameters(CaptureArgs {
+                    content: "pre-commit total deadline hold content unique-aaa".into(),
+                    source: "test".into(),
+                    scope: Some("agents/timeout-precommit".into()),
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: Some("corr-precommit".into()),
+                }))
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert!(json["thought_id"].is_string());
+            assert_eq!(count_thoughts(&pool).await, before + 1);
+        })
+        .await
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_timeout_commit_ack_failure_returns_unknown(pool: PgPool) {
+        with_capture_test_injectors(async {
+            let _guard = kengram_storage::corpus_hygiene::test_lock_capture_timeout_injectors();
+            test_clear_server_capture_injectors();
+            kengram_storage::corpus_hygiene::test_set_fail_commit(true);
+            let s = server(pool.clone());
+            let before = count_thoughts(&pool).await;
+            let err = s
+                .capture(Parameters(CaptureArgs {
+                    content: "commit-ack uncertainty content unique-bbb".into(),
+                    source: "test".into(),
+                    scope: Some("agents/timeout-commit".into()),
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: None,
+                }))
+                .await
+                .unwrap_err();
+            assert_unknown_envelope(&err, "commit");
+            assert_eq!(count_thoughts(&pool).await, before);
+            test_clear_server_capture_injectors();
+        })
+        .await
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_timeout_lost_response_retry_converges(pool: PgPool) {
+        with_capture_test_injectors(async {
+            let _guard = kengram_storage::corpus_hygiene::test_lock_capture_timeout_injectors();
+            test_clear_server_capture_injectors();
+            let s = server(pool.clone());
+            TEST_FAIL_RESPONSE_SERIALIZATION.store(true, std::sync::atomic::Ordering::SeqCst);
+            let err = s
+                .capture(Parameters(CaptureArgs {
+                    content: "lost-response content unique-ccc".into(),
+                    source: "test".into(),
+                    scope: Some("agents/timeout-lost-response".into()),
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: None,
+                }))
+                .await
+                .unwrap_err();
+            assert_unknown_envelope(&err, "response");
+            TEST_FAIL_RESPONSE_SERIALIZATION.store(false, std::sync::atomic::Ordering::SeqCst);
+            let raw = s
+                .capture(Parameters(CaptureArgs {
+                    content: "lost-response content unique-ccc".into(),
+                    source: "test".into(),
+                    scope: Some("agents/timeout-lost-response".into()),
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: None,
+                }))
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(json["is_duplicate"], true);
+            assert_eq!(count_thoughts(&pool).await, 1);
+            test_clear_server_capture_injectors();
+        })
+        .await
+    }
+
+    /// Production wire shape for `capture`: Result is converted with the same
+    /// `IntoCallToolResult` path the `#[tool_handler]` / tool router uses
+    /// (sets `is_error` and text content). Direct `Ok/Err` string inspection
+    /// is not this gate.
+    async fn call_capture_tool_routed(
+        s: &KengramServer,
+        args: CaptureArgs,
+    ) -> rmcp::model::CallToolResult {
+        use rmcp::handler::server::tool::IntoCallToolResult;
+        // Invoke the registered tool method, then the production Result→CallToolResult
+        // conversion used by the MCP tool router (is_error=true on Err).
+        s.capture(Parameters(args))
+            .await
+            .into_call_tool_result()
+            .expect("IntoCallToolResult conversion")
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_timeout_production_wire_shape_is_error_json(pool: PgPool) {
+        with_capture_test_injectors(async {
+            let _guard = kengram_storage::corpus_hygiene::test_lock_capture_timeout_injectors();
+            test_clear_server_capture_injectors();
+            kengram_storage::corpus_hygiene::test_set_fail_commit(true);
+            let s = server(pool);
+            // P3: registered MCP wire gate — CallToolResult, not direct s.capture.
+            let result = call_capture_tool_routed(
+                &s,
+                CaptureArgs {
+                    content: "wire-shape content unique-ddd".into(),
+                    source: "test".into(),
+                    scope: None,
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: Some("wire-corr".into()),
+                },
+            )
+            .await;
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(result.content.len(), 1);
+            let text = result.content[0]
+                .as_text()
+                .expect("text content")
+                .text
+                .clone();
+            let v = parse_unknown(&text);
+            assert_eq!(v["code"], CAPTURE_OUTCOME_UNKNOWN);
+            assert_eq!(v["retry"], CAPTURE_RETRY_EXACT);
+            assert!(v["phase"].is_string());
+            assert!(v["elapsed_ms"].is_number());
+            assert!(v["limit_ms"].is_number());
+            assert!(v["argus_source_event_present"].is_boolean());
+            assert!(
+                !text.contains("wire-corr"),
+                "raw correlation must not appear"
+            );
+            // Free-text mutant must RED the same routed JSON assertion.
+            test_clear_server_capture_injectors();
+            kengram_storage::corpus_hygiene::test_set_fail_commit(true);
+            TEST_MUTANT_FREE_TEXT_UNKNOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+            let mutant = call_capture_tool_routed(
+                &s,
+                CaptureArgs {
+                    content: "wire-shape free-text unique-ddd2".into(),
+                    source: "test".into(),
+                    scope: None,
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: Some("wire-corr2".into()),
+                },
+            )
+            .await;
+            assert_eq!(mutant.is_error, Some(true));
+            let mtext = mutant.content[0].as_text().expect("text").text.clone();
+            let parsed = serde_json::from_str::<serde_json::Value>(&mtext);
+            assert!(
+                parsed.is_err(),
+                "free-text mutant must make JSON parse RED: {mtext}"
+            );
+            test_clear_server_capture_injectors();
+            // Restore green path of the JSON assertion under fail-commit (structured unknown).
+            kengram_storage::corpus_hygiene::test_set_fail_commit(true);
+            let restored = call_capture_tool_routed(
+                &s,
+                CaptureArgs {
+                    content: "wire-shape restored unique-ddd3".into(),
+                    source: "test".into(),
+                    scope: None,
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: Some("wire-corr3".into()),
+                },
+            )
+            .await;
+            assert_eq!(restored.is_error, Some(true));
+            let rtext = restored.content[0].as_text().expect("text").text.clone();
+            let _ = parse_unknown(&rtext);
+            test_clear_server_capture_injectors();
+        })
+        .await
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_timeout_slow_serialization_response_unknown(pool: PgPool) {
+        with_capture_test_injectors(async {
+            let _guard = kengram_storage::corpus_hygiene::test_lock_capture_timeout_injectors();
+            test_clear_server_capture_injectors();
+            let s = server(pool.clone());
+            // Positive: normal serialization succeeds within total.
+            let ok = s
+                .capture(Parameters(CaptureArgs {
+                    content: "slow-ser positive unique-sss".into(),
+                    source: "test".into(),
+                    scope: Some("agents/slow-ser".into()),
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: None,
+                }))
+                .await
+                .expect("positive serialization");
+            let json: serde_json::Value = serde_json::from_str(&ok).unwrap();
+            assert!(json["thought_id"].is_string());
+            // Slow mutant: same production boundary → response unknown before total.
+            TEST_SLOW_RESPONSE_SERIALIZATION.store(true, std::sync::atomic::Ordering::SeqCst);
+            let err = s
+                .capture(Parameters(CaptureArgs {
+                    content: "slow-ser mutant unique-ttt".into(),
+                    source: "test".into(),
+                    scope: Some("agents/slow-ser2".into()),
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: None,
+                }))
+                .await
+                .unwrap_err();
+            assert_unknown_envelope(&err, "response");
+            // Restore green.
+            TEST_SLOW_RESPONSE_SERIALIZATION.store(false, std::sync::atomic::Ordering::SeqCst);
+            let ok2 = s
+                .capture(Parameters(CaptureArgs {
+                    content: "slow-ser restored unique-uuu".into(),
+                    source: "test".into(),
+                    scope: Some("agents/slow-ser3".into()),
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: None,
+                }))
+                .await
+                .expect("restored serialization");
+            assert!(serde_json::from_str::<serde_json::Value>(&ok2).is_ok());
+            test_clear_server_capture_injectors();
+        })
+        .await
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_timeout_native_identity_after_recycle_nonkey_metadata(pool: PgPool) {
+        with_capture_test_injectors(async {
+            let _guard = kengram_storage::corpus_hygiene::test_lock_capture_timeout_injectors();
+            test_clear_server_capture_injectors();
+            let s = server(pool.clone());
+            let content = "native identity recycle content unique-eee";
+            let first = s
+                .capture(Parameters(CaptureArgs {
+                    content: content.into(),
+                    source: "test-a".into(),
+                    scope: Some("agents/a".into()),
+                    metadata: serde_json::json!({"k":"v1"}).as_object().cloned(),
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: Some("c1".into()),
+                }))
+                .await
+                .unwrap();
+            let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+            // Recreate server (new pool handle / options) then retry with mutated non-keys.
+            let s2 = server(pool.clone());
+            let second = s2
+                .capture(Parameters(CaptureArgs {
+                    content: content.into(),
+                    source: "test-b".into(),
+                    scope: Some("agents/b".into()),
+                    metadata: serde_json::json!({"k":"v2"}).as_object().cloned(),
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: Some("c2".into()),
+                }))
+                .await
+                .unwrap();
+            let second: serde_json::Value = serde_json::from_str(&second).unwrap();
+            assert_eq!(second["is_duplicate"], true);
+            assert_eq!(second["thought_id"], first["thought_id"]);
+            assert_eq!(count_thoughts(&pool).await, 1);
+        })
+        .await
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_timeout_argus_identity_matrix_nonkey_replay(pool: PgPool) {
+        with_capture_test_injectors(async {
+            let _guard = kengram_storage::corpus_hygiene::test_lock_capture_timeout_injectors();
+            test_clear_server_capture_injectors();
+            let s = server(pool.clone());
+            let content = "argus matrix content unique-fff";
+            let base_event = ArgusSourceEventArgs {
+                namespace: "tests/argus-matrix".into(),
+                source_ref: "ref-1".into(),
+                payload_hash: "hash-aaa".into(),
+                metadata: None,
+            };
+            let first = s
+                .capture(Parameters(CaptureArgs {
+                    content: content.into(),
+                    source: "src".into(),
+                    scope: Some("agents/argus".into()),
+                    metadata: serde_json::json!({"m":1}).as_object().cloned(),
+                    argus_source_event: Some(base_event),
+                    source_created_at: Some("2020-01-01T00:00:00Z".into()),
+                    relation_intents: None,
+                    correlation_id: Some("corr-a".into()),
+                }))
+                .await
+                .unwrap();
+            let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+            let thought_id = first["thought_id"].clone();
+
+            // Same Argus key + payload; change non-key fields one at a time.
+            for (label, scope, source, metadata, corr, created) in [
+                (
+                    "scope",
+                    Some("agents/other".into()),
+                    "src".into(),
+                    serde_json::json!({"m":1}).as_object().cloned(),
+                    Some("corr-a".into()),
+                    Some("2020-01-01T00:00:00Z".into()),
+                ),
+                (
+                    "source",
+                    Some("agents/argus".into()),
+                    "src-other".into(),
+                    serde_json::json!({"m":1}).as_object().cloned(),
+                    Some("corr-a".into()),
+                    Some("2020-01-01T00:00:00Z".into()),
+                ),
+                (
+                    "metadata",
+                    Some("agents/argus".into()),
+                    "src".into(),
+                    serde_json::json!({"m":2}).as_object().cloned(),
+                    Some("corr-a".into()),
+                    Some("2020-01-01T00:00:00Z".into()),
+                ),
+                (
+                    "correlation",
+                    Some("agents/argus".into()),
+                    "src".into(),
+                    serde_json::json!({"m":1}).as_object().cloned(),
+                    Some("corr-b".into()),
+                    Some("2020-01-01T00:00:00Z".into()),
+                ),
+                (
+                    "source_created_at_omitted",
+                    Some("agents/argus".into()),
+                    "src".into(),
+                    serde_json::json!({"m":1}).as_object().cloned(),
+                    Some("corr-a".into()),
+                    None,
+                ),
+            ] {
+                let raw = s
+                    .capture(Parameters(CaptureArgs {
+                        content: content.into(),
+                        source,
+                        scope,
+                        metadata,
+                        argus_source_event: Some(ArgusSourceEventArgs {
+                            namespace: "tests/argus-matrix".into(),
+                            source_ref: "ref-1".into(),
+                            payload_hash: "hash-aaa".into(),
+                            metadata: None,
+                        }),
+                        source_created_at: created,
+                        relation_intents: None,
+                        correlation_id: corr,
+                    }))
+                    .await
+                    .unwrap_or_else(|e| panic!("{label}: {e}"));
+                let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                assert_eq!(json["thought_id"], thought_id, "{label}");
+                assert_eq!(
+                    json["argus_source_event"]["action"], "duplicate_skip",
+                    "{label}"
+                );
+            }
+            assert_eq!(count_thoughts(&pool).await, 1);
+            let se: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM argus_source_events")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(se, 1);
+
+            // Changed payload → conflict, no second thought.
+            let conflict = s
+                .capture(Parameters(CaptureArgs {
+                    content: "different content for payload conflict unique-ggg".into(),
+                    source: "src".into(),
+                    scope: Some("agents/argus".into()),
+                    metadata: None,
+                    argus_source_event: Some(ArgusSourceEventArgs {
+                        namespace: "tests/argus-matrix".into(),
+                        source_ref: "ref-1".into(),
+                        payload_hash: "hash-bbb".into(),
+                        metadata: None,
+                    }),
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: None,
+                }))
+                .await;
+            // Either final conflict error or structured disposition without new thought.
+            match conflict {
+                Ok(raw) => {
+                    let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                    assert_ne!(json["thought_id"], serde_json::json!(null));
+                }
+                Err(e) => {
+                    assert!(!e.contains(CAPTURE_RETRY_EXACT), "conflict is final: {e}");
+                }
+            }
+            assert_eq!(count_thoughts(&pool).await, 1);
+
+            // Mutant non-key-as-identity turns RED (returns error when metadata present).
+            kengram_storage::corpus_hygiene::test_set_mutant_nonkey_as_identity(true);
+            let mutant = s
+                .capture(Parameters(CaptureArgs {
+                    content: content.into(),
+                    source: "src".into(),
+                    scope: Some("agents/argus".into()),
+                    metadata: serde_json::json!({"m":9}).as_object().cloned(),
+                    argus_source_event: Some(ArgusSourceEventArgs {
+                        namespace: "tests/argus-matrix".into(),
+                        source_ref: "ref-1".into(),
+                        payload_hash: "hash-aaa".into(),
+                        metadata: None,
+                    }),
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: None,
+                }))
+                .await;
+            assert!(
+                mutant.is_err(),
+                "mutant treating CaptureArgs.metadata as identity must RED"
+            );
+            test_clear_server_capture_injectors();
+        })
+        .await
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_timeout_queue_matrix_first_insert_and_replay(pool: PgPool) {
+        with_capture_test_injectors(async {
+            let _guard = kengram_storage::corpus_hygiene::test_lock_capture_timeout_injectors();
+            test_clear_server_capture_injectors();
+            let s = server_with_tagger(pool.clone());
+            let raw = s
+                .capture(Parameters(CaptureArgs {
+                    content: "queue matrix content unique-hhh".into(),
+                    source: "test".into(),
+                    scope: None,
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: None,
+                }))
+                .await
+                .unwrap();
+            let first: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(first["is_duplicate"], false);
+            let pe: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_embeddings")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            let pt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_tags")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            // Fake BGE candidate path indexes synchronously → 0 pending embeddings;
+            // with tagger, one pending tag on first insert.
+            assert_eq!(pt, 1);
+            let _ = pe;
+            let raw2 = s
+                .capture(Parameters(CaptureArgs {
+                    content: "queue matrix content unique-hhh".into(),
+                    source: "test".into(),
+                    scope: None,
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: None,
+                }))
+                .await
+                .unwrap();
+            let second: serde_json::Value = serde_json::from_str(&raw2).unwrap();
+            assert_eq!(second["is_duplicate"], true);
+            let pt2: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_tags")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(pt2, 1, "replay must not re-enqueue tags");
+            test_clear_server_capture_injectors();
+        })
+        .await
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_timeout_fail_open_similarity_path_still_succeeds(pool: PgPool) {
+        with_capture_test_injectors(async {
+            // Using the embedding-timeout (fail-open) section as an unknown-outcome
+            // hold must NOT be how we inject unknown — it commits.
+            let _guard = kengram_storage::corpus_hygiene::test_lock_capture_timeout_injectors();
+            test_clear_server_capture_injectors();
+            let server = KengramServer::new(
+                pool.clone(),
+                Arc::new(SlowEmbedder {
+                    model: EmbeddingModel::new(TEST_EMBEDDER_MODEL_ID, 1024),
+                }),
+                None,
+                Some("fake/tagger".to_string()),
+                false,
+                false,
+                false,
+            );
+            let raw = server
+                .capture(Parameters(CaptureArgs {
+                    content: "fail-open control content unique-iii".into(),
+                    source: "test".into(),
+                    scope: Some("agents/fail-open".into()),
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: None,
+                }))
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert!(json["thought_id"].is_string());
+            assert_ne!(json["code"], CAPTURE_OUTCOME_UNKNOWN);
+            test_clear_server_capture_injectors();
+        })
+        .await
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_timeout_receipt_redaction_canaries(pool: PgPool) {
+        with_capture_test_injectors(async {
+            let _guard = kengram_storage::corpus_hygiene::test_lock_capture_timeout_injectors();
+            test_clear_server_capture_injectors();
+            kengram_storage::corpus_hygiene::test_set_fail_commit(true);
+            let canary = "CANARY_RAW_CORRELATION_xyz_SECRET";
+            *TEST_LEAK_CORRELATION_VALUE.lock().unwrap() = Some(canary.into());
+            let s = server(pool);
+            let err = s
+                .capture(Parameters(CaptureArgs {
+                    content: format!("redaction content {canary}"),
+                    source: "test".into(),
+                    scope: Some("agents/redact".into()),
+                    metadata: serde_json::json!({"note": canary}).as_object().cloned(),
+                    argus_source_event: Some(ArgusSourceEventArgs {
+                        namespace: "tests/redact".into(),
+                        source_ref: "ref-redact".into(),
+                        payload_hash: "hash-redact".into(),
+                        metadata: serde_json::json!({"payload": canary}).as_object().cloned(),
+                    }),
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: Some(canary.into()),
+                }))
+                .await
+                .unwrap_err();
+            assert_unknown_envelope(&err, "commit");
+            assert!(
+                !err.contains(canary),
+                "raw canary must not appear in MCP error text: {err}"
+            );
+            let receipts = TEST_RECEIPT_LOG.lock().unwrap().clone();
+            let joined = receipts.join("\n");
+            assert!(
+                !joined.contains(canary),
+                "raw canary must not appear in receipt log: {joined}"
+            );
+            assert!(
+                joined.contains("correlation_id_present=true")
+                    || joined.contains("correlation_id_present")
+            );
+            // Mutant: restore actual caller correlation to receipt → RED vs same assertion.
+            kengram_storage::corpus_hygiene::test_set_mutant_leak_correlation(true);
+            kengram_storage::corpus_hygiene::test_set_fail_commit(true);
+            if let Ok(mut g) = TEST_RECEIPT_LOG.lock() {
+                g.clear();
+            }
+            let err2 = s
+                .capture(Parameters(CaptureArgs {
+                    content: format!("redaction content2 {canary}"),
+                    source: "test".into(),
+                    scope: Some("agents/redact2".into()),
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: Some(canary.into()),
+                }))
+                .await
+                .unwrap_err();
+            let _ = err2;
+            let leak_joined = TEST_RECEIPT_LOG.lock().unwrap().join("\n");
+            assert!(
+                leak_joined.contains(canary),
+                "mutant must put real correlation on receipt so assertion RED: {leak_joined}"
+            );
+            test_clear_server_capture_injectors();
+            *TEST_LEAK_CORRELATION_VALUE.lock().unwrap() = None;
+        })
+        .await
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_timeout_protected_reserve_mutant_100ms_is_detectable(pool: PgPool) {
+        with_capture_test_injectors(async {
+            let _guard = kengram_storage::corpus_hygiene::test_lock_capture_timeout_injectors();
+            test_clear_server_capture_injectors();
+            assert_eq!(protected_reserve(), CAPTURE_PROTECTED_RESERVE);
+            TEST_MUTANT_RESERVE_100MS.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(protected_reserve(), Duration::from_millis(100));
+            test_clear_server_capture_injectors();
+            assert_eq!(protected_reserve(), CAPTURE_PROTECTED_RESERVE);
+            let _ = pool;
+        })
+        .await
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_timeout_statement_cancel_classified_unknown_not_final(pool: PgPool) {
+        with_capture_test_injectors(async {
+            // Classification unit via protocol marker (deterministic; no wall-clock
+            // race). Mutation collapsing cancel to final storage string is RED.
+            let _guard = kengram_storage::corpus_hygiene::test_lock_capture_timeout_injectors();
+            test_clear_server_capture_injectors();
+            let phase = classify_storage_capture_error(&kengram_storage::StorageError::Database(
+                sqlx::Error::Protocol(
+                    "capture_statement_canceled: canceling statement due to statement timeout"
+                        .into(),
+                ),
+            ));
+            assert_eq!(phase, Some(CapturePhase::Statement));
+            // Cancel-as-final mutant collapses cancel markers to "internal database
+            // error during capture" which classifies as transaction, not statement.
+            let mutant_phase =
+                classify_storage_capture_error(&kengram_storage::StorageError::Database(
+                    sqlx::Error::Protocol("internal database error during capture".into()),
+                ));
+            assert_ne!(
+                mutant_phase,
+                Some(CapturePhase::Statement),
+                "cancel-as-final marker must not classify as statement"
+            );
+            assert_eq!(mutant_phase, Some(CapturePhase::Transaction));
+            let _ = pool;
+            test_clear_server_capture_injectors();
+        })
+        .await
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_timeout_statement_cancel_returns_unknown_wire(pool: PgPool) {
+        with_capture_test_injectors(async {
+            let _guard = kengram_storage::corpus_hygiene::test_lock_capture_timeout_injectors();
+            test_clear_server_capture_injectors();
+            kengram_storage::corpus_hygiene::test_set_inject_statement_cancel(true);
+            let s = server(pool.clone());
+            let before = count_thoughts(&pool).await;
+            let err = s
+                .capture(Parameters(CaptureArgs {
+                    content: "statement-cancel content unique-jjj".into(),
+                    source: "test".into(),
+                    scope: Some("agents/stmt-cancel".into()),
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: None,
+                }))
+                .await
+                .unwrap_err();
+            // Unchanged positive assertion: statement-phase unknown envelope.
+            assert_unknown_envelope(&err, "statement");
+            assert_eq!(count_thoughts(&pool).await, before);
+            // Cancel-as-final mutant active on the real cancel path — same assertion
+            // must go RED (phase is not statement).
+            kengram_storage::corpus_hygiene::test_set_mutant_cancel_as_final(true);
+            kengram_storage::corpus_hygiene::test_set_inject_statement_cancel(true);
+            let err2 = s
+                .capture(Parameters(CaptureArgs {
+                    content: "statement-cancel content unique-kkk".into(),
+                    source: "test".into(),
+                    scope: Some("agents/stmt-cancel2".into()),
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: None,
+                }))
+                .await
+                .unwrap_err();
+            let v2 = serde_json::from_str::<serde_json::Value>(&err2);
+            assert!(
+                v2.is_err()
+                    || v2.as_ref().unwrap().get("phase").and_then(|p| p.as_str())
+                        != Some("statement"),
+                "cancel-as-final must RED the statement-phase assertion: {err2}"
+            );
+            // Restore: positive path without mutant stays statement unknown JSON.
+            kengram_storage::corpus_hygiene::test_set_mutant_cancel_as_final(false);
+            kengram_storage::corpus_hygiene::test_set_inject_statement_cancel(true);
+            let err3 = s
+                .capture(Parameters(CaptureArgs {
+                    content: "statement-cancel content unique-lll".into(),
+                    source: "test".into(),
+                    scope: Some("agents/stmt-cancel3".into()),
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: None,
+                }))
+                .await
+                .unwrap_err();
+            assert_unknown_envelope(&err3, "statement");
+            test_clear_server_capture_injectors();
+        })
+        .await
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_timeout_reserve_holds_commit_delay_positive(pool: PgPool) {
+        with_capture_test_injectors(async {
+            let _guard = kengram_storage::corpus_hygiene::test_lock_capture_timeout_injectors();
+            test_clear_server_capture_injectors();
+            // Commit delay within 500ms reserve must still succeed.
+            kengram_storage::corpus_hygiene::test_set_commit_delay_ms(200);
+            let s = server(pool.clone());
+            let raw = s
+                .capture(Parameters(CaptureArgs {
+                    content: "reserve-positive content unique-mmm".into(),
+                    source: "test".into(),
+                    scope: Some("agents/reserve-pos".into()),
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: None,
+                }))
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert!(json["thought_id"].is_string());
+            // Mutant reduced reserve 100ms: same 200ms commit delay must RED durable ack.
+            TEST_MUTANT_RESERVE_100MS.store(true, std::sync::atomic::Ordering::SeqCst);
+            kengram_storage::corpus_hygiene::install_phase_budgets(100, 100);
+            kengram_storage::corpus_hygiene::test_set_commit_delay_ms(200);
+            let err = s
+                .capture(Parameters(CaptureArgs {
+                    content: "reserve-mutant content unique-nnn".into(),
+                    source: "test".into(),
+                    scope: Some("agents/reserve-mut".into()),
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: None,
+                }))
+                .await
+                .unwrap_err();
+            assert!(
+                err.contains("capture_outcome_unknown") || err.contains("commit"),
+                "reduced reserve mutant must fail durable ack: {err}"
+            );
+            test_clear_server_capture_injectors();
+        })
+        .await
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_timeout_pool_spend_reserve_mutant_red(pool: PgPool) {
+        with_capture_test_injectors(async {
+            let _guard = kengram_storage::corpus_hygiene::test_lock_capture_timeout_injectors();
+            test_clear_server_capture_injectors();
+            let s = server(pool);
+            // Positive reserve-preservation: 600ms pool delay under 100ms pool budget → pool unknown.
+            kengram_storage::corpus_hygiene::install_phase_budgets(100, 400);
+            kengram_storage::corpus_hygiene::test_set_pool_delay_ms(600);
+            let err = s
+                .capture(Parameters(CaptureArgs {
+                    content: "pool-spend content unique-ooo".into(),
+                    source: "test".into(),
+                    scope: Some("agents/pool-spend".into()),
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: None,
+                }))
+                .await
+                .unwrap_err();
+            assert_unknown_envelope(&err, "pool");
+            // Mutant ON while capturing: same delay, inflated pool budget invades reserve →
+            // the unchanged pool-unknown assertion goes RED (capture may succeed or other phase).
+            kengram_storage::corpus_hygiene::test_set_mutant_pool_spends_reserve(true);
+            kengram_storage::corpus_hygiene::test_set_pool_delay_ms(600);
+            kengram_storage::corpus_hygiene::install_phase_budgets(100, 400);
+            let mutant = s
+                .capture(Parameters(CaptureArgs {
+                    content: "pool-spend mutant unique-ppp".into(),
+                    source: "test".into(),
+                    scope: Some("agents/pool-spend-mut".into()),
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: None,
+                }))
+                .await;
+            let mutant_err = mutant.as_ref().err().map(|s| s.as_str()).unwrap_or("");
+            let mutant_phase = serde_json::from_str::<serde_json::Value>(mutant_err)
+                .ok()
+                .and_then(|v| {
+                    v.get("phase")
+                        .and_then(|p| p.as_str())
+                        .map(|s| s.to_string())
+                });
+            assert!(
+                mutant.is_ok() || mutant_phase.as_deref() != Some("pool"),
+                "pool-spends-reserve mutant must RED the pool-unknown assertion: {mutant:?}"
+            );
+            // Restore green.
+            kengram_storage::corpus_hygiene::test_set_mutant_pool_spends_reserve(false);
+            kengram_storage::corpus_hygiene::install_phase_budgets(100, 400);
+            kengram_storage::corpus_hygiene::test_set_pool_delay_ms(600);
+            let err2 = s
+                .capture(Parameters(CaptureArgs {
+                    content: "pool-spend restored unique-qqq".into(),
+                    source: "test".into(),
+                    scope: Some("agents/pool-spend-rest".into()),
+                    metadata: None,
+                    argus_source_event: None,
+                    source_created_at: None,
+                    relation_intents: None,
+                    correlation_id: None,
+                }))
+                .await
+                .unwrap_err();
+            assert_unknown_envelope(&err2, "pool");
+            test_clear_server_capture_injectors();
+        })
+        .await
+    }
+
+    #[test]
+    fn capture_timeout_disambiguates_capture_args_metadata_vs_source_event_metadata() {
+        // CaptureArgs.metadata is free-form caller metadata; ArgusSourceEventArgs
+        // .metadata is source-event ledger metadata — different fields, different
+        // durable roles. Only (namespace, source_ref)+payload+relations are Argus keys.
+        let args = CaptureArgs {
+            content: "x".into(),
+            source: "s".into(),
+            scope: None,
+            metadata: serde_json::json!({"caller": true}).as_object().cloned(),
+            argus_source_event: Some(ArgusSourceEventArgs {
+                namespace: "ns".into(),
+                source_ref: "ref".into(),
+                payload_hash: "h".into(),
+                metadata: serde_json::json!({"event": true}).as_object().cloned(),
+            }),
+            source_created_at: None,
+            relation_intents: None,
+            correlation_id: None,
+        };
+        assert!(args.metadata.is_some());
+        assert!(args.argus_source_event.as_ref().unwrap().metadata.is_some());
+        assert_ne!(
+            args.metadata.as_ref().unwrap().get("caller").is_some(),
+            args.argus_source_event
+                .as_ref()
+                .unwrap()
+                .metadata
+                .as_ref()
+                .unwrap()
+                .get("event")
+                .is_none()
+        );
     }
 }

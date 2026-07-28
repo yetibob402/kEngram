@@ -125,36 +125,6 @@ fn storage_is_fingerprint_unique_violation(err: &kengram_storage::StorageError) 
     )
 }
 
-/// Look up the keeper row for content that lost the insert race on
-/// `thoughts_content_fingerprint_unique`.
-async fn existing_thought_id_for_content(
-    pool: &PgPool,
-    content: &str,
-) -> Result<ThoughtId, CaptureError> {
-    let id: Option<uuid::Uuid> = sqlx::query_scalar(
-        r#"
-        SELECT id
-        FROM public.thoughts
-        WHERE content_fingerprint = digest($1::text, 'sha256')
-          AND retracted_at IS NULL
-        LIMIT 1
-        "#,
-    )
-    .bind(content)
-    .fetch_optional(pool)
-    .await
-    .map_err(kengram_storage::StorageError::from)?;
-
-    id.map(ThoughtId::from).ok_or_else(|| {
-        CaptureError::Storage(kengram_storage::StorageError::Database(
-            sqlx::Error::Protocol(
-                "thoughts_content_fingerprint_unique fired but no keeper thought row was found"
-                    .to_string(),
-            ),
-        ))
-    })
-}
-
 pub async fn capture(
     pool: &PgPool,
     embedder_model_id: &str,
@@ -227,64 +197,52 @@ pub async fn capture_with_gate_options(
         .source_created_at
         .or_else(|| Some(OffsetDateTime::now_utc()));
 
-    let gated = kengram_storage::corpus_hygiene::capture_thought_gated(
-        pool,
-        kengram_storage::corpus_hygiene::GatedCaptureRequest {
-            scope: scope.as_str(),
-            content: &request.content,
-            source: request.source.as_str(),
-            metadata: metadata.as_value(),
-            source_created_at,
-            candidate_embedding: options.candidate_embedding.as_deref(),
-            embedding_model_id: Some(embedder_model_id),
-            embedding_model_version: Some(1),
-            bypass_reason,
-            source_event_namespace: source_event.as_ref().map(|event| event.namespace.as_str()),
-            source_event_ref: source_event.as_ref().map(|event| event.source_ref.as_str()),
-            source_event_payload_hash: source_event
-                .as_ref()
-                .map(|event| event.payload_hash.as_str()),
-            source_event_metadata,
-            relation_intents: &relation_intents,
-            tagger_model_id,
-            claimed_producer_class: options.claimed_producer_class.as_deref(),
-            correlation_id: options.correlation_id.as_deref(),
-            force_keep_token: None,
-        },
-    )
-    .await;
-
-    // Race: two concurrent captures of the same content can both miss the
-    // pre-insert fingerprint SELECT and one INSERT then hits
-    // thoughts_content_fingerprint_unique (23505). That is an idempotent
-    // success — return the keeper thought_id with is_duplicate=true. Any other
-    // DB error (including other 23505 constraints) stays a hard failure.
-    let result = match gated {
-        Ok(result) => result,
-        Err(err) if storage_is_fingerprint_unique_violation(&err) => {
-            let thought_id = existing_thought_id_for_content(pool, &request.content).await?;
-            let argus_source_event = source_event.map(|event| ArgusSourceEventResponse {
-                action: "duplicate_skip".to_string(),
-                namespace: event.namespace,
-                source_ref: event.source_ref,
-                payload_hash: event.payload_hash,
-                status: "stored".to_string(),
-                thought_id: Some(thought_id),
-            });
-            return Ok(CaptureResponse {
-                thought_id,
-                embedding_status: EmbeddingStatus::Pending,
-                is_duplicate: true,
-                argus_source_event,
-                dedup_kind: Some("exact_duplicate".to_string()),
-                matched_thought_id: Some(thought_id),
-                similarity: None,
-                relation_results: serde_json::json!([]),
-                gate_event_id: None,
-            });
-        }
-        Err(err) => return Err(CaptureError::Storage(err)),
+    // Race: concurrent same-content captures can both miss the pre-insert
+    // fingerprint SELECT; the loser INSERT hits thoughts_content_fingerprint_unique
+    // (23505) and the gate transaction rolls back. Do NOT fabricate a CaptureResponse
+    // after rollback (that produced "stored" receipts without durable ledger rows).
+    // Re-enter the normal gated path so exact_duplicate (and source-event / relation
+    // disposition) are executed and committed. Other 23505s rethrow.
+    let run_gate = || {
+        kengram_storage::corpus_hygiene::capture_thought_gated(
+            pool,
+            kengram_storage::corpus_hygiene::GatedCaptureRequest {
+                scope: scope.as_str(),
+                content: &request.content,
+                source: request.source.as_str(),
+                metadata: metadata.as_value(),
+                source_created_at,
+                candidate_embedding: options.candidate_embedding.as_deref(),
+                embedding_model_id: Some(embedder_model_id),
+                embedding_model_version: Some(1),
+                bypass_reason,
+                source_event_namespace: source_event.as_ref().map(|event| event.namespace.as_str()),
+                source_event_ref: source_event.as_ref().map(|event| event.source_ref.as_str()),
+                source_event_payload_hash: source_event
+                    .as_ref()
+                    .map(|event| event.payload_hash.as_str()),
+                source_event_metadata,
+                relation_intents: &relation_intents,
+                tagger_model_id,
+                claimed_producer_class: options.claimed_producer_class.as_deref(),
+                correlation_id: options.correlation_id.as_deref(),
+                force_keep_token: None,
+            },
+        )
     };
+
+    let mut gated = run_gate().await;
+    for _ in 0..3 {
+        match gated {
+            Ok(_) => break,
+            Err(ref err) if storage_is_fingerprint_unique_violation(err) => {
+                // Winner has committed; re-resolve through a live gate transaction.
+                gated = run_gate().await;
+            }
+            Err(_) => break,
+        }
+    }
+    let result = gated.map_err(CaptureError::Storage)?;
 
     // A conflicting replay does not select a new corpus row, but the source
     // event ledger still identifies the original thought for the established
@@ -920,6 +878,132 @@ mod tests {
         // With 8 racers, typically >0 duplicates; allow all-new only if
         // serialization made the gate always win (still one row).
         let _ = dup_flags;
+    }
+
+    /// Neo CN probe: N same-content captures with DISTINCT source events must
+    /// each leave a durable argus_source_events row when they report stored.
+    /// Catches post-rollback fabrication (receipts without ledger rows).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn distinct_source_event_racers_have_durable_ledger(pool: PgPool) {
+        let content = "distinct source-event racer content v1";
+        let n = 16usize;
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let pool = pool.clone();
+            let content = content.to_string();
+            handles.push(tokio::spawn(async move {
+                let req = CaptureRequest {
+                    content: content.clone(),
+                    source: Source::new("manual").unwrap(),
+                    scope: Some(Scope::new("agents/diesel").unwrap()),
+                    metadata: None,
+                    argus_source_event: Some(ArgusSourceEventRequest {
+                        namespace: "tests/diesel-idempotency".to_string(),
+                        source_ref: format!("racer-{i}"),
+                        payload_hash: format!("hash-racer-{i}"),
+                        metadata: None,
+                    }),
+                };
+                capture(&pool, TEST_EMBEDDER_MODEL_ID, Some(TEST_TAGGER_MODEL_ID), req).await
+            }));
+        }
+        let mut stored_receipts = 0usize;
+        let mut ok = 0usize;
+        for h in handles {
+            let resp = h.await.expect("join").expect("capture must succeed");
+            ok += 1;
+            if let Some(ev) = &resp.argus_source_event {
+                if ev.status == "stored" || ev.action == "stored" || ev.action == "duplicate_skip" {
+                    // any successful disposition still needs a durable row
+                    stored_receipts += 1;
+                }
+            }
+        }
+        assert_eq!(ok, n, "all racers must return Ok");
+        let thoughts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM thoughts WHERE content = $1 AND retracted_at IS NULL",
+        )
+        .bind(content)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(thoughts, 1, "exactly one thought for content");
+
+        let ledger: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM argus_source_events WHERE namespace = $1",
+        )
+        .bind("tests/diesel-idempotency")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            ledger as usize, n,
+            "durable source-event rows must equal racer count (got {ledger} vs {n})"
+        );
+        assert_eq!(
+            stored_receipts, n,
+            "every racer must carry source-event disposition"
+        );
+
+        // Relation intents: one racer with a no-op empty intent still needs gate durability.
+        // Bookkeeping: gate events should exist for at least the winner path.
+        let _ = stored_receipts;
+    }
+
+    /// A 23505 on a DIFFERENT unique constraint must not be classified as fingerprint
+    /// duplicate success — rethrow / surface as storage error.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn foreign_unique_23505_is_not_swallowed(pool: PgPool) {
+        // Isolate a non-fingerprint unique index for the probe.
+        sqlx::query(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS reviewer_other_unique_value
+            ON public.thoughts ((metadata->>'reviewer_probe'))
+            WHERE metadata ? 'reviewer_probe'
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let first = CaptureRequest {
+            content: "foreign unique A".to_string(),
+            source: Source::new("manual").unwrap(),
+            scope: None,
+            metadata: Some(Metadata::from(json!({"reviewer_probe": "same-key"}))),
+            argus_source_event: None,
+        };
+        capture(&pool, TEST_EMBEDDER_MODEL_ID, None, first)
+            .await
+            .expect("first insert ok");
+
+        let second = CaptureRequest {
+            content: "foreign unique B different content".to_string(),
+            source: Source::new("manual").unwrap(),
+            scope: None,
+            metadata: Some(Metadata::from(json!({"reviewer_probe": "same-key"}))),
+            argus_source_event: None,
+        };
+        let err = capture(&pool, TEST_EMBEDDER_MODEL_ID, None, second)
+            .await
+            .expect_err("must not treat foreign unique as fingerprint duplicate");
+        match err {
+            CaptureError::Storage(kengram_storage::StorageError::Database(ref e)) => {
+                assert!(
+                    !is_thoughts_content_fingerprint_unique_violation(e)
+                        || e.to_string().contains("reviewer_other_unique")
+                        || e.to_string().contains("23505"),
+                    "error should be the foreign unique path: {e}"
+                );
+                // If it were fingerprint unique, content differs so fingerprint differs —
+                // this must be the metadata unique index.
+                if let sqlx::Error::Database(db) = e {
+                    let c = db.constraint().unwrap_or("");
+                    assert_ne!(c, THOUGHTS_CONTENT_FINGERPRINT_UNIQUE);
+                }
+            }
+            other => panic!("expected Storage Database error, got {other:?}"),
+        }
     }
 
 

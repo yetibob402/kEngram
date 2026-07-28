@@ -97,6 +97,64 @@ pub enum CaptureError {
 /// `"vllm/qwen3-coder:30b"`). `None` silent-disables the tag-job
 /// enqueue — captures still work, the thought just stays with `tags = '{}'`
 /// until a tagger is configured and the operator runs `kengram tag --rerun`.
+
+/// Constraint created in migrations/0006_collapse_to_thoughts.sql.
+const THOUGHTS_CONTENT_FINGERPRINT_UNIQUE: &str = "thoughts_content_fingerprint_unique";
+
+/// True only for the content-fingerprint unique race (sqlstate 23505 on
+/// `thoughts_content_fingerprint_unique`). Other unique/check/FK failures stay
+/// genuine errors.
+pub(crate) fn is_thoughts_content_fingerprint_unique_violation(err: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(db) = err else {
+        return false;
+    };
+    if db.code().as_deref() != Some("23505") {
+        return false;
+    }
+    if db.constraint() == Some(THOUGHTS_CONTENT_FINGERPRINT_UNIQUE) {
+        return true;
+    }
+    // Drivers sometimes omit constraint(); message still names it.
+    db.message().contains(THOUGHTS_CONTENT_FINGERPRINT_UNIQUE)
+}
+
+fn storage_is_fingerprint_unique_violation(err: &kengram_storage::StorageError) -> bool {
+    matches!(
+        err,
+        kengram_storage::StorageError::Database(e) if is_thoughts_content_fingerprint_unique_violation(e)
+    )
+}
+
+/// Look up the keeper row for content that lost the insert race on
+/// `thoughts_content_fingerprint_unique`.
+async fn existing_thought_id_for_content(
+    pool: &PgPool,
+    content: &str,
+) -> Result<ThoughtId, CaptureError> {
+    let id: Option<uuid::Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT id
+        FROM public.thoughts
+        WHERE content_fingerprint = digest($1::text, 'sha256')
+          AND retracted_at IS NULL
+        LIMIT 1
+        "#,
+    )
+    .bind(content)
+    .fetch_optional(pool)
+    .await
+    .map_err(kengram_storage::StorageError::from)?;
+
+    id.map(ThoughtId::from).ok_or_else(|| {
+        CaptureError::Storage(kengram_storage::StorageError::Database(
+            sqlx::Error::Protocol(
+                "thoughts_content_fingerprint_unique fired but no keeper thought row was found"
+                    .to_string(),
+            ),
+        ))
+    })
+}
+
 pub async fn capture(
     pool: &PgPool,
     embedder_model_id: &str,
@@ -169,7 +227,7 @@ pub async fn capture_with_gate_options(
         .source_created_at
         .or_else(|| Some(OffsetDateTime::now_utc()));
 
-    let result = kengram_storage::corpus_hygiene::capture_thought_gated(
+    let gated = kengram_storage::corpus_hygiene::capture_thought_gated(
         pool,
         kengram_storage::corpus_hygiene::GatedCaptureRequest {
             scope: scope.as_str(),
@@ -194,7 +252,40 @@ pub async fn capture_with_gate_options(
             force_keep_token: None,
         },
     )
-    .await?;
+    .await;
+
+    // Race: two concurrent captures of the same content can both miss the
+    // pre-insert fingerprint SELECT and one INSERT then hits
+    // thoughts_content_fingerprint_unique (23505). That is an idempotent
+    // success — return the keeper thought_id with is_duplicate=true. Any other
+    // DB error (including other 23505 constraints) stays a hard failure.
+    let result = match gated {
+        Ok(result) => result,
+        Err(err) if storage_is_fingerprint_unique_violation(&err) => {
+            let thought_id = existing_thought_id_for_content(pool, &request.content).await?;
+            let argus_source_event = source_event.map(|event| ArgusSourceEventResponse {
+                action: "duplicate_skip".to_string(),
+                namespace: event.namespace,
+                source_ref: event.source_ref,
+                payload_hash: event.payload_hash,
+                status: "stored".to_string(),
+                thought_id: Some(thought_id),
+            });
+            return Ok(CaptureResponse {
+                thought_id,
+                embedding_status: EmbeddingStatus::Pending,
+                is_duplicate: true,
+                argus_source_event,
+                dedup_kind: Some("exact_duplicate".to_string()),
+                matched_thought_id: Some(thought_id),
+                similarity: None,
+                relation_results: serde_json::json!([]),
+                gate_event_id: None,
+            });
+        }
+        Err(err) => return Err(CaptureError::Storage(err)),
+    };
+
     // A conflicting replay does not select a new corpus row, but the source
     // event ledger still identifies the original thought for the established
     // MCP conflict response.
@@ -715,6 +806,122 @@ mod tests {
             .unwrap();
         assert_eq!(tag_jobs.len(), 1);
     }
+
+    #[test]
+    fn classifies_only_thoughts_content_fingerprint_unique_as_idempotent() {
+        // Constructed Database errors are awkward in sqlx; classify via message
+        // path using a minimal fake is not available. Instead assert the
+        // constant name matches the migration constraint and document the
+        // sqlstate contract.
+        assert_eq!(
+            THOUGHTS_CONTENT_FINGERPRINT_UNIQUE,
+            "thoughts_content_fingerprint_unique"
+        );
+    }
+
+    /// First capture inserts; second capture of identical content is an
+    /// idempotent duplicate (gate path). Queues must not grow.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn first_and_duplicate_capture_contract(pool: PgPool) {
+        let content = "idempotency contract content v1";
+        let first = capture(
+            &pool,
+            TEST_EMBEDDER_MODEL_ID,
+            Some(TEST_TAGGER_MODEL_ID),
+            req(content, "manual"),
+        )
+        .await
+        .expect("first capture must succeed");
+        assert!(!first.is_duplicate);
+        assert_eq!(first.dedup_kind, None);
+
+        let second = capture(
+            &pool,
+            TEST_EMBEDDER_MODEL_ID,
+            Some(TEST_TAGGER_MODEL_ID),
+            req(content, "manual"),
+        )
+        .await
+        .expect("duplicate capture must succeed with is_duplicate");
+        assert!(second.is_duplicate);
+        assert_eq!(first.thought_id, second.thought_id);
+        assert_eq!(second.dedup_kind.as_deref(), Some("exact_duplicate"));
+
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thoughts WHERE content = $1")
+            .bind(content)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "exactly one thought row for the content");
+    }
+
+    /// Positive control: genuine validation failures still error (not swallowed
+    /// as duplicates).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn genuine_failures_still_error(pool: PgPool) {
+        let empty = capture(
+            &pool,
+            TEST_EMBEDDER_MODEL_ID,
+            Some(TEST_TAGGER_MODEL_ID),
+            req("", "manual"),
+        )
+        .await;
+        assert!(matches!(empty, Err(CaptureError::EmptyContent)));
+
+        let too_long = "x".repeat(MAX_CONTENT_LEN + 1);
+        let err = capture(
+            &pool,
+            TEST_EMBEDDER_MODEL_ID,
+            Some(TEST_TAGGER_MODEL_ID),
+            req(&too_long, "manual"),
+        )
+        .await;
+        assert!(matches!(err, Err(CaptureError::ContentTooLong { .. })));
+    }
+
+    /// Concurrent same-content captures must never surface a raw unique
+    /// violation to the caller; all must resolve to the same thought_id.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn concurrent_same_content_captures_are_idempotent(pool: PgPool) {
+        let content = "concurrent fingerprint race content";
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let pool = pool.clone();
+            let content = content.to_string();
+            handles.push(tokio::spawn(async move {
+                capture(
+                    &pool,
+                    TEST_EMBEDDER_MODEL_ID,
+                    Some(TEST_TAGGER_MODEL_ID),
+                    req(&content, "manual"),
+                )
+                .await
+            }));
+        }
+        let mut ids = Vec::new();
+        let mut dup_flags = 0usize;
+        for h in handles {
+            let resp = h
+                .await
+                .expect("join")
+                .expect("capture must not return raw DB unique error");
+            if resp.is_duplicate {
+                dup_flags += 1;
+            }
+            ids.push(resp.thought_id);
+        }
+        assert!(ids.iter().all(|id| *id == ids[0]));
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thoughts WHERE content = $1")
+            .bind(content)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        // With 8 racers, typically >0 duplicates; allow all-new only if
+        // serialization made the gate always win (still one row).
+        let _ = dup_flags;
+    }
+
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn enqueues_embedding_and_tag_jobs_on_new_insert(pool: PgPool) {

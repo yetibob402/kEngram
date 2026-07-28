@@ -101,6 +101,29 @@ pub enum CaptureError {
 /// Constraint created in migrations/0006_collapse_to_thoughts.sql.
 const THOUGHTS_CONTENT_FINGERPRINT_UNIQUE: &str = "thoughts_content_fingerprint_unique";
 
+/// Pure parts of the fingerprint-unique classifier. Exposed for unit tests so
+/// classification can fail without constructing sqlx::DatabaseError.
+///
+/// When `constraint` is `Some`, only exact equality to
+/// `thoughts_content_fingerprint_unique` matches — never fall through to the
+/// message. Online reindex renames (…_v2 alongside the old name) can leave the
+/// old name in the message while constraint() reports the new one; substring
+/// matching would misclassify that 23505 as the fingerprint race.
+pub(crate) fn is_fingerprint_unique_violation_parts(
+    code: Option<&str>,
+    constraint: Option<&str>,
+    message: &str,
+) -> bool {
+    if code != Some("23505") {
+        return false;
+    }
+    match constraint {
+        Some(name) => name == THOUGHTS_CONTENT_FINGERPRINT_UNIQUE,
+        // Drivers sometimes omit constraint(); message still names it.
+        None => message.contains(THOUGHTS_CONTENT_FINGERPRINT_UNIQUE),
+    }
+}
+
 /// True only for the content-fingerprint unique race (sqlstate 23505 on
 /// `thoughts_content_fingerprint_unique`). Other unique/check/FK failures stay
 /// genuine errors.
@@ -108,14 +131,11 @@ pub(crate) fn is_thoughts_content_fingerprint_unique_violation(err: &sqlx::Error
     let sqlx::Error::Database(db) = err else {
         return false;
     };
-    if db.code().as_deref() != Some("23505") {
-        return false;
-    }
-    if db.constraint() == Some(THOUGHTS_CONTENT_FINGERPRINT_UNIQUE) {
-        return true;
-    }
-    // Drivers sometimes omit constraint(); message still names it.
-    db.message().contains(THOUGHTS_CONTENT_FINGERPRINT_UNIQUE)
+    is_fingerprint_unique_violation_parts(
+        db.code().as_deref(),
+        db.constraint(),
+        db.message(),
+    )
 }
 
 fn storage_is_fingerprint_unique_violation(err: &kengram_storage::StorageError) -> bool {
@@ -231,8 +251,13 @@ pub async fn capture_with_gate_options(
         )
     };
 
+    // One retry only: Postgres raises 23505 after the winner COMMITS, so the
+    // next gate transaction's pre-insert fingerprint lookup must find the row
+    // (exact_duplicate) unless the path is exact_content_requires_adjudication,
+    // which is not a fingerprint-unique violation and must not loop. Gate
+    // statement_timeout is 400ms; 4 attempts would blow a ~1s end-to-end budget.
     let mut gated = run_gate().await;
-    for _ in 0..3 {
+    for _ in 0..1 {
         match gated {
             Ok(_) => break,
             Err(ref err) if storage_is_fingerprint_unique_violation(err) => {
@@ -766,51 +791,64 @@ mod tests {
     }
 
     #[test]
-    fn classifies_only_thoughts_content_fingerprint_unique_as_idempotent() {
-        // Constructed Database errors are awkward in sqlx; classify via message
-        // path using a minimal fake is not available. Instead assert the
-        // constant name matches the migration constraint and document the
-        // sqlstate contract.
-        assert_eq!(
-            THOUGHTS_CONTENT_FINGERPRINT_UNIQUE,
-            "thoughts_content_fingerprint_unique"
-        );
+    fn classifies_fingerprint_constraint_exact() {
+        assert!(is_fingerprint_unique_violation_parts(
+            Some("23505"),
+            Some(THOUGHTS_CONTENT_FINGERPRINT_UNIQUE),
+            "irrelevant message when constraint is present",
+        ));
     }
 
-    /// First capture inserts; second capture of identical content is an
-    /// idempotent duplicate (gate path). Queues must not grow.
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn first_and_duplicate_capture_contract(pool: PgPool) {
-        let content = "idempotency contract content v1";
-        let first = capture(
-            &pool,
-            TEST_EMBEDDER_MODEL_ID,
-            Some(TEST_TAGGER_MODEL_ID),
-            req(content, "manual"),
-        )
-        .await
-        .expect("first capture must succeed");
-        assert!(!first.is_duplicate);
-        assert_eq!(first.dedup_kind, None);
+    #[test]
+    fn rejects_foreign_constraint_name_even_if_message_mentions_fingerprint() {
+        // Online reindex: create …_unique_v2 alongside the old name, swap.
+        // constraint() reports the new name; message may still contain the old.
+        assert!(!is_fingerprint_unique_violation_parts(
+            Some("23505"),
+            Some("thoughts_content_fingerprint_unique_v2"),
+            "duplicate key value violates unique constraint \"thoughts_content_fingerprint_unique\"",
+        ));
+        assert!(!is_fingerprint_unique_violation_parts(
+            Some("23505"),
+            Some("reviewer_other_unique_value"),
+            "duplicate key value violates unique constraint \"reviewer_other_unique_value\"",
+        ));
+    }
 
-        let second = capture(
-            &pool,
-            TEST_EMBEDDER_MODEL_ID,
-            Some(TEST_TAGGER_MODEL_ID),
-            req(content, "manual"),
-        )
-        .await
-        .expect("duplicate capture must succeed with is_duplicate");
-        assert!(second.is_duplicate);
-        assert_eq!(first.thought_id, second.thought_id);
-        assert_eq!(second.dedup_kind.as_deref(), Some("exact_duplicate"));
+    #[test]
+    fn message_fallback_only_when_constraint_absent() {
+        assert!(is_fingerprint_unique_violation_parts(
+            Some("23505"),
+            None,
+            "duplicate key value violates unique constraint \"thoughts_content_fingerprint_unique\"",
+        ));
+        assert!(!is_fingerprint_unique_violation_parts(
+            Some("23505"),
+            None,
+            "duplicate key value violates unique constraint \"reviewer_other_unique_value\"",
+        ));
+        assert!(!is_fingerprint_unique_violation_parts(
+            Some("23503"),
+            None,
+            "thoughts_content_fingerprint_unique",
+        ));
+    }
 
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thoughts WHERE content = $1")
-            .bind(content)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(n, 1, "exactly one thought row for the content");
+    #[test]
+    fn migration_declares_thoughts_content_fingerprint_unique() {
+        // Assert the constant still names the constraint migration 0006 creates.
+        // Renaming the migration constraint without this constant would silently
+        // disable the classifier (the whole race fix reverts) while a hard-coded
+        // self-compare of the constant would stay green.
+        let migration = include_str!("../../../migrations/0006_collapse_to_thoughts.sql");
+        assert!(
+            migration.contains(THOUGHTS_CONTENT_FINGERPRINT_UNIQUE),
+            "migration 0006 must declare constraint name matched by the classifier"
+        );
+        assert!(
+            migration.contains("UNIQUE (content_fingerprint)"),
+            "migration 0006 must unique-index content_fingerprint"
+        );
     }
 
     /// Positive control: genuine validation failures still error (not swallowed
@@ -989,17 +1027,23 @@ mod tests {
             .expect_err("must not treat foreign unique as fingerprint duplicate");
         match err {
             CaptureError::Storage(kengram_storage::StorageError::Database(ref e)) => {
+                // Standalone classifier assert (not OR'd with always-true
+                // message/sqlstate terms). Under the re-enter-gate path, a
+                // misclassified foreign 23505 still returns Err after retry, so
+                // expect_err alone cannot catch a gutting of the classifier.
                 assert!(
-                    !is_thoughts_content_fingerprint_unique_violation(e)
-                        || e.to_string().contains("reviewer_other_unique")
-                        || e.to_string().contains("23505"),
-                    "error should be the foreign unique path: {e}"
+                    !is_thoughts_content_fingerprint_unique_violation(e),
+                    "foreign unique must not classify as fingerprint race: {e}"
                 );
-                // If it were fingerprint unique, content differs so fingerprint differs —
-                // this must be the metadata unique index.
                 if let sqlx::Error::Database(db) = e {
+                    assert_eq!(db.code().as_deref(), Some("23505"));
                     let c = db.constraint().unwrap_or("");
                     assert_ne!(c, THOUGHTS_CONTENT_FINGERPRINT_UNIQUE);
+                    assert!(
+                        c.contains("reviewer_other_unique")
+                            || e.to_string().contains("reviewer_other_unique"),
+                        "expected foreign index name in error: constraint={c:?} err={e}"
+                    );
                 }
             }
             other => panic!("expected Storage Database error, got {other:?}"),

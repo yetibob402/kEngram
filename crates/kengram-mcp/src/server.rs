@@ -2064,6 +2064,187 @@ mod tests {
         );
     }
 
+
+    // Jones board 506841 / PR8 CN: Path A recovery must bind to full current
+    // request identity (namespace, source_ref, payload_hash). A prior ASE row
+    // under the same ns/ref with a different payload must not prove success.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn adversary_existing_source_identity_with_different_payload_cannot_recover_success(
+        pool: PgPool,
+    ) {
+        let s = server(pool.clone());
+        let original_content = "jones adversary original payload content under ase identity";
+        let stored_payload =
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string();
+        let original_raw = s
+            .capture(Parameters(CaptureArgs {
+                content: original_content.into(),
+                source: "test".into(),
+                scope: Some("agents/jones-adversary-payload".into()),
+                metadata: None,
+                argus_source_event: Some(ArgusSourceEventArgs {
+                    namespace: "agents/jones-adversary-payload".into(),
+                    source_ref: "same-source-ref-different-payload".into(),
+                    payload_hash: stored_payload.clone(),
+                    metadata: None,
+                }),
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: Some("jones-payload-orig".into()),
+            }))
+            .await
+            .expect("original ASE capture must succeed");
+        let original: serde_json::Value = serde_json::from_str(&original_raw).unwrap();
+        assert!(original["thought_id"].as_str().is_some());
+        assert_eq!(
+            original["argus_source_event"]["payload_hash"],
+            stored_payload
+        );
+
+        // Hang before gate under the same (namespace, source_ref) but a
+        // different payload_hash — this request never lands its own ASE row.
+        let hang_content = format!(
+            "{}jones-adversary-different-payload-hang",
+            capture::test_hooks::HANG_BEFORE_GATE_PREFIX
+        );
+        let current_payload =
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string();
+        let result = s
+            .capture(Parameters(CaptureArgs {
+                content: hang_content,
+                source: "test".into(),
+                scope: Some("agents/jones-adversary-payload".into()),
+                metadata: None,
+                argus_source_event: Some(ArgusSourceEventArgs {
+                    namespace: "agents/jones-adversary-payload".into(),
+                    source_ref: "same-source-ref-different-payload".into(),
+                    payload_hash: current_payload,
+                    metadata: None,
+                }),
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: Some("jones-payload-conflict-hang".into()),
+            }))
+            .await;
+
+        let err = result.expect_err(
+            "a prior source identity with a different payload cannot prove the current request succeeded",
+        );
+        let body: serde_json::Value = serde_json::from_str(&err).unwrap_or_else(|_| {
+            panic!("deadline error must be JSON envelope, got: {err}");
+        });
+        assert_eq!(body["code"], "capture_deadline_exceeded", "{body}");
+        assert_eq!(body["persisted"], false, "{body}");
+
+        let stored_row: (String, Option<uuid::Uuid>) = sqlx::query_as(
+            r#"
+            SELECT payload_hash, thought_id
+            FROM argus_source_events
+            WHERE namespace = $1 AND source_ref = $2
+            "#,
+        )
+        .bind("agents/jones-adversary-payload")
+        .bind("same-source-ref-different-payload")
+        .fetch_one(&pool)
+        .await
+        .expect("original ASE row still present");
+        assert_eq!(stored_row.0, stored_payload);
+        assert_eq!(
+            stored_row.1.map(|id| id.to_string()),
+            original["thought_id"].as_str().map(str::to_string)
+        );
+    }
+
+    // Jones board 506848 / PR8 CN: Path B without ASE must require a non-empty
+    // correlation_id matching a gate row for this attempt. An unkeyed prior
+    // same-content gate must not prove a hung-before-gate call succeeded.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn adversary_unkeyed_prior_gate_cannot_prove_current_attempt_succeeded(pool: PgPool) {
+        let s = server(pool.clone());
+        let content = format!(
+            "{}unkeyed-prior-gate-adversary-content",
+            capture::test_hooks::HANG_BEFORE_GATE_PREFIX
+        );
+
+        let thought_id: uuid::Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO thoughts (id, scope, content, content_fingerprint, source, metadata)
+            VALUES (
+              gen_random_uuid(),
+              'agents/jones-unkeyed-prior',
+              $1,
+              digest($1::text, 'sha256'),
+              'test',
+              '{}'::jsonb
+            )
+            RETURNING id
+            "#,
+        )
+        .bind(&content)
+        .fetch_one(&pool)
+        .await
+        .expect("sql preseed thought for unkeyed prior gate");
+
+        sqlx::query(
+            r#"
+            INSERT INTO thought_ingest_gate_events (
+              request_identity, producer_principal, producer_class, profile_revision,
+              correlation_id, scope, source, candidate_fingerprint, candidate_content,
+              mode, action, matched_thought_id, effective_created_at, observed_at
+            ) VALUES (
+              'jones-unkeyed-prior-request',
+              current_user,
+              'test',
+              1,
+              'prior-attempt-correlation',
+              'agents/jones-unkeyed-prior',
+              'test',
+              digest($1::text, 'sha256'),
+              $1,
+              'enforce',
+              'stored',
+              $2,
+              now(),
+              now()
+            )
+            "#,
+        )
+        .bind(&content)
+        .bind(thought_id)
+        .execute(&pool)
+        .await
+        .expect("sql preseed prior gate with correlation");
+
+        // Current attempt: same content, hang before gate, correlation_id absent.
+        // Must not recover success via the unkeyed prior gate row.
+        let result = s
+            .capture(Parameters(CaptureArgs {
+                content: content.clone(),
+                source: "test".into(),
+                scope: Some("agents/jones-unkeyed-prior".into()),
+                metadata: None,
+                argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
+            }))
+            .await;
+
+        let err = result.expect_err(
+            "content plus an unkeyed prior gate cannot prove this hung-before-gate attempt succeeded",
+        );
+        let body: serde_json::Value = serde_json::from_str(&err).unwrap_or_else(|_| {
+            panic!("deadline error must be JSON envelope, got: {err}");
+        });
+        assert_eq!(body["code"], "capture_deadline_exceeded", "{body}");
+        assert_eq!(body["persisted"], false, "{body}");
+        assert!(
+            body.get("thought_id").is_none()
+                || body["thought_id"].is_null(),
+            "must not return prior thought as success: existing_id={thought_id} body={body}"
+        );
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn capture_tool_validation_error_reports_message(pool: PgPool) {
         let s = server(pool);

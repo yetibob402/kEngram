@@ -448,10 +448,13 @@ async fn begin_probe_tx(
 /// 2. Never claim success for a pre-existing content match when this request's
 ///    `argus_source_event` identity did not land (hang-before-gate + preseed).
 ///
-/// When `argus_source_event` is present, recovery is keyed on (namespace,
-/// source_ref) — content fingerprint alone is insufficient.
-/// When absent, recovery requires a gate_event row for the content fingerprint
-/// (optionally filtered by correlation_id).
+/// When `argus_source_event` is present, recovery is keyed on full source
+/// identity: (namespace, source_ref, payload_hash). A matching ns/ref with a
+/// different stored payload_hash is NotPersisted (payload conflict is not
+/// success for this request) — jones board 506841.
+/// When absent, recovery requires a gate_event for the content fingerprint
+/// **and** a non-empty correlation_id that matches the gate row — unkeyed
+/// prior gates cannot prove the current attempt (jones board 506848).
 pub async fn recover_after_deadline(
     pool: &PgPool,
     content: &str,
@@ -491,6 +494,16 @@ pub async fn recover_after_deadline(
             // land a source-event row → not persisted for *this* attempt.
             return Ok(DeadlineRecovery::NotPersisted);
         };
+
+        // Full current request identity: payload_hash must match stored row.
+        // A prior capture under the same (namespace, source_ref) with a different
+        // payload is a conflict class — not proof this attempt succeeded.
+        if phash != ev.payload_hash {
+            tx.commit()
+                .await
+                .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
+            return Ok(DeadlineRecovery::NotPersisted);
+        }
 
         let Some(thought_uuid) = thought_id_opt else {
             tx.commit()
@@ -562,22 +575,29 @@ pub async fn recover_after_deadline(
         }));
     }
 
-    // --- Path B: no source-event — require gate_event for this content ---
-    // Gate rows store matched_thought_id for duplicate actions; new inserts
-    // put the thought only in `thoughts` (matched_thought_id is null). Require
-    // both a gate row (proves *this* request's gate ran) and a content match.
+    // --- Path B: no source-event — require gate_event bound to THIS attempt ---
+    // Full identity without ASE is (content fingerprint + correlation_id).
+    // Unkeyed prior same-content gates must not prove a hung-before-gate call
+    // (correlation_id absent/NULL would match any prior row).
+    let Some(corr) = correlation_id.map(str::trim).filter(|c| !c.is_empty()) else {
+        tx.commit()
+            .await
+            .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
+        return Ok(DeadlineRecovery::NotPersisted);
+    };
+
     let gate: Option<(uuid::Uuid, String, Option<uuid::Uuid>, Option<f64>)> = sqlx::query_as(
         r#"
         SELECT g.id, g.action, g.matched_thought_id, g.similarity
         FROM thought_ingest_gate_events g
         WHERE g.candidate_fingerprint = digest($1::text, 'sha256')
-          AND ($2::text IS NULL OR g.correlation_id = $2)
-        ORDER BY g.created_at DESC
+          AND g.correlation_id = $2
+        ORDER BY created_at DESC
         LIMIT 1
         "#,
     )
     .bind(content)
-    .bind(correlation_id)
+    .bind(corr)
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;

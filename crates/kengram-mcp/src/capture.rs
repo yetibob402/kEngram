@@ -251,21 +251,38 @@ pub async fn capture_with_gate_options(
         )
     };
 
-    // One retry only: Postgres raises 23505 after the winner COMMITS, so the
-    // next gate transaction's pre-insert fingerprint lookup must find the row
-    // (exact_duplicate) unless the path is exact_content_requires_adjudication,
-    // which is not a fingerprint-unique violation and must not loop. Gate
-    // statement_timeout is 400ms; 4 attempts would blow a ~1s end-to-end budget.
+    // Re-enter the gate on fingerprint-unique races until the winner row is
+    // visible as exact_duplicate (or a non-fingerprint error breaks out).
+    //
+    // History: hunter argued one retry is enough because Postgres raises 23505
+    // only after the winner COMMITS, so the next pre-insert SELECT must find
+    // the row. Neo's exact-head rebind @ 0e356a8 measured that as
+    // schedule-dependent under `distinct_source_event_racers_have_durable_ledger`
+    // (16 concurrent same-content captures with distinct source events on an
+    // `agents/*` scope — advisory fail_open insert path races with the lock
+    // holder). One retry still leaked raw thoughts_content_fingerprint_unique
+    // 23505; a retry-disabled mutant was also flaky (3 green then RED). Named
+    // input that needs depth > 1: that 16-way racer.
+    //
+    // Cap at 4 attempts (1 initial + 3 re-entries). Fingerprint-race attempts
+    // typically short-circuit on insert-conflict or exact_duplicate rather than
+    // burning the full 400ms comparison timeout; non-fingerprint errors never
+    // loop. exact_content_requires_adjudication uses sqlstate 23505 but not our
+    // constraint name, so the classifier returns false and we rethrow.
+    const FINGERPRINT_UNIQUE_MAX_ATTEMPTS: u32 = 4;
     let mut gated = run_gate().await;
-    for _ in 0..1 {
-        match gated {
-            Ok(_) => break,
-            Err(ref err) if storage_is_fingerprint_unique_violation(err) => {
-                // Winner has committed; re-resolve through a live gate transaction.
-                gated = run_gate().await;
-            }
-            Err(_) => break,
+    let mut attempts = 1u32;
+    while let Err(ref err) = gated {
+        if attempts >= FINGERPRINT_UNIQUE_MAX_ATTEMPTS
+            || !storage_is_fingerprint_unique_violation(err)
+        {
+            break;
         }
+        attempts += 1;
+        // Yield so the winner commit and sibling racers can progress before we
+        // re-enter; pure schedule insurance for the multi-wave case neo saw.
+        tokio::task::yield_now().await;
+        gated = run_gate().await;
     }
     let result = gated.map_err(CaptureError::Storage)?;
 

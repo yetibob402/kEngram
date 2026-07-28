@@ -42,8 +42,15 @@ use crate::search::{
     RecentResponse, SearchRequest, SearchResponse, SearchRuntimeOptions,
 };
 
+/// Wall-clock budget for the **durable gated INSERT path only**.
+/// Embedding is fully async (pending_embeddings + worker); it must never
+/// consume this budget. Default 1s matches the reviewed fleet SLO.
 const CAPTURE_TOTAL_TIMEOUT: Duration = Duration::from_secs(1);
-const CAPTURE_EMBEDDING_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Post-deadline persistence probe budget (carl MEDIUM). Must not hang the
+/// MCP call after the insert path already timed out; elapsed routes to the
+/// existing `persisted: null` / `persisted_probe_error` envelope.
+const CAPTURE_PROBE_TIMEOUT: Duration = capture::CAPTURE_PERSISTENCE_PROBE_TIMEOUT;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CaptureArgs {
@@ -85,7 +92,9 @@ pub struct CaptureArgs {
     )]
     pub relation_intents: Option<Vec<CaptureRelationIntentArgs>>,
 
-    #[schemars(description = "Optional caller correlation id recorded in the durable gate event.")]
+    #[schemars(
+        description = "Optional caller correlation id retained in thought metadata for forensics. Gate ledger and deadline recovery use a server-minted per-call attempt id (not this value) so reused client correlations cannot prove a later attempt succeeded."
+    )]
     pub correlation_id: Option<String>,
 }
 
@@ -492,7 +501,7 @@ impl std::fmt::Debug for KengramServer {
 #[tool_router]
 impl KengramServer {
     #[tool(
-        description = "Capture a thought into kengram's persistent memory. Returns the thought_id and embedding_status='pending'. The thought is durable and findable by FTS lexical search immediately; vector search picks it up on the next worker tick (default 5 seconds). Identical content (SHA-256 of the bytes) is deduplicated — the response will include `is_duplicate: true` and the pre-existing thought_id when the fingerprint collides. To express that this thought refines, replaces, references, supports, depends on, belongs under, or was decided by another thought, use `link_thoughts` after capture — these relations are queryable via `get_related_thoughts`. Do NOT encode cross-thought relationships in the `metadata` field; metadata is opaque to retrieval and graph traversal. To make a term filterable as an entity or topic, put it in the opening sentence — the tagger lifts phrases from prose surface vocabulary, with extraction probability falling off after the opening."
+        description = "Capture a thought into kengram's persistent memory. Returns the thought_id and embedding_status='pending' after the durable gated insert (embedding is async on the worker; the capture deadline bounds insert only, never embed). The thought is findable by FTS lexical search immediately; vector search picks it up on the next worker tick (default 5 seconds). Identical content (SHA-256 of the bytes) is deduplicated — the response will include `is_duplicate: true` and the pre-existing thought_id when the fingerprint collides. To express that this thought refines, replaces, references, supports, depends on, belongs under, or was decided by another thought, use `link_thoughts` after capture — these relations are queryable via `get_related_thoughts`. Do NOT encode cross-thought relationships in the `metadata` field; metadata is opaque to retrieval and graph traversal. To make a term filterable as an entity or topic, put it in the opening sentence — the tagger lifts phrases from prose surface vocabulary, with extraction probability falling off after the opening."
     )]
     async fn capture(&self, Parameters(args): Parameters<CaptureArgs>) -> Result<String, String> {
         let capture_deadline = Instant::now() + CAPTURE_TOTAL_TIMEOUT;
@@ -506,7 +515,7 @@ impl KengramServer {
         // Map<String, Value> → Value::Object → Metadata. The Map type on
         // the args struct keeps the schema's `type: "object"` concrete so
         // claude.ai's MCP client forwards the field intact.
-        let metadata = args
+        let mut metadata = args
             .metadata
             .map(serde_json::Value::Object)
             .map(Metadata::from);
@@ -551,55 +560,53 @@ impl KengramServer {
             return Err("relation_intents require argus_source_event identity".to_string());
         }
 
-        // Obtain the candidate vector before entering the gate transaction.
-        // Only the reviewed BGE identity can participate in semantic compare;
-        // every other outcome becomes a structured fail-open reason.
-        let (candidate_embedding, bypass_reason) = if self.embedder.model().id == "bge-m3:1024"
-            && self.embedder.model().dimensions == 1024
-        {
-            let texts = vec![args.content.clone()];
-            let embedding_timeout = CAPTURE_EMBEDDING_TIMEOUT
-                .min(capture_deadline.saturating_duration_since(Instant::now()));
-            match tokio::time::timeout(embedding_timeout, self.embedder.embed(&texts)).await {
-                Ok(Ok(vectors)) if vectors.len() == 1 && vectors[0].len() == 1024 => (
-                    Some(vectors.into_iter().next().expect("length checked")),
-                    None,
-                ),
-                Ok(Ok(vectors)) => (
-                    None,
-                    Some(serde_json::json!({
-                        "code": "embedding_dimension_mismatch",
-                        "returned_vectors": vectors.len(),
-                        "expected_dimensions": 1024
-                    })),
-                ),
-                Ok(Err(error)) => (
-                    None,
-                    Some(serde_json::json!({
-                        "code": "embedding_unavailable",
-                        "detail": error.to_string()
-                    })),
-                ),
-                Err(_) => (
-                    None,
-                    Some(serde_json::json!({
-                        "code": "embedding_timeout",
-                        "timeout_ms": CAPTURE_EMBEDDING_TIMEOUT.as_millis()
-                    })),
-                ),
-            }
-        } else {
-            (
-                None,
-                Some(serde_json::json!({
-                    "code": "embedding_model_mismatch",
-                    "model_id": self.embedder.model().id,
-                    "dimensions": self.embedder.model().dimensions,
-                    "required": "bge-m3:1024"
-                })),
-            )
-        };
+        // Embedding is fully async: durable gated insert first, worker drain
+        // writes vectors later (`embedding_status: pending`). Synchronous
+        // embedder calls used to consume the 1s deadline and return errors
+        // that persisted NOTHING (carl RCA / 223-failure class residual).
+        // Semantic compare is fail-open with an explicit deferred reason.
+        let candidate_embedding: Option<Vec<f32>> = None;
+        let bypass_reason = Some(serde_json::json!({
+            "code": "embedding_deferred_to_worker",
+            "detail": "capture returns after durable gated insert; embedding is async via pending_embeddings"
+        }));
 
+        let content_for_probe = args.content.clone();
+        // Server-minted per-call identity for gate ledger + deadline recovery
+        // (jones 509399). Caller correlation_id is reusable and must NOT alone
+        // prove this attempt succeeded; keep it in metadata for forensics.
+        let call_attempt_id = uuid::Uuid::new_v4().to_string();
+        let correlation_for_probe = Some(call_attempt_id.clone());
+        let caller_correlation = args
+            .correlation_id
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(ref client_corr) = caller_correlation {
+            // Forensic only — not used as recovery key (server attempt id is).
+            let mut map = metadata
+                .as_ref()
+                .map(|m| m.as_value().as_object().cloned().unwrap_or_default())
+                .unwrap_or_default();
+            map.insert(
+                "client_correlation_id".to_string(),
+                serde_json::Value::String(client_corr.clone()),
+            );
+            metadata = Some(Metadata::from(serde_json::Value::Object(map)));
+        }
+        let argus_for_probe =
+            args.argus_source_event
+                .as_ref()
+                .map(|event| capture::ArgusSourceEventRequest {
+                    namespace: event.namespace.clone(),
+                    source_ref: event.source_ref.clone(),
+                    payload_hash: event.payload_hash.clone(),
+                    metadata: event
+                        .metadata
+                        .clone()
+                        .map(serde_json::Value::Object)
+                        .map(Metadata::from),
+                });
         let request = CaptureRequest {
             content: args.content,
             source,
@@ -618,36 +625,86 @@ impl KengramServer {
             }),
         };
 
-        let resp = tokio::time::timeout_at(
-            capture_deadline,
-            capture::capture_with_gate_options(
-                &self.pool,
-                // Invalid/unavailable candidates always queue the reviewed BGE
-                // model, independent of a stale server embedder configuration.
-                "bge-m3:1024",
-                self.tagger_model_id.as_deref(),
-                request,
-                capture::CaptureGateOptions {
-                    source_created_at,
-                    candidate_embedding,
-                    bypass_reason,
-                    relation_intents,
-                    // The database derives the authenticated producer class from
-                    // session_user. Leaving this optional assertion unset also
-                    // keeps the reviewed break-glass/admin-DSN rollback usable.
-                    claimed_producer_class: None,
-                    correlation_id: args.correlation_id,
-                },
-            ),
-        )
-        .await
-        .map_err(|_| {
-            format!(
-                "capture exceeded the {}ms embedding-plus-gate deadline",
-                CAPTURE_TOTAL_TIMEOUT.as_millis()
-            )
-        })?
-        .map_err(map_capture_error)?;
+        let gate_fut = capture::capture_with_gate_options(
+            &self.pool,
+            // Worker pairs pending rows with the active reviewed BGE identity.
+            "bge-m3:1024",
+            self.tagger_model_id.as_deref(),
+            request,
+            capture::CaptureGateOptions {
+                source_created_at,
+                candidate_embedding,
+                bypass_reason,
+                relation_intents,
+                // The database derives the authenticated producer class from
+                // session_user. Leaving this optional assertion unset also
+                // keeps the reviewed break-glass/admin-DSN rollback usable.
+                claimed_producer_class: None,
+                correlation_id: Some(call_attempt_id),
+            },
+        );
+
+        let resp = match tokio::time::timeout_at(capture_deadline, gate_fut).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(err)) => return Err(map_capture_error(err)),
+            Err(_elapsed) => {
+                // Deadline bound the INSERT path only. Be HONEST about
+                // persistence: a cancelled future may have committed.
+                // Recovery is ledger-keyed (jones P1): never synthesize success
+                // with null gate/source receipts when the DB has rows, and never
+                // claim success for preseeded content without this request's
+                // source-event / gate evidence.
+                let probe = tokio::time::timeout(
+                    CAPTURE_PROBE_TIMEOUT,
+                    capture::recover_after_deadline(
+                        &self.pool,
+                        &content_for_probe,
+                        argus_for_probe.as_ref(),
+                        correlation_for_probe.as_deref(),
+                    ),
+                )
+                .await;
+                match probe {
+                    Ok(Ok(capture::DeadlineRecovery::Recovered(resp))) => resp,
+                    Ok(Ok(capture::DeadlineRecovery::NotPersisted)) => {
+                        return Err(serde_json::json!({
+                            "code": "capture_deadline_exceeded",
+                            "persisted": false,
+                            "limit_ms": CAPTURE_TOTAL_TIMEOUT.as_millis(),
+                            "detail": "capture exceeded the insert-path deadline before durable ledger evidence for this request was observed; safe to retry the exact request",
+                            "retry": "retry_exact_request"
+                        })
+                        .to_string());
+                    }
+                    Ok(Err(probe_err)) => {
+                        return Err(serde_json::json!({
+                            "code": "capture_deadline_exceeded",
+                            "persisted": null,
+                            "persisted_probe_error": true,
+                            "limit_ms": CAPTURE_TOTAL_TIMEOUT.as_millis(),
+                            "detail": format!(
+                                "capture exceeded the insert-path deadline; could not confirm persistence ({})",
+                                map_capture_error(probe_err)
+                            ),
+                            "retry": "retry_exact_request"
+                        })
+                        .to_string());
+                    }
+                    Err(_probe_elapsed) => {
+                        return Err(serde_json::json!({
+                            "code": "capture_deadline_exceeded",
+                            "persisted": null,
+                            "persisted_probe_error": true,
+                            "limit_ms": CAPTURE_TOTAL_TIMEOUT.as_millis(),
+                            "probe_timeout_ms": CAPTURE_PROBE_TIMEOUT.as_millis(),
+                            "detail": "capture exceeded the insert-path deadline; persistence probe itself timed out before confirmation",
+                            "retry": "retry_exact_request"
+                        })
+                        .to_string());
+                    }
+                }
+            }
+        };
 
         let body = serde_json::json!({
             "thought_id": resp.thought_id.to_string(),
@@ -1761,7 +1818,8 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn capture_total_deadline_reserves_gate_time_after_embedding_timeout(pool: PgPool) {
+    async fn capture_ignores_slow_embedder_and_returns_pending_within_insert_budget(pool: PgPool) {
+        // Sync embed is off the capture path; a 2s embedder must not block or fail capture.
         let server = KengramServer::new(
             pool.clone(),
             Arc::new(SlowEmbedder {
@@ -1776,19 +1834,17 @@ mod tests {
         let started = std::time::Instant::now();
         let raw = server
             .capture(Parameters(CaptureArgs {
-                content:
-                    "Embedding timeout must still leave time for a durable gated fail-open insert."
-                        .into(),
+                content: "Slow embedder must not consume the insert-path deadline.".into(),
                 source: "test".into(),
-                scope: Some("agents/total-deadline".into()),
+                scope: Some("agents/insert-only-deadline".into()),
                 metadata: None,
                 argus_source_event: None,
                 source_created_at: None,
                 relation_intents: None,
-                correlation_id: Some("total-deadline-test".into()),
+                correlation_id: Some("insert-only-deadline-test".into()),
             }))
             .await
-            .unwrap();
+            .expect("capture must succeed without waiting on embedder");
         let elapsed = started.elapsed();
         let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let gate_event_id = response["gate_event_id"].as_str().unwrap();
@@ -1808,10 +1864,520 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(elapsed < CAPTURE_TOTAL_TIMEOUT, "elapsed={elapsed:?}");
-        assert_eq!(bypass_code, "embedding_timeout");
+        assert!(
+            elapsed < CAPTURE_TOTAL_TIMEOUT,
+            "elapsed={elapsed:?} must stay under insert-only budget"
+        );
+        assert_eq!(bypass_code, "embedding_deferred_to_worker");
+        assert_eq!(response["embedding_status"], "pending");
         assert_eq!(pending_embedding, 1);
         assert_eq!(pending_tag, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_long_content_succeeds_within_insert_budget(pool: PgPool) {
+        let s = server(pool.clone());
+        // 100 KiB+ payload (class: long content used to die on embed+gate deadline)
+        let content = format!("long-capture-prefix-{}-", "x".repeat(100 * 1024));
+        assert!(content.len() > 100 * 1024);
+        let started = std::time::Instant::now();
+        let raw = s
+            .capture(Parameters(CaptureArgs {
+                content: content.clone(),
+                source: "test".into(),
+                scope: Some("agents/long-content".into()),
+                metadata: None,
+                argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: Some("long-content-test".into()),
+            }))
+            .await
+            .expect("100KB+ capture must succeed within insert budget");
+        let elapsed = started.elapsed();
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(response["thought_id"].as_str().is_some());
+        assert_eq!(response["embedding_status"], "pending");
+        assert_eq!(response["is_duplicate"], false);
+        assert!(
+            elapsed < CAPTURE_TOTAL_TIMEOUT,
+            "elapsed={elapsed:?} for {} bytes",
+            content.len()
+        );
+        // Carl oracle shape: identical re-capture is_duplicate true
+        let raw2 = s
+            .capture(Parameters(CaptureArgs {
+                content,
+                source: "test".into(),
+                scope: Some("agents/long-content".into()),
+                metadata: None,
+                argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: Some("long-content-test-2".into()),
+            }))
+            .await
+            .unwrap();
+        let response2: serde_json::Value = serde_json::from_str(&raw2).unwrap();
+        assert_eq!(response2["is_duplicate"], true);
+        assert_eq!(response2["thought_id"], response["thought_id"]);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_deadline_after_durable_insert_recovers_and_oracle_duplicate(pool: PgPool) {
+        // Carl dedup-oracle: if the first call hits the deadline AFTER the gate
+        // committed, the client must still observe a durable thought (success
+        // recovery here) and an identical re-capture must return is_duplicate.
+        let s = server(pool.clone());
+        let content = format!(
+            "{}deadline-oracle-content-must-persist-once",
+            capture::test_hooks::HANG_AFTER_GATE_PREFIX
+        );
+        let raw = s
+            .capture(Parameters(CaptureArgs {
+                content: content.clone(),
+                source: "test".into(),
+                scope: Some("agents/deadline-oracle".into()),
+                metadata: None,
+                argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: Some("deadline-oracle-1".into()),
+            }))
+            .await
+            .expect("deadline after commit must recover as success with thought_id");
+        let first: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(first["thought_id"].as_str().is_some());
+        assert_eq!(first["embedding_status"], "pending");
+        // Jones invariant 1: recovery must not synthesize null gate_event_id
+        // when the gate ledger has a row for this request.
+        assert!(
+            first["gate_event_id"].as_str().is_some(),
+            "timeout-after-commit recovery must hydrate gate_event_id: {first}"
+        );
+
+        // Re-capture identical bytes (hang only on first insert).
+        let raw2 = s
+            .capture(Parameters(CaptureArgs {
+                content,
+                source: "test".into(),
+                scope: Some("agents/deadline-oracle".into()),
+                metadata: None,
+                argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: Some("deadline-oracle-2".into()),
+            }))
+            .await
+            .unwrap();
+        let second: serde_json::Value = serde_json::from_str(&raw2).unwrap();
+        assert_eq!(
+            second["is_duplicate"], true,
+            "identical re-capture after durable first must be is_duplicate: {second}"
+        );
+        assert_eq!(second["thought_id"], first["thought_id"]);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_deadline_before_gate_reports_persisted_false(pool: PgPool) {
+        // Carl coverage: deadline with no durable row must return honest
+        // persisted:false (not a silent hang, not a confident wrong true).
+        let s = server(pool.clone());
+        let content = format!(
+            "{}deadline-before-gate-must-not-persist",
+            capture::test_hooks::HANG_BEFORE_GATE_PREFIX
+        );
+        let err = s
+            .capture(Parameters(CaptureArgs {
+                content: content.clone(),
+                source: "test".into(),
+                scope: Some("agents/deadline-persisted-false".into()),
+                metadata: None,
+                argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: Some("deadline-persisted-false".into()),
+            }))
+            .await
+            .expect_err("must error when gate never runs");
+        let body: serde_json::Value = serde_json::from_str(&err).unwrap_or_else(|_| {
+            panic!("deadline error must be JSON envelope, got: {err}");
+        });
+        assert_eq!(body["code"], "capture_deadline_exceeded");
+        assert_eq!(body["persisted"], false);
+        assert_eq!(body["retry"], "retry_exact_request");
+        let rows: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::bigint
+            FROM thoughts
+            WHERE content_fingerprint = digest($1::text, 'sha256')
+              AND retracted_at IS NULL
+            "#,
+        )
+        .bind(&content)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 0, "no durable thought on persisted=false path");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_deadline_preseed_hang_before_gate_does_not_claim_old_thought(pool: PgPool) {
+        // Jones attack 2 class: content already in DB, this request hangs before
+        // gate with a *new* argus_source_event identity. Recovery must not claim
+        // success for the old thought while source_event_rows for this ref = 0.
+        let s = server(pool.clone());
+        let content = format!(
+            "{}preseed-via-sql-then-hang-before-gate",
+            capture::test_hooks::HANG_BEFORE_GATE_PREFIX
+        );
+        sqlx::query(
+            r#"
+            INSERT INTO thoughts (id, scope, content, content_fingerprint, source, metadata)
+            VALUES (
+              gen_random_uuid(),
+              'agents/preseed-deadline',
+              $1,
+              digest($1::text, 'sha256'),
+              'test',
+              '{}'::jsonb
+            )
+            "#,
+        )
+        .bind(&content)
+        .execute(&pool)
+        .await
+        .expect("sql preseed thought");
+
+        let err = s
+            .capture(Parameters(CaptureArgs {
+                content: content.clone(),
+                source: "test".into(),
+                scope: Some("agents/preseed-deadline".into()),
+                metadata: None,
+                argus_source_event: Some(ArgusSourceEventArgs {
+                    namespace: "test".into(),
+                    source_ref: "hang-before-ref-new".into(),
+                    payload_hash: "hash-hang-before-new".into(),
+                    metadata: None,
+                }),
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: Some("hang-before-2".into()),
+            }))
+            .await
+            .expect_err(
+                "must not claim success for preseeded content without this request's ledger",
+            );
+        let body: serde_json::Value = serde_json::from_str(&err).expect("json err");
+        assert_eq!(body["code"], "capture_deadline_exceeded");
+        assert_eq!(body["persisted"], false, "{body}");
+        let se_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::bigint FROM argus_source_events
+            WHERE namespace = 'test' AND source_ref = 'hang-before-ref-new'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            se_count, 0,
+            "this request must not leave a source_event row"
+        );
+    }
+
+    // Jones board 506841 / PR8 CN: Path A recovery must bind to full current
+    // request identity (namespace, source_ref, payload_hash). A prior ASE row
+    // under the same ns/ref with a different payload must not prove success.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn adversary_existing_source_identity_with_different_payload_cannot_recover_success(
+        pool: PgPool,
+    ) {
+        let s = server(pool.clone());
+        let original_content = "jones adversary original payload content under ase identity";
+        let stored_payload =
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string();
+        let original_raw = s
+            .capture(Parameters(CaptureArgs {
+                content: original_content.into(),
+                source: "test".into(),
+                scope: Some("agents/jones-adversary-payload".into()),
+                metadata: None,
+                argus_source_event: Some(ArgusSourceEventArgs {
+                    namespace: "agents/jones-adversary-payload".into(),
+                    source_ref: "same-source-ref-different-payload".into(),
+                    payload_hash: stored_payload.clone(),
+                    metadata: None,
+                }),
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: Some("jones-payload-orig".into()),
+            }))
+            .await
+            .expect("original ASE capture must succeed");
+        let original: serde_json::Value = serde_json::from_str(&original_raw).unwrap();
+        assert!(original["thought_id"].as_str().is_some());
+        assert_eq!(
+            original["argus_source_event"]["payload_hash"],
+            stored_payload
+        );
+
+        // Hang before gate under the same (namespace, source_ref) but a
+        // different payload_hash — this request never lands its own ASE row.
+        let hang_content = format!(
+            "{}jones-adversary-different-payload-hang",
+            capture::test_hooks::HANG_BEFORE_GATE_PREFIX
+        );
+        let current_payload =
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string();
+        let result = s
+            .capture(Parameters(CaptureArgs {
+                content: hang_content,
+                source: "test".into(),
+                scope: Some("agents/jones-adversary-payload".into()),
+                metadata: None,
+                argus_source_event: Some(ArgusSourceEventArgs {
+                    namespace: "agents/jones-adversary-payload".into(),
+                    source_ref: "same-source-ref-different-payload".into(),
+                    payload_hash: current_payload.clone(),
+                    metadata: None,
+                }),
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: Some("jones-payload-conflict-hang".into()),
+            }))
+            .await;
+
+        // Knox design: honest answer is the conflict response, never the old
+        // request as success-stored, and never a silent deadline that hides
+        // a known identity conflict.
+        let raw = result.expect(
+            "a prior source identity with a different payload must surface as conflict, not stored success",
+        );
+        let body: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|_| {
+            panic!("conflict recovery must be JSON CaptureResponse, got: {raw}");
+        });
+        assert_eq!(
+            body["argus_source_event"]["action"], "conflict",
+            "must not recover old success as stored: {body}"
+        );
+        assert_eq!(body["argus_source_event"]["status"], "conflict", "{body}");
+        assert_eq!(
+            body["argus_source_event"]["payload_hash"], stored_payload,
+            "conflict surfaces stored (original) payload, not the refused one: {body}"
+        );
+        assert_ne!(
+            body["argus_source_event"]["payload_hash"], current_payload,
+            "refused payload must not be claimed stored: {body}"
+        );
+        assert_eq!(
+            body["thought_id"], original["thought_id"],
+            "conflict points at the original thought, not a fabricated new write: {body}"
+        );
+
+        let stored_row: (String, Option<uuid::Uuid>, String) = sqlx::query_as(
+            r#"
+            SELECT payload_hash, thought_id, status
+            FROM argus_source_events
+            WHERE namespace = $1 AND source_ref = $2
+            "#,
+        )
+        .bind("agents/jones-adversary-payload")
+        .bind("same-source-ref-different-payload")
+        .fetch_one(&pool)
+        .await
+        .expect("original ASE row still present");
+        assert_eq!(stored_row.0, stored_payload);
+        assert_eq!(
+            stored_row.1.map(|id| id.to_string()),
+            original["thought_id"].as_str().map(str::to_string)
+        );
+        // Hang-before-gate never mutated the ASE row; recovery only reports.
+        assert_eq!(stored_row.2, "stored");
+    }
+
+    // Jones board 506848 / knox design: Path B without ASE forbids content-
+    // only history inference. Require non-empty correlation_id (call-window
+    // binder) matching a gate row for this fingerprint. Unkeyed prior same-
+    // content gates must not prove a hung-before-gate call succeeded.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn adversary_unkeyed_prior_gate_cannot_prove_current_attempt_succeeded(pool: PgPool) {
+        let s = server(pool.clone());
+        let content = format!(
+            "{}unkeyed-prior-gate-adversary-content",
+            capture::test_hooks::HANG_BEFORE_GATE_PREFIX
+        );
+
+        let thought_id: uuid::Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO thoughts (id, scope, content, content_fingerprint, source, metadata)
+            VALUES (
+              gen_random_uuid(),
+              'agents/jones-unkeyed-prior',
+              $1,
+              digest($1::text, 'sha256'),
+              'test',
+              '{}'::jsonb
+            )
+            RETURNING id
+            "#,
+        )
+        .bind(&content)
+        .fetch_one(&pool)
+        .await
+        .expect("sql preseed thought for unkeyed prior gate");
+
+        sqlx::query(
+            r#"
+            INSERT INTO thought_ingest_gate_events (
+              request_identity, producer_principal, producer_class, profile_revision,
+              correlation_id, scope, source, candidate_fingerprint, candidate_content,
+              mode, action, matched_thought_id, effective_created_at, observed_at
+            ) VALUES (
+              'jones-unkeyed-prior-request',
+              current_user,
+              'test',
+              1,
+              'prior-attempt-correlation',
+              'agents/jones-unkeyed-prior',
+              'test',
+              digest($1::text, 'sha256'),
+              $1,
+              'enforce',
+              'stored',
+              $2,
+              now(),
+              now()
+            )
+            "#,
+        )
+        .bind(&content)
+        .bind(thought_id)
+        .execute(&pool)
+        .await
+        .expect("sql preseed prior gate with correlation");
+
+        // Current attempt: same content, hang before gate, correlation_id absent.
+        // Must not recover success via the unkeyed prior gate row.
+        let result = s
+            .capture(Parameters(CaptureArgs {
+                content: content.clone(),
+                source: "test".into(),
+                scope: Some("agents/jones-unkeyed-prior".into()),
+                metadata: None,
+                argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
+            }))
+            .await;
+
+        let err = result.expect_err(
+            "content plus an unkeyed prior gate cannot prove this hung-before-gate attempt succeeded",
+        );
+        let body: serde_json::Value = serde_json::from_str(&err).unwrap_or_else(|_| {
+            panic!("deadline error must be JSON envelope, got: {err}");
+        });
+        assert_eq!(body["code"], "capture_deadline_exceeded", "{body}");
+        assert_eq!(body["persisted"], false, "{body}");
+        assert!(
+            body.get("thought_id").is_none() || body["thought_id"].is_null(),
+            "must not return prior thought as success: existing_id={thought_id} body={body}"
+        );
+    }
+
+    // Jones board 509399 / knox design: Path B without ASE forbids content-
+    // only history inference. Require non-empty correlation_id (call-window
+    // binder) matching a gate row for this fingerprint. Unkeyed prior same-
+    // content gates must not prove a hung-before-gate call succeeded.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn adversary_reused_correlation_prior_gate_cannot_prove_current_attempt_succeeded(
+        pool: PgPool,
+    ) {
+        let s = server(pool.clone());
+        let content = format!(
+            "{}unkeyed-prior-gate-adversary-content",
+            capture::test_hooks::HANG_BEFORE_GATE_PREFIX
+        );
+
+        let thought_id: uuid::Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO thoughts (id, scope, content, content_fingerprint, source, metadata)
+            VALUES (
+              gen_random_uuid(),
+              'agents/jones-unkeyed-prior',
+              $1,
+              digest($1::text, 'sha256'),
+              'test',
+              '{}'::jsonb
+            )
+            RETURNING id
+            "#,
+        )
+        .bind(&content)
+        .fetch_one(&pool)
+        .await
+        .expect("sql preseed thought for unkeyed prior gate");
+
+        sqlx::query(
+            r#"
+            INSERT INTO thought_ingest_gate_events (
+              request_identity, producer_principal, producer_class, profile_revision,
+              correlation_id, scope, source, candidate_fingerprint, candidate_content,
+              mode, action, matched_thought_id, effective_created_at, observed_at
+            ) VALUES (
+              'jones-unkeyed-prior-request',
+              current_user,
+              'test',
+              1,
+              'prior-attempt-correlation',
+              'agents/jones-unkeyed-prior',
+              'test',
+              digest($1::text, 'sha256'),
+              $1,
+              'enforce',
+              'stored',
+              $2,
+              now(),
+              now()
+            )
+            "#,
+        )
+        .bind(&content)
+        .bind(thought_id)
+        .execute(&pool)
+        .await
+        .expect("sql preseed prior gate with correlation");
+
+        // Current attempt: same content, hang before gate, and caller reuses the
+        // prior non-empty correlation. Reuse must not turn history into this call
+        // (server-minted attempt id is the recovery key).
+        let result = s
+            .capture(Parameters(CaptureArgs {
+                content: content.clone(),
+                source: "test".into(),
+                scope: Some("agents/jones-unkeyed-prior".into()),
+                metadata: None,
+                argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: Some("prior-attempt-correlation".into()),
+            }))
+            .await;
+
+        let err = result.expect_err(
+            "reused correlation plus a prior gate cannot prove this hung-before-gate attempt succeeded",
+        );
+        let body: serde_json::Value = serde_json::from_str(&err).unwrap_or_else(|_| {
+            panic!("deadline error must be JSON envelope, got: {err}");
+        });
+        assert_eq!(body["code"], "capture_deadline_exceeded", "{body}");
+        assert_eq!(body["persisted"], false, "{body}");
+        assert!(
+            body.get("thought_id").is_none() || body["thought_id"].is_null(),
+            "must not return prior thought as success: existing_id={thought_id} body={body}"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -2118,7 +2684,8 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn get_thought_tool_returns_synchronously_indexed_provenance(pool: PgPool) {
+    async fn get_thought_tool_returns_pending_provenance_until_worker_drains(pool: PgPool) {
+        // Capture no longer embeds synchronously — durable insert returns pending.
         let s = server(pool);
         let cap_raw = s
             .capture(Parameters(CaptureArgs {
@@ -2135,6 +2702,7 @@ mod tests {
             .unwrap();
         let cap_json: serde_json::Value = serde_json::from_str(&cap_raw).unwrap();
         let thought_id = cap_json["thought_id"].as_str().unwrap().to_string();
+        assert_eq!(cap_json["embedding_status"], "pending");
 
         let raw = s
             .get_thought(Parameters(GetThoughtArgs { thought_id }))
@@ -2143,8 +2711,8 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(json["thought"].is_object());
         assert_eq!(json["thought"]["content"], "hello");
-        assert_eq!(json["provenance"]["embedding_status"], "indexed");
-        assert!(json["provenance"]["embedded_at"].is_string());
+        assert_eq!(json["provenance"]["embedding_status"], "pending");
+        assert!(json["provenance"]["embedded_at"].is_null());
         // No linked_facts field post-M4.
         assert!(json["provenance"].get("linked_facts").is_none());
         // Tag fields exist (empty defaults).
@@ -2304,10 +2872,10 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn capture_with_bge_candidate_needs_no_redundant_drain(pool: PgPool) {
-        // The synchronous BGE candidate is persisted atomically. The legacy
-        // capture response retains `pending`, while authoritative provenance
-        // is already indexed and no queue row exists.
+    async fn capture_defers_embedding_to_worker_drain(pool: PgPool) {
+        // Capture inserts durable thought + pending_embeddings row; vector
+        // status becomes indexed only after the worker drain (not on the
+        // capture hot path).
         let s = server(pool.clone());
 
         let cap_raw = s
@@ -2327,11 +2895,20 @@ mod tests {
         let thought_id = cap_json["thought_id"].as_str().unwrap().to_string();
         assert_eq!(cap_json["embedding_status"], "pending");
 
+        let before = s
+            .get_thought(Parameters(GetThoughtArgs {
+                thought_id: thought_id.clone(),
+            }))
+            .await
+            .unwrap();
+        let before_json: serde_json::Value = serde_json::from_str(&before).unwrap();
+        assert_eq!(before_json["provenance"]["embedding_status"], "pending");
+
         let report = crate::drain::drain_pending_embeddings(&pool, s.embedder.as_ref(), 16)
             .await
             .unwrap();
-        assert_eq!(report.found, 0);
-        assert_eq!(report.embedded, 0);
+        assert_eq!(report.found, 1);
+        assert_eq!(report.embedded, 1);
         assert_eq!(report.failed, 0);
 
         let raw = s

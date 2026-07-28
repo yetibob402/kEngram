@@ -10,8 +10,8 @@
 //! `retract_thought`. Tag drainage lives in the worker, not here.
 
 use kengram_core::{
-    Embedder, EmbeddingStatus, LinkDirection, LinkTarget, Metadata, RelationKind, Scope, Source,
-    SparseEmbedder, ThoughtId,
+    Embedder, LinkDirection, LinkTarget, Metadata, RelationKind, Scope, Source, SparseEmbedder,
+    ThoughtId,
 };
 use kengram_embed::Reranker;
 use rmcp::{
@@ -570,6 +570,20 @@ impl KengramServer {
         }));
 
         let content_for_probe = args.content.clone();
+        let correlation_for_probe = args.correlation_id.clone();
+        let argus_for_probe =
+            args.argus_source_event
+                .as_ref()
+                .map(|event| capture::ArgusSourceEventRequest {
+                    namespace: event.namespace.clone(),
+                    source_ref: event.source_ref.clone(),
+                    payload_hash: event.payload_hash.clone(),
+                    metadata: event
+                        .metadata
+                        .clone()
+                        .map(serde_json::Value::Object)
+                        .map(Metadata::from),
+                });
         let request = CaptureRequest {
             content: args.content,
             source,
@@ -613,37 +627,28 @@ impl KengramServer {
             Err(_elapsed) => {
                 // Deadline bound the INSERT path only. Be HONEST about
                 // persistence: a cancelled future may have committed.
-                // Probe is itself budgeted (carl MEDIUM): unbounded probe on
-                // a path taken because the DB was already slow can hang the
-                // agent rather than return an error.
+                // Recovery is ledger-keyed (jones P1): never synthesize success
+                // with null gate/source receipts when the DB has rows, and never
+                // claim success for preseeded content without this request's
+                // source-event / gate evidence.
                 let probe = tokio::time::timeout(
                     CAPTURE_PROBE_TIMEOUT,
-                    capture::find_thought_id_by_content(&self.pool, &content_for_probe),
+                    capture::recover_after_deadline(
+                        &self.pool,
+                        &content_for_probe,
+                        argus_for_probe.as_ref(),
+                        correlation_for_probe.as_deref(),
+                    ),
                 )
                 .await;
                 match probe {
-                    Ok(Ok(Some(thought_id))) => {
-                        // Durable row present — surface SUCCESS (contract:
-                        // success after gated insert). Re-capture of the same
-                        // content will report is_duplicate=true (carl oracle).
-                        capture::CaptureResponse {
-                            thought_id,
-                            embedding_status: EmbeddingStatus::Pending,
-                            is_duplicate: false,
-                            argus_source_event: None,
-                            dedup_kind: None,
-                            matched_thought_id: None,
-                            similarity: None,
-                            relation_results: serde_json::json!([]),
-                            gate_event_id: None,
-                        }
-                    }
-                    Ok(Ok(None)) => {
+                    Ok(Ok(capture::DeadlineRecovery::Recovered(resp))) => resp,
+                    Ok(Ok(capture::DeadlineRecovery::NotPersisted)) => {
                         return Err(serde_json::json!({
                             "code": "capture_deadline_exceeded",
                             "persisted": false,
                             "limit_ms": CAPTURE_TOTAL_TIMEOUT.as_millis(),
-                            "detail": "capture exceeded the insert-path deadline before a durable thought row was observed; safe to retry the exact request",
+                            "detail": "capture exceeded the insert-path deadline before durable ledger evidence for this request was observed; safe to retry the exact request",
                             "retry": "retry_exact_request"
                         })
                         .to_string());
@@ -663,7 +668,6 @@ impl KengramServer {
                         .to_string());
                     }
                     Err(_probe_elapsed) => {
-                        // Same envelope as probe Err — no new contract.
                         return Err(serde_json::json!({
                             "code": "capture_deadline_exceeded",
                             "persisted": null,
@@ -1922,6 +1926,12 @@ mod tests {
         let first: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(first["thought_id"].as_str().is_some());
         assert_eq!(first["embedding_status"], "pending");
+        // Jones invariant 1: recovery must not synthesize null gate_event_id
+        // when the gate ledger has a row for this request.
+        assert!(
+            first["gate_event_id"].as_str().is_some(),
+            "timeout-after-commit recovery must hydrate gate_event_id: {first}"
+        );
 
         // Re-capture identical bytes (hang only on first insert).
         let raw2 = s
@@ -1986,6 +1996,72 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rows, 0, "no durable thought on persisted=false path");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_deadline_preseed_hang_before_gate_does_not_claim_old_thought(pool: PgPool) {
+        // Jones attack 2 class: content already in DB, this request hangs before
+        // gate with a *new* argus_source_event identity. Recovery must not claim
+        // success for the old thought while source_event_rows for this ref = 0.
+        let s = server(pool.clone());
+        let content = format!(
+            "{}preseed-via-sql-then-hang-before-gate",
+            capture::test_hooks::HANG_BEFORE_GATE_PREFIX
+        );
+        sqlx::query(
+            r#"
+            INSERT INTO thoughts (id, scope, content, content_fingerprint, source, metadata)
+            VALUES (
+              gen_random_uuid(),
+              'agents/preseed-deadline',
+              $1,
+              digest($1::text, 'sha256'),
+              'test',
+              '{}'::jsonb
+            )
+            "#,
+        )
+        .bind(&content)
+        .execute(&pool)
+        .await
+        .expect("sql preseed thought");
+
+        let err = s
+            .capture(Parameters(CaptureArgs {
+                content: content.clone(),
+                source: "test".into(),
+                scope: Some("agents/preseed-deadline".into()),
+                metadata: None,
+                argus_source_event: Some(ArgusSourceEventArgs {
+                    namespace: "test".into(),
+                    source_ref: "hang-before-ref-new".into(),
+                    payload_hash: "hash-hang-before-new".into(),
+                    metadata: None,
+                }),
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: Some("hang-before-2".into()),
+            }))
+            .await
+            .expect_err(
+                "must not claim success for preseeded content without this request's ledger",
+            );
+        let body: serde_json::Value = serde_json::from_str(&err).expect("json err");
+        assert_eq!(body["code"], "capture_deadline_exceeded");
+        assert_eq!(body["persisted"], false, "{body}");
+        let se_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::bigint FROM argus_source_events
+            WHERE namespace = 'test' AND source_ref = 'hang-before-ref-new'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            se_count, 0,
+            "this request must not leave a source_event row"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]

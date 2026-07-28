@@ -381,9 +381,6 @@ pub async fn capture_with_gate_options(
     Ok(response)
 }
 
-/// Look up a durable thought by content fingerprint (SHA-256 of content bytes
-/// as stored by the gate). Used when the MCP deadline fires so the caller can
-/// be told honestly whether the insert landed.
 /// Probe budget for post-deadline honesty lookup. Kept short: this path only
 /// runs when the insert already exhausted the outer 1s budget.
 pub const CAPTURE_PERSISTENCE_PROBE_TIMEOUT: std::time::Duration =
@@ -392,22 +389,23 @@ pub const CAPTURE_PERSISTENCE_PROBE_TIMEOUT: std::time::Duration =
 /// Local statement_timeout for the persistence probe transaction.
 const CAPTURE_PROBE_STATEMENT_TIMEOUT: &str = "150ms";
 
+/// Result of post-deadline recovery (jones P1: content-only synthesis lies).
+#[derive(Debug, Clone)]
+pub enum DeadlineRecovery {
+    /// This request (or its content/source identity) durably landed; fields
+    /// are hydrated from the ledger so receipts match DB rows.
+    Recovered(CaptureResponse),
+    /// No durable evidence that *this* request completed the gate.
+    NotPersisted,
+}
+
+/// Look up a durable thought by content fingerprint (SHA-256 of content bytes
+/// as stored by the gate).
 pub async fn find_thought_id_by_content(
     pool: &PgPool,
     content: &str,
 ) -> Result<Option<ThoughtId>, CaptureError> {
-    // Match codebase idiom: set_config statement_timeout local inside a tx so
-    // the probe cannot inherit an unbounded session/global timeout on the
-    // exact path taken when the DB was already slow (carl MEDIUM).
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
-    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
-        .bind(CAPTURE_PROBE_STATEMENT_TIMEOUT)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
+    let mut tx = begin_probe_tx(pool).await?;
     let row: Option<(uuid::Uuid,)> = sqlx::query_as(
         r#"
         SELECT id
@@ -421,11 +419,225 @@ pub async fn find_thought_id_by_content(
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
-    // Read-only probe — commit to release the connection cleanly.
     tx.commit()
         .await
         .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
     Ok(row.map(|(id,)| ThoughtId::from(id)))
+}
+
+async fn begin_probe_tx(
+    pool: &PgPool,
+) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, CaptureError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
+    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+        .bind(CAPTURE_PROBE_STATEMENT_TIMEOUT)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
+    Ok(tx)
+}
+
+/// Honest post-deadline recovery.
+///
+/// Invariants (jones attack legs at b2418da):
+/// 1. Never synthesize success with null `gate_event_id` / `argus_source_event`
+///    when the ledger has those rows for this request.
+/// 2. Never claim success for a pre-existing content match when this request's
+///    `argus_source_event` identity did not land (hang-before-gate + preseed).
+///
+/// When `argus_source_event` is present, recovery is keyed on (namespace,
+/// source_ref) — content fingerprint alone is insufficient.
+/// When absent, recovery requires a gate_event row for the content fingerprint
+/// (optionally filtered by correlation_id).
+pub async fn recover_after_deadline(
+    pool: &PgPool,
+    content: &str,
+    argus_source_event: Option<&ArgusSourceEventRequest>,
+    correlation_id: Option<&str>,
+) -> Result<DeadlineRecovery, CaptureError> {
+    let mut tx = begin_probe_tx(pool).await?;
+
+    // --- Path A: source-event identity (preferred when present) ---
+    if let Some(ev) = argus_source_event {
+        let se: Option<(
+            uuid::Uuid,
+            String,
+            String,
+            String,
+            String,
+            Option<uuid::Uuid>,
+        )> = sqlx::query_as(
+            r#"
+                SELECT id, namespace, source_ref, payload_hash, status, thought_id
+                FROM argus_source_events
+                WHERE namespace = $1 AND source_ref = $2
+                LIMIT 1
+                "#,
+        )
+        .bind(&ev.namespace)
+        .bind(&ev.source_ref)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
+
+        let Some((_se_id, ns, sref, phash, status, thought_id_opt)) = se else {
+            tx.commit()
+                .await
+                .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
+            // Content may exist from an earlier capture; this request did not
+            // land a source-event row → not persisted for *this* attempt.
+            return Ok(DeadlineRecovery::NotPersisted);
+        };
+
+        let Some(thought_uuid) = thought_id_opt else {
+            tx.commit()
+                .await
+                .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
+            return Ok(DeadlineRecovery::NotPersisted);
+        };
+        let thought_id = ThoughtId::from(thought_uuid);
+
+        let gate: Option<(uuid::Uuid, String, Option<uuid::Uuid>, Option<f64>)> = sqlx::query_as(
+            r#"
+            SELECT id, action, matched_thought_id, similarity
+            FROM thought_ingest_gate_events
+            WHERE source_event_namespace = $1
+              AND source_event_ref = $2
+              AND ($3::text IS NULL OR correlation_id = $3)
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(&ns)
+        .bind(&sref)
+        .bind(correlation_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
+
+        let (gate_event_id, action, matched, similarity) = match gate {
+            Some((id, action, matched, sim)) => (Some(id), action, matched, sim),
+            None => {
+                // Source event landed but gate ledger row missing — still
+                // durable identity; receipts partial but not fabricated null
+                // when we can surface source_event.
+                (None, "stored".to_string(), None, None)
+            }
+        };
+        let is_duplicate = matches!(
+            action.as_str(),
+            "exact_duplicate" | "semantic_duplicate" | "replay"
+        );
+
+        let argus = ArgusSourceEventResponse {
+            action: if action == "replay" {
+                "duplicate_skip".to_string()
+            } else {
+                action.clone()
+            },
+            namespace: ns,
+            source_ref: sref,
+            payload_hash: phash,
+            status,
+            thought_id: Some(thought_id),
+        };
+
+        return Ok(DeadlineRecovery::Recovered(CaptureResponse {
+            thought_id,
+            embedding_status: EmbeddingStatus::Pending,
+            is_duplicate,
+            argus_source_event: Some(argus),
+            dedup_kind: is_duplicate.then_some(action),
+            matched_thought_id: matched.map(ThoughtId::from),
+            similarity,
+            relation_results: serde_json::json!([]),
+            gate_event_id,
+        }));
+    }
+
+    // --- Path B: no source-event — require gate_event for this content ---
+    // Gate rows store matched_thought_id for duplicate actions; new inserts
+    // put the thought only in `thoughts` (matched_thought_id is null). Require
+    // both a gate row (proves *this* request's gate ran) and a content match.
+    let gate: Option<(uuid::Uuid, String, Option<uuid::Uuid>, Option<f64>)> = sqlx::query_as(
+        r#"
+        SELECT g.id, g.action, g.matched_thought_id, g.similarity
+        FROM thought_ingest_gate_events g
+        WHERE g.candidate_fingerprint = digest($1::text, 'sha256')
+          AND ($2::text IS NULL OR g.correlation_id = $2)
+        ORDER BY g.created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(content)
+    .bind(correlation_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
+
+    let Some((gate_id, action, matched, similarity)) = gate else {
+        // Content thought without gate row is ambiguous (preseed / hang-before).
+        // Do not claim this request succeeded (jones attack 2 class).
+        tx.commit()
+            .await
+            .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
+        return Ok(DeadlineRecovery::NotPersisted);
+    };
+
+    let thought_row: Option<(uuid::Uuid,)> = sqlx::query_as(
+        r#"
+        SELECT id FROM thoughts
+        WHERE content_fingerprint = digest($1::text, 'sha256')
+          AND retracted_at IS NULL
+        LIMIT 1
+        "#,
+    )
+    .bind(content)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
+
+    let thought_uuid = match (thought_row, matched) {
+        (Some((id,)), _) => id,
+        (None, Some(id)) => id,
+        (None, None) => {
+            tx.commit()
+                .await
+                .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
+            return Ok(DeadlineRecovery::NotPersisted);
+        }
+    };
+
+    tx.commit()
+        .await
+        .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
+
+    let thought_id = ThoughtId::from(thought_uuid);
+    let is_duplicate = matches!(
+        action.as_str(),
+        "exact_duplicate" | "semantic_duplicate" | "replay"
+    );
+
+    Ok(DeadlineRecovery::Recovered(CaptureResponse {
+        thought_id,
+        embedding_status: EmbeddingStatus::Pending,
+        is_duplicate,
+        argus_source_event: None,
+        dedup_kind: is_duplicate.then_some(action.clone()),
+        matched_thought_id: matched
+            .map(ThoughtId::from)
+            .or_else(|| if is_duplicate { Some(thought_id) } else { None }),
+        similarity,
+        relation_results: serde_json::json!([]),
+        gate_event_id: Some(gate_id),
+    }))
 }
 
 #[cfg(test)]

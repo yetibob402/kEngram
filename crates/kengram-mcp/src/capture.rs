@@ -144,11 +144,7 @@ pub(crate) fn is_thoughts_content_fingerprint_unique_violation(err: &sqlx::Error
     let sqlx::Error::Database(db) = err else {
         return false;
     };
-    is_fingerprint_unique_violation_parts(
-        db.code().as_deref(),
-        db.constraint(),
-        db.message(),
-    )
+    is_fingerprint_unique_violation_parts(db.code().as_deref(), db.constraint(), db.message())
 }
 
 fn storage_is_fingerprint_unique_violation(err: &kengram_storage::StorageError) -> bool {
@@ -234,7 +230,10 @@ pub async fn capture_with_gate_options(
     // zero durable rows (carl coverage: persisted=false path).
     #[cfg(test)]
     {
-        if request.content.starts_with(test_hooks::HANG_BEFORE_GATE_PREFIX) {
+        if request
+            .content
+            .starts_with(test_hooks::HANG_BEFORE_GATE_PREFIX)
+        {
             std::future::pending::<()>().await;
         }
     }
@@ -370,7 +369,11 @@ pub async fn capture_with_gate_options(
         // Only hang on first durable insert; exact_duplicate must return so
         // the re-capture oracle can observe is_duplicate=true without another
         // timeout recovery (which would force is_duplicate=false).
-        if !is_duplicate && request.content.starts_with(test_hooks::HANG_AFTER_GATE_PREFIX) {
+        if !is_duplicate
+            && request
+                .content
+                .starts_with(test_hooks::HANG_AFTER_GATE_PREFIX)
+        {
             std::future::pending::<()>().await;
         }
     }
@@ -1076,7 +1079,13 @@ mod tests {
                         metadata: None,
                     }),
                 };
-                capture(&pool, TEST_EMBEDDER_MODEL_ID, Some(TEST_TAGGER_MODEL_ID), req).await
+                capture(
+                    &pool,
+                    TEST_EMBEDDER_MODEL_ID,
+                    Some(TEST_TAGGER_MODEL_ID),
+                    req,
+                )
+                .await
             }));
         }
         let mut stored_receipts = 0usize;
@@ -1101,13 +1110,12 @@ mod tests {
         .unwrap();
         assert_eq!(thoughts, 1, "exactly one thought for content");
 
-        let ledger: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM argus_source_events WHERE namespace = $1",
-        )
-        .bind("tests/diesel-idempotency")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let ledger: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM argus_source_events WHERE namespace = $1")
+                .bind("tests/diesel-idempotency")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(
             ledger as usize, n,
             "durable source-event rows must equal racer count (got {ledger} vs {n})"
@@ -1183,7 +1191,6 @@ mod tests {
             other => panic!("expected Storage Database error, got {other:?}"),
         }
     }
-
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn enqueues_embedding_and_tag_jobs_on_new_insert(pool: PgPool) {

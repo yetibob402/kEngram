@@ -1897,9 +1897,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn capture_deadline_after_durable_insert_recovers_and_oracle_duplicate(
-        pool: PgPool,
-    ) {
+    async fn capture_deadline_after_durable_insert_recovers_and_oracle_duplicate(pool: PgPool) {
         // Carl dedup-oracle: if the first call hits the deadline AFTER the gate
         // committed, the client must still observe a durable thought (success
         // recovery here) and an identical re-capture must return is_duplicate.

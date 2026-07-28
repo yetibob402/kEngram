@@ -458,9 +458,11 @@ async fn begin_probe_tx(
 /// **conflict** response (not old success, not a blank deadline silence).
 ///
 /// When ASE is absent, content-only inference is forbidden without a
-/// call-window binder: a non-empty `correlation_id` that matches a gate row
-/// for this fingerprint. Unkeyed prior same-content gates cannot prove a
-/// hung-before-gate attempt (else NotPersisted / persisted=false).
+/// **server-minted** call-window binder: a non-empty `correlation_id` that
+/// matches a gate row for this fingerprint. Callers may supply a correlation
+/// for forensics, but the MCP capture path mints a unique attempt id per call
+/// so reused client correlations cannot prove a later attempt (jones 509399).
+/// Unkeyed / mismatched prior gates cannot prove hang-before-gate success.
 pub async fn recover_after_deadline(
     pool: &PgPool,
     content: &str,
@@ -650,8 +652,10 @@ pub async fn recover_after_deadline(
     }
 
     // --- Path B: no ASE — forbid content/history inference without call binder ---
-    // correlation_id is the call-window key recorded on gate_events. Absent or
-    // empty → cannot bound history to THIS attempt → NotPersisted.
+    // correlation_id must be the server-minted attempt id written on THIS call's
+    // gate row. Caller-reused correlation strings must not match a prior gate
+    // for a hang-before-gate attempt (that gate was never written for this call).
+    // Absent or empty → NotPersisted.
     let Some(corr) = correlation_id.map(str::trim).filter(|c| !c.is_empty()) else {
         tx.commit()
             .await

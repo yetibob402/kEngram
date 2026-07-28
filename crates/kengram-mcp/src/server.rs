@@ -92,7 +92,9 @@ pub struct CaptureArgs {
     )]
     pub relation_intents: Option<Vec<CaptureRelationIntentArgs>>,
 
-    #[schemars(description = "Optional caller correlation id recorded in the durable gate event.")]
+    #[schemars(
+        description = "Optional caller correlation id retained in thought metadata for forensics. Gate ledger and deadline recovery use a server-minted per-call attempt id (not this value) so reused client correlations cannot prove a later attempt succeeded."
+    )]
     pub correlation_id: Option<String>,
 }
 
@@ -513,7 +515,7 @@ impl KengramServer {
         // Map<String, Value> → Value::Object → Metadata. The Map type on
         // the args struct keeps the schema's `type: "object"` concrete so
         // claude.ai's MCP client forwards the field intact.
-        let metadata = args
+        let mut metadata = args
             .metadata
             .map(serde_json::Value::Object)
             .map(Metadata::from);
@@ -570,7 +572,28 @@ impl KengramServer {
         }));
 
         let content_for_probe = args.content.clone();
-        let correlation_for_probe = args.correlation_id.clone();
+        // Server-minted per-call identity for gate ledger + deadline recovery
+        // (jones 509399). Caller correlation_id is reusable and must NOT alone
+        // prove this attempt succeeded; keep it in metadata for forensics.
+        let call_attempt_id = uuid::Uuid::new_v4().to_string();
+        let correlation_for_probe = Some(call_attempt_id.clone());
+        let caller_correlation = args
+            .correlation_id
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(ref client_corr) = caller_correlation {
+            // Forensic only — not used as recovery key (server attempt id is).
+            let mut map = metadata
+                .as_ref()
+                .map(|m| m.as_value().as_object().cloned().unwrap_or_default())
+                .unwrap_or_default();
+            map.insert(
+                "client_correlation_id".to_string(),
+                serde_json::Value::String(client_corr.clone()),
+            );
+            metadata = Some(Metadata::from(serde_json::Value::Object(map)));
+        }
         let argus_for_probe =
             args.argus_source_event
                 .as_ref()
@@ -617,7 +640,7 @@ impl KengramServer {
                 // session_user. Leaving this optional assertion unset also
                 // keeps the reviewed break-glass/admin-DSN rollback usable.
                 claimed_producer_class: None,
-                correlation_id: args.correlation_id,
+                correlation_id: Some(call_attempt_id),
             },
         );
 
@@ -2064,7 +2087,6 @@ mod tests {
         );
     }
 
-
     // Jones board 506841 / PR8 CN: Path A recovery must bind to full current
     // request identity (namespace, source_ref, payload_hash). A prior ASE row
     // under the same ns/ref with a different payload must not prove success.
@@ -2260,8 +2282,100 @@ mod tests {
         assert_eq!(body["code"], "capture_deadline_exceeded", "{body}");
         assert_eq!(body["persisted"], false, "{body}");
         assert!(
-            body.get("thought_id").is_none()
-                || body["thought_id"].is_null(),
+            body.get("thought_id").is_none() || body["thought_id"].is_null(),
+            "must not return prior thought as success: existing_id={thought_id} body={body}"
+        );
+    }
+
+    // Jones board 509399 / knox design: Path B without ASE forbids content-
+    // only history inference. Require non-empty correlation_id (call-window
+    // binder) matching a gate row for this fingerprint. Unkeyed prior same-
+    // content gates must not prove a hung-before-gate call succeeded.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn adversary_reused_correlation_prior_gate_cannot_prove_current_attempt_succeeded(
+        pool: PgPool,
+    ) {
+        let s = server(pool.clone());
+        let content = format!(
+            "{}unkeyed-prior-gate-adversary-content",
+            capture::test_hooks::HANG_BEFORE_GATE_PREFIX
+        );
+
+        let thought_id: uuid::Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO thoughts (id, scope, content, content_fingerprint, source, metadata)
+            VALUES (
+              gen_random_uuid(),
+              'agents/jones-unkeyed-prior',
+              $1,
+              digest($1::text, 'sha256'),
+              'test',
+              '{}'::jsonb
+            )
+            RETURNING id
+            "#,
+        )
+        .bind(&content)
+        .fetch_one(&pool)
+        .await
+        .expect("sql preseed thought for unkeyed prior gate");
+
+        sqlx::query(
+            r#"
+            INSERT INTO thought_ingest_gate_events (
+              request_identity, producer_principal, producer_class, profile_revision,
+              correlation_id, scope, source, candidate_fingerprint, candidate_content,
+              mode, action, matched_thought_id, effective_created_at, observed_at
+            ) VALUES (
+              'jones-unkeyed-prior-request',
+              current_user,
+              'test',
+              1,
+              'prior-attempt-correlation',
+              'agents/jones-unkeyed-prior',
+              'test',
+              digest($1::text, 'sha256'),
+              $1,
+              'enforce',
+              'stored',
+              $2,
+              now(),
+              now()
+            )
+            "#,
+        )
+        .bind(&content)
+        .bind(thought_id)
+        .execute(&pool)
+        .await
+        .expect("sql preseed prior gate with correlation");
+
+        // Current attempt: same content, hang before gate, and caller reuses the
+        // prior non-empty correlation. Reuse must not turn history into this call
+        // (server-minted attempt id is the recovery key).
+        let result = s
+            .capture(Parameters(CaptureArgs {
+                content: content.clone(),
+                source: "test".into(),
+                scope: Some("agents/jones-unkeyed-prior".into()),
+                metadata: None,
+                argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: Some("prior-attempt-correlation".into()),
+            }))
+            .await;
+
+        let err = result.expect_err(
+            "reused correlation plus a prior gate cannot prove this hung-before-gate attempt succeeded",
+        );
+        let body: serde_json::Value = serde_json::from_str(&err).unwrap_or_else(|_| {
+            panic!("deadline error must be JSON envelope, got: {err}");
+        });
+        assert_eq!(body["code"], "capture_deadline_exceeded", "{body}");
+        assert_eq!(body["persisted"], false, "{body}");
+        assert!(
+            body.get("thought_id").is_none() || body["thought_id"].is_null(),
             "must not return prior thought as success: existing_id={thought_id} body={body}"
         );
     }

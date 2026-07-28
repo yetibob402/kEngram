@@ -230,6 +230,15 @@ pub async fn capture_with_gate_options(
         .source_created_at
         .or_else(|| Some(OffsetDateTime::now_utc()));
 
+    // Test-only: hang BEFORE any gate SQL so the outer deadline can fire with
+    // zero durable rows (carl coverage: persisted=false path).
+    #[cfg(test)]
+    {
+        if request.content.starts_with(test_hooks::HANG_BEFORE_GATE_PREFIX) {
+            std::future::pending::<()>().await;
+        }
+    }
+
     // Race: concurrent same-content captures can both miss the pre-insert
     // fingerprint SELECT; the loser INSERT hits thoughts_content_fingerprint_unique
     // (23505) and the gate transaction rolls back. Do NOT fabricate a CaptureResponse
@@ -372,10 +381,30 @@ pub async fn capture_with_gate_options(
 /// Look up a durable thought by content fingerprint (SHA-256 of content bytes
 /// as stored by the gate). Used when the MCP deadline fires so the caller can
 /// be told honestly whether the insert landed.
+/// Probe budget for post-deadline honesty lookup. Kept short: this path only
+/// runs when the insert already exhausted the outer 1s budget.
+pub const CAPTURE_PERSISTENCE_PROBE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(200);
+
+/// Local statement_timeout for the persistence probe transaction.
+const CAPTURE_PROBE_STATEMENT_TIMEOUT: &str = "150ms";
+
 pub async fn find_thought_id_by_content(
     pool: &PgPool,
     content: &str,
 ) -> Result<Option<ThoughtId>, CaptureError> {
+    // Match codebase idiom: set_config statement_timeout local inside a tx so
+    // the probe cannot inherit an unbounded session/global timeout on the
+    // exact path taken when the DB was already slow (carl MEDIUM).
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
+    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+        .bind(CAPTURE_PROBE_STATEMENT_TIMEOUT)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
     let row: Option<(uuid::Uuid,)> = sqlx::query_as(
         r#"
         SELECT id
@@ -386,9 +415,13 @@ pub async fn find_thought_id_by_content(
         "#,
     )
     .bind(content)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
+    // Read-only probe — commit to release the connection cleanly.
+    tx.commit()
+        .await
+        .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
     Ok(row.map(|(id,)| ThoughtId::from(id)))
 }
 
@@ -397,6 +430,10 @@ pub mod test_hooks {
     /// Prefix content with this string to hang after durable gate commit
     /// (carl deadline oracle). Parallel-safe: only that capture hangs.
     pub const HANG_AFTER_GATE_PREFIX: &str = "__KENGRAM_TEST_HANG_AFTER_GATE__\n";
+
+    /// Prefix content to hang *before* any gate SQL (carl coverage: deadline
+    /// with persisted=false / no durable row). Content-keyed for parallel tests.
+    pub const HANG_BEFORE_GATE_PREFIX: &str = "__KENGRAM_TEST_HANG_BEFORE_GATE__\n";
 }
 
 #[cfg(test)]

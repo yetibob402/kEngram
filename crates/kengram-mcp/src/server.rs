@@ -47,6 +47,11 @@ use crate::search::{
 /// consume this budget. Default 1s matches the reviewed fleet SLO.
 const CAPTURE_TOTAL_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Post-deadline persistence probe budget (carl MEDIUM). Must not hang the
+/// MCP call after the insert path already timed out; elapsed routes to the
+/// existing `persisted: null` / `persisted_probe_error` envelope.
+const CAPTURE_PROBE_TIMEOUT: Duration = capture::CAPTURE_PERSISTENCE_PROBE_TIMEOUT;
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CaptureArgs {
     #[schemars(description = "The thought text. Required, non-empty, max 1 MiB.")]
@@ -608,8 +613,16 @@ impl KengramServer {
             Err(_elapsed) => {
                 // Deadline bound the INSERT path only. Be HONEST about
                 // persistence: a cancelled future may have committed.
-                match capture::find_thought_id_by_content(&self.pool, &content_for_probe).await {
-                    Ok(Some(thought_id)) => {
+                // Probe is itself budgeted (carl MEDIUM): unbounded probe on
+                // a path taken because the DB was already slow can hang the
+                // agent rather than return an error.
+                let probe = tokio::time::timeout(
+                    CAPTURE_PROBE_TIMEOUT,
+                    capture::find_thought_id_by_content(&self.pool, &content_for_probe),
+                )
+                .await;
+                match probe {
+                    Ok(Ok(Some(thought_id))) => {
                         // Durable row present — surface SUCCESS (contract:
                         // success after gated insert). Re-capture of the same
                         // content will report is_duplicate=true (carl oracle).
@@ -625,7 +638,7 @@ impl KengramServer {
                             gate_event_id: None,
                         }
                     }
-                    Ok(None) => {
+                    Ok(Ok(None)) => {
                         return Err(serde_json::json!({
                             "code": "capture_deadline_exceeded",
                             "persisted": false,
@@ -635,7 +648,7 @@ impl KengramServer {
                         })
                         .to_string());
                     }
-                    Err(probe_err) => {
+                    Ok(Err(probe_err)) => {
                         return Err(serde_json::json!({
                             "code": "capture_deadline_exceeded",
                             "persisted": null,
@@ -645,6 +658,19 @@ impl KengramServer {
                                 "capture exceeded the insert-path deadline; could not confirm persistence ({})",
                                 map_capture_error(probe_err)
                             ),
+                            "retry": "retry_exact_request"
+                        })
+                        .to_string());
+                    }
+                    Err(_probe_elapsed) => {
+                        // Same envelope as probe Err — no new contract.
+                        return Err(serde_json::json!({
+                            "code": "capture_deadline_exceeded",
+                            "persisted": null,
+                            "persisted_probe_error": true,
+                            "limit_ms": CAPTURE_TOTAL_TIMEOUT.as_millis(),
+                            "probe_timeout_ms": CAPTURE_PROBE_TIMEOUT.as_millis(),
+                            "detail": "capture exceeded the insert-path deadline; persistence probe itself timed out before confirmation",
                             "retry": "retry_exact_request"
                         })
                         .to_string());
@@ -1919,6 +1945,49 @@ mod tests {
             "identical re-capture after durable first must be is_duplicate: {second}"
         );
         assert_eq!(second["thought_id"], first["thought_id"]);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn capture_deadline_before_gate_reports_persisted_false(pool: PgPool) {
+        // Carl coverage: deadline with no durable row must return honest
+        // persisted:false (not a silent hang, not a confident wrong true).
+        let s = server(pool.clone());
+        let content = format!(
+            "{}deadline-before-gate-must-not-persist",
+            capture::test_hooks::HANG_BEFORE_GATE_PREFIX
+        );
+        let err = s
+            .capture(Parameters(CaptureArgs {
+                content: content.clone(),
+                source: "test".into(),
+                scope: Some("agents/deadline-persisted-false".into()),
+                metadata: None,
+                argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: Some("deadline-persisted-false".into()),
+            }))
+            .await
+            .expect_err("must error when gate never runs");
+        let body: serde_json::Value = serde_json::from_str(&err).unwrap_or_else(|_| {
+            panic!("deadline error must be JSON envelope, got: {err}");
+        });
+        assert_eq!(body["code"], "capture_deadline_exceeded");
+        assert_eq!(body["persisted"], false);
+        assert_eq!(body["retry"], "retry_exact_request");
+        let rows: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::bigint
+            FROM thoughts
+            WHERE content_fingerprint = digest($1::text, 'sha256')
+              AND retracted_at IS NULL
+            "#,
+        )
+        .bind(&content)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 0, "no durable thought on persisted=false path");
     }
 
     #[sqlx::test(migrations = "../../migrations")]

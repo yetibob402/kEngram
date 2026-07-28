@@ -1013,6 +1013,12 @@ fn map_capture_error(err: CaptureError) -> String {
         CaptureError::InvalidArgusSourceEvent(reason) => {
             format!("invalid argus_source_event: {reason}")
         }
+        CaptureError::FingerprintRaceBudgetExceeded { budget_ms } => {
+            // Named, caller-retryable — not a raw SQLSTATE leak.
+            format!(
+                "fingerprint_race_budget_exceeded: content-fingerprint unique race did not resolve within {budget_ms}ms"
+            )
+        }
         CaptureError::Storage(e) => {
             tracing::error!(error = %e, "capture storage error");
             "internal database error during capture".to_string()

@@ -70,6 +70,12 @@ pub struct CaptureResponse {
     pub gate_event_id: Option<uuid::Uuid>,
 }
 
+/// Wall-clock budget for fingerprint-unique re-entry after a 23505.
+/// Uncapped attempt counts (neo) stay schedule-independent; a time budget
+/// converts a pathological hang (winner row invisible while unique index
+/// still rejects) into a clean named error the caller can retry.
+pub const FINGERPRINT_RACE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
     #[error("content must be non-empty")]
@@ -80,6 +86,13 @@ pub enum CaptureError {
 
     #[error("invalid argus_source_event: {0}")]
     InvalidArgusSourceEvent(&'static str),
+
+    /// Fingerprint-unique race did not resolve within [`FINGERPRINT_RACE_BUDGET`].
+    /// Not a raw SQLSTATE leak — callers may retry once (fleet read-result mitigation).
+    #[error(
+        "fingerprint_race_budget_exceeded: content-fingerprint unique race did not resolve within {budget_ms}ms"
+    )]
+    FingerprintRaceBudgetExceeded { budget_ms: u64 },
 
     #[error("storage error: {0}")]
     Storage(#[from] kengram_storage::StorageError),
@@ -251,23 +264,35 @@ pub async fn capture_with_gate_options(
         )
     };
 
-    // DETERMINISTIC resolution for fingerprint-unique races (knox R3 / neo):
+    // DETERMINISTIC resolution for fingerprint-unique races (knox R3 / neo +
+    // hunter safety consolidation):
     // after a thoughts_content_fingerprint_unique 23505 the gate transaction
     // has rolled back — re-enter until the gate resolves (exact_duplicate once
     // the winner row is visible, or a later insert wins). No fixed attempt
-    // cap: an arbitrary cap re-introduces schedule-dependent raw-23505 leaks
-    // (neo measured one retry and a 4-cap both insufficient under unlucky
-    // multi-wave schedules). Small exponential backoff between re-entries.
+    // cap: counts are schedule-dependent (neo). Wall-clock budget
+    // FINGERPRINT_RACE_BUDGET bounds the loop so a pathological state where
+    // the unique index rejects while SELECT still misses cannot hang the
+    // fleet-memory hot path forever (statement_timeout is per-transaction
+    // only). On expiry: FingerprintRaceBudgetExceeded (named, not raw 23505).
     //
     // Foreign uniques and exact_content_requires_adjudication rethrow
     // immediately (classifier false → break). Only fingerprint-unique loops.
+    let deadline = tokio::time::Instant::now() + FINGERPRINT_RACE_BUDGET;
     let mut gated = run_gate().await;
     let mut backoff_ms: u64 = 1;
     loop {
         match gated {
             Ok(_) => break,
             Err(ref err) if storage_is_fingerprint_unique_violation(err) => {
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(CaptureError::FingerprintRaceBudgetExceeded {
+                        budget_ms: FINGERPRINT_RACE_BUDGET.as_millis() as u64,
+                    });
+                }
+                let remaining = deadline - now;
+                let sleep_for = std::time::Duration::from_millis(backoff_ms).min(remaining);
+                tokio::time::sleep(sleep_for).await;
                 backoff_ms = (backoff_ms.saturating_mul(2)).min(32);
                 gated = run_gate().await;
             }
@@ -795,6 +820,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tag_jobs.len(), 1);
+    }
+
+    #[test]
+    fn fingerprint_race_budget_is_two_seconds() {
+        assert_eq!(FINGERPRINT_RACE_BUDGET, std::time::Duration::from_secs(2));
+        let err = CaptureError::FingerprintRaceBudgetExceeded { budget_ms: 2000 };
+        let s = err.to_string();
+        assert!(
+            s.contains("fingerprint_race_budget_exceeded"),
+            "named error must be stable for callers: {s}"
+        );
     }
 
     #[test]

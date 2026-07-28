@@ -152,10 +152,53 @@ pub(crate) fn is_thoughts_content_fingerprint_unique_violation(err: &sqlx::Error
 }
 
 fn storage_is_fingerprint_unique_violation(err: &kengram_storage::StorageError) -> bool {
+    #[cfg(test)]
+    if let kengram_storage::StorageError::Database(sqlx::Error::Protocol(msg)) = err {
+        if msg == fingerprint_race_test_hook::SENTINEL {
+            return true;
+        }
+    }
     matches!(
         err,
         kengram_storage::StorageError::Database(e) if is_thoughts_content_fingerprint_unique_violation(e)
     )
+}
+
+/// Test-only: force the fingerprint-race re-enter arm without depending on a
+/// schedule-lucky concurrent INSERT. Armed per task; consumed once inside the
+/// resolution loop so a retry-disabled mutant goes RED every run.
+#[cfg(test)]
+pub mod fingerprint_race_test_hook {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    // Atomic (not thread_local): tokio tasks migrate across worker threads.
+    static REMAINING: AtomicU32 = AtomicU32::new(0);
+    pub const SENTINEL: &str = "__test_fingerprint_unique_race__";
+    pub fn clear() {
+        REMAINING.store(0, Ordering::SeqCst);
+    }
+    pub fn arm_once() {
+        REMAINING.fetch_add(1, Ordering::SeqCst);
+    }
+    pub fn take() -> bool {
+        let mut prev = REMAINING.load(Ordering::SeqCst);
+        loop {
+            if prev == 0 {
+                return false;
+            }
+            match REMAINING.compare_exchange_weak(
+                prev,
+                prev - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(p) => prev = p,
+            }
+        }
+    }
+    pub fn inject_err() -> kengram_storage::StorageError {
+        kengram_storage::StorageError::Database(sqlx::Error::Protocol(SENTINEL.into()))
+    }
 }
 
 pub async fn capture(
@@ -281,6 +324,12 @@ pub async fn capture_with_gate_options(
     let mut gated = run_gate().await;
     let mut backoff_ms: u64 = 1;
     loop {
+        // Test hook: replace the first attempt with a sentinel fingerprint-race
+        // error so the re-enter arm is exercised without schedule-lucky 23505.
+        #[cfg(test)]
+        if fingerprint_race_test_hook::take() {
+            gated = Err(fingerprint_race_test_hook::inject_err());
+        }
         match gated {
             Ok(_) => break,
             Err(ref err) if storage_is_fingerprint_unique_violation(err) => {
@@ -920,11 +969,12 @@ mod tests {
 
     /// Concurrent same-content captures must never surface a raw unique
     /// violation to the caller; all must resolve to the same thought_id.
-    /// Barrier forces a simultaneous start so the race is not schedule-lucky.
+    /// Deterministic retry-arm entry via fingerprint_race_test_hook::arm_once.
     #[sqlx::test(migrations = "../../migrations")]
     async fn concurrent_same_content_captures_are_idempotent(pool: PgPool) {
         let content = "concurrent fingerprint race content";
         let n = 8usize;
+        fingerprint_race_test_hook::clear();
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(n));
         let mut handles = Vec::new();
         for _ in 0..n {
@@ -932,6 +982,7 @@ mod tests {
             let content = content.to_string();
             let barrier = barrier.clone();
             handles.push(tokio::spawn(async move {
+                fingerprint_race_test_hook::arm_once();
                 barrier.wait().await;
                 capture(
                     &pool,
@@ -969,11 +1020,13 @@ mod tests {
     /// Neo CN probe: N same-content captures with DISTINCT source events must
     /// each leave a durable argus_source_events row when they report stored.
     /// Catches post-rollback fabrication (receipts without ledger rows).
-    /// Barrier sync-starts all racers so fingerprint 23505 is forced, not flaky.
+    /// Deterministic retry-arm entry via fingerprint_race_test_hook::arm_once
+    /// (neo merge standard — mutant without re-enter must RED every run).
     #[sqlx::test(migrations = "../../migrations")]
     async fn distinct_source_event_racers_have_durable_ledger(pool: PgPool) {
         let content = "distinct source-event racer content v1";
         let n = 16usize;
+        fingerprint_race_test_hook::clear();
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(n));
         let mut handles = Vec::new();
         for i in 0..n {
@@ -981,6 +1034,7 @@ mod tests {
             let content = content.to_string();
             let barrier = barrier.clone();
             handles.push(tokio::spawn(async move {
+                fingerprint_race_test_hook::arm_once();
                 barrier.wait().await;
                 let req = CaptureRequest {
                     content: content.clone(),

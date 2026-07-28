@@ -70,6 +70,12 @@ pub struct CaptureResponse {
     pub gate_event_id: Option<uuid::Uuid>,
 }
 
+/// Wall-clock budget for fingerprint-unique re-entry after a 23505.
+/// Uncapped attempt counts (neo) stay schedule-independent; a time budget
+/// converts a pathological hang (winner row invisible while unique index
+/// still rejects) into a clean named error the caller can retry.
+pub const FINGERPRINT_RACE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
     #[error("content must be non-empty")]
@@ -80,6 +86,13 @@ pub enum CaptureError {
 
     #[error("invalid argus_source_event: {0}")]
     InvalidArgusSourceEvent(&'static str),
+
+    /// Fingerprint-unique race did not resolve within [`FINGERPRINT_RACE_BUDGET`].
+    /// Not a raw SQLSTATE leak — callers may retry once (fleet read-result mitigation).
+    #[error(
+        "fingerprint_race_budget_exceeded: content-fingerprint unique race did not resolve within {budget_ms}ms"
+    )]
+    FingerprintRaceBudgetExceeded { budget_ms: u64 },
 
     #[error("storage error: {0}")]
     Storage(#[from] kengram_storage::StorageError),
@@ -97,6 +110,54 @@ pub enum CaptureError {
 /// `"vllm/qwen3-coder:30b"`). `None` silent-disables the tag-job
 /// enqueue — captures still work, the thought just stays with `tags = '{}'`
 /// until a tagger is configured and the operator runs `kengram tag --rerun`.
+
+/// Constraint created in migrations/0006_collapse_to_thoughts.sql.
+const THOUGHTS_CONTENT_FINGERPRINT_UNIQUE: &str = "thoughts_content_fingerprint_unique";
+
+/// Pure parts of the fingerprint-unique classifier. Exposed for unit tests so
+/// classification can fail without constructing sqlx::DatabaseError.
+///
+/// When `constraint` is `Some`, only exact equality to
+/// `thoughts_content_fingerprint_unique` matches — never fall through to the
+/// message. Online reindex renames (…_v2 alongside the old name) can leave the
+/// old name in the message while constraint() reports the new one; substring
+/// matching would misclassify that 23505 as the fingerprint race.
+pub(crate) fn is_fingerprint_unique_violation_parts(
+    code: Option<&str>,
+    constraint: Option<&str>,
+    message: &str,
+) -> bool {
+    if code != Some("23505") {
+        return false;
+    }
+    match constraint {
+        Some(name) => name == THOUGHTS_CONTENT_FINGERPRINT_UNIQUE,
+        // Drivers sometimes omit constraint(); message still names it.
+        None => message.contains(THOUGHTS_CONTENT_FINGERPRINT_UNIQUE),
+    }
+}
+
+/// True only for the content-fingerprint unique race (sqlstate 23505 on
+/// `thoughts_content_fingerprint_unique`). Other unique/check/FK failures stay
+/// genuine errors.
+pub(crate) fn is_thoughts_content_fingerprint_unique_violation(err: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(db) = err else {
+        return false;
+    };
+    is_fingerprint_unique_violation_parts(
+        db.code().as_deref(),
+        db.constraint(),
+        db.message(),
+    )
+}
+
+fn storage_is_fingerprint_unique_violation(err: &kengram_storage::StorageError) -> bool {
+    matches!(
+        err,
+        kengram_storage::StorageError::Database(e) if is_thoughts_content_fingerprint_unique_violation(e)
+    )
+}
+
 pub async fn capture(
     pool: &PgPool,
     embedder_model_id: &str,
@@ -169,32 +230,77 @@ pub async fn capture_with_gate_options(
         .source_created_at
         .or_else(|| Some(OffsetDateTime::now_utc()));
 
-    let result = kengram_storage::corpus_hygiene::capture_thought_gated(
-        pool,
-        kengram_storage::corpus_hygiene::GatedCaptureRequest {
-            scope: scope.as_str(),
-            content: &request.content,
-            source: request.source.as_str(),
-            metadata: metadata.as_value(),
-            source_created_at,
-            candidate_embedding: options.candidate_embedding.as_deref(),
-            embedding_model_id: Some(embedder_model_id),
-            embedding_model_version: Some(1),
-            bypass_reason,
-            source_event_namespace: source_event.as_ref().map(|event| event.namespace.as_str()),
-            source_event_ref: source_event.as_ref().map(|event| event.source_ref.as_str()),
-            source_event_payload_hash: source_event
-                .as_ref()
-                .map(|event| event.payload_hash.as_str()),
-            source_event_metadata,
-            relation_intents: &relation_intents,
-            tagger_model_id,
-            claimed_producer_class: options.claimed_producer_class.as_deref(),
-            correlation_id: options.correlation_id.as_deref(),
-            force_keep_token: None,
-        },
-    )
-    .await?;
+    // Race: concurrent same-content captures can both miss the pre-insert
+    // fingerprint SELECT; the loser INSERT hits thoughts_content_fingerprint_unique
+    // (23505) and the gate transaction rolls back. Do NOT fabricate a CaptureResponse
+    // after rollback (that produced "stored" receipts without durable ledger rows).
+    // Re-enter the normal gated path so exact_duplicate (and source-event / relation
+    // disposition) are executed and committed. Other 23505s rethrow.
+    let run_gate = || {
+        kengram_storage::corpus_hygiene::capture_thought_gated(
+            pool,
+            kengram_storage::corpus_hygiene::GatedCaptureRequest {
+                scope: scope.as_str(),
+                content: &request.content,
+                source: request.source.as_str(),
+                metadata: metadata.as_value(),
+                source_created_at,
+                candidate_embedding: options.candidate_embedding.as_deref(),
+                embedding_model_id: Some(embedder_model_id),
+                embedding_model_version: Some(1),
+                bypass_reason,
+                source_event_namespace: source_event.as_ref().map(|event| event.namespace.as_str()),
+                source_event_ref: source_event.as_ref().map(|event| event.source_ref.as_str()),
+                source_event_payload_hash: source_event
+                    .as_ref()
+                    .map(|event| event.payload_hash.as_str()),
+                source_event_metadata,
+                relation_intents: &relation_intents,
+                tagger_model_id,
+                claimed_producer_class: options.claimed_producer_class.as_deref(),
+                correlation_id: options.correlation_id.as_deref(),
+                force_keep_token: None,
+            },
+        )
+    };
+
+    // DETERMINISTIC resolution for fingerprint-unique races (knox R3 / neo +
+    // hunter safety consolidation):
+    // after a thoughts_content_fingerprint_unique 23505 the gate transaction
+    // has rolled back — re-enter until the gate resolves (exact_duplicate once
+    // the winner row is visible, or a later insert wins). No fixed attempt
+    // cap: counts are schedule-dependent (neo). Wall-clock budget
+    // FINGERPRINT_RACE_BUDGET bounds the loop so a pathological state where
+    // the unique index rejects while SELECT still misses cannot hang the
+    // fleet-memory hot path forever (statement_timeout is per-transaction
+    // only). On expiry: FingerprintRaceBudgetExceeded (named, not raw 23505).
+    //
+    // Foreign uniques and exact_content_requires_adjudication rethrow
+    // immediately (classifier false → break). Only fingerprint-unique loops.
+    let deadline = tokio::time::Instant::now() + FINGERPRINT_RACE_BUDGET;
+    let mut gated = run_gate().await;
+    let mut backoff_ms: u64 = 1;
+    loop {
+        match gated {
+            Ok(_) => break,
+            Err(ref err) if storage_is_fingerprint_unique_violation(err) => {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(CaptureError::FingerprintRaceBudgetExceeded {
+                        budget_ms: FINGERPRINT_RACE_BUDGET.as_millis() as u64,
+                    });
+                }
+                let remaining = deadline - now;
+                let sleep_for = std::time::Duration::from_millis(backoff_ms).min(remaining);
+                tokio::time::sleep(sleep_for).await;
+                backoff_ms = (backoff_ms.saturating_mul(2)).min(32);
+                gated = run_gate().await;
+            }
+            Err(_) => break,
+        }
+    }
+    let result = gated.map_err(CaptureError::Storage)?;
+
     // A conflicting replay does not select a new corpus row, but the source
     // event ledger still identifies the original thought for the established
     // MCP conflict response.
@@ -715,6 +821,287 @@ mod tests {
             .unwrap();
         assert_eq!(tag_jobs.len(), 1);
     }
+
+    #[test]
+    fn fingerprint_race_budget_is_two_seconds() {
+        assert_eq!(FINGERPRINT_RACE_BUDGET, std::time::Duration::from_secs(2));
+        let err = CaptureError::FingerprintRaceBudgetExceeded { budget_ms: 2000 };
+        let s = err.to_string();
+        assert!(
+            s.contains("fingerprint_race_budget_exceeded"),
+            "named error must be stable for callers: {s}"
+        );
+    }
+
+    #[test]
+    fn classifies_fingerprint_constraint_exact() {
+        assert!(is_fingerprint_unique_violation_parts(
+            Some("23505"),
+            Some(THOUGHTS_CONTENT_FINGERPRINT_UNIQUE),
+            "irrelevant message when constraint is present",
+        ));
+    }
+
+    #[test]
+    fn rejects_foreign_constraint_name_even_if_message_mentions_fingerprint() {
+        // Online reindex: create …_unique_v2 alongside the old name, swap.
+        // constraint() reports the new name; message may still contain the old.
+        assert!(!is_fingerprint_unique_violation_parts(
+            Some("23505"),
+            Some("thoughts_content_fingerprint_unique_v2"),
+            "duplicate key value violates unique constraint \"thoughts_content_fingerprint_unique\"",
+        ));
+        assert!(!is_fingerprint_unique_violation_parts(
+            Some("23505"),
+            Some("reviewer_other_unique_value"),
+            "duplicate key value violates unique constraint \"reviewer_other_unique_value\"",
+        ));
+    }
+
+    #[test]
+    fn message_fallback_only_when_constraint_absent() {
+        assert!(is_fingerprint_unique_violation_parts(
+            Some("23505"),
+            None,
+            "duplicate key value violates unique constraint \"thoughts_content_fingerprint_unique\"",
+        ));
+        assert!(!is_fingerprint_unique_violation_parts(
+            Some("23505"),
+            None,
+            "duplicate key value violates unique constraint \"reviewer_other_unique_value\"",
+        ));
+        assert!(!is_fingerprint_unique_violation_parts(
+            Some("23503"),
+            None,
+            "thoughts_content_fingerprint_unique",
+        ));
+    }
+
+    #[test]
+    fn migration_declares_thoughts_content_fingerprint_unique() {
+        // Assert the constant still names the constraint migration 0006 creates.
+        // Renaming the migration constraint without this constant would silently
+        // disable the classifier (the whole race fix reverts) while a hard-coded
+        // self-compare of the constant would stay green.
+        let migration = include_str!("../../../migrations/0006_collapse_to_thoughts.sql");
+        assert!(
+            migration.contains(THOUGHTS_CONTENT_FINGERPRINT_UNIQUE),
+            "migration 0006 must declare constraint name matched by the classifier"
+        );
+        assert!(
+            migration.contains("UNIQUE (content_fingerprint)"),
+            "migration 0006 must unique-index content_fingerprint"
+        );
+    }
+
+    /// Positive control: genuine validation failures still error (not swallowed
+    /// as duplicates).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn genuine_failures_still_error(pool: PgPool) {
+        let empty = capture(
+            &pool,
+            TEST_EMBEDDER_MODEL_ID,
+            Some(TEST_TAGGER_MODEL_ID),
+            req("", "manual"),
+        )
+        .await;
+        assert!(matches!(empty, Err(CaptureError::EmptyContent)));
+
+        let too_long = "x".repeat(MAX_CONTENT_LEN + 1);
+        let err = capture(
+            &pool,
+            TEST_EMBEDDER_MODEL_ID,
+            Some(TEST_TAGGER_MODEL_ID),
+            req(&too_long, "manual"),
+        )
+        .await;
+        assert!(matches!(err, Err(CaptureError::ContentTooLong { .. })));
+    }
+
+    /// Concurrent same-content captures must never surface a raw unique
+    /// violation to the caller; all must resolve to the same thought_id.
+    /// Barrier forces a simultaneous start so the race is not schedule-lucky.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn concurrent_same_content_captures_are_idempotent(pool: PgPool) {
+        let content = "concurrent fingerprint race content";
+        let n = 8usize;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(n));
+        let mut handles = Vec::new();
+        for _ in 0..n {
+            let pool = pool.clone();
+            let content = content.to_string();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                capture(
+                    &pool,
+                    TEST_EMBEDDER_MODEL_ID,
+                    Some(TEST_TAGGER_MODEL_ID),
+                    req(&content, "manual"),
+                )
+                .await
+            }));
+        }
+        let mut ids = Vec::new();
+        let mut dup_flags = 0usize;
+        for h in handles {
+            let resp = h
+                .await
+                .expect("join")
+                .expect("capture must not return raw DB unique error");
+            if resp.is_duplicate {
+                dup_flags += 1;
+            }
+            ids.push(resp.thought_id);
+        }
+        assert!(ids.iter().all(|id| *id == ids[0]));
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thoughts WHERE content = $1")
+            .bind(content)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        // With 8 racers, typically >0 duplicates; allow all-new only if
+        // serialization made the gate always win (still one row).
+        let _ = dup_flags;
+    }
+
+    /// Neo CN probe: N same-content captures with DISTINCT source events must
+    /// each leave a durable argus_source_events row when they report stored.
+    /// Catches post-rollback fabrication (receipts without ledger rows).
+    /// Barrier sync-starts all racers so fingerprint 23505 is forced, not flaky.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn distinct_source_event_racers_have_durable_ledger(pool: PgPool) {
+        let content = "distinct source-event racer content v1";
+        let n = 16usize;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(n));
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let pool = pool.clone();
+            let content = content.to_string();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let req = CaptureRequest {
+                    content: content.clone(),
+                    source: Source::new("manual").unwrap(),
+                    scope: Some(Scope::new("agents/diesel").unwrap()),
+                    metadata: None,
+                    argus_source_event: Some(ArgusSourceEventRequest {
+                        namespace: "tests/diesel-idempotency".to_string(),
+                        source_ref: format!("racer-{i}"),
+                        payload_hash: format!("hash-racer-{i}"),
+                        metadata: None,
+                    }),
+                };
+                capture(&pool, TEST_EMBEDDER_MODEL_ID, Some(TEST_TAGGER_MODEL_ID), req).await
+            }));
+        }
+        let mut stored_receipts = 0usize;
+        let mut ok = 0usize;
+        for h in handles {
+            let resp = h.await.expect("join").expect("capture must succeed");
+            ok += 1;
+            if let Some(ev) = &resp.argus_source_event {
+                if ev.status == "stored" || ev.action == "stored" || ev.action == "duplicate_skip" {
+                    // any successful disposition still needs a durable row
+                    stored_receipts += 1;
+                }
+            }
+        }
+        assert_eq!(ok, n, "all racers must return Ok");
+        let thoughts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM thoughts WHERE content = $1 AND retracted_at IS NULL",
+        )
+        .bind(content)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(thoughts, 1, "exactly one thought for content");
+
+        let ledger: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM argus_source_events WHERE namespace = $1",
+        )
+        .bind("tests/diesel-idempotency")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            ledger as usize, n,
+            "durable source-event rows must equal racer count (got {ledger} vs {n})"
+        );
+        assert_eq!(
+            stored_receipts, n,
+            "every racer must carry source-event disposition"
+        );
+
+        // Relation intents: one racer with a no-op empty intent still needs gate durability.
+        // Bookkeeping: gate events should exist for at least the winner path.
+        let _ = stored_receipts;
+    }
+
+    /// A 23505 on a DIFFERENT unique constraint must not be classified as fingerprint
+    /// duplicate success — rethrow / surface as storage error.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn foreign_unique_23505_is_not_swallowed(pool: PgPool) {
+        // Isolate a non-fingerprint unique index for the probe.
+        sqlx::query(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS reviewer_other_unique_value
+            ON public.thoughts ((metadata->>'reviewer_probe'))
+            WHERE metadata ? 'reviewer_probe'
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let first = CaptureRequest {
+            content: "foreign unique A".to_string(),
+            source: Source::new("manual").unwrap(),
+            scope: None,
+            metadata: Some(Metadata::from(json!({"reviewer_probe": "same-key"}))),
+            argus_source_event: None,
+        };
+        capture(&pool, TEST_EMBEDDER_MODEL_ID, None, first)
+            .await
+            .expect("first insert ok");
+
+        let second = CaptureRequest {
+            content: "foreign unique B different content".to_string(),
+            source: Source::new("manual").unwrap(),
+            scope: None,
+            metadata: Some(Metadata::from(json!({"reviewer_probe": "same-key"}))),
+            argus_source_event: None,
+        };
+        let err = capture(&pool, TEST_EMBEDDER_MODEL_ID, None, second)
+            .await
+            .expect_err("must not treat foreign unique as fingerprint duplicate");
+        match err {
+            CaptureError::Storage(kengram_storage::StorageError::Database(ref e)) => {
+                // Standalone classifier assert (not OR'd with always-true
+                // message/sqlstate terms). Under the re-enter-gate path, a
+                // misclassified foreign 23505 still returns Err after retry, so
+                // expect_err alone cannot catch a gutting of the classifier.
+                assert!(
+                    !is_thoughts_content_fingerprint_unique_violation(e),
+                    "foreign unique must not classify as fingerprint race: {e}"
+                );
+                if let sqlx::Error::Database(db) = e {
+                    assert_eq!(db.code().as_deref(), Some("23505"));
+                    let c = db.constraint().unwrap_or("");
+                    assert_ne!(c, THOUGHTS_CONTENT_FINGERPRINT_UNIQUE);
+                    assert!(
+                        c.contains("reviewer_other_unique")
+                            || e.to_string().contains("reviewer_other_unique"),
+                        "expected foreign index name in error: constraint={c:?} err={e}"
+                    );
+                }
+            }
+            other => panic!("expected Storage Database error, got {other:?}"),
+        }
+    }
+
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn enqueues_embedding_and_tag_jobs_on_new_insert(pool: PgPool) {

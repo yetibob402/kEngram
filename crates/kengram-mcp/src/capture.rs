@@ -251,38 +251,28 @@ pub async fn capture_with_gate_options(
         )
     };
 
-    // Re-enter the gate on fingerprint-unique races until the winner row is
-    // visible as exact_duplicate (or a non-fingerprint error breaks out).
+    // DETERMINISTIC resolution for fingerprint-unique races (knox R3 / neo):
+    // after a thoughts_content_fingerprint_unique 23505 the gate transaction
+    // has rolled back — re-enter until the gate resolves (exact_duplicate once
+    // the winner row is visible, or a later insert wins). No fixed attempt
+    // cap: an arbitrary cap re-introduces schedule-dependent raw-23505 leaks
+    // (neo measured one retry and a 4-cap both insufficient under unlucky
+    // multi-wave schedules). Small exponential backoff between re-entries.
     //
-    // History: hunter argued one retry is enough because Postgres raises 23505
-    // only after the winner COMMITS, so the next pre-insert SELECT must find
-    // the row. Neo's exact-head rebind @ 0e356a8 measured that as
-    // schedule-dependent under `distinct_source_event_racers_have_durable_ledger`
-    // (16 concurrent same-content captures with distinct source events on an
-    // `agents/*` scope — advisory fail_open insert path races with the lock
-    // holder). One retry still leaked raw thoughts_content_fingerprint_unique
-    // 23505; a retry-disabled mutant was also flaky (3 green then RED). Named
-    // input that needs depth > 1: that 16-way racer.
-    //
-    // Cap at 4 attempts (1 initial + 3 re-entries). Fingerprint-race attempts
-    // typically short-circuit on insert-conflict or exact_duplicate rather than
-    // burning the full 400ms comparison timeout; non-fingerprint errors never
-    // loop. exact_content_requires_adjudication uses sqlstate 23505 but not our
-    // constraint name, so the classifier returns false and we rethrow.
-    const FINGERPRINT_UNIQUE_MAX_ATTEMPTS: u32 = 4;
+    // Foreign uniques and exact_content_requires_adjudication rethrow
+    // immediately (classifier false → break). Only fingerprint-unique loops.
     let mut gated = run_gate().await;
-    let mut attempts = 1u32;
-    while let Err(ref err) = gated {
-        if attempts >= FINGERPRINT_UNIQUE_MAX_ATTEMPTS
-            || !storage_is_fingerprint_unique_violation(err)
-        {
-            break;
+    let mut backoff_ms: u64 = 1;
+    loop {
+        match gated {
+            Ok(_) => break,
+            Err(ref err) if storage_is_fingerprint_unique_violation(err) => {
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms.saturating_mul(2)).min(32);
+                gated = run_gate().await;
+            }
+            Err(_) => break,
         }
-        attempts += 1;
-        // Yield so the winner commit and sibling racers can progress before we
-        // re-enter; pure schedule insurance for the multi-wave case neo saw.
-        tokio::task::yield_now().await;
-        gated = run_gate().await;
     }
     let result = gated.map_err(CaptureError::Storage)?;
 
@@ -894,14 +884,19 @@ mod tests {
 
     /// Concurrent same-content captures must never surface a raw unique
     /// violation to the caller; all must resolve to the same thought_id.
+    /// Barrier forces a simultaneous start so the race is not schedule-lucky.
     #[sqlx::test(migrations = "../../migrations")]
     async fn concurrent_same_content_captures_are_idempotent(pool: PgPool) {
         let content = "concurrent fingerprint race content";
+        let n = 8usize;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(n));
         let mut handles = Vec::new();
-        for _ in 0..8 {
+        for _ in 0..n {
             let pool = pool.clone();
             let content = content.to_string();
+            let barrier = barrier.clone();
             handles.push(tokio::spawn(async move {
+                barrier.wait().await;
                 capture(
                     &pool,
                     TEST_EMBEDDER_MODEL_ID,
@@ -938,15 +933,19 @@ mod tests {
     /// Neo CN probe: N same-content captures with DISTINCT source events must
     /// each leave a durable argus_source_events row when they report stored.
     /// Catches post-rollback fabrication (receipts without ledger rows).
+    /// Barrier sync-starts all racers so fingerprint 23505 is forced, not flaky.
     #[sqlx::test(migrations = "../../migrations")]
     async fn distinct_source_event_racers_have_durable_ledger(pool: PgPool) {
         let content = "distinct source-event racer content v1";
         let n = 16usize;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(n));
         let mut handles = Vec::new();
         for i in 0..n {
             let pool = pool.clone();
             let content = content.to_string();
+            let barrier = barrier.clone();
             handles.push(tokio::spawn(async move {
+                barrier.wait().await;
                 let req = CaptureRequest {
                     content: content.clone(),
                     source: Source::new("manual").unwrap(),

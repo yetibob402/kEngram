@@ -448,13 +448,19 @@ async fn begin_probe_tx(
 /// 2. Never claim success for a pre-existing content match when this request's
 ///    `argus_source_event` identity did not land (hang-before-gate + preseed).
 ///
-/// When `argus_source_event` is present, recovery is keyed on full source
-/// identity: (namespace, source_ref, payload_hash). A matching ns/ref with a
-/// different stored payload_hash is NotPersisted (payload conflict is not
-/// success for this request) — jones board 506841.
-/// When absent, recovery requires a gate_event for the content fingerprint
-/// **and** a non-empty correlation_id that matches the gate row — unkeyed
-/// prior gates cannot prove the current attempt (jones board 506848).
+/// Structural rule (knox design / jones 506841+506848): recovery keys on
+/// THIS call's identity — never content/history inference across keys.
+///
+/// When `argus_source_event` is present, the probe keys **strictly** on the
+/// ASE triple (namespace, source_ref, payload_hash). Content fingerprint is
+/// only a secondary check *within* that key, never a substitute for it.
+/// Same ns/ref with a different stored payload_hash is the established MCP
+/// **conflict** response (not old success, not a blank deadline silence).
+///
+/// When ASE is absent, content-only inference is forbidden without a
+/// call-window binder: a non-empty `correlation_id` that matches a gate row
+/// for this fingerprint. Unkeyed prior same-content gates cannot prove a
+/// hung-before-gate attempt (else NotPersisted / persisted=false).
 pub async fn recover_after_deadline(
     pool: &PgPool,
     content: &str,
@@ -463,9 +469,10 @@ pub async fn recover_after_deadline(
 ) -> Result<DeadlineRecovery, CaptureError> {
     let mut tx = begin_probe_tx(pool).await?;
 
-    // --- Path A: source-event identity (preferred when present) ---
+    // --- Path A: ASE triple is the sole recovery key when present ---
     if let Some(ev) = argus_source_event {
-        let se: Option<(
+        // Success path: exact triple match only (never ns/ref alone).
+        let se_exact: Option<(
             uuid::Uuid,
             String,
             String,
@@ -476,34 +483,91 @@ pub async fn recover_after_deadline(
             r#"
                 SELECT id, namespace, source_ref, payload_hash, status, thought_id
                 FROM argus_source_events
-                WHERE namespace = $1 AND source_ref = $2
+                WHERE namespace = $1
+                  AND source_ref = $2
+                  AND payload_hash = $3
                 LIMIT 1
                 "#,
         )
         .bind(&ev.namespace)
         .bind(&ev.source_ref)
+        .bind(&ev.payload_hash)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
 
-        let Some((_se_id, ns, sref, phash, status, thought_id_opt)) = se else {
-            tx.commit()
-                .await
-                .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
-            // Content may exist from an earlier capture; this request did not
-            // land a source-event row → not persisted for *this* attempt.
-            return Ok(DeadlineRecovery::NotPersisted);
-        };
+        if se_exact.is_none() {
+            // No triple match. Same ns/ref with a *different* payload is a
+            // payload_hash conflict — honest MCP conflict, not inferred success
+            // and not NotPersisted (knox: conflict error, not old success).
+            let se_ns_ref: Option<(
+                uuid::Uuid,
+                String,
+                String,
+                String,
+                String,
+                Option<uuid::Uuid>,
+            )> = sqlx::query_as(
+                r#"
+                SELECT id, namespace, source_ref, payload_hash, status, thought_id
+                FROM argus_source_events
+                WHERE namespace = $1 AND source_ref = $2
+                LIMIT 1
+                "#,
+            )
+            .bind(&ev.namespace)
+            .bind(&ev.source_ref)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
 
-        // Full current request identity: payload_hash must match stored row.
-        // A prior capture under the same (namespace, source_ref) with a different
-        // payload is a conflict class — not proof this attempt succeeded.
-        if phash != ev.payload_hash {
+            if let Some((_id, ns, sref, stored_phash, _status, thought_id_opt)) = se_ns_ref {
+                if stored_phash != ev.payload_hash {
+                    tx.commit().await.map_err(|e| {
+                        CaptureError::Storage(kengram_storage::StorageError::Database(e))
+                    })?;
+                    // Match live gate contract: action/status=conflict, surface
+                    // stored payload + original thought (no new write claimed).
+                    let thought_id = match thought_id_opt {
+                        Some(u) => ThoughtId::from(u),
+                        None => {
+                            // Conflict row without thought is still not success
+                            // for *this* payload; refuse inferred recovery.
+                            return Ok(DeadlineRecovery::NotPersisted);
+                        }
+                    };
+                    let argus = ArgusSourceEventResponse {
+                        action: "conflict".to_string(),
+                        namespace: ns,
+                        source_ref: sref,
+                        // Stored (original) payload — caller sees the conflict
+                        // against what is durably bound to this identity.
+                        payload_hash: stored_phash,
+                        status: "conflict".to_string(),
+                        thought_id: Some(thought_id),
+                    };
+                    return Ok(DeadlineRecovery::Recovered(CaptureResponse {
+                        thought_id,
+                        embedding_status: EmbeddingStatus::Pending,
+                        is_duplicate: false,
+                        argus_source_event: Some(argus),
+                        dedup_kind: None,
+                        matched_thought_id: Some(thought_id),
+                        similarity: None,
+                        relation_results: serde_json::json!([]),
+                        gate_event_id: None,
+                    }));
+                }
+            }
+
             tx.commit()
                 .await
                 .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
+            // No ASE row for this identity at all → this attempt did not land.
             return Ok(DeadlineRecovery::NotPersisted);
         }
+
+        let (_se_id, ns, sref, phash, status, thought_id_opt) = se_exact.expect("checked");
 
         let Some(thought_uuid) = thought_id_opt else {
             tx.commit()
@@ -513,23 +577,34 @@ pub async fn recover_after_deadline(
         };
         let thought_id = ThoughtId::from(thought_uuid);
 
+        // Secondary receipts *within* the ASE triple only — never cross keys.
         let gate: Option<(uuid::Uuid, String, Option<uuid::Uuid>, Option<f64>)> = sqlx::query_as(
             r#"
             SELECT id, action, matched_thought_id, similarity
             FROM thought_ingest_gate_events
             WHERE source_event_namespace = $1
               AND source_event_ref = $2
-              AND ($3::text IS NULL OR correlation_id = $3)
+              AND (
+                    source_event_payload_hash IS NULL
+                    OR source_event_payload_hash = $3
+                  )
+              AND ($4::text IS NULL OR correlation_id = $4)
             ORDER BY created_at DESC
             LIMIT 1
             "#,
         )
         .bind(&ns)
         .bind(&sref)
+        .bind(&phash)
         .bind(correlation_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
+
+        // Optional content secondary check within the ASE key: if a thought is
+        // bound but content fingerprint disagrees, still trust ASE ledger
+        // (conflict/replay identity is ASE-keyed, not content-keyed).
+        let _ = content;
 
         tx.commit()
             .await
@@ -538,9 +613,8 @@ pub async fn recover_after_deadline(
         let (gate_event_id, action, matched, similarity) = match gate {
             Some((id, action, matched, sim)) => (Some(id), action, matched, sim),
             None => {
-                // Source event landed but gate ledger row missing — still
-                // durable identity; receipts partial but not fabricated null
-                // when we can surface source_event.
+                // Source event triple landed but gate ledger row missing —
+                // durable ASE identity still proves this request's payload.
                 (None, "stored".to_string(), None, None)
             }
         };
@@ -575,10 +649,9 @@ pub async fn recover_after_deadline(
         }));
     }
 
-    // --- Path B: no source-event — require gate_event bound to THIS attempt ---
-    // Full identity without ASE is (content fingerprint + correlation_id).
-    // Unkeyed prior same-content gates must not prove a hung-before-gate call
-    // (correlation_id absent/NULL would match any prior row).
+    // --- Path B: no ASE — forbid content/history inference without call binder ---
+    // correlation_id is the call-window key recorded on gate_events. Absent or
+    // empty → cannot bound history to THIS attempt → NotPersisted.
     let Some(corr) = correlation_id.map(str::trim).filter(|c| !c.is_empty()) else {
         tx.commit()
             .await

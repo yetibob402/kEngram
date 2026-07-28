@@ -2118,7 +2118,7 @@ mod tests {
                 argus_source_event: Some(ArgusSourceEventArgs {
                     namespace: "agents/jones-adversary-payload".into(),
                     source_ref: "same-source-ref-different-payload".into(),
-                    payload_hash: current_payload,
+                    payload_hash: current_payload.clone(),
                     metadata: None,
                 }),
                 source_created_at: None,
@@ -2127,18 +2127,36 @@ mod tests {
             }))
             .await;
 
-        let err = result.expect_err(
-            "a prior source identity with a different payload cannot prove the current request succeeded",
+        // Knox design: honest answer is the conflict response, never the old
+        // request as success-stored, and never a silent deadline that hides
+        // a known identity conflict.
+        let raw = result.expect(
+            "a prior source identity with a different payload must surface as conflict, not stored success",
         );
-        let body: serde_json::Value = serde_json::from_str(&err).unwrap_or_else(|_| {
-            panic!("deadline error must be JSON envelope, got: {err}");
+        let body: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|_| {
+            panic!("conflict recovery must be JSON CaptureResponse, got: {raw}");
         });
-        assert_eq!(body["code"], "capture_deadline_exceeded", "{body}");
-        assert_eq!(body["persisted"], false, "{body}");
+        assert_eq!(
+            body["argus_source_event"]["action"], "conflict",
+            "must not recover old success as stored: {body}"
+        );
+        assert_eq!(body["argus_source_event"]["status"], "conflict", "{body}");
+        assert_eq!(
+            body["argus_source_event"]["payload_hash"], stored_payload,
+            "conflict surfaces stored (original) payload, not the refused one: {body}"
+        );
+        assert_ne!(
+            body["argus_source_event"]["payload_hash"], current_payload,
+            "refused payload must not be claimed stored: {body}"
+        );
+        assert_eq!(
+            body["thought_id"], original["thought_id"],
+            "conflict points at the original thought, not a fabricated new write: {body}"
+        );
 
-        let stored_row: (String, Option<uuid::Uuid>) = sqlx::query_as(
+        let stored_row: (String, Option<uuid::Uuid>, String) = sqlx::query_as(
             r#"
-            SELECT payload_hash, thought_id
+            SELECT payload_hash, thought_id, status
             FROM argus_source_events
             WHERE namespace = $1 AND source_ref = $2
             "#,
@@ -2153,11 +2171,14 @@ mod tests {
             stored_row.1.map(|id| id.to_string()),
             original["thought_id"].as_str().map(str::to_string)
         );
+        // Hang-before-gate never mutated the ASE row; recovery only reports.
+        assert_eq!(stored_row.2, "stored");
     }
 
-    // Jones board 506848 / PR8 CN: Path B without ASE must require a non-empty
-    // correlation_id matching a gate row for this attempt. An unkeyed prior
-    // same-content gate must not prove a hung-before-gate call succeeded.
+    // Jones board 506848 / knox design: Path B without ASE forbids content-
+    // only history inference. Require non-empty correlation_id (call-window
+    // binder) matching a gate row for this fingerprint. Unkeyed prior same-
+    // content gates must not prove a hung-before-gate call succeeded.
     #[sqlx::test(migrations = "../../migrations")]
     async fn adversary_unkeyed_prior_gate_cannot_prove_current_attempt_succeeded(pool: PgPool) {
         let s = server(pool.clone());

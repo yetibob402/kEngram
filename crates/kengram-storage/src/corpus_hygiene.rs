@@ -11,9 +11,14 @@ use sqlx::{PgPool, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-/// Leaves the MCP caller enough of its one-second end-to-end budget to commit
-/// and serialize a structured fail-open result after a comparison timeout.
-const CAPTURE_GATE_STATEMENT_TIMEOUT: &str = "400ms";
+/// Per-transaction statement_timeout for the gate INSERT path only.
+///
+/// Overrides any lower global/session statement_timeout for the duration of
+/// this transaction (`set_config(..., true)` is local). Sized for durable
+/// gated insert of large content without relying on a synchronous embedder;
+/// embedding is async via pending_embeddings + worker drain.
+/// Must stay under the MCP capture total deadline (1s) with room for commit.
+const CAPTURE_GATE_STATEMENT_TIMEOUT: &str = "800ms";
 
 #[derive(Debug, Clone)]
 pub struct GatedCaptureRequest<'a> {

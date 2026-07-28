@@ -341,7 +341,7 @@ pub async fn capture_with_gate_options(
         }
     });
 
-    Ok(CaptureResponse {
+    let response = CaptureResponse {
         thought_id,
         embedding_status: EmbeddingStatus::Pending,
         is_duplicate,
@@ -351,7 +351,52 @@ pub async fn capture_with_gate_options(
         similarity: result.similarity,
         relation_results: result.relation_results,
         gate_event_id: result.gate_event_id,
-    })
+    };
+
+    // Test-only: hang AFTER durable gate commit when content carries the
+    // marker prefix. Content-keyed (not a global flag) so parallel sqlx::test
+    // workers cannot poison each other.
+    #[cfg(test)]
+    {
+        // Only hang on first durable insert; exact_duplicate must return so
+        // the re-capture oracle can observe is_duplicate=true without another
+        // timeout recovery (which would force is_duplicate=false).
+        if !is_duplicate && request.content.starts_with(test_hooks::HANG_AFTER_GATE_PREFIX) {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    Ok(response)
+}
+
+/// Look up a durable thought by content fingerprint (SHA-256 of content bytes
+/// as stored by the gate). Used when the MCP deadline fires so the caller can
+/// be told honestly whether the insert landed.
+pub async fn find_thought_id_by_content(
+    pool: &PgPool,
+    content: &str,
+) -> Result<Option<ThoughtId>, CaptureError> {
+    let row: Option<(uuid::Uuid,)> = sqlx::query_as(
+        r#"
+        SELECT id
+        FROM thoughts
+        WHERE content_fingerprint = digest($1::text, 'sha256')
+          AND retracted_at IS NULL
+        LIMIT 1
+        "#,
+    )
+    .bind(content)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| CaptureError::Storage(kengram_storage::StorageError::Database(e)))?;
+    Ok(row.map(|(id,)| ThoughtId::from(id)))
+}
+
+#[cfg(test)]
+pub mod test_hooks {
+    /// Prefix content with this string to hang after durable gate commit
+    /// (carl deadline oracle). Parallel-safe: only that capture hangs.
+    pub const HANG_AFTER_GATE_PREFIX: &str = "__KENGRAM_TEST_HANG_AFTER_GATE__\n";
 }
 
 #[cfg(test)]

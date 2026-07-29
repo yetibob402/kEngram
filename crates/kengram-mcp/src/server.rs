@@ -2925,6 +2925,14 @@ mod tests {
             .to_string();
 
         let se_id = uuid::Uuid::new_v4().to_string();
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let se_hash: String = a
+            .as_bytes()
+            .iter()
+            .chain(b.as_bytes().iter())
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         s.link_thoughts(Parameters(LinkThoughtsArgs {
             from_thought_id: from_id.clone(),
             relation: "replaces".into(),
@@ -2935,8 +2943,8 @@ mod tests {
             note: None,
             source_event: RelationSourceEventArgs {
                 namespace: "tests/relation".into(),
-                source_ref: se_id.clone(),
-                payload_hash: se_id,
+                source_ref: se_id,
+                payload_hash: se_hash,
                 metadata: None,
             },
         }))

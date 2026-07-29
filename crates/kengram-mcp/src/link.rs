@@ -398,10 +398,23 @@ fn validate_source_event(event: &RelationSourceEventRequest) -> Result<(), LinkE
     if event.source_ref.trim().is_empty() {
         return Err(LinkError::InvalidSourceEvent("source_ref is required"));
     }
-    if event.payload_hash.trim().is_empty() {
+    let hash = event.payload_hash.as_str();
+    if hash.trim().is_empty() {
         return Err(LinkError::InvalidSourceEvent("payload_hash is required"));
     }
+    // Documented contract: exact 64 lowercase hex (SHA-256). Board 550689 —
+    // previously any nonempty string was accepted (UUID-with-hyphens green).
+    if !is_sha256_payload_hash(hash) {
+        return Err(LinkError::InvalidSourceEvent(
+            "payload_hash must be 64 lowercase hex characters (SHA-256)",
+        ));
+    }
     Ok(())
+}
+
+/// SHA-256 digest as 64 lowercase hex digits (no 0x prefix, no uppercase).
+fn is_sha256_payload_hash(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 pub(crate) fn validate_target(target: &LinkTarget) -> Result<(), LinkError> {
@@ -443,14 +456,74 @@ mod tests {
 
     const TEST_EMBEDDER_MODEL_ID: &str = "bge-m3:1024";
 
+    fn test_payload_hash() -> String {
+        // 32 random bytes → 64 lowercase hex (valid SHA-256 shape).
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        a.as_bytes()
+            .iter()
+            .chain(b.as_bytes().iter())
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     fn relation_event() -> RelationSourceEventRequest {
         let id = uuid::Uuid::new_v4().to_string();
         RelationSourceEventRequest {
             namespace: "tests/relation".to_string(),
-            source_ref: id.clone(),
-            payload_hash: id,
+            source_ref: id,
+            payload_hash: test_payload_hash(),
             metadata: serde_json::json!({}),
         }
+    }
+
+    #[test]
+    fn payload_hash_rejects_uuid_with_hyphens() {
+        // Board 550689 RED case: documented 64-hex contract must reject UUID form.
+        let id = uuid::Uuid::new_v4().to_string();
+        assert!(id.contains('-'), "fixture must be hyphenated UUID");
+        let err = super::validate_source_event(&RelationSourceEventRequest {
+            namespace: "tests/relation".into(),
+            source_ref: "ref".into(),
+            payload_hash: id,
+            metadata: serde_json::json!({}),
+        })
+        .unwrap_err();
+        match err {
+            LinkError::InvalidSourceEvent(msg) => {
+                assert!(
+                    msg.contains("64 lowercase hex") || msg.contains("payload_hash"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected InvalidSourceEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn payload_hash_accepts_64_lowercase_hex() {
+        let hash = test_payload_hash();
+        assert_eq!(hash.len(), 64);
+        super::validate_source_event(&RelationSourceEventRequest {
+            namespace: "tests/relation".into(),
+            source_ref: "ref".into(),
+            payload_hash: hash,
+            metadata: serde_json::json!({}),
+        })
+        .expect("valid shape must pass");
+    }
+
+    #[test]
+    fn payload_hash_rejects_uppercase_hex() {
+        let hash = "A".repeat(64);
+        let err = super::validate_source_event(&RelationSourceEventRequest {
+            namespace: "tests/relation".into(),
+            source_ref: "ref".into(),
+            payload_hash: hash,
+            metadata: serde_json::json!({}),
+        })
+        .unwrap_err();
+        assert!(matches!(err, LinkError::InvalidSourceEvent(_)), "{err:?}");
     }
 
     const RELATION_CLAIM_TEST_LOCK: i64 = 7_301_002;

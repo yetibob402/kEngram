@@ -117,10 +117,18 @@ mod tests {
 
     fn relation_event() -> RelationSourceEventRequest {
         let id = uuid::Uuid::new_v4().to_string();
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let payload_hash: String = a
+            .as_bytes()
+            .iter()
+            .chain(b.as_bytes().iter())
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         RelationSourceEventRequest {
             namespace: "tests/retract".to_string(),
-            source_ref: id.clone(),
-            payload_hash: id,
+            source_ref: id,
+            payload_hash,
             metadata: serde_json::json!({}),
         }
     }

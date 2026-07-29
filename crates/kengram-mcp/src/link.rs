@@ -1294,6 +1294,65 @@ mod tests {
         assert_eq!(r.relation, RelationKind::Refines);
     }
 
+    /// Jones PR9 blocker seq 538210: unruled kinds must NOT inherit the
+    /// retracted-TO exemption. requires/references/supports/belongs_to/decided_by
+    /// against a retracted target must fail (EndpointRetracted), while
+    /// replaces|refines succeed (ruled set).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn link_unruled_relation_to_retracted_is_rejected(pool: PgPool) {
+        let retracted = cap(&pool, "retracted-target-for-unruled").await;
+        let live = cap(&pool, "live-source-for-unruled").await;
+        assert!(
+            kengram_storage::retract_thought(&pool, retracted, Some("retract for unruled probe"))
+                .await
+                .unwrap()
+                .retracted
+        );
+
+        let unruled = [
+            RelationKind::Requires,
+            RelationKind::References,
+            RelationKind::Supports,
+            RelationKind::BelongsTo,
+            RelationKind::DecidedBy,
+        ];
+        for rel in unruled {
+            let err = link_thoughts(
+                &pool,
+                LinkThoughtsRequest {
+                    from_thought_id: live,
+                    relation: rel,
+                    target: LinkTarget::Thought(retracted),
+                    note: Some(format!("unruled {rel:?} to retracted must fail")),
+                    source_event: relation_event(),
+                    claimed_producer_class: None,
+                },
+            )
+            .await
+            .expect_err(&format!("{rel:?} to retracted must be rejected"));
+            match err {
+                LinkError::EndpointRetracted(id) => assert_eq!(id, retracted),
+                other => panic!("expected EndpointRetracted for {rel:?}, got {other:?}"),
+            }
+        }
+
+        // Bidirectional ruled controls still green on the same endpoints.
+        let rep = link_thoughts(
+            &pool,
+            LinkThoughtsRequest {
+                from_thought_id: live,
+                relation: RelationKind::Replaces,
+                target: LinkTarget::Thought(retracted),
+                note: Some("ruled replaces still ok".into()),
+                source_event: relation_event(),
+                claimed_producer_class: None,
+            },
+        )
+        .await
+        .expect("ruled replaces to retracted");
+        assert!(rep.is_new);
+    }
+
     /// Creating a link *from* a retracted thought still fails — only the to-side
     /// is allowed to be retracted for provenance edges.
     #[sqlx::test(migrations = "../../migrations")]

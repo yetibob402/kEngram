@@ -10,8 +10,11 @@
 -- Design (m5-selective-relations): edges survive thought retraction; soft-retract
 -- keeps the row so FK stays valid. Correction provenance needs replaces -> retracted.
 --
--- Fix: still require the *from* endpoint of create/replace_tagger_set to be active;
--- existence-lock only for *to* thought targets (retracted allowed).
+-- Fix: require *from* of create/replace_tagger_set active always.
+-- TO thought may be retracted ONLY for ruled relations replaces|refines
+-- (supersession provenance; Knox design ruling + jones sealed RED).
+-- Unruled kinds (requires, references, supports, belongs_to, decided_by)
+-- still require an active TO — jones PR9 blocker seq 538210 / probe at ae74f45.
 
 -- Knox DESIGN RULING 2026-07-29 (a2a 3ea8ed16, hunter two-sided evidence):
 -- replaces/refines TO retracted targets MUST be VALID (supersession provenance).
@@ -69,9 +72,8 @@ BEGIN
                 -- Legacy 2-arg semantics: every locked id must be active.
                 v_must_be_active := true;
             ELSE
-                -- Only the from-side (or other explicitly listed) ids must be active.
-                -- Thought targets may be retracted so replaces/supports provenance
-                -- edges can point at superseded predecessors.
+                -- Only listed ids must be active (from-side always; TO unless
+                -- relation is ruled replaces|refines supersession provenance).
                 v_must_be_active := v_id = ANY (p_active_required_ids);
             END IF;
             IF v_must_be_active AND v_retracted_at IS NOT NULL THEN
@@ -223,6 +225,12 @@ BEGIN
             INTO v_endpoint_ids
             FROM jsonb_array_elements(v_op->'relations')
             WHERE value->>'to_kind' = 'thought';
+            -- Tagger TOs: only replaces|refines may target retracted thoughts.
+            SELECT v_active_required_ids || COALESCE(array_agg((value->>'to_value')::uuid), ARRAY[]::uuid[])
+            INTO v_active_required_ids
+            FROM jsonb_array_elements(v_op->'relations')
+            WHERE value->>'to_kind' = 'thought'
+              AND COALESCE(value->>'relation', '') NOT IN ('replaces', 'refines');
             CONTINUE;
         END IF;
         IF v_to_value IS NULL THEN
@@ -232,6 +240,7 @@ BEGIN
             RAISE EXCEPTION 'invalid_relation_target_kind:%', v_to_kind USING ERRCODE = '22023';
         END IF;
         v_endpoint_ids := array_append(v_endpoint_ids, v_from);
+        v_relation := v_op->>'relation';
         IF v_action = 'create' THEN
             v_active_required_ids := array_append(v_active_required_ids, v_from);
         END IF;
@@ -241,6 +250,12 @@ BEGIN
                 RAISE EXCEPTION 'relation_intent_self_reference' USING ERRCODE = '23514';
             END IF;
             v_endpoint_ids := array_append(v_endpoint_ids, v_to_thought);
+            -- Ruled set only: replaces|refines may point at a retracted TO.
+            -- Jones blocker 538210: unruled kinds must still require active TO.
+            IF v_action = 'create'
+               AND COALESCE(v_relation, '') NOT IN ('replaces', 'refines') THEN
+                v_active_required_ids := array_append(v_active_required_ids, v_to_thought);
+            END IF;
         END IF;
     END LOOP;
 
@@ -251,8 +266,8 @@ BEGIN
     IF NOT v_require_active AND v_profile.producer_class <> 'break_glass_passthrough' THEN
         v_require_active := true;
     END IF;
-    -- Active check applies only to from-side create/replace_tagger endpoints.
-    -- Thought targets may be retracted (replaces provenance to a retracted predecessor).
+    -- Active: from-side always on create/tagger; TO also unless relation is
+    -- ruled replaces|refines (supersession provenance to retracted predecessor).
     PERFORM public.lock_thought_relation_endpoints(
         v_endpoint_ids,
         v_require_active,

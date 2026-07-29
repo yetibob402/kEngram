@@ -1250,6 +1250,73 @@ mod tests {
         assert_ne!(first.link_id, second.link_id);
     }
 
+    /// Post-deploy P1 (knox 2026-07-29): PR9 binary can ship while migration 0033
+    /// is unapplied — live then serves per-kind EndpointRetracted text but still
+    /// refuses replaces→retracted. Bind native link_thoughts path + assert gate
+    /// body includes allowlist after sqlx::test applies migrations.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn native_link_replaces_to_retracted_after_migrations(pool: PgPool) {
+        let has_allowlist: bool = sqlx::query_scalar(
+            r#"
+            SELECT position('v_active_required_ids' in pg_get_functiondef(p.oid)) > 0
+            FROM pg_proc p
+            JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = 'public'
+              AND p.proname = 'mutate_thought_relations_serialized'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("mutate_thought_relations_serialized must exist after migrations");
+        assert!(
+            has_allowlist,
+            "migration 0033 not applied in test DB: mutate lacks v_active_required_ids"
+        );
+
+        let arity: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::bigint
+            FROM pg_proc p
+            JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = 'public'
+              AND p.proname = 'lock_thought_relation_endpoints'
+              AND pg_get_function_identity_arguments(p.oid)
+                  LIKE '%p_active_required_ids%'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            arity, 1,
+            "lock_thought_relation_endpoints must be 3-arg form"
+        );
+
+        let predecessor = cap(&pool, "native-mcp-retracted-predecessor").await;
+        let corrected = cap(&pool, "native-mcp-corrected-successor").await;
+        assert!(
+            kengram_storage::retract_thought(&pool, predecessor, Some("native path fixture"))
+                .await
+                .unwrap()
+                .retracted
+        );
+        let rep = link_thoughts(
+            &pool,
+            LinkThoughtsRequest {
+                from_thought_id: corrected,
+                relation: RelationKind::Replaces,
+                target: LinkTarget::Thought(predecessor),
+                note: Some("native MCP replaces to retracted must succeed".into()),
+                source_event: relation_event(),
+                claimed_producer_class: None,
+            },
+        )
+        .await
+        .expect("NATIVE link_thoughts replaces→retracted after 0033");
+        assert!(rep.is_new);
+        assert_eq!(rep.relation, RelationKind::Replaces);
+    }
+
     /// Jones sealed RED (2026-07-29 a2a 0d7a41a3 / board 533148):
     /// from 95a2398c-03fc-47ed-81ba-2b4bc118e4da (indexed live) replaces
     /// to 4f5b6c00-987e-4338-a91c-d971dbcd2122 (retracted) returned literal

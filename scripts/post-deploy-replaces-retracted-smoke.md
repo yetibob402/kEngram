@@ -55,7 +55,7 @@ sqlx migrate run      # resolve checksum gaps carefully if present
 
 ## 3. Native MCP functional smoke
 
-1. `replaces` live→retracted → success  
-2. `supports` same pair → EndpointRetracted per-kind text  
+1. `replaces` live→retracted → success
+2. `supports` same pair → EndpointRetracted per-kind text
 
 Binary restart alone is **not** deploy complete.

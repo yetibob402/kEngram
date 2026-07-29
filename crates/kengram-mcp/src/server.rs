@@ -877,6 +877,7 @@ impl KengramServer {
 
         let body = serde_json::json!({
             "retracted": resp.retracted,
+            "status": resp.status,
         });
         serde_json::to_string(&body).map_err(|e| format!("response serialization error: {e}"))
     }
@@ -1121,8 +1122,13 @@ fn map_read_error(err: ReadError) -> String {
 
 fn map_retract_error(err: RetractError) -> String {
     match err {
-        RetractError::NotFoundOrAlreadyRetracted(id) => {
-            format!("thought not found or already retracted: {id}")
+        RetractError::NotFound(id) => format!("thought not found: {id}"),
+        RetractError::AlreadyRetracted(id) => format!("thought already retracted: {id}"),
+        RetractError::ChainFromRequiresUnlink(id) => format!(
+            "thought {id} is from-side of a live replaces/refines edge; unlink or repoint before retract"
+        ),
+        RetractError::Refused { thought_id, status } => {
+            format!("retract refused for thought {thought_id}: status={status}")
         }
         RetractError::Storage(e) => {
             tracing::error!(error = %e, "retract_thought storage error");

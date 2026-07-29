@@ -38,6 +38,17 @@ Focused selectors (examples; still require the same env bindings):
 ```bash
 cargo test -p kengram-mcp --lib retract -- --test-threads=1
 cargo test -p kengram-mcp --lib server::tests::retract_thought_tool_reports_chain_from_not_not_found -- --exact --test-threads=1
+# Board 550689 payload_hash shape — unit + production callers (Jones 555325/26, 555885 exact-shape)
+cargo test -p kengram-mcp --lib link::tests::payload_hash_rejects_uuid_with_hyphens -- --exact --test-threads=1
+cargo test -p kengram-mcp --lib link::tests::payload_hash_accepts_64_lowercase_hex -- --exact --test-threads=1
+cargo test -p kengram-mcp --lib link::tests::payload_hash_rejects_63_lowercase_hex -- --exact --test-threads=1
+cargo test -p kengram-mcp --lib link::tests::payload_hash_rejects_65_lowercase_hex -- --exact --test-threads=1
+cargo test -p kengram-mcp --lib link::tests::payload_hash_rejects_63_a_plus_g -- --exact --test-threads=1
+cargo test -p kengram-mcp --lib link::tests::link_thoughts_rejects_nonhex_payload_hash -- --exact --test-threads=1
+cargo test -p kengram-mcp --lib link::tests::unlink_thoughts_rejects_nonhex_payload_hash -- --exact --test-threads=1
+cargo test -p kengram-mcp --lib link::tests::link_thoughts_rejects_exact_shape_payload_hash -- --exact --test-threads=1
+cargo test -p kengram-mcp --lib link::tests::unlink_thoughts_rejects_exact_shape_payload_hash -- --exact --test-threads=1
+cargo test -p kengram-mcp --lib payload_hash -- --test-threads=1
 ```
 
 ### 2. Format gate

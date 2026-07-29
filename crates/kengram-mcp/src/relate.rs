@@ -202,7 +202,15 @@ mod tests {
                 source_event: crate::link::RelationSourceEventRequest {
                     namespace: "tests/relate".to_string(),
                     source_ref: uuid::Uuid::new_v4().to_string(),
-                    payload_hash: uuid::Uuid::new_v4().to_string(),
+                    payload_hash: {
+                        let a = uuid::Uuid::new_v4();
+                        let b = uuid::Uuid::new_v4();
+                        a.as_bytes()
+                            .iter()
+                            .chain(b.as_bytes().iter())
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect()
+                    },
                     metadata: serde_json::json!({}),
                 },
                 claimed_producer_class: None,

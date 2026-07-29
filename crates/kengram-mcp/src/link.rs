@@ -398,10 +398,23 @@ fn validate_source_event(event: &RelationSourceEventRequest) -> Result<(), LinkE
     if event.source_ref.trim().is_empty() {
         return Err(LinkError::InvalidSourceEvent("source_ref is required"));
     }
-    if event.payload_hash.trim().is_empty() {
+    let hash = event.payload_hash.as_str();
+    if hash.trim().is_empty() {
         return Err(LinkError::InvalidSourceEvent("payload_hash is required"));
     }
+    // Documented contract: exact 64 lowercase hex (SHA-256). Board 550689 —
+    // previously any nonempty string was accepted (UUID-with-hyphens green).
+    if !is_sha256_payload_hash(hash) {
+        return Err(LinkError::InvalidSourceEvent(
+            "payload_hash must be 64 lowercase hex characters (SHA-256)",
+        ));
+    }
     Ok(())
+}
+
+/// SHA-256 digest as 64 lowercase hex digits (no 0x prefix, no uppercase).
+fn is_sha256_payload_hash(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 pub(crate) fn validate_target(target: &LinkTarget) -> Result<(), LinkError> {
@@ -443,13 +456,273 @@ mod tests {
 
     const TEST_EMBEDDER_MODEL_ID: &str = "bge-m3:1024";
 
+    fn test_payload_hash() -> String {
+        // 32 random bytes → 64 lowercase hex (valid SHA-256 shape).
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        a.as_bytes()
+            .iter()
+            .chain(b.as_bytes().iter())
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     fn relation_event() -> RelationSourceEventRequest {
         let id = uuid::Uuid::new_v4().to_string();
         RelationSourceEventRequest {
             namespace: "tests/relation".to_string(),
-            source_ref: id.clone(),
+            source_ref: id,
+            payload_hash: test_payload_hash(),
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn payload_hash_rejects_uuid_with_hyphens() {
+        // Board 550689 RED case: documented 64-hex contract must reject UUID form.
+        let id = uuid::Uuid::new_v4().to_string();
+        assert!(id.contains('-'), "fixture must be hyphenated UUID");
+        let err = super::validate_source_event(&RelationSourceEventRequest {
+            namespace: "tests/relation".into(),
+            source_ref: "ref".into(),
             payload_hash: id,
             metadata: serde_json::json!({}),
+        })
+        .unwrap_err();
+        match err {
+            LinkError::InvalidSourceEvent(msg) => {
+                assert!(
+                    msg.contains("64 lowercase hex") || msg.contains("payload_hash"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected InvalidSourceEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn payload_hash_accepts_64_lowercase_hex() {
+        let hash = test_payload_hash();
+        assert_eq!(hash.len(), 64);
+        super::validate_source_event(&RelationSourceEventRequest {
+            namespace: "tests/relation".into(),
+            source_ref: "ref".into(),
+            payload_hash: hash,
+            metadata: serde_json::json!({}),
+        })
+        .expect("valid shape must pass");
+    }
+
+    #[test]
+    fn payload_hash_rejects_uppercase_hex() {
+        let hash = "A".repeat(64);
+        let err = super::validate_source_event(&RelationSourceEventRequest {
+            namespace: "tests/relation".into(),
+            source_ref: "ref".into(),
+            payload_hash: hash,
+            metadata: serde_json::json!({}),
+        })
+        .unwrap_err();
+        assert!(matches!(err, LinkError::InvalidSourceEvent(_)), "{err:?}");
+    }
+
+    #[test]
+    fn payload_hash_rejects_63_lowercase_hex() {
+        // Jones 555885 exact-shape: length 63 must fail (not only UUID/uppercase).
+        let hash = "a".repeat(63);
+        let err = super::validate_source_event(&RelationSourceEventRequest {
+            namespace: "tests/relation".into(),
+            source_ref: "ref".into(),
+            payload_hash: hash,
+            metadata: serde_json::json!({}),
+        })
+        .unwrap_err();
+        assert!(matches!(err, LinkError::InvalidSourceEvent(_)), "{err:?}");
+    }
+
+    #[test]
+    fn payload_hash_rejects_65_lowercase_hex() {
+        // Jones 555885 exact-shape: length 65 must fail.
+        let hash = "a".repeat(65);
+        let err = super::validate_source_event(&RelationSourceEventRequest {
+            namespace: "tests/relation".into(),
+            source_ref: "ref".into(),
+            payload_hash: hash,
+            metadata: serde_json::json!({}),
+        })
+        .unwrap_err();
+        assert!(matches!(err, LinkError::InvalidSourceEvent(_)), "{err:?}");
+    }
+
+    #[test]
+    fn payload_hash_rejects_63_a_plus_g() {
+        // Jones 555885 exact-shape: invalid hex digit `g` (and length 64 with g).
+        // Reviewer probe: 63 a + g.
+        let hash = format!("{}g", "a".repeat(63));
+        assert_eq!(hash.len(), 64);
+        assert!(hash.contains('g'));
+        let err = super::validate_source_event(&RelationSourceEventRequest {
+            namespace: "tests/relation".into(),
+            source_ref: "ref".into(),
+            payload_hash: hash,
+            metadata: serde_json::json!({}),
+        })
+        .unwrap_err();
+        assert!(matches!(err, LinkError::InvalidSourceEvent(_)), "{err:?}");
+    }
+
+    /// Production caller must reject the same three exact-shape violators
+    /// (wrap-the-executed-primitive; private units alone leave caller mutants green).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn link_thoughts_rejects_exact_shape_payload_hash(pool: PgPool) {
+        let a = cap(&pool, "A").await;
+        let b = cap(&pool, "B").await;
+        let cases = [
+            ("len63", "a".repeat(63)),
+            ("len65", "a".repeat(65)),
+            ("63a_plus_g", format!("{}g", "a".repeat(63))),
+        ];
+        for (label, bad) in cases {
+            let err = link_thoughts(
+                &pool,
+                LinkThoughtsRequest {
+                    from_thought_id: a,
+                    relation: RelationKind::Refines,
+                    target: LinkTarget::Thought(b),
+                    note: None,
+                    source_event: RelationSourceEventRequest {
+                        namespace: "tests/relation".into(),
+                        source_ref: format!("ref-{label}"),
+                        payload_hash: bad,
+                        metadata: serde_json::json!({}),
+                    },
+                    claimed_producer_class: None,
+                },
+            )
+            .await
+            .unwrap_err();
+            match err {
+                LinkError::InvalidSourceEvent(msg) => {
+                    assert!(
+                        msg.contains("64 lowercase hex") || msg.contains("payload_hash"),
+                        "{label}: {msg}"
+                    );
+                }
+                other => {
+                    panic!("{label}: expected InvalidSourceEvent via link_thoughts, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn unlink_thoughts_rejects_exact_shape_payload_hash(pool: PgPool) {
+        let a = cap(&pool, "A").await;
+        let b = cap(&pool, "B").await;
+        let target = LinkTarget::Thought(b);
+        let cases = [
+            ("len63", "a".repeat(63)),
+            ("len65", "a".repeat(65)),
+            ("63a_plus_g", format!("{}g", "a".repeat(63))),
+        ];
+        for (label, bad) in cases {
+            let err = unlink_thoughts(
+                &pool,
+                a,
+                RelationKind::Refines,
+                &target,
+                RelationSourceEventRequest {
+                    namespace: "tests/relation".into(),
+                    source_ref: format!("unref-{label}"),
+                    payload_hash: bad,
+                    metadata: serde_json::json!({}),
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+            match err {
+                LinkError::InvalidSourceEvent(msg) => {
+                    assert!(
+                        msg.contains("64 lowercase hex") || msg.contains("payload_hash"),
+                        "{label}: {msg}"
+                    );
+                }
+                other => panic!(
+                    "{label}: expected InvalidSourceEvent via unlink_thoughts, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// Jones 555325: production `link_thoughts` must reject non-hex payload_hash
+    /// (private validate_source_event unit alone is not a production-caller gate).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn link_thoughts_rejects_nonhex_payload_hash(pool: PgPool) {
+        let a = cap(&pool, "A").await;
+        let b = cap(&pool, "B").await;
+        let bad = uuid::Uuid::new_v4().to_string();
+        assert!(bad.contains('-'));
+        let err = link_thoughts(
+            &pool,
+            LinkThoughtsRequest {
+                from_thought_id: a,
+                relation: RelationKind::Refines,
+                target: LinkTarget::Thought(b),
+                note: None,
+                source_event: RelationSourceEventRequest {
+                    namespace: "tests/relation".into(),
+                    source_ref: uuid::Uuid::new_v4().to_string(),
+                    payload_hash: bad,
+                    metadata: serde_json::json!({}),
+                },
+                claimed_producer_class: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        match err {
+            LinkError::InvalidSourceEvent(msg) => {
+                assert!(
+                    msg.contains("64 lowercase hex") || msg.contains("payload_hash"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected InvalidSourceEvent via link_thoughts, got {other:?}"),
+        }
+    }
+
+    /// Jones 555326: production `unlink_thoughts` must reject non-hex payload_hash.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn unlink_thoughts_rejects_nonhex_payload_hash(pool: PgPool) {
+        let a = cap(&pool, "A").await;
+        let b = cap(&pool, "B").await;
+        let target = LinkTarget::Thought(b);
+        let bad = uuid::Uuid::new_v4().to_string();
+        assert!(bad.contains('-'));
+        let err = unlink_thoughts(
+            &pool,
+            a,
+            RelationKind::Refines,
+            &target,
+            RelationSourceEventRequest {
+                namespace: "tests/relation".into(),
+                source_ref: uuid::Uuid::new_v4().to_string(),
+                payload_hash: bad,
+                metadata: serde_json::json!({}),
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        match err {
+            LinkError::InvalidSourceEvent(msg) => {
+                assert!(
+                    msg.contains("64 lowercase hex") || msg.contains("payload_hash"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected InvalidSourceEvent via unlink_thoughts, got {other:?}"),
         }
     }
 

@@ -249,4 +249,99 @@ mod tests {
         assert!(!msg.contains("not found"), "{msg}");
         assert!(msg.contains("from-side") || msg.contains("unlink"), "{msg}");
     }
+
+    /// Jones exact historical discriminator (board 547350 a2a cb357a4f):
+    /// Unlinking inbound replaces (710a47d8→3424acda) is NOT enough when the
+    /// thought is also FROM of its own replaces edge to a predecessor.
+    /// Retract must refuse with chain-from status, never false not-found.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn retract_after_unlink_inbound_still_blocked_when_from(pool: PgPool) {
+        use crate::link::unlink_thoughts;
+
+        let predecessor = cap(&pool, "predecessor of wrong memory").await;
+        let wrong = cap(&pool, "wrong memory also supersedes predecessor").await;
+        let corrector = cap(&pool, "correcting thought inbound supersession").await;
+
+        // wrong is FROM of replaces → predecessor
+        link_thoughts(
+            &pool,
+            LinkThoughtsRequest {
+                from_thought_id: wrong,
+                relation: RelationKind::Replaces,
+                target: LinkTarget::Thought(predecessor),
+                note: Some("wrong also claims supersession".into()),
+                source_event: relation_event(),
+                claimed_producer_class: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // corrector replaces wrong (inbound supersession on wrong)
+        link_thoughts(
+            &pool,
+            LinkThoughtsRequest {
+                from_thought_id: corrector,
+                relation: RelationKind::Replaces,
+                target: LinkTarget::Thought(wrong),
+                note: Some("inbound supersession".into()),
+                source_event: relation_event(),
+                claimed_producer_class: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Unlink only inbound pair (corrector→wrong) — jones step (2)
+        let un = unlink_thoughts(
+            &pool,
+            corrector,
+            RelationKind::Replaces,
+            &LinkTarget::Thought(wrong),
+            relation_event(),
+            None,
+        )
+        .await
+        .expect("unlink inbound");
+        assert_eq!(un.status.as_str(), "deleted_now");
+
+        // Retract wrong — still FROM of replaces to predecessor
+        let err = retract_thought(
+            &pool,
+            RetractThoughtRequest {
+                thought_id: wrong,
+                reason: Some("jones discriminator after inbound unlink".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+        match err {
+            RetractError::ChainFromRequiresUnlink(id) => assert_eq!(id, wrong),
+            other => panic!("expected ChainFromRequiresUnlink not not-found: {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(!msg.contains("not found"), "must not lie not-found: {msg}");
+
+        // Unlink outbound FROM edge, then retract succeeds
+        unlink_thoughts(
+            &pool,
+            wrong,
+            RelationKind::Replaces,
+            &LinkTarget::Thought(predecessor),
+            relation_event(),
+            None,
+        )
+        .await
+        .unwrap();
+        let resp = retract_thought(
+            &pool,
+            RetractThoughtRequest {
+                thought_id: wrong,
+                reason: Some("after both edges cleared".into()),
+            },
+        )
+        .await
+        .expect("retract after no FROM supersession edges");
+        assert!(resp.retracted);
+    }
 }

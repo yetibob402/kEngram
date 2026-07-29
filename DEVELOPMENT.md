@@ -890,3 +890,5 @@ After releasing the binary, run `sqlx migrate run` against the live DSN. Binary 
 
 
 After any manual migration apply to prod before merge, record the schema-ahead-of-main delta on the owning PR (inverse of deploy-without-migrate). Bidirectional checks are in `scripts/post-deploy-replaces-retracted-smoke.md`.
+
+Use `./scripts/schema-binary-migrate-gate.sh --compare` for bidirectional schema/binary deploy hygiene (not `ls migrations | sort | tail`). Self-test: `./scripts/schema-binary-migrate-gate-selftest.sh`.

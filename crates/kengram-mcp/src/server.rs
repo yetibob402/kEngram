@@ -33,7 +33,9 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::time::Instant;
 
 use crate::capture::{self, CaptureError, CaptureRequest, MAX_CONTENT_LEN};
-use crate::link::{self, LinkError, MAX_LINK_NOTE_LEN};
+use crate::link::{
+    self, EndpointRetractedDetail, LinkError, MAX_LINK_NOTE_LEN, RetractedEndpointSide,
+};
 use crate::query_expansion::QueryExpansionProvider;
 use crate::relate::{self, GetRelatedThoughtsRequest, RelateError};
 use crate::retract::{self, RetractError, RetractThoughtRequest};
@@ -1472,7 +1474,7 @@ Tools: `capture`, `search_thoughts`, `recent_thoughts`, `list_scopes`, `get_thou
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kengram_core::{EmbedderError, EmbeddingModel, TagKind, Tags};
+    use kengram_core::{EmbedderError, EmbeddingModel, RelationKind, TagKind, Tags};
     use kengram_embed::FakeEmbedder;
 
     const TEST_EMBEDDER_MODEL_ID: &str = "bge-m3:1024";
@@ -2976,5 +2978,66 @@ mod tests {
             .await
             .unwrap();
         assert!(jobs.is_empty());
+    }
+
+    /// Jones blocker board 539725 / head 13e8abef: helper-only tests on
+    /// EndpointRetractedDetail::message never call production map_link_error.
+    /// Mutating map_link_error back to "to-side may be retracted" left
+    /// link_unruled_relation_to_retracted_is_rejected green. This control
+    /// calls the production mapper and must RED on that false phrase.
+    #[test]
+    fn map_link_error_endpoint_retracted_to_teaches_per_kind_rule() {
+        use crate::link::{EndpointRetractedDetail, RetractedEndpointSide};
+
+        let id = ThoughtId::new();
+        let unruled = [
+            RelationKind::Requires,
+            RelationKind::References,
+            RelationKind::Supports,
+            RelationKind::BelongsTo,
+            RelationKind::DecidedBy,
+        ];
+        for rel in unruled {
+            let msg = map_link_error(LinkError::EndpointRetracted(EndpointRetractedDetail {
+                id,
+                relation: Some(rel),
+                side: RetractedEndpointSide::To,
+            }));
+            assert!(
+                msg.contains("target retracted"),
+                "production mapper must lead with target retracted: {msg}"
+            );
+            assert!(
+                msg.contains(rel.as_str()),
+                "production mapper must name relation {rel}: {msg}"
+            );
+            assert!(
+                msg.contains("requires a live target"),
+                "production mapper must state live-target requirement: {msg}"
+            );
+            assert!(
+                msg.contains("only replaces/refines"),
+                "production mapper must teach supersession allowlist: {msg}"
+            );
+            // Exact false phrase from pre-fix map_link_error (jones mutation probe).
+            assert!(
+                !msg.contains("to-side may be retracted"),
+                "production mapper must not use unconditional exemption text: {msg}"
+            );
+        }
+
+        let from_msg = map_link_error(LinkError::EndpointRetracted(EndpointRetractedDetail {
+            id,
+            relation: Some(RelationKind::Supports),
+            side: RetractedEndpointSide::From,
+        }));
+        assert!(
+            from_msg.contains("from-side"),
+            "from-side path must stay distinct: {from_msg}"
+        );
+        assert!(
+            !from_msg.contains("to-side may be retracted"),
+            "from-side must not carry false to-side exemption: {from_msg}"
+        );
     }
 }

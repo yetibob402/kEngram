@@ -104,4 +104,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 - Author commits as **YetiWerks** / `bhrbek@gmail.com` on Yetiwerks-governed clones.
 - Builders do not deploy prod; merge owners run the ordered post-merge drill
-  (merge → build → schema gate equal-green → restart → native probe).
+  (merge → **build from an immutable clone/worktree at the merge commit** →
+  schema gate equal-green → restart → native probe).
+  **Never** `cargo build --release` from the live deploy checkout if it can
+  carry untracked files under `migrations/` — `sqlx` compile-time migrate
+  embedding will bake those into the binary (board 552086 dirty-migration-embed
+  class; clean pattern: detached worktree like `kengram-clean-build-<sha>`).
+  Prove tracked-only set (e.g. 33 files / manifest `ad33eff8…` at d1dc680) and
+  absence of known untracked needles before restart. Do **not** run `migrate`
+  from a dirty-built binary.

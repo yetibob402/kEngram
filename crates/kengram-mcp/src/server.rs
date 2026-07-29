@@ -2874,7 +2874,8 @@ mod tests {
             }))
             .await
             .unwrap_err();
-        assert!(err.contains("not found or already retracted"));
+        assert!(err.contains("already retracted"), "{err}");
+        assert!(!err.contains("not found"), "must not collapse already_retracted into not-found: {err}");
     }
 
     #[sqlx::test(migrations = "../../migrations")]

@@ -1167,9 +1167,12 @@ mod tests {
         assert_ne!(first.link_id, second.link_id);
     }
 
-    /// Jones repro class (board 533148): replaces from live corrected thought
-    /// to a retracted predecessor must succeed. Opaque "internal database error"
-    /// was wrong — gate raised relation_endpoint_retracted on the to-side.
+    /// Jones sealed RED (2026-07-29 a2a 0d7a41a3 / board 533148):
+    /// from 95a2398c-03fc-47ed-81ba-2b4bc118e4da (indexed live) replaces
+    /// to 4f5b6c00-987e-4338-a91c-d971dbcd2122 (retracted) returned literal
+    /// "internal database error"; source_ref jones:kengram-replaces-repro:7f4ac9b2-…
+    /// payload_hash 47b19664571cf33b…. Gate raised relation_endpoint_retracted on
+    /// the to-side; MCP collapsed it. After 0033 this must succeed.
     #[sqlx::test(migrations = "../../migrations")]
     async fn link_replaces_to_retracted_thought_succeeds(pool: PgPool) {
         let predecessor = cap(&pool, "old-verdict-to-retract").await;

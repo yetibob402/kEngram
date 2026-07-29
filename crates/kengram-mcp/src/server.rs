@@ -111,8 +111,9 @@ pub struct ArgusSourceEventArgs {
     pub source_ref: String,
 
     #[schemars(
-        description = "SHA-256 of the canonical request payload as 64 lowercase hex chars (from canonicalJson(payload) or equivalent). Nested under argus_source_event. Reusing the same (namespace, source_ref) with a different hash is a conflict, not a silent overwrite."
+        description = "SHA-256 of the canonical request payload as 64 lowercase hex chars (from canonicalJson(payload) or equivalent). Nested under argus_source_event. Canonical field name is payload_hash; payload_sha256 is accepted as a serde alias (board 536066 / jones RED residual — wrong name was a discarded contract error). Reusing the same (namespace, source_ref) with a different hash is a conflict, not a silent overwrite."
     )]
+    #[serde(alias = "payload_sha256")]
     pub payload_hash: String,
 
     #[schemars(
@@ -272,8 +273,9 @@ pub struct RelationSourceEventArgs {
     pub source_ref: String,
 
     #[schemars(
-        description = "SHA-256 of the canonical request payload; reusing the identity with a different hash is rejected as a conflict."
+        description = "SHA-256 of the canonical request payload (64 hex). Canonical name payload_hash; payload_sha256 accepted as alias (board 536066). Reusing the identity with a different hash is rejected as a conflict."
     )]
+    #[serde(alias = "payload_sha256")]
     pub payload_hash: String,
 
     #[schemars(description = "Optional metadata stored with the durable relation request.")]

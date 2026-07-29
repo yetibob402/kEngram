@@ -526,6 +526,135 @@ mod tests {
         assert!(matches!(err, LinkError::InvalidSourceEvent(_)), "{err:?}");
     }
 
+    #[test]
+    fn payload_hash_rejects_63_lowercase_hex() {
+        // Jones 555885 exact-shape: length 63 must fail (not only UUID/uppercase).
+        let hash = "a".repeat(63);
+        let err = super::validate_source_event(&RelationSourceEventRequest {
+            namespace: "tests/relation".into(),
+            source_ref: "ref".into(),
+            payload_hash: hash,
+            metadata: serde_json::json!({}),
+        })
+        .unwrap_err();
+        assert!(matches!(err, LinkError::InvalidSourceEvent(_)), "{err:?}");
+    }
+
+    #[test]
+    fn payload_hash_rejects_65_lowercase_hex() {
+        // Jones 555885 exact-shape: length 65 must fail.
+        let hash = "a".repeat(65);
+        let err = super::validate_source_event(&RelationSourceEventRequest {
+            namespace: "tests/relation".into(),
+            source_ref: "ref".into(),
+            payload_hash: hash,
+            metadata: serde_json::json!({}),
+        })
+        .unwrap_err();
+        assert!(matches!(err, LinkError::InvalidSourceEvent(_)), "{err:?}");
+    }
+
+    #[test]
+    fn payload_hash_rejects_63_a_plus_g() {
+        // Jones 555885 exact-shape: invalid hex digit `g` (and length 64 with g).
+        // Reviewer probe: 63 a + g.
+        let hash = format!("{}g", "a".repeat(63));
+        assert_eq!(hash.len(), 64);
+        assert!(hash.contains('g'));
+        let err = super::validate_source_event(&RelationSourceEventRequest {
+            namespace: "tests/relation".into(),
+            source_ref: "ref".into(),
+            payload_hash: hash,
+            metadata: serde_json::json!({}),
+        })
+        .unwrap_err();
+        assert!(matches!(err, LinkError::InvalidSourceEvent(_)), "{err:?}");
+    }
+
+    /// Production caller must reject the same three exact-shape violators
+    /// (wrap-the-executed-primitive; private units alone leave caller mutants green).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn link_thoughts_rejects_exact_shape_payload_hash(pool: PgPool) {
+        let a = cap(&pool, "A").await;
+        let b = cap(&pool, "B").await;
+        let cases = [
+            ("len63", "a".repeat(63)),
+            ("len65", "a".repeat(65)),
+            ("63a_plus_g", format!("{}g", "a".repeat(63))),
+        ];
+        for (label, bad) in cases {
+            let err = link_thoughts(
+                &pool,
+                LinkThoughtsRequest {
+                    from_thought_id: a,
+                    relation: RelationKind::Refines,
+                    target: LinkTarget::Thought(b),
+                    note: None,
+                    source_event: RelationSourceEventRequest {
+                        namespace: "tests/relation".into(),
+                        source_ref: format!("ref-{label}"),
+                        payload_hash: bad,
+                        metadata: serde_json::json!({}),
+                    },
+                    claimed_producer_class: None,
+                },
+            )
+            .await
+            .unwrap_err();
+            match err {
+                LinkError::InvalidSourceEvent(msg) => {
+                    assert!(
+                        msg.contains("64 lowercase hex") || msg.contains("payload_hash"),
+                        "{label}: {msg}"
+                    );
+                }
+                other => {
+                    panic!("{label}: expected InvalidSourceEvent via link_thoughts, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn unlink_thoughts_rejects_exact_shape_payload_hash(pool: PgPool) {
+        let a = cap(&pool, "A").await;
+        let b = cap(&pool, "B").await;
+        let target = LinkTarget::Thought(b);
+        let cases = [
+            ("len63", "a".repeat(63)),
+            ("len65", "a".repeat(65)),
+            ("63a_plus_g", format!("{}g", "a".repeat(63))),
+        ];
+        for (label, bad) in cases {
+            let err = unlink_thoughts(
+                &pool,
+                a,
+                RelationKind::Refines,
+                &target,
+                RelationSourceEventRequest {
+                    namespace: "tests/relation".into(),
+                    source_ref: format!("unref-{label}"),
+                    payload_hash: bad,
+                    metadata: serde_json::json!({}),
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+            match err {
+                LinkError::InvalidSourceEvent(msg) => {
+                    assert!(
+                        msg.contains("64 lowercase hex") || msg.contains("payload_hash"),
+                        "{label}: {msg}"
+                    );
+                }
+                other => panic!(
+                    "{label}: expected InvalidSourceEvent via unlink_thoughts, got {other:?}"
+                ),
+            }
+        }
+    }
+
     /// Jones 555325: production `link_thoughts` must reject non-hex payload_hash
     /// (private validate_source_event unit alone is not a production-caller gate).
     #[sqlx::test(migrations = "../../migrations")]

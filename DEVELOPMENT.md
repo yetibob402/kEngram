@@ -887,3 +887,6 @@ For a pragmatic middle ground — a headless single-server host that keeps the D
 ## Post-deploy migration gate (PR9 residual)
 
 After releasing the binary, run `sqlx migrate run` against the live DSN. Binary restart without migration leaves the old 2-arg endpoint lock and refuses supersession links. See `scripts/post-deploy-replaces-retracted-smoke.md`.
+
+
+After any manual migration apply to prod before merge, record the schema-ahead-of-main delta on the owning PR (inverse of deploy-without-migrate). Bidirectional checks are in `scripts/post-deploy-replaces-retracted-smoke.md`.

@@ -2875,7 +2875,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("already retracted"), "{err}");
-        assert!(!err.contains("not found"), "must not collapse already_retracted into not-found: {err}");
+        assert!(
+            !err.contains("not found"),
+            "must not collapse already_retracted into not-found: {err}"
+        );
     }
 
     /// Jones PR11 CN: production MCP caller must surface ChainFromRequiresUnlink

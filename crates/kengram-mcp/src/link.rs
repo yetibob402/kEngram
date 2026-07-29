@@ -92,8 +92,9 @@ pub enum LinkError {
     #[error("to_thought_id {0} not found")]
     ToThoughtMissing(ThoughtId),
 
-    /// From-endpoint (or other active-required endpoint) is retracted.
-    /// Targets may be retracted; this is for the live source side of a create.
+    /// An active-required endpoint is retracted.
+    /// From-side of create must always be live. To-side may be retracted only
+    /// for supersession relations replaces|refines; other kinds refuse.
     #[error("relation endpoint is retracted: {0}")]
     EndpointRetracted(ThoughtId),
 

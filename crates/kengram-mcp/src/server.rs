@@ -1140,7 +1140,7 @@ fn map_link_error(err: LinkError) -> String {
         LinkError::FromThoughtMissing(id) => format!("from_thought_id {id} not found"),
         LinkError::ToThoughtMissing(id) => format!("to_thought_id {id} not found"),
         LinkError::EndpointRetracted(id) => format!(
-            "relation endpoint is retracted: {id} (from-side of create must be live; to-side may be retracted)"
+            "relation endpoint is retracted: {id} (from-side of create must be live; to-side may be retracted only for supersession relations replaces|refines — other kinds refuse retracted targets)"
         ),
         LinkError::NoteTooLong { got, max } => {
             format!("note too long: {got} bytes (max {max} = {MAX_LINK_NOTE_LEN})")

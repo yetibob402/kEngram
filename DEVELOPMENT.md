@@ -883,3 +883,12 @@ If something else already binds `5432`, edit `docker-compose.yml` to map a diffe
 In production, Postgres runs as a systemd-managed service (not Docker), and the embedder is a TEI sidecar (also systemd-managed) rather than Ollama. Both deployment shapes are described in `DESIGN.md` §11. The dev setup here exists for ergonomics — the production setup is operator-managed and out of scope for this file.
 
 For a pragmatic middle ground — a headless single-server host that keeps the Docker backing services *and* runs the kEngram server and worker as systemd units so the whole stack survives a reboot — see [docs/linux-autostart.md](docs/linux-autostart.md). Ready-to-copy unit files ship in [`contrib/systemd/`](contrib/systemd/).
+
+## Post-deploy migration gate (PR9 residual)
+
+After releasing the binary, run `sqlx migrate run` against the live DSN. Binary restart without migration leaves the old 2-arg endpoint lock and refuses supersession links. See `scripts/post-deploy-replaces-retracted-smoke.md`.
+
+
+After any manual migration apply to prod before merge, record the schema-ahead-of-main delta on the owning PR (inverse of deploy-without-migrate). Bidirectional checks are in `scripts/post-deploy-replaces-retracted-smoke.md`.
+
+Use `./scripts/schema-binary-migrate-gate.sh --compare` for bidirectional schema/binary deploy hygiene (not `ls migrations | sort | tail`). Self-test: `./scripts/schema-binary-migrate-gate-selftest.sh`.

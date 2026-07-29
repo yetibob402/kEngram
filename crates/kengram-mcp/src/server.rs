@@ -33,9 +33,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::time::Instant;
 
 use crate::capture::{self, CaptureError, CaptureRequest, MAX_CONTENT_LEN};
-use crate::link::{
-    self, EndpointRetractedDetail, LinkError, MAX_LINK_NOTE_LEN, RetractedEndpointSide,
-};
+use crate::link::{self, LinkError, MAX_LINK_NOTE_LEN};
 use crate::query_expansion::QueryExpansionProvider;
 use crate::relate::{self, GetRelatedThoughtsRequest, RelateError};
 use crate::retract::{self, RetractError, RetractThoughtRequest};

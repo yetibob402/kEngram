@@ -78,7 +78,7 @@ pub struct CaptureArgs {
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
 
     #[schemars(
-        description = "Optional Argus source-event idempotency gate. When present, capture is keyed by (namespace, source_ref) with payload_hash conflict detection before the thought row is written."
+        description = "Optional Argus source-event idempotency gate. MUST be a nested OBJECT (JSON type object) with required fields namespace, source_ref, payload_hash — do NOT flatten those three keys onto the top-level capture arguments (that is structured-arg misuse and the fields will be ignored or rejected). When present, capture is keyed by (namespace, source_ref) with payload_hash conflict detection before the thought row is written. payload_hash should be the 64-char lowercase hex SHA-256 of the canonical payload bytes. relation_intents require this identity."
     )]
     pub argus_source_event: Option<ArgusSourceEventArgs>,
 
@@ -100,16 +100,25 @@ pub struct CaptureArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ArgusSourceEventArgs {
-    #[schemars(description = "Argus source-event namespace, e.g. agents/trinity.")]
+    #[schemars(
+        description = "Argus source-event namespace, e.g. agents/trinity or conversations/agents. Nested under argus_source_event — not a top-level capture field."
+    )]
     pub namespace: String,
 
-    #[schemars(description = "Producer-stable replay key inside namespace.")]
+    #[schemars(
+        description = "Producer-stable replay key inside namespace (e.g. a2a:<msg_id>). Nested under argus_source_event."
+    )]
     pub source_ref: String,
 
-    #[schemars(description = "Payload SHA-256 derived from canonicalJson(payload).")]
+    #[schemars(
+        description = "SHA-256 of the canonical request payload as 64 lowercase hex chars (from canonicalJson(payload) or equivalent). Nested under argus_source_event. Canonical field name is payload_hash; payload_sha256 is accepted as a serde alias (board 536066 / jones RED residual — wrong name was a discarded contract error). Reusing the same (namespace, source_ref) with a different hash is a conflict, not a silent overwrite."
+    )]
+    #[serde(alias = "payload_sha256")]
     pub payload_hash: String,
 
-    #[schemars(description = "Optional metadata stored on argus_source_events.metadata.")]
+    #[schemars(
+        description = "Optional metadata object stored on argus_source_events.metadata. Must be a JSON object when present (Map), not a string or array — same concrete-object schema rule as tag_filter."
+    )]
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
@@ -264,8 +273,9 @@ pub struct RelationSourceEventArgs {
     pub source_ref: String,
 
     #[schemars(
-        description = "SHA-256 of the canonical request payload; reusing the identity with a different hash is rejected as a conflict."
+        description = "SHA-256 of the canonical request payload (64 hex). Canonical name payload_hash; payload_sha256 accepted as alias (board 536066). Reusing the identity with a different hash is rejected as a conflict."
     )]
+    #[serde(alias = "payload_sha256")]
     pub payload_hash: String,
 
     #[schemars(description = "Optional metadata stored with the durable relation request.")]
@@ -557,7 +567,9 @@ impl KengramServer {
             .collect::<Result<Vec<_>, String>>()?;
 
         if !relation_intents.is_empty() && args.argus_source_event.is_none() {
-            return Err("relation_intents require argus_source_event identity".to_string());
+            return Err(
+                "relation_intents require argus_source_event identity: pass a nested object argus_source_event={namespace,source_ref,payload_hash} (do not flatten those keys onto capture top-level)".to_string(),
+            );
         }
 
         // Embedding is fully async: durable gated insert first, worker drain
@@ -1127,6 +1139,7 @@ fn map_link_error(err: LinkError) -> String {
         }
         LinkError::FromThoughtMissing(id) => format!("from_thought_id {id} not found"),
         LinkError::ToThoughtMissing(id) => format!("to_thought_id {id} not found"),
+        LinkError::EndpointRetracted(detail) => detail.message(),
         LinkError::NoteTooLong { got, max } => {
             format!("note too long: {got} bytes (max {max} = {MAX_LINK_NOTE_LEN})")
         }
@@ -1459,7 +1472,7 @@ Tools: `capture`, `search_thoughts`, `recent_thoughts`, `list_scopes`, `get_thou
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kengram_core::{EmbedderError, EmbeddingModel, TagKind, Tags};
+    use kengram_core::{EmbedderError, EmbeddingModel, RelationKind, TagKind, Tags};
     use kengram_embed::FakeEmbedder;
 
     const TEST_EMBEDDER_MODEL_ID: &str = "bge-m3:1024";
@@ -2963,5 +2976,66 @@ mod tests {
             .await
             .unwrap();
         assert!(jobs.is_empty());
+    }
+
+    /// Jones blocker board 539725 / head 13e8abef: helper-only tests on
+    /// EndpointRetractedDetail::message never call production map_link_error.
+    /// Mutating map_link_error back to "to-side may be retracted" left
+    /// link_unruled_relation_to_retracted_is_rejected green. This control
+    /// calls the production mapper and must RED on that false phrase.
+    #[test]
+    fn map_link_error_endpoint_retracted_to_teaches_per_kind_rule() {
+        use crate::link::{EndpointRetractedDetail, RetractedEndpointSide};
+
+        let id = ThoughtId::new();
+        let unruled = [
+            RelationKind::Requires,
+            RelationKind::References,
+            RelationKind::Supports,
+            RelationKind::BelongsTo,
+            RelationKind::DecidedBy,
+        ];
+        for rel in unruled {
+            let msg = map_link_error(LinkError::EndpointRetracted(EndpointRetractedDetail {
+                id,
+                relation: Some(rel),
+                side: RetractedEndpointSide::To,
+            }));
+            assert!(
+                msg.contains("target retracted"),
+                "production mapper must lead with target retracted: {msg}"
+            );
+            assert!(
+                msg.contains(rel.as_str()),
+                "production mapper must name relation {rel}: {msg}"
+            );
+            assert!(
+                msg.contains("requires a live target"),
+                "production mapper must state live-target requirement: {msg}"
+            );
+            assert!(
+                msg.contains("only replaces/refines"),
+                "production mapper must teach supersession allowlist: {msg}"
+            );
+            // Exact false phrase from pre-fix map_link_error (jones mutation probe).
+            assert!(
+                !msg.contains("to-side may be retracted"),
+                "production mapper must not use unconditional exemption text: {msg}"
+            );
+        }
+
+        let from_msg = map_link_error(LinkError::EndpointRetracted(EndpointRetractedDetail {
+            id,
+            relation: Some(RelationKind::Supports),
+            side: RetractedEndpointSide::From,
+        }));
+        assert!(
+            from_msg.contains("from-side"),
+            "from-side path must stay distinct: {from_msg}"
+        );
+        assert!(
+            !from_msg.contains("to-side may be retracted"),
+            "from-side must not carry false to-side exemption: {from_msg}"
+        );
     }
 }

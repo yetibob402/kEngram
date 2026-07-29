@@ -63,6 +63,20 @@ impl RelationKind {
         Self::DecidedBy,
         Self::Refines,
     ];
+
+    /// Whether this relation may target a *retracted* thought.
+    ///
+    /// Knox HIGH ruling (2026-07-29 a2a 986d6320): the retracted-target exemption
+    /// is exactly the supersession pair `{replaces, refines}` and nothing else.
+    /// Principle: supersession relations point BACKWARD at history — their entire
+    /// purpose is referencing what was retracted. Every OTHER relation kind
+    /// asserts CURRENT relevance; linking live thoughts to retracted content
+    /// through them reintroduces retracted material into recall (the original
+    /// guard's job). Fail-closed: any future vocabulary kind defaults to `false`
+    /// until explicitly added here *and* in migration 0033's SQL allowlist.
+    pub fn allows_retracted_target(self) -> bool {
+        matches!(self, Self::Replaces | Self::Refines)
+    }
 }
 
 impl fmt::Display for RelationKind {
@@ -312,6 +326,33 @@ pub struct ThoughtLink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retracted_target_allowlist_is_supersession_pair_only() {
+        let exempt: Vec<_> = RelationKind::ALL
+            .into_iter()
+            .filter(|k| k.allows_retracted_target())
+            .collect();
+        assert_eq!(
+            exempt,
+            vec![RelationKind::Replaces, RelationKind::Refines],
+            "exemption must be supersession pair only; new kinds fail-closed"
+        );
+        let refuse: Vec<_> = RelationKind::ALL
+            .into_iter()
+            .filter(|k| !k.allows_retracted_target())
+            .collect();
+        assert_eq!(
+            refuse.len(),
+            5,
+            "five non-supersession kinds refuse retracted TO"
+        );
+        assert!(refuse.contains(&RelationKind::Requires));
+        assert!(refuse.contains(&RelationKind::References));
+        assert!(refuse.contains(&RelationKind::Supports));
+        assert!(refuse.contains(&RelationKind::BelongsTo));
+        assert!(refuse.contains(&RelationKind::DecidedBy));
+    }
 
     #[test]
     fn relation_kind_serializes_to_snake_case() {

@@ -526,6 +526,77 @@ mod tests {
         assert!(matches!(err, LinkError::InvalidSourceEvent(_)), "{err:?}");
     }
 
+    /// Jones 555325: production `link_thoughts` must reject non-hex payload_hash
+    /// (private validate_source_event unit alone is not a production-caller gate).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn link_thoughts_rejects_nonhex_payload_hash(pool: PgPool) {
+        let a = cap(&pool, "A").await;
+        let b = cap(&pool, "B").await;
+        let bad = uuid::Uuid::new_v4().to_string();
+        assert!(bad.contains('-'));
+        let err = link_thoughts(
+            &pool,
+            LinkThoughtsRequest {
+                from_thought_id: a,
+                relation: RelationKind::Refines,
+                target: LinkTarget::Thought(b),
+                note: None,
+                source_event: RelationSourceEventRequest {
+                    namespace: "tests/relation".into(),
+                    source_ref: uuid::Uuid::new_v4().to_string(),
+                    payload_hash: bad,
+                    metadata: serde_json::json!({}),
+                },
+                claimed_producer_class: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        match err {
+            LinkError::InvalidSourceEvent(msg) => {
+                assert!(
+                    msg.contains("64 lowercase hex") || msg.contains("payload_hash"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected InvalidSourceEvent via link_thoughts, got {other:?}"),
+        }
+    }
+
+    /// Jones 555326: production `unlink_thoughts` must reject non-hex payload_hash.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn unlink_thoughts_rejects_nonhex_payload_hash(pool: PgPool) {
+        let a = cap(&pool, "A").await;
+        let b = cap(&pool, "B").await;
+        let target = LinkTarget::Thought(b);
+        let bad = uuid::Uuid::new_v4().to_string();
+        assert!(bad.contains('-'));
+        let err = unlink_thoughts(
+            &pool,
+            a,
+            RelationKind::Refines,
+            &target,
+            RelationSourceEventRequest {
+                namespace: "tests/relation".into(),
+                source_ref: uuid::Uuid::new_v4().to_string(),
+                payload_hash: bad,
+                metadata: serde_json::json!({}),
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        match err {
+            LinkError::InvalidSourceEvent(msg) => {
+                assert!(
+                    msg.contains("64 lowercase hex") || msg.contains("payload_hash"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected InvalidSourceEvent via unlink_thoughts, got {other:?}"),
+        }
+    }
+
     const RELATION_CLAIM_TEST_LOCK: i64 = 7_301_002;
 
     async fn install_relation_claim_barrier(pool: &PgPool) {

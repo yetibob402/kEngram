@@ -1222,6 +1222,78 @@ mod tests {
         assert_eq!(rep.target, LinkTarget::Thought(predecessor));
     }
 
+    /// Hunter positive control class: identical link shape against a *live*
+    /// target must succeed (control link_id 9041c982 in live evidence). Same
+    /// payload_hash succeeds on live TO and used to fail only on retracted TO.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn link_replaces_to_live_thought_still_succeeds(pool: PgPool) {
+        let predecessor = cap(&pool, "live-predecessor-still-valid").await;
+        let corrected = cap(&pool, "corrected-points-at-live-predecessor").await;
+
+        let rep = link_thoughts(
+            &pool,
+            LinkThoughtsRequest {
+                from_thought_id: corrected,
+                relation: RelationKind::Replaces,
+                target: LinkTarget::Thought(predecessor),
+                note: Some("positive control replaces to live target".into()),
+                source_event: relation_event(),
+                claimed_producer_class: None,
+            },
+        )
+        .await
+        .expect("replaces to live target (hunter positive control class)");
+        assert!(rep.is_new);
+        assert_eq!(rep.target, LinkTarget::Thought(predecessor));
+
+        // refines to live also fine
+        let refined_from = cap(&pool, "refines-from-live").await;
+        let refined_to = cap(&pool, "refines-to-live").await;
+        let r = link_thoughts(
+            &pool,
+            LinkThoughtsRequest {
+                from_thought_id: refined_from,
+                relation: RelationKind::Refines,
+                target: LinkTarget::Thought(refined_to),
+                note: None,
+                source_event: relation_event(),
+                claimed_producer_class: None,
+            },
+        )
+        .await
+        .expect("refines to live");
+        assert!(r.is_new);
+    }
+
+    /// Knox design: refines TO a retracted target is also valid supersession-
+    /// adjacent provenance (same active-from / retracted-to rule as replaces).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn link_refines_to_retracted_thought_succeeds(pool: PgPool) {
+        let older = cap(&pool, "older-thinking-to-retract").await;
+        let newer = cap(&pool, "newer-refined-thinking").await;
+        assert!(
+            kengram_storage::retract_thought(&pool, older, Some("superseded by refine"))
+                .await
+                .unwrap()
+                .retracted
+        );
+        let r = link_thoughts(
+            &pool,
+            LinkThoughtsRequest {
+                from_thought_id: newer,
+                relation: RelationKind::Refines,
+                target: LinkTarget::Thought(older),
+                note: Some("refines retracted predecessor".into()),
+                source_event: relation_event(),
+                claimed_producer_class: None,
+            },
+        )
+        .await
+        .expect("refines to retracted must succeed per design ruling");
+        assert!(r.is_new);
+        assert_eq!(r.relation, RelationKind::Refines);
+    }
+
     /// Creating a link *from* a retracted thought still fails — only the to-side
     /// is allowed to be retracted for provenance edges.
     #[sqlx::test(migrations = "../../migrations")]

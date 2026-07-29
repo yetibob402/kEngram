@@ -13,6 +13,13 @@
 -- Fix: still require the *from* endpoint of create/replace_tagger_set to be active;
 -- existence-lock only for *to* thought targets (retracted allowed).
 
+-- Knox DESIGN RULING 2026-07-29 (a2a 3ea8ed16, hunter two-sided evidence):
+-- replaces/refines TO retracted targets MUST be VALID (supersession provenance).
+-- Do NOT enforce link-first ordering — that fights the documented
+-- retract-then-capture-corrected + link_thoughts correction flow.
+-- Discriminator: same payload_hash fails on retracted TO, succeeds on live TO
+-- (hunter positive control link_id 9041c982). Jones sealed RED bound.
+--
 
 -- 0033: relation targets may be retracted (m5 edges-survive-retraction).
 -- From-endpoints of create/replace_tagger_set still require active.

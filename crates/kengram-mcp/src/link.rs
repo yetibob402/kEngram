@@ -1309,13 +1309,12 @@ mod tests {
                 .retracted
         );
 
-        let unruled = [
-            RelationKind::Requires,
-            RelationKind::References,
-            RelationKind::Supports,
-            RelationKind::BelongsTo,
-            RelationKind::DecidedBy,
-        ];
+        // Bidirectional matrix (Knox HIGH): every non-allowlisted kind refuses.
+        let unruled: Vec<_> = RelationKind::ALL
+            .into_iter()
+            .filter(|k| !k.allows_retracted_target())
+            .collect();
+        assert_eq!(unruled.len(), 5, "five refuse controls");
         for rel in unruled {
             let err = link_thoughts(
                 &pool,
@@ -1336,21 +1335,26 @@ mod tests {
             }
         }
 
-        // Bidirectional ruled controls still green on the same endpoints.
-        let rep = link_thoughts(
-            &pool,
-            LinkThoughtsRequest {
-                from_thought_id: live,
-                relation: RelationKind::Replaces,
-                target: LinkTarget::Thought(retracted),
-                note: Some("ruled replaces still ok".into()),
-                source_event: relation_event(),
-                claimed_producer_class: None,
-            },
-        )
-        .await
-        .expect("ruled replaces to retracted");
-        assert!(rep.is_new);
+        // Both exempt kinds succeed on the same retracted TO (two greens).
+        for rel in RelationKind::ALL
+            .into_iter()
+            .filter(|k| k.allows_retracted_target())
+        {
+            let ok = link_thoughts(
+                &pool,
+                LinkThoughtsRequest {
+                    from_thought_id: live,
+                    relation: rel,
+                    target: LinkTarget::Thought(retracted),
+                    note: Some(format!("ruled {rel} still ok")),
+                    source_event: relation_event(),
+                    claimed_producer_class: None,
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("ruled {rel} to retracted must succeed: {e:?}"));
+            assert!(ok.is_new, "{rel}");
+        }
     }
 
     /// Creating a link *from* a retracted thought still fails — only the to-side

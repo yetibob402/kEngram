@@ -10,6 +10,13 @@
 -- Design (m5-selective-relations): edges survive thought retraction; soft-retract
 -- keeps the row so FK stays valid. Correction provenance needs replaces -> retracted.
 --
+-- PRINCIPLE (Knox HIGH a2a 986d6320): supersession relations point BACKWARD at
+-- history — their entire purpose is referencing what was retracted. Every OTHER
+-- relation kind asserts CURRENT relevance; linking live→retracted through them
+-- reintroduces retracted material into recall (the original guard's job).
+-- ALLOWLIST (fail-closed): exactly {replaces, refines}. Future kinds default to
+-- REFUSE until explicitly added here AND in RelationKind::allows_retracted_target.
+-- CONTROLS: 5 non-exempt refuse + 2 exempt succeed + future fail-closed.
 -- Fix: require *from* of create/replace_tagger_set active always.
 -- TO thought may be retracted ONLY for ruled relations replaces|refines
 -- (supersession provenance; Knox design ruling + jones sealed RED).

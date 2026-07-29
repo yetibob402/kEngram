@@ -877,6 +877,7 @@ impl KengramServer {
 
         let body = serde_json::json!({
             "retracted": resp.retracted,
+            "status": resp.status,
         });
         serde_json::to_string(&body).map_err(|e| format!("response serialization error: {e}"))
     }
@@ -1121,8 +1122,13 @@ fn map_read_error(err: ReadError) -> String {
 
 fn map_retract_error(err: RetractError) -> String {
     match err {
-        RetractError::NotFoundOrAlreadyRetracted(id) => {
-            format!("thought not found or already retracted: {id}")
+        RetractError::NotFound(id) => format!("thought not found: {id}"),
+        RetractError::AlreadyRetracted(id) => format!("thought already retracted: {id}"),
+        RetractError::ChainFromRequiresUnlink(id) => format!(
+            "thought {id} is from-side of a live replaces/refines edge; unlink or repoint before retract"
+        ),
+        RetractError::Refused { thought_id, status } => {
+            format!("retract refused for thought {thought_id}: status={status}")
         }
         RetractError::Storage(e) => {
             tracing::error!(error = %e, "retract_thought storage error");
@@ -2868,7 +2874,91 @@ mod tests {
             }))
             .await
             .unwrap_err();
-        assert!(err.contains("not found or already retracted"));
+        assert!(err.contains("already retracted"), "{err}");
+        assert!(
+            !err.contains("not found"),
+            "must not collapse already_retracted into not-found: {err}"
+        );
+    }
+
+    /// Jones PR11 CN: production MCP caller must surface ChainFromRequiresUnlink
+    /// through map_retract_error — not false "not found". Mutant that maps
+    /// ChainFromRequiresUnlink → "thought not found" must fail this test.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn retract_thought_tool_reports_chain_from_not_not_found(pool: PgPool) {
+        let s = server(pool.clone());
+
+        let cap_old = s
+            .capture(Parameters(CaptureArgs {
+                content: "predecessor claim".into(),
+                source: "test".into(),
+                scope: None,
+                metadata: None,
+                argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
+            }))
+            .await
+            .unwrap();
+        let old_id = serde_json::from_str::<serde_json::Value>(&cap_old).unwrap()["thought_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let cap_from = s
+            .capture(Parameters(CaptureArgs {
+                content: "successor from-side claim".into(),
+                source: "test".into(),
+                scope: None,
+                metadata: None,
+                argus_source_event: None,
+                source_created_at: None,
+                relation_intents: None,
+                correlation_id: None,
+            }))
+            .await
+            .unwrap();
+        let from_id = serde_json::from_str::<serde_json::Value>(&cap_from).unwrap()["thought_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let se_id = uuid::Uuid::new_v4().to_string();
+        s.link_thoughts(Parameters(LinkThoughtsArgs {
+            from_thought_id: from_id.clone(),
+            relation: "replaces".into(),
+            to_thought_id: Some(old_id),
+            to_entity: None,
+            to_person: None,
+            to_url: None,
+            note: None,
+            source_event: RelationSourceEventArgs {
+                namespace: "tests/relation".into(),
+                source_ref: se_id.clone(),
+                payload_hash: se_id,
+                metadata: None,
+            },
+        }))
+        .await
+        .expect("live FROM-side replaces edge");
+
+        let err = s
+            .retract_thought(Parameters(RetractThoughtArgs {
+                thought_id: from_id,
+                reason: Some("try retract FROM of replaces".into()),
+            }))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.contains("unlink") || err.contains("repoint") || err.contains("from-side"),
+            "must teach unlink/repoint semantics: {err}"
+        );
+        assert!(
+            !err.contains("not found"),
+            "must not false-not-found collapse for chain-from caller path: {err}"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]

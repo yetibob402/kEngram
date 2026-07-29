@@ -78,7 +78,7 @@ pub struct CaptureArgs {
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
 
     #[schemars(
-        description = "Optional Argus source-event idempotency gate. When present, capture is keyed by (namespace, source_ref) with payload_hash conflict detection before the thought row is written."
+        description = "Optional Argus source-event idempotency gate. MUST be a nested OBJECT (JSON type object) with required fields namespace, source_ref, payload_hash — do NOT flatten those three keys onto the top-level capture arguments (that is structured-arg misuse and the fields will be ignored or rejected). When present, capture is keyed by (namespace, source_ref) with payload_hash conflict detection before the thought row is written. payload_hash should be the 64-char lowercase hex SHA-256 of the canonical payload bytes. relation_intents require this identity."
     )]
     pub argus_source_event: Option<ArgusSourceEventArgs>,
 
@@ -100,16 +100,24 @@ pub struct CaptureArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ArgusSourceEventArgs {
-    #[schemars(description = "Argus source-event namespace, e.g. agents/trinity.")]
+    #[schemars(
+        description = "Argus source-event namespace, e.g. agents/trinity or conversations/agents. Nested under argus_source_event — not a top-level capture field."
+    )]
     pub namespace: String,
 
-    #[schemars(description = "Producer-stable replay key inside namespace.")]
+    #[schemars(
+        description = "Producer-stable replay key inside namespace (e.g. a2a:<msg_id>). Nested under argus_source_event."
+    )]
     pub source_ref: String,
 
-    #[schemars(description = "Payload SHA-256 derived from canonicalJson(payload).")]
+    #[schemars(
+        description = "SHA-256 of the canonical request payload as 64 lowercase hex chars (from canonicalJson(payload) or equivalent). Nested under argus_source_event. Reusing the same (namespace, source_ref) with a different hash is a conflict, not a silent overwrite."
+    )]
     pub payload_hash: String,
 
-    #[schemars(description = "Optional metadata stored on argus_source_events.metadata.")]
+    #[schemars(
+        description = "Optional metadata object stored on argus_source_events.metadata. Must be a JSON object when present (Map), not a string or array — same concrete-object schema rule as tag_filter."
+    )]
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
@@ -557,7 +565,9 @@ impl KengramServer {
             .collect::<Result<Vec<_>, String>>()?;
 
         if !relation_intents.is_empty() && args.argus_source_event.is_none() {
-            return Err("relation_intents require argus_source_event identity".to_string());
+            return Err(
+                "relation_intents require argus_source_event identity: pass a nested object argus_source_event={namespace,source_ref,payload_hash} (do not flatten those keys onto capture top-level)".to_string(),
+            );
         }
 
         // Embedding is fully async: durable gated insert first, worker drain
@@ -1127,6 +1137,9 @@ fn map_link_error(err: LinkError) -> String {
         }
         LinkError::FromThoughtMissing(id) => format!("from_thought_id {id} not found"),
         LinkError::ToThoughtMissing(id) => format!("to_thought_id {id} not found"),
+        LinkError::EndpointRetracted(id) => format!(
+            "relation endpoint is retracted: {id} (from-side of create must be live; to-side may be retracted)"
+        ),
         LinkError::NoteTooLong { got, max } => {
             format!("note too long: {got} bytes (max {max} = {MAX_LINK_NOTE_LEN})")
         }

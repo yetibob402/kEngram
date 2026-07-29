@@ -92,6 +92,11 @@ pub enum LinkError {
     #[error("to_thought_id {0} not found")]
     ToThoughtMissing(ThoughtId),
 
+    /// From-endpoint (or other active-required endpoint) is retracted.
+    /// Targets may be retracted; this is for the live source side of a create.
+    #[error("relation endpoint is retracted: {0}")]
+    EndpointRetracted(ThoughtId),
+
     #[error("note too long: {got} bytes, max {max}")]
     NoteTooLong { got: usize, max: usize },
 
@@ -115,6 +120,25 @@ pub enum LinkError {
 
     #[error("relation source-event replay conflicts with its prior payload or intent")]
     SourceEventConflict,
+}
+
+/// Map storage/sqlx failures that carry gate RAISE messages into actionable
+/// `LinkError` variants so MCP does not collapse them to "internal database error".
+fn classify_link_storage_error(err: kengram_storage::StorageError) -> LinkError {
+    if let kengram_storage::StorageError::Database(sqlx::Error::Database(db)) = &err {
+        let msg = db.message();
+        if let Some(rest) = msg.strip_prefix("relation_endpoint_retracted:") {
+            if let Ok(id) = uuid::Uuid::parse_str(rest.trim()) {
+                return LinkError::EndpointRetracted(ThoughtId::from(id));
+            }
+        }
+        if let Some(rest) = msg.strip_prefix("relation_endpoint_missing:") {
+            if let Ok(id) = uuid::Uuid::parse_str(rest.trim()) {
+                return LinkError::ToThoughtMissing(ThoughtId::from(id));
+            }
+        }
+    }
+    LinkError::Storage(err)
 }
 
 /// Create a link from a thought to a polymorphic target. Idempotent on the
@@ -185,7 +209,8 @@ pub async fn link_thoughts(
             claimed_producer_class: request.claimed_producer_class.as_deref(),
         },
     )
-    .await?;
+    .await
+    .map_err(classify_link_storage_error)?;
     if result.get("status").and_then(|v| v.as_str()) == Some("source_event_conflict") {
         return Err(LinkError::SourceEventConflict);
     }
@@ -257,7 +282,8 @@ pub async fn unlink_thoughts(
             claimed_producer_class,
         },
     )
-    .await?;
+    .await
+    .map_err(classify_link_storage_error)?;
     if result.get("status").and_then(|v| v.as_str()) == Some("source_event_conflict") {
         return Err(LinkError::SourceEventConflict);
     }
@@ -1139,5 +1165,89 @@ mod tests {
         let second = link_thoughts(&pool, req()).await.unwrap();
         assert!(second.is_new);
         assert_ne!(first.link_id, second.link_id);
+    }
+
+    /// Jones repro class (board 533148): replaces from live corrected thought
+    /// to a retracted predecessor must succeed. Opaque "internal database error"
+    /// was wrong — gate raised relation_endpoint_retracted on the to-side.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn link_replaces_to_retracted_thought_succeeds(pool: PgPool) {
+        let predecessor = cap(&pool, "old-verdict-to-retract").await;
+        let corrected = cap(&pool, "corrected-superseding-verdict").await;
+        let live_support = cap(&pool, "live-support-target").await;
+
+        let retracted = kengram_storage::retract_thought(&pool, predecessor, Some("test retract"))
+            .await
+            .expect("retract predecessor");
+        assert!(
+            retracted.retracted,
+            "predecessor should retract once: {retracted:?}"
+        );
+
+        // control: supports to a live third thought
+        let support = link_thoughts(
+            &pool,
+            LinkThoughtsRequest {
+                from_thought_id: corrected,
+                relation: RelationKind::Supports,
+                target: LinkTarget::Thought(live_support),
+                note: Some("control supports".into()),
+                source_event: relation_event(),
+                claimed_producer_class: None,
+            },
+        )
+        .await
+        .expect("supports to live target");
+        assert!(support.is_new);
+
+        // defect under test
+        let rep = link_thoughts(
+            &pool,
+            LinkThoughtsRequest {
+                from_thought_id: corrected,
+                relation: RelationKind::Replaces,
+                target: LinkTarget::Thought(predecessor),
+                note: Some("corrected replaces retracted predecessor".into()),
+                source_event: relation_event(),
+                claimed_producer_class: None,
+            },
+        )
+        .await
+        .expect("replaces to retracted target must succeed");
+        assert!(rep.is_new);
+        assert_eq!(rep.relation, RelationKind::Replaces);
+        assert_eq!(rep.target, LinkTarget::Thought(predecessor));
+    }
+
+    /// Creating a link *from* a retracted thought still fails — only the to-side
+    /// is allowed to be retracted for provenance edges.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn link_from_retracted_thought_is_rejected(pool: PgPool) {
+        let from = cap(&pool, "retracted-from").await;
+        let to = cap(&pool, "live-to").await;
+        assert!(
+            kengram_storage::retract_thought(&pool, from, Some("retract from"))
+                .await
+                .unwrap()
+                .retracted
+        );
+
+        let err = link_thoughts(
+            &pool,
+            LinkThoughtsRequest {
+                from_thought_id: from,
+                relation: RelationKind::Supports,
+                target: LinkTarget::Thought(to),
+                note: None,
+                source_event: relation_event(),
+                claimed_producer_class: None,
+            },
+        )
+        .await
+        .expect_err("from-side retracted must fail");
+        match err {
+            LinkError::EndpointRetracted(id) => assert_eq!(id, from),
+            other => panic!("expected EndpointRetracted, got {other:?}"),
+        }
     }
 }

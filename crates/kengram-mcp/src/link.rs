@@ -81,6 +81,50 @@ pub struct UnlinkThoughtsResponse {
     pub status: UnlinkStatus,
 }
 
+/// Which side of a link create hit a retracted thought.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetractedEndpointSide {
+    From,
+    To,
+    Unknown,
+}
+
+/// Structured retracted-endpoint failure so MCP can teach the allowlist rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointRetractedDetail {
+    pub id: ThoughtId,
+    pub relation: Option<RelationKind>,
+    pub side: RetractedEndpointSide,
+}
+
+impl EndpointRetractedDetail {
+    pub fn message(&self) -> String {
+        match self.side {
+            RetractedEndpointSide::From => format!(
+                "relation endpoint is retracted: {} (from-side of create must be live)",
+                self.id
+            ),
+            RetractedEndpointSide::To => {
+                let kind = self.relation.map(|r| r.as_str()).unwrap_or("unknown");
+                format!(
+                    "target retracted; relation {kind} requires a live target (only replaces/refines may reference retracted): {}",
+                    self.id
+                )
+            }
+            RetractedEndpointSide::Unknown => format!(
+                "relation endpoint is retracted: {} (from-side must be live; only replaces/refines may target a retracted thought)",
+                self.id
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for EndpointRetractedDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LinkError {
     #[error("from_thought_id and to_thought_id must differ — self-links are not supported")]
@@ -93,10 +137,10 @@ pub enum LinkError {
     ToThoughtMissing(ThoughtId),
 
     /// An active-required endpoint is retracted.
-    /// From-side of create must always be live. To-side may be retracted only
-    /// for supersession relations replaces|refines; other kinds refuse.
-    #[error("relation endpoint is retracted: {0}")]
-    EndpointRetracted(ThoughtId),
+    /// Caller text is per-kind (Knox micro-fold / jones 539183): teaches the
+    /// supersession allowlist rather than an unconditional to-side exemption.
+    #[error("{0}")]
+    EndpointRetracted(EndpointRetractedDetail),
 
     #[error("note too long: {got} bytes, max {max}")]
     NoteTooLong { got: usize, max: usize },
@@ -130,7 +174,11 @@ fn classify_link_storage_error(err: kengram_storage::StorageError) -> LinkError 
         let msg = db.message();
         if let Some(rest) = msg.strip_prefix("relation_endpoint_retracted:") {
             if let Ok(id) = uuid::Uuid::parse_str(rest.trim()) {
-                return LinkError::EndpointRetracted(ThoughtId::from(id));
+                return LinkError::EndpointRetracted(EndpointRetractedDetail {
+                    id: ThoughtId::from(id),
+                    relation: None,
+                    side: RetractedEndpointSide::Unknown,
+                });
             }
         }
         if let Some(rest) = msg.strip_prefix("relation_endpoint_missing:") {
@@ -140,6 +188,38 @@ fn classify_link_storage_error(err: kengram_storage::StorageError) -> LinkError 
         }
     }
     LinkError::Storage(err)
+}
+
+/// Attach request relation + from/to discrimination so MCP error text is per-kind.
+fn enrich_endpoint_retracted(err: LinkError, request: &LinkThoughtsRequest) -> LinkError {
+    enrich_endpoint_retracted_parts(
+        err,
+        request.from_thought_id,
+        request.relation,
+        &request.target,
+    )
+}
+
+fn enrich_endpoint_retracted_parts(
+    err: LinkError,
+    from: ThoughtId,
+    relation: RelationKind,
+    target: &LinkTarget,
+) -> LinkError {
+    match err {
+        LinkError::EndpointRetracted(mut detail) => {
+            detail.relation = Some(relation);
+            detail.side = if detail.id == from {
+                RetractedEndpointSide::From
+            } else if matches!(target, LinkTarget::Thought(to) if *to == detail.id) {
+                RetractedEndpointSide::To
+            } else {
+                RetractedEndpointSide::Unknown
+            };
+            LinkError::EndpointRetracted(detail)
+        }
+        other => other,
+    }
 }
 
 /// Create a link from a thought to a polymorphic target. Idempotent on the
@@ -211,7 +291,7 @@ pub async fn link_thoughts(
         },
     )
     .await
-    .map_err(classify_link_storage_error)?;
+    .map_err(|e| enrich_endpoint_retracted(classify_link_storage_error(e), &request))?;
     if result.get("status").and_then(|v| v.as_str()) == Some("source_event_conflict") {
         return Err(LinkError::SourceEventConflict);
     }
@@ -284,7 +364,9 @@ pub async fn unlink_thoughts(
         },
     )
     .await
-    .map_err(classify_link_storage_error)?;
+    .map_err(|e| {
+        enrich_endpoint_retracted_parts(classify_link_storage_error(e), from, relation, target)
+    })?;
     if result.get("status").and_then(|v| v.as_str()) == Some("source_event_conflict") {
         return Err(LinkError::SourceEventConflict);
     }
@@ -1331,7 +1413,15 @@ mod tests {
             .await
             .expect_err(&format!("{rel:?} to retracted must be rejected"));
             match err {
-                LinkError::EndpointRetracted(id) => assert_eq!(id, retracted),
+                LinkError::EndpointRetracted(d) => {
+                    assert_eq!(d.id, retracted);
+                    assert_eq!(d.side, RetractedEndpointSide::To);
+                    assert_eq!(d.relation, Some(rel));
+                    let msg = d.message();
+                    assert!(msg.contains("target retracted"), "{msg}");
+                    assert!(msg.contains(rel.as_str()), "{msg}");
+                    assert!(msg.contains("only replaces/refines"), "{msg}");
+                }
                 other => panic!("expected EndpointRetracted for {rel:?}, got {other:?}"),
             }
         }
@@ -1385,7 +1475,12 @@ mod tests {
         .await
         .expect_err("from-side retracted must fail");
         match err {
-            LinkError::EndpointRetracted(id) => assert_eq!(id, from),
+            LinkError::EndpointRetracted(d) => {
+                assert_eq!(d.id, from);
+                assert_eq!(d.side, RetractedEndpointSide::From);
+                let msg = d.message();
+                assert!(msg.contains("from-side"), "{msg}");
+            }
             other => panic!("expected EndpointRetracted, got {other:?}"),
         }
     }

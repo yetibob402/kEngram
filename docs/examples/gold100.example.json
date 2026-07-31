@@ -1,0 +1,15 @@
+{
+  "format_version": 1,
+  "kind": "retrieval-gold-protection-corpus",
+  "notes": "Replace with smith clean-adjudicated gold-100 export. Offline populate only; no live restart.",
+  "items": [
+    {
+      "query_id": "KGR-EXAMPLE-001",
+      "query": "example",
+      "gold_thought_ids": [
+        "00000000-0000-0000-0000-000000000001"
+      ],
+      "source_scope": "agents/example"
+    }
+  ]
+}

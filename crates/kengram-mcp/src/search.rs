@@ -160,6 +160,10 @@ pub struct SearchRequest {
     /// Include per-stage latency diagnostics in the response. Defaults false
     /// so normal MCP callers do not receive internal timing metadata.
     pub include_profile: bool,
+    /// Optional client-supplied correlation tag (e.g. eval KGR id). When
+    /// empty/absent the service generates a UUID. Echoed as `request_id` on
+    /// the response and on the single structured stage-timing log line.
+    pub request_tag: Option<String>,
     /// JSONB containment filter against `thoughts.tags`. Examples:
     /// - `{"kind": "task"}`
     /// - `{"people": ["Sarah"]}`
@@ -227,6 +231,8 @@ pub struct SearchResponse {
     pub vector_search_available: bool,
     pub rerank_used: bool,
     pub profile: Option<SearchProfile>,
+    /// Request correlation id: client `request_tag` when supplied, else generated.
+    pub request_id: String,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -465,6 +471,12 @@ async fn search_thoughts_with_tuning(
 ) -> Result<SearchResponse, ReadError> {
     let total_started = Instant::now();
     let include_profile = request.include_profile;
+    let request_id = request
+        .request_tag
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let mut profile = SearchProfile {
         parent_resolution_mode: "sql_join_in_retrieval_legs",
         ..SearchProfile::default()
@@ -945,11 +957,53 @@ async fn search_thoughts_with_tuning(
     profile.result_count = results.len();
     profile.total_ms = elapsed_ms(total_started);
 
+    // ADDITIVE stage-timing instrumentation: one structured line per request.
+    // Zero retrieval behavior change; profile was always computed internally.
+    tracing::info!(
+        target: "kengram_search_stage_timing",
+        request_id = %request_id,
+        total_ms = profile.total_ms,
+        query_embedding_ms = profile.query_embedding_ms,
+        thought_vector_knn_ms = profile.thought_vector_knn_ms,
+        chunk_vector_knn_ms = profile.chunk_vector_knn_ms,
+        contextual_chunk_vector_knn_ms = profile.contextual_chunk_vector_knn_ms,
+        thought_fts_ms = profile.thought_fts_ms,
+        chunk_fts_ms = profile.chunk_fts_ms,
+        contextual_chunk_fts_ms = profile.contextual_chunk_fts_ms,
+        chunk_pairwise_fts_ms = profile.chunk_pairwise_fts_ms,
+        chunk_pairwise_subqueries = profile.chunk_pairwise_subqueries,
+        domain_scope_ms = profile.domain_scope_ms,
+        tag_facet_ms = profile.tag_facet_ms,
+        rrf_fusion_ms = profile.rrf_fusion_ms,
+        tag_filter_ms = profile.tag_filter_ms,
+        query_expansion_ms = profile.query_expansion_ms,
+        query_expansion_vector_knn_ms = profile.query_expansion_vector_knn_ms,
+        query_expansion_fts_ms = profile.query_expansion_fts_ms,
+        rerank_ms = profile.rerank_ms,
+        result_projection_ms = profile.result_projection_ms,
+        parent_resolution_ms = profile.parent_resolution_ms,
+        graph_expansion_ms = profile.graph_expansion_ms,
+        query_sparse_encoding_ms = profile.query_sparse_encoding_ms,
+        thought_sparse_knn_ms = profile.thought_sparse_knn_ms,
+        chunk_sparse_knn_ms = profile.chunk_sparse_knn_ms,
+        fused_hit_count = profile.fused_hit_count,
+        rerank_candidate_count = profile.rerank_candidate_count,
+        result_count = profile.result_count,
+        thought_vector_hits = profile.thought_vector_hits,
+        thought_fts_hits = profile.thought_fts_hits,
+        chunk_vector_hits = profile.chunk_vector_hits,
+        chunk_fts_hits = profile.chunk_fts_hits,
+        rerank_used = rerank_used,
+        vector_search_available = vector_search_available,
+        "search_thoughts stage timing"
+    );
+
     Ok(SearchResponse {
         results,
         vector_search_available,
         rerank_used,
         profile: include_profile.then_some(profile),
+        request_id,
     })
 }
 
@@ -2405,6 +2459,7 @@ mod tests {
                 full_pipeline_enabled: false,
                 tag_domain_routing_enabled: false,
                 include_profile: false,
+            request_tag: None,
             },
         )
         .await
@@ -2449,6 +2504,7 @@ mod tests {
                 full_pipeline_enabled: false,
                 tag_domain_routing_enabled: false,
                 include_profile: true,
+            request_tag: None,
             },
         )
         .await
@@ -2504,6 +2560,7 @@ mod tests {
                 full_pipeline_enabled: false,
                 tag_domain_routing_enabled: false,
                 include_profile: false,
+            request_tag: None,
             },
         )
         .await
@@ -2572,6 +2629,7 @@ mod tests {
             full_pipeline_enabled: false,
             tag_domain_routing_enabled: false,
             include_profile: true,
+        request_tag: None,
         };
         let off = search_thoughts(&pool, &bad, None, request.clone())
             .await
@@ -2660,6 +2718,7 @@ mod tests {
                 full_pipeline_enabled: false,
                 tag_domain_routing_enabled: false,
                 include_profile: false,
+            request_tag: None,
             },
             DEFAULT_LEXICAL_TOP_K,
             1,
@@ -2699,6 +2758,7 @@ mod tests {
                     full_pipeline_enabled: false,
                     tag_domain_routing_enabled: false,
                     include_profile: false,
+                request_tag: None,
                 },
             )
             .await
@@ -2727,6 +2787,7 @@ mod tests {
                 full_pipeline_enabled: false,
                 tag_domain_routing_enabled: false,
                 include_profile: false,
+            request_tag: None,
             },
         )
         .await
@@ -2757,6 +2818,7 @@ mod tests {
                 full_pipeline_enabled: false,
                 tag_domain_routing_enabled: false,
                 include_profile: false,
+            request_tag: None,
             },
         )
         .await
@@ -2900,6 +2962,7 @@ mod tests {
                 full_pipeline_enabled: true,
                 tag_domain_routing_enabled: false,
                 include_profile: true,
+            request_tag: None,
             },
         )
         .await
@@ -2955,6 +3018,7 @@ mod tests {
                 full_pipeline_enabled: true,
                 tag_domain_routing_enabled: false,
                 include_profile: true,
+            request_tag: None,
             },
         )
         .await
@@ -3044,6 +3108,7 @@ mod tests {
                 full_pipeline_enabled: true,
                 tag_domain_routing_enabled: false,
                 include_profile: true,
+            request_tag: None,
             },
         )
         .await
@@ -3112,6 +3177,7 @@ mod tests {
                 full_pipeline_enabled: false,
                 tag_domain_routing_enabled: false,
                 include_profile: false,
+            request_tag: None,
             },
         )
         .await
@@ -3161,6 +3227,7 @@ mod tests {
                 full_pipeline_enabled: false,
                 tag_domain_routing_enabled: false,
                 include_profile: false,
+            request_tag: None,
             },
         )
         .await
@@ -3194,6 +3261,7 @@ mod tests {
                 full_pipeline_enabled: false,
                 tag_domain_routing_enabled: false,
                 include_profile: false,
+            request_tag: None,
             },
         )
         .await
@@ -3221,6 +3289,7 @@ mod tests {
             full_pipeline_enabled: false,
             tag_domain_routing_enabled: false,
             include_profile: true,
+        request_tag: None,
         };
         let mut subordinate_only = base_request.clone();
         subordinate_only.tag_domain_routing_enabled = true;
@@ -3275,6 +3344,7 @@ mod tests {
                 full_pipeline_enabled: false,
                 tag_domain_routing_enabled: false,
                 include_profile: true,
+            request_tag: None,
             },
         )
         .await
@@ -3296,6 +3366,7 @@ mod tests {
                 full_pipeline_enabled: true,
                 tag_domain_routing_enabled: true,
                 include_profile: true,
+            request_tag: None,
             },
         )
         .await
@@ -3346,6 +3417,7 @@ mod tests {
             full_pipeline_enabled: false,
             tag_domain_routing_enabled: false,
             include_profile: true,
+        request_tag: None,
         };
         let runtime = SearchRuntimeOptions {
             query_expansion_enabled: true,
@@ -3397,6 +3469,7 @@ mod tests {
                 full_pipeline_enabled: true,
                 tag_domain_routing_enabled: false,
                 include_profile: true,
+            request_tag: None,
             },
         )
         .await
@@ -3454,6 +3527,7 @@ mod tests {
                 full_pipeline_enabled: true,
                 tag_domain_routing_enabled: false,
                 include_profile: true,
+            request_tag: None,
             },
         )
         .await
@@ -3499,6 +3573,7 @@ mod tests {
                 full_pipeline_enabled: false,
                 tag_domain_routing_enabled: false,
                 include_profile: true,
+            request_tag: None,
             },
         )
         .await
@@ -3545,6 +3620,7 @@ mod tests {
                 full_pipeline_enabled: true,
                 tag_domain_routing_enabled: false,
                 include_profile: true,
+            request_tag: None,
             },
         )
         .await
@@ -3605,6 +3681,7 @@ mod tests {
                 full_pipeline_enabled: true,
                 tag_domain_routing_enabled: false,
                 include_profile: true,
+            request_tag: None,
             },
         )
         .await
@@ -3649,6 +3726,7 @@ mod tests {
                 full_pipeline_enabled: true,
                 tag_domain_routing_enabled: false,
                 include_profile: true,
+            request_tag: None,
             },
         )
         .await
@@ -3717,6 +3795,7 @@ mod tests {
                 full_pipeline_enabled: true,
                 tag_domain_routing_enabled: false,
                 include_profile: true,
+            request_tag: None,
             },
         )
         .await
@@ -3764,6 +3843,7 @@ mod tests {
                 full_pipeline_enabled: true,
                 tag_domain_routing_enabled: false,
                 include_profile: true,
+            request_tag: None,
             },
         )
         .await
@@ -3823,6 +3903,7 @@ mod tests {
                 full_pipeline_enabled: true,
                 tag_domain_routing_enabled: false,
                 include_profile: true,
+            request_tag: None,
             },
         )
         .await
@@ -3863,6 +3944,7 @@ mod tests {
                 full_pipeline_enabled: true,
                 tag_domain_routing_enabled: false,
                 include_profile: true,
+            request_tag: None,
             },
         )
         .await
@@ -3925,6 +4007,7 @@ mod tests {
                 full_pipeline_enabled: true,
                 tag_domain_routing_enabled: false,
                 include_profile: true,
+            request_tag: None,
             },
         )
         .await
@@ -3967,6 +4050,7 @@ mod tests {
                 full_pipeline_enabled: true,
                 tag_domain_routing_enabled: false,
                 include_profile: true,
+            request_tag: None,
             },
         )
         .await
@@ -4025,6 +4109,7 @@ mod tests {
                 full_pipeline_enabled: true,
                 tag_domain_routing_enabled: false,
                 include_profile: false,
+            request_tag: None,
             },
         )
         .await
@@ -4084,6 +4169,7 @@ mod tests {
                 full_pipeline_enabled: true,
                 tag_domain_routing_enabled: false,
                 include_profile: true,
+            request_tag: None,
             },
         )
         .await
@@ -4335,6 +4421,7 @@ mod tests {
                 full_pipeline_enabled: false,
                 tag_domain_routing_enabled: false,
                 include_profile: false,
+            request_tag: None,
             },
         )
         .await

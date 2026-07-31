@@ -171,6 +171,11 @@ pub struct SearchThoughtsArgs {
     pub include_profile: Option<bool>,
 
     #[schemars(
+        description = "Optional client correlation tag (e.g. eval query id KGR-...). Echoed as request_id on the response and on the service stage-timing log line. When omitted, the service generates a UUID."
+    )]
+    pub request_tag: Option<String>,
+
+    #[schemars(
         description = "Optional JSONB-containment filter applied to each thought's `tags` field. Tags are LLM-extracted metadata with shape: { people: string[], entities: string[] (named proper-noun-style identifiers — projects, products, libraries, tools, e.g. \"kengram\", \"pgvector\"), retrieval_aliases: string[] (short advisory query aliases), domain_scope: string | null (normalized advisory routing domain), action_items: string[], topics: string[] (1-3 short lowercase subject categories — e.g. \"rust\", \"memory-systems\"), dates_mentioned: string[], kind: 'observation' | 'task' | 'idea' | 'reference' | 'person_note' | 'session' | 'decision_record' | null }. Distinguish `entities` (specific named things mentioned by name) from `topics` (broader subject categories the thought falls under). The `kind` enum is closed at the values listed; the array fields are open-vocabulary strings. Examples: {\"kind\": \"task\"} returns only thoughts the tagger classified as tasks; {\"people\": [\"Sarah\"]} returns thoughts whose people-tag contains Sarah; {\"entities\": [\"kengram\"]} returns thoughts mentioning kengram by name; {\"topics\": [\"rust\"], \"kind\": \"idea\"} combines both (top-level keys AND together; array values are subset-match). Empty object {} is a no-op. Filters compose with `scope` (or `scope_prefix`, whichever is set) via AND. Note: `entities`, `retrieval_aliases`, and `domain_scope` are LLM-extracted/advisory and best-effort unless explicitly supplied by metadata."
     )]
     // Map<String, Value> rather than Value: ensures the JSON schema renders
@@ -766,6 +771,7 @@ impl KengramServer {
             full_pipeline_enabled: self.full_pipeline_enabled,
             tag_domain_routing_enabled: self.tag_domain_routing_enabled,
             include_profile: args.include_profile.unwrap_or(false),
+            request_tag: args.request_tag,
             // Map<String, Value> on the wire → Value::Object for the
             // orchestrator's filter logic. Keeps the schema concrete (so
             // claude.ai forwards the field) without changing the
@@ -1323,6 +1329,7 @@ fn search_response_json(
         "results": results,
         "vector_search_available": resp.vector_search_available,
         "rerank_used": resp.rerank_used,
+        "request_id": resp.request_id,
     });
     if let Some(profile) = resp.profile.as_ref() {
         body["profile"] = serde_json::to_value(profile).unwrap_or(serde_json::Value::Null);
@@ -1713,10 +1720,19 @@ mod tests {
             vector_search_available: true,
             rerank_used: false,
             profile: None,
+        request_id: "test-request".to_string(),
         }
     }
 
     #[test]
+    #[test]
+    fn search_response_json_echoes_request_id() {
+        let mut resp = search_json_response();
+        resp.request_id = "KGR-42".to_string();
+        let json = search_response_json(&resp, false, false);
+        assert_eq!(json["request_id"], "KGR-42");
+    }
+
     fn search_response_json_omits_chunk_keys_when_flag_off_without_chunk_hit() {
         let json = search_response_json(&search_json_response(), false, false);
         let hit = json["results"][0].as_object().unwrap();
@@ -2481,6 +2497,7 @@ mod tests {
                 rerank: None,
                 candidate_pool: None,
                 include_profile: None,
+                request_tag: None,
                 tag_filter: None,
             }))
             .await
@@ -2539,6 +2556,7 @@ mod tests {
                 rerank: None,
                 candidate_pool: None,
                 include_profile: None,
+                request_tag: None,
                 tag_filter: None,
             }))
             .await
@@ -2609,6 +2627,7 @@ mod tests {
                 rerank: None,
                 candidate_pool: None,
                 include_profile: None,
+                request_tag: None,
                 tag_filter: serde_json::json!({"kind": "task"}).as_object().cloned(),
             }))
             .await
@@ -2646,6 +2665,7 @@ mod tests {
                 rerank: None,
                 candidate_pool: None,
                 include_profile: None,
+                request_tag: None,
                 tag_filter: None,
             }))
             .await

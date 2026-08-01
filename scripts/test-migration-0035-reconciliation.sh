@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+shopt -s dotglob nullglob
 
 export LC_ALL=C
 
@@ -83,15 +84,28 @@ source_manifest() {
   output="$2"
   : >"$output"
   count=0
-  for file in "$source_dir"/[0-9][0-9][0-9][0-9]_*.sql; do
+  for file in "$source_dir"/*.sql; do
     test -f "$file" && test ! -L "$file" || fail "invalid migration file: $file"
     base="${file##*/}"
     case "$base" in
-      [0-9][0-9][0-9][0-9]_*.sql) ;;
+      *_*.sql) ;;
       *) fail "unparseable migration filename: $base" ;;
     esac
-    padded="${base%%_*}"
-    version=$((10#$padded))
+    prefix="${base%%_*}"
+    digits="$prefix"
+    sign=""
+    case "$prefix" in
+      +*) sign="+"; digits="${prefix#+}" ;;
+      -*) sign="-"; digits="${prefix#-}" ;;
+    esac
+    case "$digits" in
+      ''|*[!0-9]*) fail "unparseable SQLx version prefix: $base" ;;
+    esac
+    version="$(printf '%s\n' "$digits" | sed 's/^0*//')" || fail "version normalization failed: $base"
+    test -n "$version" || version=0
+    if test "$sign" = "-" && test "$version" != 0; then
+      version="-$version"
+    fi
     checksum="$(shasum -a 384 "$file")" || fail "SHA-384 producer failed: $base"
     checksum="${checksum%% *}"
     case "$checksum" in
@@ -110,6 +124,17 @@ source_manifest() {
 assert_exact_1_35() {
   manifest="$1"
   awk -F '|' 'NR != $1 { exit 7 } END { if (NR != 35) exit 8 }' "$manifest" || fail "source versions are not exactly 1..35"
+}
+
+assert_info_matches_manifest() {
+  info_file="$1"
+  manifest="$2"
+  label="$3"
+  expected_versions="$WORK/${label}.source-versions"
+  info_versions="$WORK/${label}.sqlx-versions"
+  awk -F '|' '{ print $1 }' "$manifest" >"$expected_versions" || fail "$label source-version producer failed"
+  awk -F '/' 'NF < 2 || $1 !~ /^[0-9]+$/ { exit 7 } { print $1 }' "$info_file" >"$info_versions" || fail "$label SQLx-info parser failed"
+  cmp -s "$expected_versions" "$info_versions" || fail "$label manifest and SQLx resolved-version sets differ"
 }
 
 psql_query() {
@@ -157,9 +182,9 @@ CURRENT_SOURCE="$WORK/current-source"
 ROLLBACK_SOURCE="$WORK/rollback-source"
 MUTANT_SOURCE="$WORK/checksum-mutant-source"
 mkdir "$CURRENT_SOURCE" "$ROLLBACK_SOURCE" "$MUTANT_SOURCE"
-cp "$MIGRATIONS"/[0-9][0-9][0-9][0-9]_*.sql "$CURRENT_SOURCE/"
-cp "$MIGRATIONS"/[0-9][0-9][0-9][0-9]_*.sql "$ROLLBACK_SOURCE/"
-cp "$MIGRATIONS"/[0-9][0-9][0-9][0-9]_*.sql "$MUTANT_SOURCE/"
+cp "$MIGRATIONS"/*.sql "$CURRENT_SOURCE/"
+cp "$MIGRATIONS"/*.sql "$ROLLBACK_SOURCE/"
+cp "$MIGRATIONS"/*.sql "$MUTANT_SOURCE/"
 test -f "$CURRENT_SOURCE/0031_doc_source_ref_v2_aliases.sql" && test ! -L "$CURRENT_SOURCE/0031_doc_source_ref_v2_aliases.sql" || fail "current-source 0031 removal target invalid"
 /bin/rm -- "$CURRENT_SOURCE/0031_doc_source_ref_v2_aliases.sql"
 printf '\n-- Watched rollback mutant: must fail after transactional DDL.\nSELECT * FROM kengram_acceptance_force_rollback;\n' >>"$ROLLBACK_SOURCE/0035_argus_source_events_resolved_status.sql"
@@ -258,17 +283,7 @@ LEDGER_SQL="$WORK/ledger-1-34.sql"
 printf 'BEGIN;\n' >"$LEDGER_SQL"
 while IFS='|' read -r version checksum; do
   test "$version" -le 34 || continue
-  padded="$(printf '%04d' "$version")"
-  file="$(find "$MIGRATIONS" -maxdepth 1 -type f -name "${padded}_*.sql" -print)" || fail "migration lookup failed: $version"
-  test "$(printf '%s\n' "$file" | awk 'NF { count += 1 } END { print count + 0 }')" = 1 || fail "migration lookup count was not one: $version"
-  base="${file##*/}"
-  description="${base#"${padded}"_}"
-  description="${description%.sql}"
-  case "$description" in
-    *[!a-z0-9_]*) fail "unsafe migration description: $description" ;;
-  esac
-  description="${description//_/ }"
-  printf "INSERT INTO _sqlx_migrations(version,description,installed_on,success,checksum,execution_time) VALUES (%s,'%s','2026-07-23 06:07:33+00',true,decode('%s','hex'),1);\n" "$version" "$description" "$checksum" >>"$LEDGER_SQL"
+  printf "INSERT INTO _sqlx_migrations(version,description,installed_on,success,checksum,execution_time) VALUES (%s,'acceptance fixture %s','2026-07-23 06:07:33+00',true,decode('%s','hex'),1);\n" "$version" "$version" "$checksum" >>"$LEDGER_SQL"
 done <"$FULL_MANIFEST"
 printf 'COMMIT;\n' >>"$LEDGER_SQL"
 docker exec -i "$CONTAINER" psql -X -v ON_ERROR_STOP=1 -U kengram_accept -d kengram_accept <"$LEDGER_SQL" >/dev/null || fail "fixture ledger seed failed"
@@ -288,6 +303,7 @@ awk -F '|' '$1 <= 34 { print }' "$FULL_MANIFEST" >"$EXPECTED_PRE" || fail "preap
 cmp -s "$EXPECTED_PRE" "$LEDGER_PRE" || fail "preapply source/ledger checksum equality failed"
 test "$(psql_query "SELECT count(*) FROM _sqlx_migrations WHERE NOT success")" = 0 || fail "fixture has failed ledger rows"
 sqlx migrate info --source "$MIGRATIONS" --no-dotenv >"$WORK/reconciled.info" 2>&1 || fail "reconciled migrate info failed"
+assert_info_matches_manifest "$WORK/reconciled.info" "$FULL_MANIFEST" preapply
 test "$(grep -Fxc '35/pending argus source events resolved status' "$WORK/reconciled.info")" = 1 || fail "reconciled source did not report exact pending35"
 sqlx migrate run --source "$MIGRATIONS" --no-dotenv --target-version 35 --dry-run >"$WORK/reconciled-dry-run.out" 2>&1 || fail "reconciled dry-run failed"
 test "$(grep -Fxc 'Can apply 35/migrate argus source events resolved status (0ns)' "$WORK/reconciled-dry-run.out")" = 1 || fail "reconciled dry-run marker missing"
@@ -324,6 +340,7 @@ ledger_manifest "$LEDGER_POST"
 cmp -s "$FULL_MANIFEST" "$LEDGER_POST" || fail "postapply per-version source/ledger equality failed"
 test "$(psql_query "SELECT count(*) FROM _sqlx_migrations WHERE NOT success")" = 0 || fail "postapply failed ledger row exists"
 sqlx migrate info --source "$MIGRATIONS" --no-dotenv >"$WORK/postapply.info" 2>&1 || fail "postapply migrate info failed"
+assert_info_matches_manifest "$WORK/postapply.info" "$FULL_MANIFEST" postapply
 test "$(grep -Fxc '35/installed argus source events resolved status' "$WORK/postapply.info")" = 1 || fail "postapply installed35 marker missing"
 pass_case postapply-manifest-equality
 

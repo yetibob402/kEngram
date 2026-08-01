@@ -111,6 +111,27 @@ command is green at the reviewed head:
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+### 6. Migration 0035 reconciliation acceptance
+
+This suite is self-contained and never targets production. It starts a labeled,
+disposable `pgvector/pgvector:pg16` container on a random loopback port, seeds
+only the bounded pre-0035 acceptance fixture, and executes SQLx 0.8.6 migration
+semantics against that container. It enumerates every top-level `*.sql` using
+SQLx's variable-width numeric version grammar, requires the exact set 1–35,
+and compares that manifest to SQLx's resolved view. It also binds the exact
+0031/0035 identities, current `VersionMissing(31)` RED, per-version SHA-384
+equality, transactional rollback, exact apply, second-apply identity no-op,
+and exact `VersionMismatch(35)` refusal. A valid `00036_*.sql` specimen must
+make the suite RED before any database write.
+
+```bash
+./scripts/test-migration-0035-reconciliation.sh
+```
+
+Success is the terminal marker
+`PASS kengram-migration-0035-reconciliation selected=8 executed=8 failed=0 skipped=0`.
+No marker, any skip/count mismatch, or nonzero exit is failure.
+
 ## PR hygiene reminders
 
 - Author commits as **YetiWerks** / `bhrbek@gmail.com` on Yetiwerks-governed clones.

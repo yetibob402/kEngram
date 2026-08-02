@@ -145,3 +145,10 @@ No marker, any skip/count mismatch, or nonzero exit is failure.
   Prove tracked-only set (e.g. 33 files / manifest `ad33eff8…` at d1dc680) and
   absence of known untracked needles before restart. Do **not** run `migrate`
   from a dirty-built binary.
+
+- **source-event supersession transaction (724808)** (path: `scripts/test-source-event-supersession.sh`):
+<!-- argus-test-command: scripts/test-source-event-supersession.sh -->
+`bash scripts/test-source-event-supersession.sh`
+  — requires non-prod `DATABASE_URL` + `SQLX_OFFLINE=true`; selects `supersession::tests` only.
+  Terminal marker: `PASS source-event-supersession selected=<n> executed=<n> failed=0 skipped=0`.
+

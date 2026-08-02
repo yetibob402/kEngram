@@ -92,16 +92,6 @@ BEGIN
 END
 $profile$;
 
--- R5 helper: CHECK constraints cannot contain subqueries; wrap key count.
-CREATE OR REPLACE FUNCTION public.supersession_receipt_json_key_count(j jsonb)
-RETURNS integer
-LANGUAGE sql
-IMMUTABLE
-STRICT
-AS $fn$
-  SELECT count(*)::integer FROM jsonb_object_keys(j)
-$fn$;
-
 CREATE TABLE IF NOT EXISTS public.argus_source_event_supersession_receipts (
   request_id uuid PRIMARY KEY,
   request_digest bytea NOT NULL CHECK (octet_length(request_digest) = 32),
@@ -160,7 +150,7 @@ CREATE TABLE IF NOT EXISTS public.argus_source_event_supersession_receipts (
   ),
   CONSTRAINT supersession_receipt_envelope_scalars CHECK (
     jsonb_typeof(canonical_receipt_json) = 'object'
-    AND public.supersession_receipt_json_key_count(canonical_receipt_json) = 28
+    AND ((((((((((((((((((((((((((((canonical_receipt_json - 'v') - 'request_id') - 'request_digest') - 'outcome') - 'stable_source_event_id') - 'namespace') - 'source_ref') - 'expected_old_status') - 'expected_old_payload_hash') - 'expected_old_thought_id') - 'observed_missing') - 'observed_old_status') - 'observed_old_payload_hash') - 'observed_old_thought_id') - 'new_payload_hash') - 'new_thought_id') - 'replaces_link_id') - 'gate_event_id') - 'embedding_job_id') - 'tag_job_generation_id') - 'embedding_model_id') - 'tagger_model_id') - 'actor') - 'lane') - 'approval_ref') - 'reason') - 'authenticated_session_user') - 'occurred_at') = '{}'::jsonb
     AND canonical_receipt_json ?& ARRAY[
       'v', 'request_id', 'request_digest', 'outcome',
       'stable_source_event_id', 'namespace', 'source_ref',

@@ -115,6 +115,10 @@ if test "$LINE_COUNT" -ne 1; then
   exit 1
 fi
 read -r GOT_NONCE GOT_PID _rest <"$RECEIPT_PATH" || true
+if test -n "${_rest:-}"; then
+  echo "FAIL source-event-supersession: execution receipt has trailing fields (exact nonce pid only)" >&2
+  exit 1
+fi
 if test "$GOT_NONCE" != "$NONCE"; then
   echo "FAIL source-event-supersession: execution receipt nonce mismatch" >&2
   exit 1

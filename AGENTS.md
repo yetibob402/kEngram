@@ -150,5 +150,8 @@ No marker, any skip/count mismatch, or nonzero exit is failure.
 <!-- argus-test-command: scripts/test-source-event-supersession.sh -->
 `bash scripts/test-source-event-supersession.sh`
   — requires non-prod `DATABASE_URL` + `SQLX_OFFLINE=true`; selects `supersession::tests` only.
-  Terminal marker: `PASS source-event-supersession selected=<n> executed=<n> failed=0 skipped=0`.
-
+  — disposable contract: script parses the URL password and `ALTER ROLE` LOGIN for
+    `kengram_rt_supersession` plus ACL sample roles so a clean migrate 1..36 is
+    executable without undocumented setup (never against production-looking URLs).
+  Terminal marker: `PASS source-event-supersession selected=<n> executed=<n> failed=0 skipped=0`
+  (exact selected/executed equality; zero failed/ignored; cargo must have run).

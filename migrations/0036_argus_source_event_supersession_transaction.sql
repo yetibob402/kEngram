@@ -21,27 +21,59 @@ BEGIN
 END$$;
 
 -- Corpus hygiene principal + settings (exact intended state only)
-INSERT INTO public.corpus_hygiene_producer_principals (
-  principal_name, producer_class, profile_revision, enabled,
-  requires_source_created_at, keep_only, enforce_eligible, relation_allowed
-) VALUES (
-  'kengram_rt_supersession', 'source_event_supersession', 1, true,
-  true, true, false, true
-) ON CONFLICT (principal_name) DO UPDATE SET
-  producer_class = EXCLUDED.producer_class,
-  profile_revision = EXCLUDED.profile_revision,
-  enabled = EXCLUDED.enabled,
-  requires_source_created_at = EXCLUDED.requires_source_created_at,
-  keep_only = EXCLUDED.keep_only,
-  enforce_eligible = EXCLUDED.enforce_eligible,
-  relation_allowed = EXCLUDED.relation_allowed;
+DO $profile$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM public.corpus_hygiene_producer_principals
+    WHERE principal_name = 'kengram_rt_supersession'
+  ) THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM public.corpus_hygiene_producer_principals
+      WHERE principal_name = 'kengram_rt_supersession'
+        AND producer_class = 'source_event_supersession'
+        AND profile_revision = 1
+        AND enabled IS TRUE
+        AND requires_source_created_at IS TRUE
+        AND keep_only IS TRUE
+        AND enforce_eligible IS FALSE
+        AND relation_allowed IS TRUE
+    ) THEN
+      RAISE EXCEPTION 'supersession_principal_unexpected_preexisting_state';
+    END IF;
+  ELSE
+    INSERT INTO public.corpus_hygiene_producer_principals (
+      principal_name, producer_class, profile_revision, enabled,
+      requires_source_created_at, keep_only, enforce_eligible, relation_allowed
+    ) VALUES (
+      'kengram_rt_supersession', 'source_event_supersession', 1, true,
+      true, true, false, true
+    );
+  END IF;
 
-INSERT INTO public.corpus_hygiene_gate_settings (
-  principal_name, producer_class, profile_revision, mode
-) VALUES (
-  'kengram_rt_supersession', 'source_event_supersession', 1, 'off'
-) ON CONFLICT (principal_name, producer_class, profile_revision) DO UPDATE SET
-  mode = EXCLUDED.mode;
+  IF EXISTS (
+    SELECT 1 FROM public.corpus_hygiene_gate_settings
+    WHERE principal_name = 'kengram_rt_supersession'
+      AND producer_class = 'source_event_supersession'
+      AND profile_revision = 1
+  ) THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM public.corpus_hygiene_gate_settings
+      WHERE principal_name = 'kengram_rt_supersession'
+        AND producer_class = 'source_event_supersession'
+        AND profile_revision = 1
+        AND mode = 'off'
+    ) THEN
+      RAISE EXCEPTION 'supersession_gate_settings_unexpected_preexisting_state';
+    END IF;
+  ELSE
+    INSERT INTO public.corpus_hygiene_gate_settings (
+      principal_name, producer_class, profile_revision, mode
+    ) VALUES (
+      'kengram_rt_supersession', 'source_event_supersession', 1, 'off'
+    );
+  END IF;
+END
+$profile$;
 
 CREATE TABLE IF NOT EXISTS public.argus_source_event_supersession_receipts (
   request_id uuid PRIMARY KEY,
@@ -92,6 +124,57 @@ CREATE TABLE IF NOT EXISTS public.argus_source_event_supersession_receipts (
     (outcome <> 'applied' AND new_thought_id IS NULL AND replaces_link_id IS NULL
       AND gate_event_id IS NULL AND embedding_job_id IS NULL
       AND tag_job_generation_id IS NULL)
+  ),
+  CONSTRAINT supersession_receipt_digest_matches_envelope CHECK (
+    receipt_digest = public.digest(
+      pg_catalog.convert_to(canonical_receipt_json::text, 'UTF8'),
+      'sha256'
+    )
+  ),
+  CONSTRAINT supersession_receipt_envelope_scalars CHECK (
+    jsonb_typeof(canonical_receipt_json) = 'object'
+    AND (canonical_receipt_json ->> 'v') = '1'
+    AND (canonical_receipt_json ->> 'request_id') = request_id::text
+    AND (canonical_receipt_json ->> 'request_digest') = encode(request_digest, 'hex')
+    AND (canonical_receipt_json ->> 'outcome') = outcome
+    AND (canonical_receipt_json ->> 'namespace') = namespace
+    AND (canonical_receipt_json ->> 'source_ref') = source_ref
+    AND (canonical_receipt_json ->> 'expected_old_status') = expected_old_status
+    AND (canonical_receipt_json ->> 'expected_old_payload_hash') = expected_old_payload_hash
+    AND (canonical_receipt_json ->> 'new_payload_hash') = new_payload_hash
+    AND (canonical_receipt_json ->> 'embedding_model_id') = embedding_model_id
+    AND (canonical_receipt_json ->> 'tagger_model_id') = tagger_model_id
+    AND (canonical_receipt_json ->> 'actor') = actor
+    AND (canonical_receipt_json ->> 'lane') = lane
+    AND (canonical_receipt_json ->> 'approval_ref') = approval_ref
+    AND (canonical_receipt_json ->> 'reason') = reason
+    AND (canonical_receipt_json ->> 'authenticated_session_user') = authenticated_session_user
+    AND (canonical_receipt_json ? 'observed_missing')
+    AND ((canonical_receipt_json ->> 'observed_missing')::boolean) = observed_missing
+    AND (
+      (stable_source_event_id IS NULL AND (canonical_receipt_json ->> 'stable_source_event_id') IS NULL)
+      OR (canonical_receipt_json ->> 'stable_source_event_id') = stable_source_event_id::text
+    )
+    AND (
+      (new_thought_id IS NULL AND (canonical_receipt_json ->> 'new_thought_id') IS NULL)
+      OR (canonical_receipt_json ->> 'new_thought_id') = new_thought_id::text
+    )
+    AND (
+      (replaces_link_id IS NULL AND (canonical_receipt_json ->> 'replaces_link_id') IS NULL)
+      OR (canonical_receipt_json ->> 'replaces_link_id') = replaces_link_id::text
+    )
+    AND (
+      (gate_event_id IS NULL AND (canonical_receipt_json ->> 'gate_event_id') IS NULL)
+      OR (canonical_receipt_json ->> 'gate_event_id') = gate_event_id::text
+    )
+    AND (
+      (embedding_job_id IS NULL AND (canonical_receipt_json ->> 'embedding_job_id') IS NULL)
+      OR (canonical_receipt_json ->> 'embedding_job_id') = embedding_job_id::text
+    )
+    AND (
+      (tag_job_generation_id IS NULL AND (canonical_receipt_json ->> 'tag_job_generation_id') IS NULL)
+      OR (canonical_receipt_json ->> 'tag_job_generation_id') = tag_job_generation_id::text
+    )
   )
 );
 
@@ -236,7 +319,8 @@ BEGIN
   v_request_preimage := v_request_envelope::text;
   v_request_digest := public.digest(pg_catalog.convert_to(v_request_preimage, 'UTF8'), 'sha256');
 
-  v_lock_key := ('x' || substr(encode(v_request_digest, 'hex'), 1, 16))::bit(64)::bigint;
+  -- Serialize by request_id (not request body digest) per sealed contract
+  v_lock_key := ('x' || substr(encode(public.digest(pg_catalog.convert_to(p_request_id::text, 'UTF8'), 'sha256'), 'hex'), 1, 16))::bit(64)::bigint;
   PERFORM pg_advisory_xact_lock(v_lock_key);
 
   SELECT * INTO v_existing
@@ -587,5 +671,5 @@ GRANT EXECUTE ON FUNCTION public.supersede_argus_source_event(
   uuid, text, text, text, text, uuid, text, text, text, jsonb, text, text, text, text, text, text
 ) TO kengram_rt_supersession;
 
--- Gate owner needs EXECUTE on nested functions (already has as owner typically)
-GRANT kengram_runtime TO kengram_rt_supersession WITH INHERIT TRUE, SET FALSE;
+-- least-privilege: no kengram_runtime membership for dedicated role (F5)
+REVOKE kengram_runtime FROM kengram_rt_supersession;

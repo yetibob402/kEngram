@@ -973,7 +973,7 @@ mod tests {
 
     #[tokio::test]
     async fn case_10b_old_thought_missing() {
-        // R3: thought_id NULL + expected_old_thought_id NULL reaches old-thought lookup.
+        // R3/B4: exact SQLSTATE P0001 + exact outer message (no substring).
         let admin = admin_pool().await;
         let uid = Uuid::new_v4();
         let source_ref = format!("old-miss-{uid}");
@@ -1000,11 +1000,17 @@ mod tests {
         let err = call_as("kengram_rt_supersession", &req)
             .await
             .expect_err("must fail supersession_old_thought_unavailable");
-        let msg = format!("{err:?}");
-        assert!(
-            msg.contains("supersession_old_thought_unavailable"),
-            "exact unavailable error required, got {msg}"
-        );
+        match &err {
+            SupersessionError::SqlState { code, message } => {
+                assert_eq!(code.as_str(), "P0001", "exact SQLSTATE required");
+                assert_eq!(
+                    message.as_str(),
+                    "supersession_old_thought_unavailable",
+                    "exact outer message equality required (no substring)"
+                );
+            }
+            other => panic!("expected SqlState P0001 unavailable, got {other:?}"),
+        }
         let after = snap(&admin).await;
         assert_domain_unchanged(&before, &after, 0);
         let status: String =
@@ -1766,6 +1772,29 @@ mod tests {
             .execute(&admin)
             .await
             .expect("wipe receipts");
+        // B5: create exact helper signature so pre-down existence is non-vacuous.
+        sqlx::query(
+            r#"
+            CREATE OR REPLACE FUNCTION public.supersession_receipt_json_key_count(j jsonb)
+            RETURNS integer
+            LANGUAGE sql
+            IMMUTABLE
+            STRICT
+            AS $fn$
+              SELECT count(*)::integer FROM jsonb_object_keys(j)
+            $fn$;
+            "#,
+        )
+        .execute(&admin)
+        .await
+        .expect("create helper for pre-down residue probe");
+        let helper_before: bool = sqlx::query_scalar(
+            "SELECT to_regprocedure('public.supersession_receipt_json_key_count(jsonb)') IS NOT NULL",
+        )
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+        assert!(helper_before, "pre-down helper existence is load-bearing");
         assert!(
             sqlx::raw_sql(down).execute(&admin).await.is_ok(),
             "down must succeed with zero receipts"
@@ -1780,7 +1809,24 @@ mod tests {
         .fetch_one(&admin)
         .await
         .unwrap();
-        assert!(gone);
+        assert!(gone, "producer function must be absent after down");
+        let table_gone: bool = sqlx::query_scalar(
+            "SELECT to_regclass('public.argus_source_event_supersession_receipts') IS NULL",
+        )
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+        assert!(table_gone, "receipt table must be absent after down");
+        let helper_gone: bool = sqlx::query_scalar(
+            "SELECT to_regprocedure('public.supersession_receipt_json_key_count(jsonb)') IS NULL",
+        )
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+        assert!(
+            helper_gone,
+            "B5: key-count helper must be absent after down (residue zero)"
+        );
         // reinstall 0036 for later tests in same DB
         let up = include_str!(
             "../../../migrations/0036_argus_source_event_supersession_transaction.sql"

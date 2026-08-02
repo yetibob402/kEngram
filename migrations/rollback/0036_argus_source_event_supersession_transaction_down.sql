@@ -16,6 +16,8 @@ DROP TRIGGER IF EXISTS argus_source_event_supersession_receipts_no_update
   ON public.argus_source_event_supersession_receipts;
 DROP FUNCTION IF EXISTS public.argus_source_event_supersession_receipts_immutable();
 DROP TABLE IF EXISTS public.argus_source_event_supersession_receipts;
+-- B5: remove successor key-count helper if present (idempotent; residue-free rollback)
+DROP FUNCTION IF EXISTS public.supersession_receipt_json_key_count(jsonb);
 DELETE FROM public.corpus_hygiene_gate_settings
  WHERE principal_name = 'kengram_rt_supersession'
    AND producer_class = 'source_event_supersession';

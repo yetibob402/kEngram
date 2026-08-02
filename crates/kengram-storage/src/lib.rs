@@ -16,6 +16,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub mod corpus_hygiene;
+pub mod supersession;
 
 pub mod target {
     //! `embeddings.target_kind` enum-as-string. Matches the CHECK constraint

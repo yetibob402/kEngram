@@ -145,3 +145,14 @@ No marker, any skip/count mismatch, or nonzero exit is failure.
   Prove tracked-only set (e.g. 33 files / manifest `ad33eff8…` at d1dc680) and
   absence of known untracked needles before restart. Do **not** run `migrate`
   from a dirty-built binary.
+
+- **source-event supersession transaction (724808)** (path: `scripts/test-source-event-supersession.sh`):
+<!-- argus-test-command: scripts/test-source-event-supersession.sh -->
+`bash scripts/test-source-event-supersession.sh`
+  — requires non-prod `DATABASE_URL` + `SQLX_OFFLINE=true`; selects `supersession::tests` only.
+  — disposable contract: script parses the URL password and `ALTER ROLE` LOGIN for
+    `kengram_rt_supersession` plus ACL sample roles so a clean migrate 1..36 is
+    executable without undocumented setup (never against production-looking URLs).
+    Judged gate is this registered supersession E2E only (A8 scoped: unprovisioned full kengram-mcp --lib 42501 producer_principal_unmapped is diagnostic, not pass/fail). B4: case_10b requires exact SQLSTATE P0001 and exact message supersession_old_thought_unavailable. B5: zero-receipt down removes supersession_receipt_json_key_count(jsonb) with pre-proven residue.
+  Terminal marker: `PASS source-event-supersession selected=<n> executed=<n> failed=0 skipped=0`
+  (exact selected/executed equality; zero failed/ignored; cargo must have run).

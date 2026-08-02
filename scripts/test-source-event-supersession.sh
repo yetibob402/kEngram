@@ -17,7 +17,7 @@ case "$DATABASE_URL" in
     ;;
 esac
 
-SELECTED=3
+SELECTED=18
 # Run only supersession tests serially
 set +e
 OUT="$(cargo test -p kengram-storage supersession::tests -- --test-threads=1 --nocapture 2>&1)"

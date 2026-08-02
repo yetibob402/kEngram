@@ -482,10 +482,10 @@ BEGIN
 
   SELECT id INTO v_emb_id FROM public.pending_embeddings
   WHERE target_kind = 'thought' AND target_id = v_capture.thought_id
-  ORDER BY created_at DESC NULLS LAST LIMIT 1;
+  ORDER BY enqueued_at DESC NULLS LAST LIMIT 1;
   SELECT tag_job_generation_id INTO v_tag_gen FROM public.pending_tags
   WHERE thought_id = v_capture.thought_id
-  ORDER BY created_at DESC NULLS LAST LIMIT 1;
+  ORDER BY enqueued_at DESC NULLS LAST LIMIT 1;
   IF v_emb_id IS NULL OR v_tag_gen IS NULL OR v_capture.gate_event_id IS NULL THEN
     RAISE EXCEPTION 'supersession_queue_or_gate_missing' USING ERRCODE = 'P0001';
   END IF;

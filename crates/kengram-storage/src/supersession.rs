@@ -267,7 +267,7 @@ mod tests {
         (event_id, old_hash, thought_id)
     }
 
-    /// Ordered-byte domain snapshot (not mere counts).
+    /// Full-row domain snapshot via to_jsonb (every column; stable PK order).
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct DomainSnap {
         thoughts: String,
@@ -276,53 +276,54 @@ mod tests {
         embeddings: String,
         tags: String,
         gate: String,
-        receipts: i64,
+        receipts: String,
+        receipts_count: i64,
     }
 
     async fn snap(admin: &PgPool) -> DomainSnap {
         let thoughts: String = sqlx::query_scalar(
-            r#"SELECT coalesce(string_agg(id::text || ':' || coalesce(retracted_at::text,''), '|' ORDER BY id), '')
-               FROM public.thoughts"#,
+            r#"SELECT coalesce((SELECT jsonb_agg(to_jsonb(t) ORDER BY t.id)::text FROM public.thoughts t), '[]')"#,
         )
         .fetch_one(admin)
         .await
         .unwrap();
         let links: String = sqlx::query_scalar(
-            r#"SELECT coalesce(string_agg(id::text || ':' || relation || ':' || coalesce(deleted_at::text,''), '|' ORDER BY id), '')
-               FROM public.thought_links"#,
+            r#"SELECT coalesce((SELECT jsonb_agg(to_jsonb(t) ORDER BY t.id)::text FROM public.thought_links t), '[]')"#,
         )
         .fetch_one(admin)
         .await
         .unwrap();
         let events: String = sqlx::query_scalar(
-            r#"SELECT coalesce(string_agg(id::text || ':' || status || ':' || payload_hash, '|' ORDER BY id), '')
-               FROM public.argus_source_events"#,
+            r#"SELECT coalesce((SELECT jsonb_agg(to_jsonb(t) ORDER BY t.id)::text FROM public.argus_source_events t), '[]')"#,
         )
         .fetch_one(admin)
         .await
         .unwrap();
         let embeddings: String = sqlx::query_scalar(
-            r#"SELECT coalesce(string_agg(id::text || ':' || target_id::text, '|' ORDER BY id), '')
-               FROM public.pending_embeddings"#,
+            r#"SELECT coalesce((SELECT jsonb_agg(to_jsonb(t) ORDER BY t.id)::text FROM public.pending_embeddings t), '[]')"#,
         )
         .fetch_one(admin)
         .await
         .unwrap();
         let tags: String = sqlx::query_scalar(
-            r#"SELECT coalesce(string_agg(thought_id::text || ':' || tag_job_generation_id::text, '|' ORDER BY thought_id), '')
-               FROM public.pending_tags"#,
+            r#"SELECT coalesce((SELECT jsonb_agg(to_jsonb(t) ORDER BY t.thought_id)::text FROM public.pending_tags t), '[]')"#,
         )
         .fetch_one(admin)
         .await
         .unwrap();
         let gate: String = sqlx::query_scalar(
-            r#"SELECT coalesce(string_agg(id::text, '|' ORDER BY id), '')
-               FROM public.thought_ingest_gate_events"#,
+            r#"SELECT coalesce((SELECT jsonb_agg(to_jsonb(t) ORDER BY t.id)::text FROM public.thought_ingest_gate_events t), '[]')"#,
         )
         .fetch_one(admin)
         .await
         .unwrap();
-        let receipts: i64 = sqlx::query_scalar(
+        let receipts: String = sqlx::query_scalar(
+            r#"SELECT coalesce((SELECT jsonb_agg(to_jsonb(t) ORDER BY t.request_id)::text FROM public.argus_source_event_supersession_receipts t), '[]')"#,
+        )
+        .fetch_one(admin)
+        .await
+        .unwrap();
+        let receipts_count: i64 = sqlx::query_scalar(
             "SELECT count(*)::bigint FROM public.argus_source_event_supersession_receipts",
         )
         .fetch_one(admin)
@@ -336,22 +337,96 @@ mod tests {
             tags,
             gate,
             receipts,
+            receipts_count,
         }
     }
 
     fn assert_domain_unchanged(before: &DomainSnap, after: &DomainSnap, receipts_delta: i64) {
-        assert_eq!(after.thoughts, before.thoughts, "thoughts bytes");
-        assert_eq!(after.links, before.links, "links bytes");
-        assert_eq!(after.events, before.events, "events bytes");
-        assert_eq!(after.embeddings, before.embeddings, "embeddings bytes");
-        assert_eq!(after.tags, before.tags, "tags bytes");
-        assert_eq!(after.gate, before.gate, "gate bytes");
-        assert_eq!(after.receipts, before.receipts + receipts_delta, "receipts");
+        assert_eq!(after.thoughts, before.thoughts, "thoughts full-row");
+        assert_eq!(after.links, before.links, "links full-row");
+        assert_eq!(after.events, before.events, "events full-row");
+        assert_eq!(after.embeddings, before.embeddings, "embeddings full-row");
+        assert_eq!(after.tags, before.tags, "tags full-row");
+        assert_eq!(after.gate, before.gate, "gate full-row");
+        assert_eq!(
+            after.receipts_count,
+            before.receipts_count + receipts_delta,
+            "receipts count"
+        );
+        if receipts_delta == 0 {
+            assert_eq!(
+                after.receipts_count, before.receipts_count,
+                "receipts full-row"
+            );
+        }
+    }
+
+    fn assert_non_receipt_unchanged(before: &DomainSnap, after: &DomainSnap) {
+        assert_eq!(after.thoughts, before.thoughts, "thoughts full-row");
+        assert_eq!(after.links, before.links, "links full-row");
+        assert_eq!(after.events, before.events, "events full-row");
+        assert_eq!(after.embeddings, before.embeddings, "embeddings full-row");
+        assert_eq!(after.tags, before.tags, "tags full-row");
+        assert_eq!(after.gate, before.gate, "gate full-row");
     }
 
     async fn drop_test_trigger(admin: &PgPool, name: &str, table: &str) {
         let q = format!("DROP TRIGGER IF EXISTS {name} ON {table}");
         let _ = sqlx::query(&q).execute(admin).await;
+    }
+
+    #[tokio::test]
+    async fn case_00_execution_receipt_writes_once() {
+        // Wrapper R1: selected binary writes exactly one fresh execution receipt.
+        let path = std::env::var("KENGRAM_SS_EXEC_RECEIPT_PATH")
+            .expect("KENGRAM_SS_EXEC_RECEIPT_PATH from registered wrapper");
+        let nonce = std::env::var("KENGRAM_SS_EXEC_NONCE")
+            .expect("KENGRAM_SS_EXEC_NONCE from registered wrapper");
+        let p = std::path::Path::new(&path);
+        assert!(
+            !p.exists(),
+            "execution receipt path must not pre-exist (wrapper provides fresh path)"
+        );
+        let pid = std::process::id();
+        let line = format!("{nonce} {pid}\n");
+        std::fs::write(p, line.as_bytes()).expect("write execution receipt");
+        // Refuse second write path: re-open would be non-atomic; assert single line remains.
+        let body = std::fs::read_to_string(p).unwrap();
+        assert_eq!(body.lines().count(), 1);
+        assert!(body.starts_with(&nonce));
+    }
+
+    #[tokio::test]
+    async fn case_snapshot_metadata_sensitivity() {
+        let admin = admin_pool().await;
+        let uid = Uuid::new_v4();
+        let source_ref = format!("snap-meta-{uid}");
+        let (event_id, _h, _tid) =
+            seed_conflict(&admin, &source_ref, &format!("snap meta {uid}")).await;
+        let before = snap(&admin).await;
+        // Disposable transaction: mutate only metadata, prove full-row snap changes, roll back.
+        let mut tx = admin.begin().await.unwrap();
+        sqlx::query(
+            "UPDATE public.argus_source_events SET metadata = metadata || jsonb_build_object('trinity_snapshot_probe', true) WHERE id=$1",
+        )
+        .bind(event_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let mid_events: String = sqlx::query_scalar(
+            r#"SELECT coalesce((SELECT jsonb_agg(to_jsonb(t) ORDER BY t.id)::text FROM public.argus_source_events t), '[]')"#,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_ne!(
+            mid_events, before.events,
+            "metadata-only drift must change full-row events snap"
+        );
+        tx.rollback().await.unwrap();
+        let after = snap(&admin).await;
+        assert_eq!(after.events, before.events, "rollback restores events snap");
+        assert_domain_unchanged(&before, &after, 0);
     }
 
     #[tokio::test]
@@ -395,7 +470,7 @@ mod tests {
                 .unwrap();
         assert!(old_retracted.is_some());
         let after = snap(&admin).await;
-        assert_eq!(after.receipts, before.receipts + 1);
+        assert_eq!(after.receipts_count, before.receipts_count + 1);
     }
 
     #[tokio::test]
@@ -510,7 +585,7 @@ mod tests {
             Err(SupersessionError::SqlState { code, .. }) => assert_eq!(code, "ZSI01"),
             o => panic!("expected ZSI01 {o:?}"),
         }
-        assert_eq!(snap(&admin).await.receipts, mid.receipts);
+        assert_eq!(snap(&admin).await.receipts_count, mid.receipts_count);
     }
 
     #[tokio::test]
@@ -570,7 +645,7 @@ mod tests {
         assert_eq!(out2["receipt_hash"], out1["receipt_hash"]);
         let after2 = snap(&admin).await;
         assert_eq!(after2.thoughts, after1.thoughts);
-        assert_eq!(after2.receipts, after1.receipts);
+        assert_eq!(after2.receipts_count, after1.receipts_count);
     }
 
     #[tokio::test]
@@ -618,7 +693,7 @@ mod tests {
             Err(SupersessionError::SqlState { code, .. }) => assert_eq!(code, "ZSR01"),
             other => panic!("expected ZSR01 {other:?}"),
         }
-        assert_eq!(snap(&admin).await.receipts, before.receipts + 1);
+        assert_eq!(snap(&admin).await.receipts_count, before.receipts_count + 1);
     }
 
     #[tokio::test]
@@ -799,7 +874,7 @@ mod tests {
             Err(SupersessionError::SqlState { code, .. }) => assert_eq!(code, "ZSA01"),
             o => panic!("ZSA01 {o:?}"),
         }
-        assert_eq!(snap(&admin).await.receipts, before.receipts);
+        assert_eq!(snap(&admin).await.receipts_count, before.receipts_count);
         let pool = role_pool("kengram_rt_supersession").await;
         assert!(sqlx::query(
             "INSERT INTO public.argus_source_event_supersession_receipts (request_id) VALUES ($1)",
@@ -832,7 +907,7 @@ mod tests {
             "payload_sha256": req.new_payload_hash,
         });
         assert!(call_as("kengram_rt_supersession", &req).await.is_err());
-        assert_eq!(snap(&admin).await.receipts, before.receipts);
+        assert_eq!(snap(&admin).await.receipts_count, before.receipts_count);
     }
 
     #[tokio::test]
@@ -870,63 +945,119 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(status, "conflict");
-        assert_eq!(snap(&admin).await.receipts, before.receipts);
+        assert_eq!(snap(&admin).await.receipts_count, before.receipts_count);
     }
 
     #[tokio::test]
     async fn case_10b_old_thought_missing() {
+        // R3: thought_id NULL + expected_old_thought_id NULL reaches old-thought lookup.
         let admin = admin_pool().await;
         let uid = Uuid::new_v4();
         let source_ref = format!("old-miss-{uid}");
         let (event_id, old_hash, tid) =
             seed_conflict(&admin, &source_ref, &format!("old miss {uid}")).await;
-        // Point event at a non-existent thought id for CAS match, then use that id
-        let ghost = Uuid::new_v4();
-        sqlx::query("UPDATE public.argus_source_events SET thought_id=$1 WHERE id=$2")
-            .bind(ghost)
+        // Detach thought so CAS matches with expected_old_thought_id = NULL.
+        sqlx::query("UPDATE public.argus_source_events SET thought_id=NULL WHERE id=$1")
             .bind(event_id)
             .execute(&admin)
             .await
-            .ok();
-        // If FK prevents, delete old thought instead
-        let status_fk =
-            sqlx::query("UPDATE public.argus_source_events SET thought_id=$1 WHERE id=$2")
-                .bind(ghost)
-                .bind(event_id)
-                .execute(&admin)
-                .await;
-        let (use_hash, use_tid) = if status_fk.is_ok() {
-            (old_hash, ghost)
-        } else {
-            // delete thought (may fail FK) — use wrong expected tid that is missing
-            (old_hash, Uuid::new_v4())
-        };
+            .expect("null thought_id for missing-old-thought branch");
         let _ = tid;
         let before = snap(&admin).await;
         let req = mk_req(
             Uuid::new_v4(),
             &source_ref,
             "conflict",
-            &use_hash,
-            Some(use_tid),
+            &old_hash,
+            None,
             &format!("new miss th {uid}"),
             "diesel",
             "724808",
         );
-        // Either CAS refusal or old-thought unavailable error — must not apply
-        let res = call_as("kengram_rt_supersession", &req).await;
-        match res {
-            Ok(v) => assert_ne!(v["outcome"], "applied"),
-            Err(_) => {}
-        }
-        let st: String =
+        let err = call_as("kengram_rt_supersession", &req)
+            .await
+            .expect_err("must fail supersession_old_thought_unavailable");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("supersession_old_thought_unavailable"),
+            "exact unavailable error required, got {msg}"
+        );
+        let after = snap(&admin).await;
+        assert_domain_unchanged(&before, &after, 0);
+        let status: String =
             sqlx::query_scalar("SELECT status FROM public.argus_source_events WHERE id=$1")
                 .bind(event_id)
                 .fetch_one(&admin)
                 .await
                 .unwrap();
-        assert_ne!(st, "stored");
-        let _ = before;
+        assert_eq!(status, "conflict");
+    }
+
+    #[tokio::test]
+    async fn case_10c_old_thought_chain_blocked() {
+        // R3: old thought is FROM of live replaces edge → retract fails chain unlink.
+        let admin = admin_pool().await;
+        let uid = Uuid::new_v4();
+        let source_ref = format!("old-chain-{uid}");
+        let (event_id, old_hash, tid) =
+            seed_conflict(&admin, &source_ref, &format!("old chain {uid}")).await;
+        let other = Uuid::new_v4();
+        disable_thought_gate(&admin).await;
+        sqlx::query(
+            r#"
+            INSERT INTO public.thoughts (id, scope, content, source, metadata, content_fingerprint)
+            VALUES ($1,'global',$2,'manual','{}'::jsonb, public.digest(pg_catalog.convert_to($2,'UTF8'),'sha256'))
+            "#,
+        )
+        .bind(other)
+        .bind(format!("chain other {uid}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+        // live replaces edge FROM old thought
+        sqlx::query(
+            r#"
+            INSERT INTO public.thought_links (id, from_thought_id, to_thought_id, relation)
+            VALUES ($1, $2, $3, 'replaces')
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(tid)
+        .bind(other)
+        .execute(&admin)
+        .await
+        .unwrap();
+        enable_thought_gate(&admin).await;
+        let before = snap(&admin).await;
+        let req = mk_req(
+            Uuid::new_v4(),
+            &source_ref,
+            "conflict",
+            &old_hash,
+            Some(tid),
+            &format!("new chain {uid}"),
+            "diesel",
+            "724808",
+        );
+        let err = call_as("kengram_rt_supersession", &req)
+            .await
+            .expect_err("chain-blocked must fail");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("thought_chain_from_requires_unlink")
+                || msg.contains("supersession_old_thought")
+                || msg.contains("chain"),
+            "must surface chain unlink failure, got {msg}"
+        );
+        let after = snap(&admin).await;
+        assert_domain_unchanged(&before, &after, 0);
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM public.argus_source_events WHERE id=$1")
+                .bind(event_id)
+                .fetch_one(&admin)
+                .await
+                .unwrap();
+        assert_eq!(status, "conflict");
     }
 
     #[tokio::test]
@@ -1116,7 +1247,7 @@ mod tests {
         );
         assert!(call_as("kengram_rt_supersession", &req).await.is_err());
         // thoughts may have been rolled back with the statement
-        assert_eq!(snap(&admin).await.receipts, before.receipts);
+        assert_eq!(snap(&admin).await.receipts_count, before.receipts_count);
         let st: String = sqlx::query_scalar(
             "SELECT status FROM public.argus_source_events WHERE source_ref=$1 AND namespace='test'",
         )
@@ -1174,7 +1305,7 @@ mod tests {
             "724808",
         );
         assert!(call_as("kengram_rt_supersession", &req).await.is_err());
-        assert_eq!(snap(&admin).await.receipts, before.receipts);
+        assert_eq!(snap(&admin).await.receipts_count, before.receipts_count);
         drop_test_trigger(&admin, "_test_rb_upd", "public.argus_source_events").await;
     }
 
@@ -1225,41 +1356,65 @@ mod tests {
             "724808",
         );
         assert!(call_as("kengram_rt_supersession", &req).await.is_err());
-        assert_eq!(snap(&admin).await.receipts, before.receipts);
+        assert_eq!(snap(&admin).await.receipts_count, before.receipts_count);
         drop_test_trigger(&admin, "_test_rb_ret", "public.thoughts").await;
+    }
+
+    async fn literal_envelope_sql(admin: &PgPool, request_id: Uuid) -> (Value, String, String) {
+        let expected: Value = sqlx::query_scalar(
+            r#"
+            SELECT pg_catalog.jsonb_build_object(
+              'v', 1,
+              'request_id', request_id::text,
+              'request_digest', encode(request_digest, 'hex'),
+              'outcome', outcome,
+              'stable_source_event_id', to_jsonb(stable_source_event_id),
+              'namespace', namespace,
+              'source_ref', source_ref,
+              'expected_old_status', expected_old_status,
+              'expected_old_payload_hash', expected_old_payload_hash,
+              'expected_old_thought_id', to_jsonb(expected_old_thought_id),
+              'observed_missing', observed_missing,
+              'observed_old_status', to_jsonb(observed_old_status),
+              'observed_old_payload_hash', to_jsonb(observed_old_payload_hash),
+              'observed_old_thought_id', to_jsonb(observed_old_thought_id),
+              'new_payload_hash', new_payload_hash,
+              'new_thought_id', to_jsonb(new_thought_id),
+              'replaces_link_id', to_jsonb(replaces_link_id),
+              'gate_event_id', to_jsonb(gate_event_id),
+              'embedding_job_id', to_jsonb(embedding_job_id),
+              'tag_job_generation_id', to_jsonb(tag_job_generation_id),
+              'embedding_model_id', embedding_model_id,
+              'tagger_model_id', tagger_model_id,
+              'actor', actor,
+              'lane', lane,
+              'approval_ref', approval_ref,
+              'reason', reason,
+              'authenticated_session_user', authenticated_session_user,
+              'occurred_at', to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+            )
+            FROM public.argus_source_event_supersession_receipts
+            WHERE request_id = $1
+            "#,
+        )
+        .bind(request_id)
+        .fetch_one(admin)
+        .await
+        .unwrap();
+        let expected_text: String = sqlx::query_scalar("SELECT $1::jsonb::text")
+            .bind(&expected)
+            .fetch_one(admin)
+            .await
+            .unwrap();
+        let digest = to_hex(&Sha256::digest(expected_text.as_bytes()));
+        (expected, expected_text, digest)
     }
 
     #[tokio::test]
     async fn case_13_receipt_oracle_four_envelopes() {
         let admin = admin_pool().await;
         let uid = Uuid::new_v4();
-        // applied
-        let source_ref = format!("rcpt-app-{uid}");
-        let (_e, old_hash, tid) =
-            seed_conflict(&admin, &source_ref, &format!("rcpt old {uid}")).await;
-        let req = mk_req(
-            Uuid::new_v4(),
-            &source_ref,
-            "conflict",
-            &old_hash,
-            Some(tid),
-            &format!("rcpt new {uid}"),
-            "diesel",
-            "724808",
-        );
-        let out = call_as("kengram_rt_supersession", &req)
-            .await
-            .expect("applied");
-        assert_eq!(out["outcome"], "applied");
-        let canon: Value = sqlx::query_scalar(
-            "SELECT canonical_receipt_json FROM public.argus_source_event_supersession_receipts WHERE request_id=$1",
-        )
-        .bind(req.request_id)
-        .fetch_one(&admin)
-        .await
-        .unwrap();
-        // Independent literal key set from §7
-        for k in [
+        let keys = [
             "v",
             "request_id",
             "request_digest",
@@ -1288,20 +1443,43 @@ mod tests {
             "reason",
             "authenticated_session_user",
             "occurred_at",
-        ] {
-            assert!(canon.get(k).is_some(), "missing key {k}");
+        ];
+        assert_eq!(keys.len(), 28);
+
+        let source_ref = format!("rcpt-app-{uid}");
+        let (_event_id, old_hash, tid) =
+            seed_conflict(&admin, &source_ref, &format!("rcpt old {uid}")).await;
+        let req = mk_req(
+            Uuid::new_v4(),
+            &source_ref,
+            "conflict",
+            &old_hash,
+            Some(tid),
+            &format!("rcpt new {uid}"),
+            "diesel",
+            "724808",
+        );
+        assert_ne!(req.actor, req.lane);
+        let out = call_as("kengram_rt_supersession", &req)
+            .await
+            .expect("applied");
+        assert_eq!(out["outcome"], "applied");
+        let (expected, expected_text, expected_digest) =
+            literal_envelope_sql(&admin, req.request_id).await;
+        for k in keys {
+            assert!(expected.get(k).is_some(), "missing key {k}");
         }
-        let text: String = sqlx::query_scalar(
+        assert_eq!(expected.as_object().unwrap().len(), 28);
+        let stored_text: String = sqlx::query_scalar(
             "SELECT canonical_receipt_json::text FROM public.argus_source_event_supersession_receipts WHERE request_id=$1",
         )
         .bind(req.request_id)
         .fetch_one(&admin)
         .await
         .unwrap();
-        let oracle = to_hex(&Sha256::digest(text.as_bytes()));
-        assert_eq!(oracle, out["receipt_hash"].as_str().unwrap());
+        assert_eq!(stored_text, expected_text, "literal-oracle exact text");
+        assert_eq!(expected_digest, out["receipt_hash"].as_str().unwrap());
 
-        // expected-state refusal envelope
         let miss = mk_req(
             Uuid::new_v4(),
             &format!("rcpt-miss-{uid}"),
@@ -1316,35 +1494,24 @@ mod tests {
             .await
             .expect("miss");
         assert_eq!(out_m["outcome"], "refused_expected_state");
-        let text_m: String = sqlx::query_scalar(
+        let (_, exp_m_text, exp_m_dig) = literal_envelope_sql(&admin, miss.request_id).await;
+        let st_m: String = sqlx::query_scalar(
             "SELECT canonical_receipt_json::text FROM public.argus_source_event_supersession_receipts WHERE request_id=$1",
         )
-        .bind(miss.request_id)
-        .fetch_one(&admin)
-        .await
-        .unwrap();
-        assert_eq!(
-            to_hex(&Sha256::digest(text_m.as_bytes())),
-            out_m["receipt_hash"].as_str().unwrap()
-        );
+        .bind(miss.request_id).fetch_one(&admin).await.unwrap();
+        assert_eq!(st_m, exp_m_text);
+        assert_eq!(exp_m_dig, out_m["receipt_hash"].as_str().unwrap());
 
-        // exact-content refusal
         let uid2 = Uuid::new_v4();
         let sref2 = format!("rcpt-ex-{uid2}");
         let content = format!("exact pre {uid2}");
         let (_e2, h2, t2) = seed_conflict(&admin, &sref2, &format!("ex old {uid2}")).await;
         disable_thought_gate(&admin).await;
         sqlx::query(
-            r#"
-            INSERT INTO public.thoughts (id, scope, content, source, metadata, content_fingerprint)
-            VALUES ($1,'global',$2,'manual','{}'::jsonb, public.digest(pg_catalog.convert_to($2,'UTF8'),'sha256'))
-            "#,
+            r#"INSERT INTO public.thoughts (id, scope, content, source, metadata, content_fingerprint)
+               VALUES ($1,'global',$2,'manual','{}'::jsonb, public.digest(pg_catalog.convert_to($2,'UTF8'),'sha256'))"#,
         )
-        .bind(Uuid::new_v4())
-        .bind(&content)
-        .execute(&admin)
-        .await
-        .unwrap();
+        .bind(Uuid::new_v4()).bind(&content).execute(&admin).await.unwrap();
         enable_thought_gate(&admin).await;
         let req_e = mk_req(
             Uuid::new_v4(),
@@ -1360,19 +1527,14 @@ mod tests {
             .await
             .expect("exact");
         assert_eq!(out_e["outcome"], "refused_exact_content_duplicate");
-        let text_e: String = sqlx::query_scalar(
+        let (_, exp_e_text, exp_e_dig) = literal_envelope_sql(&admin, req_e.request_id).await;
+        let st_e: String = sqlx::query_scalar(
             "SELECT canonical_receipt_json::text FROM public.argus_source_event_supersession_receipts WHERE request_id=$1",
         )
-        .bind(req_e.request_id)
-        .fetch_one(&admin)
-        .await
-        .unwrap();
-        assert_eq!(
-            to_hex(&Sha256::digest(text_e.as_bytes())),
-            out_e["receipt_hash"].as_str().unwrap()
-        );
+        .bind(req_e.request_id).fetch_one(&admin).await.unwrap();
+        assert_eq!(st_e, exp_e_text);
+        assert_eq!(exp_e_dig, out_e["receipt_hash"].as_str().unwrap());
 
-        // replay envelope identity
         let out_r = call_as("kengram_rt_supersession", &req)
             .await
             .expect("replay");

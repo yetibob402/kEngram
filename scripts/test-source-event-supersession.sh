@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Registered acceptance: supersession::tests on disposable non-prod PostgreSQL.
+# R1 successor: real Cargo child status + fresh test-binary execution receipt.
 # Provisions disposable LOGIN passwords for dedicated/ACL roles from DATABASE_URL
 # so a clean migrate 1..36 is executable without undocumented manual setup.
 set -euo pipefail
@@ -19,18 +20,27 @@ case "$DATABASE_URL" in
     ;;
 esac
 
-# Exact selected denominator for this head (must match #[tokio::test] count).
-SELECTED=24
+# Disposable execution-proof surface (mode 0700).
+RECEIPT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kengram-ss-exec.XXXXXX")"
+chmod 700 "$RECEIPT_DIR"
+RECEIPT_PATH="${RECEIPT_DIR}/execution.receipt"
+NONCE="$(openssl rand -hex 16)"
+export KENGRAM_SS_EXEC_RECEIPT_PATH="$RECEIPT_PATH"
+export KENGRAM_SS_EXEC_NONCE="$NONCE"
+cleanup() {
+  local st=$?
+  rm -rf "$RECEIPT_DIR" || st=1
+  exit "$st"
+}
+trap cleanup EXIT
 
 # Parse password from postgres URL user:pass@host
-# Supports postgres://user:pass@host:port/db
 PASS="$(printf '%s' "$DATABASE_URL" | sed -n 's#.*://[^:]*:\([^@]*\)@.*#\1#p')"
 if test -z "$PASS"; then
   echo "FAIL source-event-supersession: cannot parse password from DATABASE_URL for disposable role bootstrap" >&2
   exit 1
 fi
 
-# Disposable-only role password bootstrap (test contract; never for prod URLs above).
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<SQL
 DO \$\$
 DECLARE
@@ -50,15 +60,73 @@ BEGIN
 END\$\$;
 SQL
 
+# Dynamic selected denominator from Cargo list (not hard-coded).
+LIST_OUT="$(cargo test -p kengram-storage supersession::tests -- --list 2>&1 || true)"
+SELECTED="$(printf '%s\n' "$LIST_OUT" | grep -cE ': test$' || true)"
+if test -z "$SELECTED" || test "$SELECTED" -lt 1; then
+  echo "FAIL source-event-supersession: cargo list produced non-positive selection" >&2
+  printf '%s\n' "$LIST_OUT" >&2
+  exit 1
+fi
+# Require execution-receipt test and successor-named cases in the selected list.
+for need in \
+  case_00_execution_receipt_writes_once \
+  case_10b_old_thought_missing \
+  case_10c_old_thought_chain_blocked \
+  case_13_receipt_oracle_four_envelopes \
+  case_snapshot_metadata_sensitivity
+do
+  if ! printf '%s\n' "$LIST_OUT" | grep -q "${need}: test"; then
+    echo "FAIL source-event-supersession: required test missing from list: $need" >&2
+    exit 1
+  fi
+done
+
+CARGO_BIN="$(command -v cargo)"
+if test -z "$CARGO_BIN"; then
+  echo "FAIL source-event-supersession: cargo not found" >&2
+  exit 1
+fi
+
 set +e
-OUT="$(cargo test -p kengram-storage supersession::tests -- --test-threads=1 --nocapture 2>&1)"
-RC=$?
+set -o pipefail
+"$CARGO_BIN" test -p kengram-storage supersession::tests -- --test-threads=1 --nocapture 2>&1 \
+  | tee "${RECEIPT_DIR}/cargo.out"
+RC=${PIPESTATUS[0]}
+set +o pipefail
 set -e
+OUT="$(cat "${RECEIPT_DIR}/cargo.out")"
 printf '%s\n' "$OUT"
 
-# Require cargo actually ran tests
+if test "$RC" -ne 0; then
+  echo "FAIL source-event-supersession: cargo child exit $RC" >&2
+  exit 1
+fi
+
+# Fresh execution receipt from the selected Rust test binary (not stdout text).
+if test ! -f "$RECEIPT_PATH"; then
+  echo "FAIL source-event-supersession: missing execution receipt (fabricated cargo text cannot PASS)" >&2
+  exit 1
+fi
+# Exactly one line: nonce pid
+LINE_COUNT="$(wc -l <"$RECEIPT_PATH" | tr -d ' ')"
+if test "$LINE_COUNT" -ne 1; then
+  echo "FAIL source-event-supersession: execution receipt must be exactly one line (got $LINE_COUNT)" >&2
+  exit 1
+fi
+read -r GOT_NONCE GOT_PID _rest <"$RECEIPT_PATH" || true
+if test "$GOT_NONCE" != "$NONCE"; then
+  echo "FAIL source-event-supersession: execution receipt nonce mismatch" >&2
+  exit 1
+fi
+if ! printf '%s' "$GOT_PID" | grep -qE '^[1-9][0-9]*$'; then
+  echo "FAIL source-event-supersession: execution receipt PID invalid" >&2
+  exit 1
+fi
+
+# Diagnostic cargo summary only after child+receipt proof.
 if ! printf '%s\n' "$OUT" | grep -qE '^running[[:space:]]+[0-9]+[[:space:]]+tests?$'; then
-  echo "FAIL source-event-supersession: cargo did not report running tests (marker-only forbidden)" >&2
+  echo "FAIL source-event-supersession: cargo did not report running tests" >&2
   exit 1
 fi
 RUNNING="$(printf '%s\n' "$OUT" | sed -n 's/^running \([0-9][0-9]*\) tests*$/\1/p' | tail -1)"
@@ -66,13 +134,6 @@ if test -z "$RUNNING" || test "$RUNNING" -ne "$SELECTED"; then
   echo "FAIL source-event-supersession: running=$RUNNING selected=$SELECTED mismatch" >&2
   exit 1
 fi
-
-# Reject ignored/skipped
-if printf '%s\n' "$OUT" | grep -qE 'ignored|filtered out.*ignored'; then
-  # cargo always prints "filtered out" for other lib tests - allow that
-  :
-fi
-# Parse final summary line only
 SUMMARY="$(printf '%s\n' "$OUT" | grep -E '^test result:' | tail -1 || true)"
 if test -z "$SUMMARY"; then
   echo "FAIL source-event-supersession: missing cargo test result summary" >&2
@@ -95,10 +156,6 @@ if test "${FAILED_N:-1}" -ne 0; then
 fi
 if test "${IGNORED_N:-1}" -ne 0; then
   echo "FAIL source-event-supersession: ignored=$IGNORED_N (skips forbidden)" >&2
-  exit 1
-fi
-if test "$RC" -ne 0; then
-  echo "FAIL source-event-supersession cargo_rc=$RC" >&2
   exit 1
 fi
 

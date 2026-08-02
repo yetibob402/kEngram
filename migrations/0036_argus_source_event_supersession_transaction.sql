@@ -7,16 +7,33 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;
 -- Reserved SQLSTATEs (ZSD01 exact content, ZSI01 invalid status, ZSA01 unauthorized session, ZSR01 request reuse)
 DO $$
 BEGIN
+  -- R6: exact dedicated-role posture (LOGIN+INHERIT, five negative attrs, zero membership edges).
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'kengram_rt_supersession') THEN
-    IF EXISTS (
+    IF NOT EXISTS (
       SELECT 1 FROM pg_roles
       WHERE rolname = 'kengram_rt_supersession'
-        AND (rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls)
+        AND rolcanlogin IS TRUE
+        AND rolinherit IS TRUE
+        AND rolsuper IS FALSE
+        AND rolcreaterole IS FALSE
+        AND rolcreatedb IS FALSE
+        AND rolreplication IS FALSE
+        AND rolbypassrls IS FALSE
     ) THEN
-      RAISE EXCEPTION 'kengram_rt_supersession exists with unexpected attributes';
+      RAISE EXCEPTION 'kengram_rt_supersession exists with unexpected attributes (LOGIN/INHERIT/privilege posture)';
+    END IF;
+    IF EXISTS (
+      SELECT 1
+      FROM pg_auth_members m
+      JOIN pg_roles r ON r.oid = m.roleid
+      JOIN pg_roles u ON u.oid = m.member
+      WHERE r.rolname = 'kengram_rt_supersession'
+         OR u.rolname = 'kengram_rt_supersession'
+    ) THEN
+      RAISE EXCEPTION 'kengram_rt_supersession has unexpected membership edges before grants';
     END IF;
   ELSE
-    CREATE ROLE kengram_rt_supersession LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+    CREATE ROLE kengram_rt_supersession LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
   END IF;
 END$$;
 
@@ -74,6 +91,16 @@ BEGIN
   END IF;
 END
 $profile$;
+
+-- R5 helper: CHECK constraints cannot contain subqueries; wrap key count.
+CREATE OR REPLACE FUNCTION public.supersession_receipt_json_key_count(j jsonb)
+RETURNS integer
+LANGUAGE sql
+IMMUTABLE
+STRICT
+AS $fn$
+  SELECT count(*)::integer FROM jsonb_object_keys(j)
+$fn$;
 
 CREATE TABLE IF NOT EXISTS public.argus_source_event_supersession_receipts (
   request_id uuid PRIMARY KEY,
@@ -133,6 +160,17 @@ CREATE TABLE IF NOT EXISTS public.argus_source_event_supersession_receipts (
   ),
   CONSTRAINT supersession_receipt_envelope_scalars CHECK (
     jsonb_typeof(canonical_receipt_json) = 'object'
+    AND public.supersession_receipt_json_key_count(canonical_receipt_json) = 28
+    AND canonical_receipt_json ?& ARRAY[
+      'v', 'request_id', 'request_digest', 'outcome',
+      'stable_source_event_id', 'namespace', 'source_ref',
+      'expected_old_status', 'expected_old_payload_hash',
+      'expected_old_thought_id', 'observed_missing', 'observed_old_status',
+      'observed_old_payload_hash', 'observed_old_thought_id', 'new_payload_hash',
+      'new_thought_id', 'replaces_link_id', 'gate_event_id', 'embedding_job_id',
+      'tag_job_generation_id', 'embedding_model_id', 'tagger_model_id', 'actor',
+      'lane', 'approval_ref', 'reason', 'authenticated_session_user', 'occurred_at'
+    ]
     AND (canonical_receipt_json ->> 'v') = '1'
     AND (canonical_receipt_json ->> 'request_id') = request_id::text
     AND (canonical_receipt_json ->> 'request_digest') = encode(request_digest, 'hex')
@@ -152,27 +190,45 @@ CREATE TABLE IF NOT EXISTS public.argus_source_event_supersession_receipts (
     AND (canonical_receipt_json ? 'observed_missing')
     AND ((canonical_receipt_json ->> 'observed_missing')::boolean) = observed_missing
     AND (
-      (stable_source_event_id IS NULL AND (canonical_receipt_json ->> 'stable_source_event_id') IS NULL)
+      (expected_old_thought_id IS NULL AND jsonb_typeof(canonical_receipt_json -> 'expected_old_thought_id') = 'null')
+      OR (canonical_receipt_json ->> 'expected_old_thought_id') = expected_old_thought_id::text
+    )
+    AND (
+      (observed_old_status IS NULL AND jsonb_typeof(canonical_receipt_json -> 'observed_old_status') = 'null')
+      OR (canonical_receipt_json ->> 'observed_old_status') = observed_old_status
+    )
+    AND (
+      (observed_old_payload_hash IS NULL AND jsonb_typeof(canonical_receipt_json -> 'observed_old_payload_hash') = 'null')
+      OR (canonical_receipt_json ->> 'observed_old_payload_hash') = observed_old_payload_hash
+    )
+    AND (
+      (observed_old_thought_id IS NULL AND jsonb_typeof(canonical_receipt_json -> 'observed_old_thought_id') = 'null')
+      OR (canonical_receipt_json ->> 'observed_old_thought_id') = observed_old_thought_id::text
+    )
+    AND (canonical_receipt_json ->> 'occurred_at') =
+      to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+    AND (
+      (stable_source_event_id IS NULL AND jsonb_typeof(canonical_receipt_json -> 'stable_source_event_id') = 'null')
       OR (canonical_receipt_json ->> 'stable_source_event_id') = stable_source_event_id::text
     )
     AND (
-      (new_thought_id IS NULL AND (canonical_receipt_json ->> 'new_thought_id') IS NULL)
+      (new_thought_id IS NULL AND jsonb_typeof(canonical_receipt_json -> 'new_thought_id') = 'null')
       OR (canonical_receipt_json ->> 'new_thought_id') = new_thought_id::text
     )
     AND (
-      (replaces_link_id IS NULL AND (canonical_receipt_json ->> 'replaces_link_id') IS NULL)
+      (replaces_link_id IS NULL AND jsonb_typeof(canonical_receipt_json -> 'replaces_link_id') = 'null')
       OR (canonical_receipt_json ->> 'replaces_link_id') = replaces_link_id::text
     )
     AND (
-      (gate_event_id IS NULL AND (canonical_receipt_json ->> 'gate_event_id') IS NULL)
+      (gate_event_id IS NULL AND jsonb_typeof(canonical_receipt_json -> 'gate_event_id') = 'null')
       OR (canonical_receipt_json ->> 'gate_event_id') = gate_event_id::text
     )
     AND (
-      (embedding_job_id IS NULL AND (canonical_receipt_json ->> 'embedding_job_id') IS NULL)
+      (embedding_job_id IS NULL AND jsonb_typeof(canonical_receipt_json -> 'embedding_job_id') = 'null')
       OR (canonical_receipt_json ->> 'embedding_job_id') = embedding_job_id::text
     )
     AND (
-      (tag_job_generation_id IS NULL AND (canonical_receipt_json ->> 'tag_job_generation_id') IS NULL)
+      (tag_job_generation_id IS NULL AND jsonb_typeof(canonical_receipt_json -> 'tag_job_generation_id') = 'null')
       OR (canonical_receipt_json ->> 'tag_job_generation_id') = tag_job_generation_id::text
     )
   )
@@ -198,6 +254,34 @@ CREATE TRIGGER argus_source_event_supersession_receipts_no_update
 
 REVOKE ALL ON public.argus_source_event_supersession_receipts FROM PUBLIC;
 GRANT SELECT ON public.argus_source_event_supersession_receipts TO kengram_rt_supersession;
+
+-- R6 post-grant: dedicated role must still have zero role-membership edges either direction.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM pg_auth_members m
+    JOIN pg_roles r ON r.oid = m.roleid
+    JOIN pg_roles u ON u.oid = m.member
+    WHERE r.rolname = 'kengram_rt_supersession'
+       OR u.rolname = 'kengram_rt_supersession'
+  ) THEN
+    RAISE EXCEPTION 'kengram_rt_supersession has unexpected membership edges after grants';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_roles
+    WHERE rolname = 'kengram_rt_supersession'
+      AND rolcanlogin IS TRUE
+      AND rolinherit IS TRUE
+      AND rolsuper IS FALSE
+      AND rolcreaterole IS FALSE
+      AND rolcreatedb IS FALSE
+      AND rolreplication IS FALSE
+      AND rolbypassrls IS FALSE
+  ) THEN
+    RAISE EXCEPTION 'kengram_rt_supersession post-grant attribute posture invalid';
+  END IF;
+END$$;
 
 CREATE OR REPLACE FUNCTION public.supersede_argus_source_event(
   p_request_id uuid,
